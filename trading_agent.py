@@ -29,6 +29,11 @@ from alpaca.trading.requests import MarketOrderRequest
 import alerts
 import db
 import news_agent
+from config import (
+    SYMBOLS, POLL_INTERVAL_SECONDS,
+    MOMENTUM_BUY_THRESHOLD, MOMENTUM_SELL_THRESHOLD,
+    TAKE_PROFIT_PCT, SENTIMENT_BLOCK_BUY, SENTIMENT_BLOCK_SELL,
+)
 from market_data import get_latest_quotes
 from risk_manager import RiskManager
 
@@ -39,15 +44,6 @@ API_SECRET = os.getenv("ALPACA_API_SECRET")
 
 if not API_KEY or not API_SECRET:
     raise EnvironmentError("ALPACA_API_KEY or ALPACA_API_SECRET not found in .env")
-
-SYMBOLS = ["META", "AAPL", "NVDA", "GOOGL", "ORCL"]
-POLL_INTERVAL_SECONDS = 300
-
-MOMENTUM_BUY_THRESHOLD = 0.02
-MOMENTUM_SELL_THRESHOLD = -0.02
-TAKE_PROFIT_PCT = 0.08
-SENTIMENT_BLOCK_BUY = -0.3   # block BUY if sentiment is below this
-SENTIMENT_BLOCK_SELL = 0.3   # block SELL if sentiment is above this
 
 ET = ZoneInfo("America/New_York")
 

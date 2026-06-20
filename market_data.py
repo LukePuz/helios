@@ -5,6 +5,8 @@ from dotenv import load_dotenv
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
 
+from config import SYMBOLS
+
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 API_KEY = os.getenv("ALPACA_API_KEY")
@@ -12,8 +14,6 @@ API_SECRET = os.getenv("ALPACA_API_SECRET")
 
 if not API_KEY or not API_SECRET:
     raise EnvironmentError("ALPACA_API_KEY or ALPACA_API_SECRET not found in .env")
-
-SYMBOLS = ["META", "AAPL", "NVDA", "GOOGL", "ORCL"]
 
 client = StockHistoricalDataClient(API_KEY, API_SECRET)
 

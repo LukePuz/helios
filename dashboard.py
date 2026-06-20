@@ -16,13 +16,12 @@ except ImportError:
     _HAS_AUTOREFRESH = False
 
 import db
+from config import SYMBOLS, START_VALUE
 from market_data import get_latest_quotes
 from alpaca.trading.client import TradingClient
 
 API_KEY = os.getenv("ALPACA_API_KEY")
 API_SECRET = os.getenv("ALPACA_API_SECRET")
-SYMBOLS = ["META", "AAPL", "NVDA", "GOOGL", "ORCL"]
-START_VALUE = 100_000.0
 
 st.set_page_config(page_title="MANGOS Trading Bot", layout="wide")
 

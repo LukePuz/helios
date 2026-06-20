@@ -1,48 +1,123 @@
 """
-Central configuration. Edit this file to change the symbol universe.
-All other modules import SYMBOLS from here.
+Central configuration. All strategy parameters and risk rules live here.
+Symbol universe is now driven by knowledge/watchlist.md via knowledge_loader.
 """
+from __future__ import annotations
 
-SYMBOLS: list[str] = [
-    # Mega-cap tech / AI hyperscalers
-    "META", "AAPL", "NVDA", "GOOGL", "ORCL",
-    "MSFT", "AMZN", "TSLA",
+# ---------------------------------------------------------------------------
+# Symbol universe — derived from watchlist at import time
+# Keep SYMBOLS for any module that still references it directly.
+# ---------------------------------------------------------------------------
+def _load_symbols() -> list[str]:
+    try:
+        from knowledge_loader import get_all_tickers
+        tickers = get_all_tickers()
+        if tickers:
+            return tickers
+    except Exception:
+        pass
+    # Fallback if knowledge_loader isn't available yet
+    return [
+        "META", "AAPL", "NVDA", "GOOGL", "ORCL", "MSFT", "AMZN", "TSLA",
+        "AMD", "AVGO", "QCOM", "MU", "ARM", "AMAT", "LRCX", "ASML", "KLAC",
+        "PLTR", "CRM", "NOW", "SNOW", "NET", "DDOG",
+        "IONQ", "RGTI", "QBTS", "QUBT",
+    ]
 
-    # AI chips & hardware
-    "AMD", "AVGO", "QCOM", "MU", "ARM",
 
-    # Semiconductor equipment — picks & shovels for the AI buildout
-    "AMAT", "LRCX", "ASML", "KLAC",
+SYMBOLS: list[str] = _load_symbols()
 
-    # AI software & data platforms
-    "PLTR", "CRM", "NOW", "SNOW",
-
-    # Cloud & AI infrastructure
-    "NET", "DDOG",
-
-    # Quantum computing — pure plays
-    "IONQ",   # IonQ: trapped-ion quantum computers, NASA/US Air Force contracts
-    "RGTI",   # Rigetti Computing: superconducting qubits, cloud quantum access
-    "QBTS",   # D-Wave Quantum: quantum annealing, earliest commercial quantum company
-    "QUBT",   # Quantum Computing Inc: quantum software and optimization
-    "ARQQ",   # Arqit Quantum: quantum encryption / satellite key distribution
-
-    # Quantum-adjacent photonics & optics
-    "LITE",   # Lumentum: photonic components used in quantum networking hardware
-    "COHR",   # Coherent Corp: lasers and photonics critical to quantum lab infrastructure
-]
-
-# Strategy thresholds — edit here, applies everywhere
-MOMENTUM_BUY_THRESHOLD  =  0.02   # 5-day momentum > +2% triggers BUY
-MOMENTUM_SELL_THRESHOLD = -0.02   # 5-day momentum < -2% triggers SELL
-TAKE_PROFIT_PCT         =  0.08   # Exit when position is up 8%
-SENTIMENT_BLOCK_BUY     = -0.3    # Block BUY if news sentiment below this
-SENTIMENT_BLOCK_SELL    =  0.3    # Block SELL if news sentiment above this
-
-# Risk rules — must match risk_manager.py
-MAX_RISK_PER_TRADE  = 0.02   # 2% of portfolio per trade
-MAX_POSITION_PCT    = 0.20   # 20% max per position
-DRAWDOWN_HALT_PCT   = 0.10   # Halt if portfolio drops 10%
-
+# ---------------------------------------------------------------------------
+# Portfolio baseline
+# ---------------------------------------------------------------------------
 START_VALUE = 100_000.0
-POLL_INTERVAL_SECONDS = 300  # 5 minutes
+POLL_INTERVAL_SECONDS = 300  # 5 minutes (portfolio snapshots)
+
+# ---------------------------------------------------------------------------
+# Risk rules — authoritative source; risk_manager.py reads these
+# ---------------------------------------------------------------------------
+DRAWDOWN_HALT_PCT = 0.10   # Halt all trading if portfolio drops 10% from start
+
+# Per-bucket position caps (initial entry ceiling)
+MAX_POSITION_PCT_COMPOUNDER  = 0.12   # 12% at entry; allow up to 15% via gains
+MAX_POSITION_PCT_ACCELERATOR = 0.07   # 7% at entry; allow up to 8% via gains
+MAX_POSITION_PCT_MOONSHOT    = 0.02   # 2% hard cap always
+
+# Theme / sector concentration limits
+MAX_SINGLE_THEME_PCT   = 0.35   # 35% per sector/thesis
+MAX_AI_INFRA_PCT       = 0.60   # 60% total AI infrastructure exposure
+MAX_MOONSHOT_TOTAL_PCT = 0.10   # 10% total moonshots
+
+# Sizing table: (bucket, conviction_band) → (min_pct, max_pct) of portfolio
+# conviction_band is the lower bound of the 2-point band
+BUCKET_SIZE_TABLE: dict[str, dict[int, tuple[float, float]]] = {
+    "Compounder":  {9: (0.08, 0.12), 7: (0.05, 0.08), 5: (0.03, 0.05), 3: (0.02, 0.03)},
+    "Accelerator": {9: (0.04, 0.07), 7: (0.03, 0.05), 5: (0.02, 0.03), 3: (0.01, 0.02)},
+    "Moonshot":    {9: (0.01, 0.02), 7: (0.005, 0.01), 5: (0.0025, 0.005), 3: (None, None)},
+}
+
+# Regime sizing multiplier
+REGIME_MULTIPLIER: dict[str, float] = {
+    "Strong Risk-On": 1.2,
+    "Risk-On":        1.0,
+    "Neutral":        0.75,
+    "Risk-Off":       0.5,
+    "Strong Risk-Off": 0.25,
+}
+
+# ATR stop multipliers by bucket
+ATR_STOP_MULTIPLIER: dict[str, tuple[float, float]] = {
+    "Compounder":  (2.0, 3.0),    # 2-3× ATR
+    "Accelerator": (1.5, 2.0),    # 1.5-2× ATR
+    "Moonshot":    (None, None),   # defined max loss, not ATR-based
+}
+MOONSHOT_MAX_LOSS_PCT = 0.35   # 35% of position value for moonshot stop
+
+# Trailing stop activation thresholds
+TRAILING_STOP_ACTIVATE: dict[str, float] = {
+    "Compounder":  0.30,   # activate after 30% gain
+    "Accelerator": 0.20,   # activate after 20% gain
+}
+TRAILING_STOP_DISTANCE: dict[str, tuple[float, float]] = {
+    "Compounder":  (0.15, 0.20),
+    "Accelerator": (0.10, 0.15),
+}
+
+# ---------------------------------------------------------------------------
+# Agent pipeline thresholds
+# ---------------------------------------------------------------------------
+MIN_CONVICTION_TO_QUEUE   = 5      # analyst conviction score (1-10) min to pass to risk
+MIN_UPSIDE_DOWNSIDE_RATIO = 2.0    # minimum 2:1 upside/downside required
+MIN_COMPOSITE_SCORE_HIGH  = 75     # scanner score threshold for HIGH priority
+MIN_COMPOSITE_SCORE_MEDIUM = 50    # scanner score threshold for MEDIUM priority
+
+# ---------------------------------------------------------------------------
+# Market regime
+# ---------------------------------------------------------------------------
+REGIME_CACHE_TTL_SECONDS = 3600   # 1 hour
+
+REGIME_THRESHOLDS: dict[str, tuple[float, float]] = {
+    "Strong Risk-On": (75, 100),
+    "Risk-On":        (55, 74),
+    "Neutral":        (40, 54),
+    "Risk-Off":       (20, 39),
+    "Strong Risk-Off": (0, 19),
+}
+
+# ---------------------------------------------------------------------------
+# Approval gate
+# ---------------------------------------------------------------------------
+APPROVAL_EXPIRY_HOURS = 6     # pending approvals auto-expire after 6 hours
+
+# ---------------------------------------------------------------------------
+# Portfolio safety
+# ---------------------------------------------------------------------------
+MAX_DRAWDOWN_PCT = 0.15       # alert at 15% drawdown from START_VALUE
+
+# ---------------------------------------------------------------------------
+# Ollama model config
+# ---------------------------------------------------------------------------
+import os
+OLLAMA_HOST      = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+SCREENER_MODEL   = os.getenv("SCREENER_MODEL", "qwen2.5:7b")
+ANALYST_MODEL    = os.getenv("ANALYST_MODEL", "qwen2.5:72b")

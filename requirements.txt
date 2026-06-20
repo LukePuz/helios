@@ -1,8 +1,29 @@
+# Broker & market data
 alpaca-py>=0.28.0
+polygon-api-client>=1.13.0
+
+# Environment & config
 python-dotenv>=1.0.0
+
+# Database
 psycopg2-binary>=2.9.9
+
+# Vector store & embeddings
+chromadb>=0.5.0
+sentence-transformers>=3.0.0
+
+# Async task queue
+celery>=5.4.0
+redis>=5.0.0
+
+# Agent framework (install manually: pip install crewai)
+# crewai — add when Python 3.12 venv is active
+
+# Dashboard & visualization
 streamlit>=1.35.0
 streamlit-autorefresh>=1.0.1
 plotly>=5.22.0
 pandas>=2.2.0
+
+# HTTP
 requests>=2.32.0

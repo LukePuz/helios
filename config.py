@@ -19,6 +19,17 @@ SYMBOLS: list[str] = [
 
     # Cloud & AI infrastructure
     "NET", "DDOG",
+
+    # Quantum computing — pure plays
+    "IONQ",   # IonQ: trapped-ion quantum computers, NASA/US Air Force contracts
+    "RGTI",   # Rigetti Computing: superconducting qubits, cloud quantum access
+    "QBTS",   # D-Wave Quantum: quantum annealing, earliest commercial quantum company
+    "QUBT",   # Quantum Computing Inc: quantum software and optimization
+    "ARQQ",   # Arqit Quantum: quantum encryption / satellite key distribution
+
+    # Quantum-adjacent photonics & optics
+    "LITE",   # Lumentum: photonic components used in quantum networking hardware
+    "COHR",   # Coherent Corp: lasers and photonics critical to quantum lab infrastructure
 ]
 
 # Strategy thresholds — edit here, applies everywhere

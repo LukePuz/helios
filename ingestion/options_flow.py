@@ -116,6 +116,75 @@ def get_all_flow_summaries() -> dict[str, dict]:
     return summaries
 
 
+def get_darkpool_activity(ticker: str) -> dict:
+    """
+    Fetches dark pool prints for a ticker via Unusual Whales.
+    A significant print (>$1M single transaction) suggests institutional accumulation.
+    Returns stub with has_significant_print=False on error or missing key.
+    """
+    stub = {"ticker": ticker, "has_significant_print": False, "total_value": 0, "largest_print": 0, "summary": ""}
+    if not API_KEY:
+        return stub
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/darkpool/{ticker}",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json().get("data", [])
+        if not data:
+            return stub
+
+        values = [float(d.get("size", 0)) * float(d.get("price", 0)) for d in data]
+        total  = sum(values)
+        largest = max(values) if values else 0
+        significant = largest > 1_000_000
+
+        return {
+            "ticker":                ticker,
+            "has_significant_print": significant,
+            "total_value":           total,
+            "largest_print":         largest,
+            "print_count":           len(data),
+            "summary": (
+                f"{ticker} dark pool: {len(data)} prints, "
+                f"total ${total/1e6:.1f}M, largest ${largest/1e6:.1f}M"
+                if data else "No dark pool activity"
+            ),
+        }
+    except Exception as e:
+        log.debug(f"Dark pool fetch failed for {ticker}: {e}")
+        return stub
+
+
+def get_etf_flows(etf_tickers: list[str] | None = None) -> dict:
+    """
+    Fetches options flow for a set of ETFs.
+    Used by the Market Regime Agent to score market breadth.
+    Returns {ticker: {call_ratio, net_premium, direction}} for each ETF.
+    """
+    if etf_tickers is None:
+        etf_tickers = ["SPY", "QQQ", "SOXX", "XLK", "ARKK"]
+
+    if not API_KEY:
+        return {}
+
+    results = {}
+    for ticker in etf_tickers:
+        try:
+            summary = get_flow_summary(ticker)
+            results[ticker] = {
+                "call_ratio":  summary.get("call_ratio", 0.5),
+                "net_premium": summary.get("total_premium", 0),
+                "direction":   summary.get("sentiment", "NEUTRAL"),
+            }
+            time.sleep(0.15)
+        except Exception as e:
+            log.debug(f"ETF flow failed for {ticker}: {e}")
+    return results
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     if not API_KEY:

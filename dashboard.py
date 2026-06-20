@@ -1,4 +1,5 @@
 import os
+import subprocess
 from pathlib import Path
 
 import pandas as pd
@@ -8,197 +9,672 @@ from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
-# streamlit-autorefresh is optional — fall back to a manual button if missing
-try:
-    from streamlit_autorefresh import st_autorefresh
-    _HAS_AUTOREFRESH = True
-except ImportError:
-    _HAS_AUTOREFRESH = False
-
+import alerts
 import db
+import process_manager as pm
 from config import SYMBOLS, START_VALUE
 from market_data import get_latest_quotes
 from alpaca.trading.client import TradingClient
+from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import MarketOrderRequest
 
-API_KEY = os.getenv("ALPACA_API_KEY")
+API_KEY    = os.getenv("ALPACA_API_KEY")
 API_SECRET = os.getenv("ALPACA_API_SECRET")
 
-st.set_page_config(page_title="MANGOS Trading Bot", layout="wide")
+st.set_page_config(page_title="Trading Bot", layout="wide", page_icon="📈")
 
-if _HAS_AUTOREFRESH:
-    st_autorefresh(interval=30_000, key="dashboard_refresh")
-else:
-    if st.button("Refresh"):
-        st.rerun()
 
-# Cache the Alpaca client for the session
+
 @st.cache_resource
-def _trading_client() -> TradingClient:
+def _client() -> TradingClient:
     return TradingClient(API_KEY, API_SECRET, paper=True)
 
-client = _trading_client()
 
-# ---------------------------------------------------------------------------
-# Header
-# ---------------------------------------------------------------------------
-st.title("MANGOS Paper Trading Dashboard")
-st.caption("META · AAPL · NVDA · GOOGL · ORCL  |  Paper trading only  |  Refreshes every 30s")
+client = _client()
 
-# ---------------------------------------------------------------------------
-# Account metrics
-# ---------------------------------------------------------------------------
-try:
-    account = client.get_account()
-    portfolio_value = float(account.portfolio_value)
-    cash = float(account.cash)
-    buying_power = float(account.buying_power)
-    pl = portfolio_value - START_VALUE
-    pl_pct = pl / START_VALUE
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Portfolio Value", f"${portfolio_value:,.2f}")
-    c2.metric("P&L vs $100k Start", f"${pl:+,.2f}", f"{pl_pct:+.2%}")
-    c3.metric("Cash", f"${cash:,.2f}")
-    c4.metric("Buying Power", f"${buying_power:,.2f}")
-except Exception as e:
-    st.error(f"Could not fetch account: {e}")
+# ── Sidebar: System Control ───────────────────────────────────────────────────
+with st.sidebar:
+    st.title("System Control")
+    st.caption("Paper trading only")
 
-st.divider()
 
-# ---------------------------------------------------------------------------
-# Positions + Live Prices
-# ---------------------------------------------------------------------------
-col_pos, col_prices = st.columns(2)
+    status = pm.get_status()
 
-with col_pos:
-    st.subheader("Open Positions")
-    try:
-        positions = client.get_all_positions()
-        if not positions:
-            st.info("No open positions.")
-        else:
-            try:
-                quotes = get_latest_quotes(SYMBOLS)
-            except Exception:
-                quotes = {}
-            rows = []
-            for p in positions:
-                sym = p.symbol
-                current = quotes.get(sym, {}).get("mid", float(p.current_price or 0))
-                entry = float(p.avg_entry_price)
-                qty = int(float(p.qty))
-                pl_pos = (current - entry) * qty
-                pl_pct_pos = (current - entry) / entry
-                rows.append({
-                    "Symbol": sym,
-                    "Qty": qty,
-                    "Entry": f"${entry:.2f}",
-                    "Current": f"${current:.2f}",
-                    "P&L $": f"${pl_pos:+,.2f}",
-                    "P&L %": f"{pl_pct_pos:+.2%}",
-                })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    except Exception as e:
-        st.warning(f"Could not load positions: {e}")
+    def _dot(running: bool) -> str:
+        return "🟢" if running else "🔴"
 
-with col_prices:
-    st.subheader("Live MANGOS Prices")
-    try:
-        quotes = get_latest_quotes(SYMBOLS)
-        price_rows = [
-            {
-                "Symbol": sym,
-                "Bid": f"${q['bid']:.2f}",
-                "Ask": f"${q['ask']:.2f}",
-                "Mid": f"${q['mid']:.2f}",
-            }
-            for sym, q in quotes.items()
-        ]
-        st.dataframe(pd.DataFrame(price_rows), use_container_width=True, hide_index=True)
-    except Exception as e:
-        st.warning(f"Could not fetch prices: {e}")
+    # Redis
+    redis_status = "Running" if status["redis"] else "Not running"
+    st.markdown(f"{_dot(status['redis'])} **Redis** — {redis_status}")
+    if not status["redis"]:
+        st.caption("Run: docker start redis")
 
-st.divider()
-
-# ---------------------------------------------------------------------------
-# Portfolio value chart
-# ---------------------------------------------------------------------------
-st.subheader("Portfolio Value Over Time")
-try:
-    history = db.get_portfolio_history(limit=288)
-    if not history:
-        st.info("No history yet — data appears after the first tick.")
+    # Ollama
+    ollama_model = os.getenv("ANALYST_MODEL", "qwen2.5:3b")
+    ollama_ok, ollama_info = pm.ollama_status()
+    col1, col2 = st.columns([3, 1])
+    col1.markdown(f"{_dot(ollama_ok)} **Ollama** — {ollama_model}")
+    with col2.popover("ℹ️"):
+        st.markdown(f"**Current model:** `{ollama_model}`\n\nThe AI reasoning engine. Generates investment theses with conviction scores before any trade executes. Swap to `qwen2.5:72b` when the new build arrives.")
+    if ollama_ok:
+        st.caption(ollama_info)
     else:
-        df_hist = pd.DataFrame(history)
-        df_hist["timestamp"] = pd.to_datetime(df_hist["timestamp"], utc=True)
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=df_hist["timestamp"],
-            y=df_hist["total_value"],
-            mode="lines",
-            name="Portfolio",
-            line=dict(color="#00cc88", width=2),
-            fill="tozeroy",
-            fillcolor="rgba(0,204,136,0.08)",
-        ))
-        fig.add_hline(
-            y=START_VALUE,
-            line_dash="dot",
-            line_color="#888",
-            annotation_text=f"Start ${START_VALUE:,.0f}",
-        )
-        fig.update_layout(
-            height=280,
-            margin=dict(l=0, r=0, t=10, b=0),
-            yaxis=dict(tickprefix="$", tickformat=",.0f"),
-            showlegend=False,
-        )
-        st.plotly_chart(fig, use_container_width=True)
-except Exception as e:
-    st.warning(f"Could not load history: {e}")
+        st.caption("Ollama not running — start it from the system tray")
 
-st.divider()
+    st.divider()
 
-# ---------------------------------------------------------------------------
-# Trades + Signals
-# ---------------------------------------------------------------------------
-col_t, col_s = st.columns(2)
+    _SERVICE_INFO = {
+        "celery_worker": "Runs the background ingestion tasks — pulls SEC filings, FRED macro data, arXiv quantum/AI papers, options flow, congressional trades, and insider filings. Each event gets stored in the vector database and routed to the AI pipeline.",
+        "celery_beat": "The scheduler. Fires each ingestion task on a timer: options flow every 5 min, SEC filings every 10 min, macro data every hour, congressional trades every 6 hours, arXiv papers once daily at 9 AM ET. Also triggers daily regime assessment at 9:30 AM and scanner at 9:35 AM ET.",
+    }
 
-with col_t:
-    st.subheader("Recent Trades")
+    for name, svc in pm.SERVICES.items():
+        running = status[name]
+        col1, col2, col3 = st.columns([3, 1, 2])
+        col1.markdown(f"{_dot(running)} **{svc['label']}**")
+        with col2.popover("ℹ️"):
+            st.markdown(_SERVICE_INFO[name])
+        btn_label = "Stop" if running else "Start"
+        btn_type  = "secondary" if running else "primary"
+        if col3.button(btn_label, key=f"btn_{name}", type=btn_type):
+            if running:
+                result = pm.stop(name)
+                st.toast(f"Stopped {svc['label']}" if result == "ok" else result)
+            else:
+                result = pm.start(name)
+                st.toast(f"Started {svc['label']}" if result == "ok" else result)
+            st.rerun()
+
+
+    st.divider()
+
+    # Regime badge
     try:
-        trades = db.get_recent_trades(limit=20)
-        if not trades:
-            st.info("No trades logged yet.")
+        _regime = db.get_latest_regime()
+        if _regime:
+            _rname  = _regime.get("regime", "Unknown")
+            _rscore = float(_regime.get("score", 0))
+            _remoji = (
+                "🟢🟢" if "Strong Risk-On" in _rname else
+                "🟢"  if "Risk-On"        in _rname else
+                "🔴🔴" if "Strong Risk-Off" in _rname else
+                "🔴"  if "Risk-Off"       in _rname else
+                "🟡"
+            )
+            st.markdown(f"**Market Regime**")
+            st.markdown(f"{_remoji} **{_rname}**")
+            st.progress(_rscore / 100, text=f"Score: {_rscore:.0f}/100")
         else:
-            df_t = pd.DataFrame(trades)
-            df_t["timestamp"] = pd.to_datetime(df_t["timestamp"], utc=True).dt.strftime("%m/%d %H:%M")
-            df_t["price"] = df_t["price"].apply(lambda x: f"${x:.2f}")
-            st.dataframe(df_t, use_container_width=True, hide_index=True)
-    except Exception as e:
-        st.warning(f"Could not load trades: {e}")
+            st.caption("No regime data yet.")
+    except Exception:
+        pass
 
-with col_s:
-    st.subheader("Signal Log")
+    st.divider()
+
+    if st.button("Refresh Dashboard", use_container_width=True, type="primary"):
+        st.rerun()
+
+
+# ── Tabs ──────────────────────────────────────────────────────────────────────
+tab_portfolio, tab_regime, tab_approvals, tab_outcomes, tab_macro, tab_technicals, tab_signals, tab_trade, tab_logs = st.tabs([
+    "Portfolio", "Market Regime", "Pending Approvals", "Outcomes", "Macro", "Technicals", "Signal Log", "Manual Trade", "Logs",
+])
+
+
+# ── Tab 1: Portfolio ──────────────────────────────────────────────────────────
+with tab_portfolio:
+    st.header("Portfolio Overview")
+
     try:
-        signals = db.get_recent_signals(limit=20)
+        account  = client.get_account()
+        pv       = float(account.portfolio_value)
+        cash     = float(account.cash)
+        bp       = float(account.buying_power)
+        pl       = pv - START_VALUE
+        pl_pct   = pl / START_VALUE
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Portfolio Value",      f"${pv:,.2f}")
+        c2.metric("P&L vs $100k Start",   f"${pl:+,.2f}", f"{pl_pct:+.2%}")
+        c3.metric("Cash",                 f"${cash:,.2f}")
+        c4.metric("Buying Power",         f"${bp:,.2f}")
+    except Exception as e:
+        st.error(f"Could not fetch account: {e}")
+
+    st.divider()
+
+    col_pos, col_prices = st.columns(2)
+
+    with col_pos:
+        st.subheader("Open Positions")
+        try:
+            positions = client.get_all_positions()
+            if not positions:
+                st.info("No open positions.")
+            else:
+                quotes = get_latest_quotes(SYMBOLS)
+                rows = []
+                for p in positions:
+                    sym     = p.symbol
+                    current = quotes.get(sym, {}).get("mid", float(p.current_price or 0))
+                    entry   = float(p.avg_entry_price)
+                    qty     = int(float(p.qty))
+                    pl_pos  = (current - entry) * qty
+                    rows.append({
+                        "Symbol":  sym,
+                        "Qty":     qty,
+                        "Entry":   f"${entry:.2f}",
+                        "Current": f"${current:.2f}",
+                        "P&L $":   f"${pl_pos:+,.2f}",
+                        "P&L %":   f"{(current - entry) / entry:+.2%}",
+                    })
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.warning(f"Could not load positions: {e}")
+
+    with col_prices:
+        st.subheader("Live Prices")
+        try:
+            quotes = get_latest_quotes(SYMBOLS)
+            rows = [
+                {"Symbol": sym, "Bid": f"${q['bid']:.2f}", "Ask": f"${q['ask']:.2f}", "Mid": f"${q['mid']:.2f}"}
+                for sym, q in quotes.items()
+            ]
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.warning(f"Could not fetch prices: {e}")
+
+    st.divider()
+
+    st.subheader("Portfolio Value Over Time")
+    try:
+        history = db.get_portfolio_history(limit=288)
+        if not history:
+            st.info("No history yet — appears after the first snapshot.")
+        else:
+            df_hist = pd.DataFrame(history)
+            df_hist["timestamp"] = pd.to_datetime(df_hist["timestamp"], utc=True)
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=df_hist["timestamp"], y=df_hist["total_value"],
+                mode="lines", line=dict(color="#00cc88", width=2),
+                fill="tozeroy", fillcolor="rgba(0,204,136,0.08)",
+            ))
+            fig.add_hline(y=START_VALUE, line_dash="dot", line_color="#888",
+                          annotation_text=f"Start ${START_VALUE:,.0f}")
+            fig.update_layout(height=280, margin=dict(l=0, r=0, t=10, b=0),
+                              yaxis=dict(tickprefix="$", tickformat=",.0f"), showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+    except Exception as e:
+        st.warning(f"Could not load history: {e}")
+
+    st.divider()
+
+    col_t, col_s = st.columns(2)
+
+    with col_t:
+        st.subheader("Recent Trades")
+        try:
+            trades = db.get_recent_trades(limit=20)
+            if not trades:
+                st.info("No trades logged yet.")
+            else:
+                df_t = pd.DataFrame(trades)
+                df_t["timestamp"] = pd.to_datetime(df_t["timestamp"], utc=True).dt.strftime("%m/%d %H:%M")
+                df_t["price"] = df_t["price"].apply(lambda x: f"${x:.2f}")
+                st.dataframe(df_t, use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.warning(f"Could not load trades: {e}")
+
+    with col_s:
+        st.subheader("Recent Signals")
+        try:
+            signals = db.get_recent_signals(limit=20)
+            if not signals:
+                st.info("No signals logged yet.")
+            else:
+                df_s = pd.DataFrame(signals)
+                df_s["timestamp"] = pd.to_datetime(df_s["timestamp"], utc=True).dt.strftime("%m/%d %H:%M")
+                df_s["confidence"] = df_s["confidence"].apply(lambda x: f"{x:.2%}")
+                st.dataframe(df_s, use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.warning(f"Could not load signals: {e}")
+
+
+# ── Tab 2: Market Regime ──────────────────────────────────────────────────────
+with tab_regime:
+    st.header("Market Regime")
+
+    if st.button("Refresh Regime", key="regime_refresh"):
+        st.rerun()
+
+    try:
+        regime_data = db.get_latest_regime()
+        if not regime_data:
+            st.info(
+                "No regime data yet. Regime is assessed at 9:30 AM ET on market days "
+                "or at startup via `python main.py`."
+            )
+        else:
+            rname  = regime_data.get("regime", "Unknown")
+            rscore = float(regime_data.get("score") or 0)
+            rts    = regime_data.get("timestamp", "")
+
+            remoji = (
+                "🟢🟢" if "Strong Risk-On" in rname else
+                "🟢"  if "Risk-On"        in rname else
+                "🔴🔴" if "Strong Risk-Off" in rname else
+                "🔴"  if "Risk-Off"       in rname else
+                "🟡"
+            )
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Regime", f"{remoji} {rname}")
+            c2.metric("Score", f"{rscore:.1f} / 100")
+            if rts:
+                c3.metric("Last Updated", pd.to_datetime(rts, utc=True).strftime("%b %d %I:%M %p UTC"))
+
+            st.progress(rscore / 100)
+
+            # Portfolio impact guidance
+            impact = regime_data.get("portfolio_impact_json") or {}
+            if impact:
+                st.divider()
+                st.subheader("Portfolio Impact Guidance")
+                ic1, ic2, ic3 = st.columns(3)
+                ic1.metric("Equity Exposure", impact.get("equity_exposure", "—"))
+                ic2.metric("Cash Target",     impact.get("cash_target", "—"))
+                lev_allowed = impact.get("options_leverage_allowed", False)
+                ic3.metric("Leverage / Options", "✅ Allowed" if lev_allowed else "⛔ Restricted")
+
+            # Signal breakdown
+            signals_json = regime_data.get("signals_json") or {}
+            if signals_json:
+                st.divider()
+                st.subheader("Signal Scores")
+                sig_rows = [
+                    {"Signal": k.replace("_", " ").title(), "Value": v}
+                    for k, v in signals_json.items()
+                ]
+                st.dataframe(pd.DataFrame(sig_rows), use_container_width=True, hide_index=True)
+
+            reasoning = regime_data.get("reasoning", "")
+            if reasoning:
+                st.divider()
+                with st.expander("Model Reasoning"):
+                    st.text(reasoning)
+
+    except Exception as e:
+        st.warning(f"Could not load regime data: {e}")
+
+
+# ── Tab 3: Pending Approvals ───────────────────────────────────────────────────
+with tab_approvals:
+    st.header("Pending Approvals")
+    st.caption("Recommendations waiting for human approval via Telegram inline buttons.")
+
+    col_filter, col_refresh = st.columns([4, 1])
+    status_filter = col_filter.selectbox(
+        "Status", ["PENDING", "APPROVED", "REJECTED", "ALL"], index=0, key="appr_status"
+    )
+    if col_refresh.button("Refresh", key="appr_refresh"):
+        st.rerun()
+
+    try:
+        status_arg = None if status_filter == "ALL" else status_filter
+        approvals  = db.get_pending_approvals(status=status_arg)
+
+        if not approvals:
+            st.info(f"No {status_filter.lower()} approvals.")
+        else:
+            rows = []
+            for a in approvals:
+                stop_raw = a.get("stop_loss_price")
+                rows.append({
+                    "ID":         a.get("id", ""),
+                    "Ticker":     a.get("ticker", ""),
+                    "Action":     a.get("action", ""),
+                    "Conviction": f"{a.get('conviction', 0)}/10",
+                    "Bucket":     a.get("thesis_bucket", ""),
+                    "Size %":     f"{float(a.get('position_size_pct') or 0):.1%}",
+                    "Stop":       f"${float(stop_raw):.2f}" if stop_raw else "—",
+                    "Status":     a.get("status", ""),
+                    "Sent":       pd.to_datetime(a.get("timestamp"), utc=True).strftime("%m/%d %H:%M")
+                                  if a.get("timestamp") else "",
+                })
+
+            df_a = pd.DataFrame(rows)
+            st.dataframe(df_a, use_container_width=True, hide_index=True)
+
+            # Detail view
+            st.divider()
+            st.subheader("Detail")
+            sel_id = st.selectbox("View reasoning for ID:", [r["ID"] for r in rows], key="appr_sel")
+            for a in approvals:
+                if a.get("id") == sel_id:
+                    st.text_area("Reasoning", a.get("reasoning", ""), height=150, disabled=True)
+                    with st.expander("Entry Strategy"):
+                        st.text(a.get("entry_strategy", "—"))
+                    break
+
+    except Exception as e:
+        st.warning(f"Could not load approvals: {e}")
+
+
+# ── Tab 4: Outcomes ───────────────────────────────────────────────────────────
+with tab_outcomes:
+    st.header("Trade Outcomes")
+    st.caption("30/60/90-day performance tracking for approved trades. Populates over time.")
+
+    if st.button("Refresh", key="outcomes_refresh"):
+        st.rerun()
+
+    try:
+        summary = db.get_outcomes_summary()
+        all_outcomes = db.get_all_outcomes(limit=200)
+
+        if not all_outcomes:
+            st.info("No outcome records yet. Outcomes are created automatically when a trade is approved and executed.")
+        else:
+            # Summary metrics
+            total = sum(b["total"] for b in summary.values())
+            wins  = sum(b["wins"]  for b in summary.values())
+            overall_wr = wins / total if total else 0
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Total Trades Tracked", total)
+            m2.metric("Overall Win Rate", f"{overall_wr:.0%}" if total else "—")
+            m3.metric("Buckets Active", len(summary))
+
+            # By bucket table
+            if summary:
+                st.divider()
+                st.subheader("By Bucket")
+                bucket_rows = [
+                    {
+                        "Bucket":      bucket,
+                        "Trades":      d["total"],
+                        "Win Rate":    f"{d['win_rate']:.0%}" if d["total"] else "—",
+                        "Avg Outcome": f"{d['avg_outcome_pct']:.1%}" if d["avg_outcome_pct"] else "—",
+                    }
+                    for bucket, d in summary.items()
+                ]
+                st.dataframe(pd.DataFrame(bucket_rows), use_container_width=True, hide_index=True)
+
+            # Full log
+            st.divider()
+            st.subheader("Full Outcome Log")
+            outcome_rows = []
+            for o in all_outcomes:
+                ep = o.get("entry_price")
+                outcome_rows.append({
+                    "Ticker":    o.get("ticker", ""),
+                    "Action":    o.get("action", ""),
+                    "Conviction": f"{o.get('conviction', '—')}/10",
+                    "Bucket":    o.get("thesis_bucket", ""),
+                    "Entry":     f"${float(ep):.2f}" if ep else "—",
+                    "Entry Date": pd.to_datetime(o.get("entry_date"), utc=True).strftime("%m/%d/%y") if o.get("entry_date") else "—",
+                    "30d":       f"${float(o['review_30d_price']):.2f}" if o.get("review_30d_price") else "—",
+                    "60d":       f"${float(o['review_60d_price']):.2f}" if o.get("review_60d_price") else "—",
+                    "90d":       f"${float(o['review_90d_price']):.2f}" if o.get("review_90d_price") else "—",
+                    "Outcome %": f"{float(o['outcome_pct']):.1%}" if o.get("outcome_pct") else "Pending",
+                })
+            st.dataframe(pd.DataFrame(outcome_rows), use_container_width=True, hide_index=True)
+
+            # Scatter plot (conviction vs outcome) — fills in over time
+            completed = [o for o in all_outcomes if o.get("outcome_pct") is not None and o.get("conviction")]
+            if completed:
+                st.divider()
+                st.subheader("Conviction vs Outcome")
+                scatter_df = pd.DataFrame([
+                    {
+                        "Conviction": o["conviction"],
+                        "Outcome %":  float(o["outcome_pct"]) * 100,
+                        "Bucket":     o.get("thesis_bucket", ""),
+                        "Ticker":     o.get("ticker", ""),
+                    }
+                    for o in completed
+                ])
+                fig = go.Figure()
+                colors = {"Compounder": "#00cc88", "Accelerator": "#3399ff", "Moonshot": "#ff9900"}
+                for bucket in scatter_df["Bucket"].unique():
+                    sub = scatter_df[scatter_df["Bucket"] == bucket]
+                    fig.add_trace(go.Scatter(
+                        x=sub["Conviction"], y=sub["Outcome %"],
+                        mode="markers+text", text=sub["Ticker"],
+                        textposition="top center", name=bucket,
+                        marker=dict(size=10, color=colors.get(bucket, "#888")),
+                    ))
+                fig.add_hline(y=0, line_dash="dot", line_color="#888")
+                fig.update_layout(
+                    height=350, margin=dict(l=0, r=0, t=10, b=0),
+                    xaxis_title="Conviction (1-10)", yaxis_title="Outcome %",
+                    showlegend=True,
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+    except Exception as e:
+        st.warning(f"Could not load outcomes: {e}")
+
+
+# ── Tab 5: Macro ───────────────────────────────────────────────────────────────
+with tab_macro:
+    st.header("Macro Environment (FRED)")
+
+    @st.cache_data(ttl=3600)
+    def _macro_snapshot() -> dict:
+        from ingestion.macro import get_macro_snapshot
+        return get_macro_snapshot()
+
+    @st.cache_data(ttl=3600)
+    def _macro_summary() -> str:
+        from ingestion.macro import get_macro_summary_text
+        return get_macro_summary_text()
+
+    if st.button("Refresh Macro Data"):
+        st.cache_data.clear()
+        st.rerun()
+
+    with st.spinner("Fetching data from FRED..."):
+        snap    = _macro_snapshot()
+        summary = _macro_summary()
+
+    # Key metrics grid
+    cols = st.columns(5)
+    key_series = ["FEDFUNDS", "VIXCLS", "DGS10", "T10Y2Y", "UNRATE"]
+    for i, sid in enumerate(key_series):
+        d = snap.get(sid, {})
+        val = d.get("value")
+        cols[i].metric(d.get("label", sid), f"{val:.2f}" if val is not None else "N/A")
+
+    st.divider()
+
+    # Full table
+    rows = []
+    for sid, d in snap.items():
+        rows.append({"Indicator": d.get("label", sid), "Value": d.get("value"), "Date": d.get("date")})
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # Summary text (used by the AI model for context)
+    with st.expander("Model Context Text (what the AI sees)"):
+        st.text(summary)
+
+
+# ── Tab 3: Technicals ─────────────────────────────────────────────────────────
+with tab_technicals:
+    st.header("Technical Indicators (Polygon)")
+
+    symbol = st.selectbox("Select Symbol", SYMBOLS, key="tech_symbol")
+
+    @st.cache_data(ttl=300)
+    def _snapshot(sym: str) -> dict:
+        from ingestion.polygon_stream import get_snapshot
+        return get_snapshot(sym)
+
+    @st.cache_data(ttl=300)
+    def _rsi(sym: str) -> float | None:
+        from ingestion.polygon_stream import get_rsi
+        return get_rsi(sym)
+
+    @st.cache_data(ttl=300)
+    def _macd(sym: str) -> dict | None:
+        from ingestion.polygon_stream import get_macd
+        return get_macd(sym)
+
+    if st.button("Refresh", key="tech_refresh"):
+        st.cache_data.clear()
+        st.rerun()
+
+    with st.spinner(f"Fetching {symbol}..."):
+        snap_tech = _snapshot(symbol)
+        rsi_val   = _rsi(symbol)
+        macd_val  = _macd(symbol)
+
+    # Price row
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Price",      f"${snap_tech.get('price') or 0:.2f}")
+    c2.metric("Change",     f"{snap_tech.get('change_pct') or 0:+.2f}%")
+    c3.metric("VWAP",       f"${snap_tech.get('vwap') or 0:.2f}")
+    c4.metric("Volume",     f"{int(snap_tech.get('volume') or 0):,}")
+    c5.metric("Prev Close", f"${snap_tech.get('prev_close') or 0:.2f}")
+
+    st.divider()
+
+    # Indicators row
+    c1, c2, c3 = st.columns(3)
+
+    if rsi_val is not None:
+        rsi_label = "OVERBOUGHT" if rsi_val > 70 else "OVERSOLD" if rsi_val < 30 else "Neutral"
+        rsi_color = "inverse" if rsi_val > 70 else "normal" if rsi_val < 30 else "off"
+        c1.metric("RSI (14)", f"{rsi_val:.1f}", rsi_label, delta_color=rsi_color)
+    else:
+        c1.metric("RSI (14)", "N/A")
+
+    if macd_val:
+        c2.metric("MACD", f"{macd_val.get('value') or 0:.4f}", macd_val.get("trend"))
+        c3.metric("MACD Histogram", f"{macd_val.get('histogram') or 0:.4f}")
+    else:
+        c2.metric("MACD", "N/A")
+        c3.metric("MACD Histogram", "N/A")
+
+    st.divider()
+
+    # Day range bar
+    low  = snap_tech.get("low")
+    high = snap_tech.get("high")
+    price = snap_tech.get("price")
+    if low and high and price:
+        st.subheader("Day Range")
+        pct_in_range = (price - low) / (high - low) if high != low else 0.5
+        st.progress(pct_in_range, text=f"${low:.2f}  ←  ${price:.2f}  →  ${high:.2f}")
+
+
+# ── Tab 6: Signal Log ────────────────────────────────────────────────────────
+with tab_signals:
+    st.header("Signal Log")
+
+    col_filter, col_limit = st.columns([3, 1])
+    limit = col_limit.number_input("Show", min_value=10, max_value=500, value=100, step=10)
+
+    try:
+        signals = db.get_recent_signals(limit=int(limit))
         if not signals:
-            st.info("No signals logged yet.")
+            st.info("No signals yet.")
         else:
             df_s = pd.DataFrame(signals)
             df_s["timestamp"] = pd.to_datetime(df_s["timestamp"], utc=True).dt.strftime("%m/%d %H:%M")
-            df_s["confidence"] = df_s["confidence"].apply(lambda x: f"{x:.2%}")
-            # Color-code the signal column
-            def _color_signal(val: str) -> str:
-                if "BUY" in val and "BLOCK" not in val and "REJECT" not in val:
-                    return "color: #00cc88"
-                if "SELL" in val and "BLOCK" not in val and "REJECT" not in val:
-                    return "color: #ff4b4b"
-                return "color: #888"
-            st.dataframe(
-                df_s.style.applymap(_color_signal, subset=["signal"]),
-                use_container_width=True,
-                hide_index=True,
+            # Handle both legacy float (0-1) and new conviction integer (1-10)
+            df_s["conviction"] = df_s["confidence"].apply(
+                lambda x: f"{int(round(x))}/10" if x is not None and x > 1.0 else (f"{x:.0%}" if x is not None else "—")
             )
+            df_s = df_s.drop(columns=["confidence"], errors="ignore")
+
+            all_sigs = sorted(df_s["signal"].unique().tolist())
+            selected = col_filter.multiselect("Filter signals", all_sigs, default=all_sigs)
+            df_s = df_s[df_s["signal"].isin(selected)]
+
+            st.dataframe(df_s, use_container_width=True, hide_index=True, height=600)
     except Exception as e:
         st.warning(f"Could not load signals: {e}")
+
+
+# ── Tab 6: Logs ───────────────────────────────────────────────────────────────
+with tab_logs:
+    st.header("Live Logs")
+
+    log_tab_labels = [svc["label"] for svc in pm.SERVICES.values()] + ["Ollama"]
+    agent_tabs = st.tabs(log_tab_labels)
+
+    for tab, (name, svc) in zip(agent_tabs, pm.SERVICES.items()):
+        with tab:
+            running = status[name]
+            st.caption(f"Status: {'🟢 Running' if running else '🔴 Stopped'}")
+            lines = st.slider("Lines", 20, 300, 80, key=f"logslider_{name}")
+            st.code(pm.get_log(name, lines), language=None)
+
+    with agent_tabs[-1]:
+        ollama_ok, ollama_info = pm.ollama_status()
+        st.caption(f"Status: {'🟢 Running' if ollama_ok else '🔴 Not running'} — {ollama_info}")
+        ollama_log = Path(os.path.expanduser("~")) / "AppData" / "Local" / "Ollama" / "server.log"
+        if ollama_log.exists():
+            lines = st.slider("Lines", 20, 300, 80, key="logslider_ollama")
+            text = ollama_log.read_text(encoding="utf-8", errors="replace").splitlines()
+            st.code("\n".join(text[-lines:]), language=None)
+        else:
+            st.info("Ollama log not found. Check system tray to confirm Ollama is running.")
+
+
+# ── Tab 5: Manual Trade ───────────────────────────────────────────────────────
+with tab_trade:
+    st.header("Manual Trade")
+    st.warning("Paper trading only — executes on Alpaca paper account.")
+
+    col_form, col_confirm = st.columns(2)
+
+    with col_form:
+        trade_symbol = st.selectbox("Symbol", SYMBOLS, key="manual_symbol")
+        trade_side   = st.radio("Side", ["BUY", "SELL"], horizontal=True)
+        trade_qty    = st.number_input("Quantity (shares)", min_value=1, max_value=10000, value=1, step=1)
+
+        try:
+            q         = get_latest_quotes([trade_symbol])
+            est_price = q.get(trade_symbol, {}).get("mid", 0.0)
+            st.metric("Current Price",    f"${est_price:.2f}")
+            st.metric("Estimated Value",  f"${est_price * trade_qty:,.2f}")
+        except Exception:
+            est_price = 0.0
+            st.caption("Could not fetch current price.")
+
+    with col_confirm:
+        st.subheader("Order Summary")
+        side_color = "green" if trade_side == "BUY" else "red"
+        st.markdown(f"""
+| Field | Value |
+|---|---|
+| Symbol | **{trade_symbol}** |
+| Side | **:{side_color}[{trade_side}]** |
+| Quantity | **{trade_qty} shares** |
+| Type | Market (DAY) |
+| Est. Value | **${est_price * trade_qty:,.2f}** |
+        """)
+
+        confirmed = st.checkbox("I confirm this is a paper trade and I want to submit this order.")
+
+        if st.button("Submit Order", type="primary", disabled=not confirmed):
+            try:
+                side = OrderSide.BUY if trade_side == "BUY" else OrderSide.SELL
+                client.submit_order(MarketOrderRequest(
+                    symbol=trade_symbol,
+                    qty=trade_qty,
+                    side=side,
+                    time_in_force=TimeInForce.DAY,
+                ))
+                reason = f"Manual trade from dashboard"
+                db.log_trade(trade_symbol, trade_side, trade_qty, est_price, reason)
+                alerts.send_trade_alert(trade_symbol, trade_side, trade_qty, est_price, reason)
+                st.success(f"Order submitted: {trade_side} {trade_qty} x {trade_symbol}")
+            except Exception as e:
+                st.error(f"Order failed: {e}")

@@ -86,6 +86,66 @@ def poll_once() -> list[dict]:
     return new_trades
 
 
+def get_gov_contracts(ticker: str, days_back: int = 30) -> list[dict]:
+    """
+    Fetches recent government contract awards for a ticker via Quiver Quant.
+    Returns list of {ticker, agency, amount, date, description}.
+    Returns [] on error or missing key.
+    """
+    if not API_KEY:
+        return []
+    try:
+        from datetime import date, timedelta
+        cutoff = (date.today() - timedelta(days=days_back)).isoformat()
+        resp = requests.get(
+            f"{BASE_URL}/historical/govcontracts/{ticker}",
+            headers={"Authorization": f"Token {API_KEY}"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        raw = resp.json() or []
+        contracts = []
+        for c in raw:
+            contract_date = c.get("Date", "")
+            if contract_date and contract_date < cutoff:
+                continue
+            amount_raw = c.get("Amount", "0")
+            try:
+                amount = float(str(amount_raw).replace(",", "").replace("$", ""))
+            except (ValueError, TypeError):
+                amount = 0.0
+            contracts.append({
+                "ticker":      ticker,
+                "agency":      c.get("Agency", "Unknown Agency"),
+                "amount":      amount,
+                "date":        contract_date,
+                "description": c.get("Description", ""),
+            })
+        return contracts
+    except Exception as e:
+        log.debug(f"Gov contracts fetch failed for {ticker}: {e}")
+        return []
+
+
+def get_recent_contracts_all(days_back: int = 14) -> dict[str, list]:
+    """
+    Fetches recent government contracts for all watchlist tickers.
+    Used by the scanner's _score_catalyst function.
+    Returns {ticker: [contracts]} — only tickers with at least one contract.
+    """
+    if not API_KEY:
+        return {}
+
+    from config import SYMBOLS
+    results = {}
+    for ticker in SYMBOLS:
+        contracts = get_gov_contracts(ticker, days_back=days_back)
+        if contracts:
+            results[ticker] = contracts
+        time.sleep(0.2)
+    return results
+
+
 def run_forever(on_new_trade, poll_interval_seconds: int = 3600) -> None:
     """
     Polls every hour. Congressional disclosures have a 30-45 day reporting lag

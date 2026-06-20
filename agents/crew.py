@@ -1,14 +1,14 @@
 """
-CrewAI Orchestration — coordinates the full agent pipeline.
+Crew Orchestrator — coordinates the full agent pipeline.
 
-Flow for every incoming event:
-  1. 7B Screener decides if the event matters
-  2. Context Engine assembles the situation brief
-  3. 72B Analyst generates the investment thesis
-  4. Risk Manager validates the position size
-  5. Alpaca executes if conviction meets threshold
+Two entry points:
+  1. process_event(event)  — event-driven (SEC filing, options flow, etc.)
+     Screen → Brief → Analyze → Risk Size → Queue for Approval
+  2. process_candidates(candidates) — scanner-driven (daily scan output)
+     Analyze → Risk Size → Queue for Approval
 
-This module is the single entry point for event-driven trading decisions.
+Human approval (Telegram inline buttons) is the only path to order execution.
+No autonomous trading.
 """
 
 import logging
@@ -21,44 +21,36 @@ load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env")
 
 log = logging.getLogger(__name__)
 
-MIN_CONVICTION_TO_TRADE = 0.65  # model must be >= 65% confident to execute
 
+# ---------------------------------------------------------------------------
+# Event-driven path (ingestion events → screen → analyze → queue)
+# ---------------------------------------------------------------------------
 
-def process_event(
-    event: dict,
-    trading_client,
-    risk_manager,
-    db_module=None,
-    alerts_module=None,
-) -> dict:
+def process_event(event: dict) -> dict:
     """
-    Full pipeline for a single event. Returns the thesis dict.
+    Full pipeline for a single inbound event.
 
     Args:
-        event:          Raw event from any ingestion source
-        trading_client: Alpaca TradingClient
-        risk_manager:   RiskManager instance
-        db_module:      db module for logging (optional)
-        alerts_module:  alerts module for Telegram (optional)
+        event: Raw event dict with keys: ticker, source, title, text, url
 
     Returns:
-        thesis dict from the analyst (or stub if model unavailable)
+        analyst recommendation dict (or SCREENED_OUT stub)
     """
     from agents.screener import screen
     from agents.analyst import analyze
+    from agents.market_regime import get_cached_regime
     from context_engine import assemble_brief
 
     ticker = event.get("ticker", "UNKNOWN")
-    log.info(f"Processing event: [{event.get('source','?')}] {ticker} — {event.get('title','')[:60]}")
+    log.info(f"[{ticker}] Processing event: {event.get('source','?')} — {event.get('title','')[:60]}")
 
-    # ── Step 1: Store event in vector memory ─────────────────────────────────
+    # ── Store in vector memory ────────────────────────────────────────────────
     try:
         import vector_store
-        collection = _event_to_collection(event)
         vector_store.store(
-            collection=collection,
-            doc_id=event.get("url", event.get("title", str(datetime.now()))),
-            text=event.get("text", event.get("title", "")),
+            collection=_event_to_collection(event),
+            doc_id=event.get("url") or event.get("title") or str(datetime.now()),
+            text=event.get("text") or event.get("title", ""),
             metadata={
                 "ticker": ticker,
                 "source": event.get("source", ""),
@@ -66,151 +58,239 @@ def process_event(
             },
         )
     except Exception as e:
-        log.warning(f"Vector store failed: {e}")
+        log.debug(f"[{ticker}] Vector store: {e}")
 
-    # ── Step 2: 7B Screener ───────────────────────────────────────────────────
+    # ── Screen for relevance ──────────────────────────────────────────────────
     screening = screen(event)
-
     if not screening.get("relevant", False):
-        log.info(f"Event screened out: {screening.get('reason','')}")
-        if db_module:
-            db_module.log_signal(
-                symbol=ticker,
-                signal="SCREENED_OUT",
-                confidence=0.0,
-                reasoning=screening.get("reason", "Not relevant"),
-            )
-        return {"signal": "SCREENED_OUT", "ticker": ticker, "conviction": 0.0}
+        reason = screening.get("reason", "Not relevant")
+        log.info(f"[{ticker}] Screened out: {reason}")
+        try:
+            import db
+            db.log_signal(ticker, "SCREENED_OUT", 0.0, reason)
+        except Exception:
+            pass
+        return {"action": "SCREENED_OUT", "ticker": ticker, "conviction": 0, "pass_to_risk": False}
 
-    log.info(f"Event relevant — urgency={screening['urgency']} — calling 72B analyst")
+    log.info(f"[{ticker}] Relevant (urgency={screening.get('urgency')}) — assembling brief")
 
-    # ── Step 3: Get current positions for context ─────────────────────────────
-    positions = {}
+    # ── Assemble situation brief ──────────────────────────────────────────────
     try:
-        open_positions = trading_client.get_all_positions()
-        for p in open_positions:
+        import os
+        from alpaca.trading.client import TradingClient
+        client = TradingClient(os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_API_SECRET"), paper=True)
+        positions = _get_positions(client)
+        brief = assemble_brief(event, positions, client)
+    except Exception as e:
+        log.warning(f"[{ticker}] Brief assembly failed: {e}")
+        brief = f"Event: {event.get('title', '')}\n{event.get('text', '')[:1000]}"
+        positions = {}
+
+    # Build a candidate-like dict from the event (for analyst interface)
+    from knowledge_loader import get_watchlist_entry
+    wl_entry = get_watchlist_entry(ticker) or {}
+    candidate = {
+        "ticker":          ticker,
+        "role":            wl_entry.get("role", "Accelerator"),
+        "tier":            wl_entry.get("tier", "Watch"),
+        "sector":          wl_entry.get("sector", ""),
+        "composite_score": 60,  # event-triggered, score is nominal
+    }
+
+    # ── Analyze ────────────────────────────────────────────────────────────────
+    regime = get_cached_regime()
+    result = analyze(candidate, situation_brief=brief, regime_packet=regime)
+
+    # ── Route to approval queue if actionable ─────────────────────────────────
+    if result.get("pass_to_risk"):
+        _route_to_approval(result, regime, client)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Scanner-driven path (batch candidates from daily scan)
+# ---------------------------------------------------------------------------
+
+def process_candidates(candidates: list[dict], max_per_run: int = 5) -> list[dict]:
+    """
+    Analyze a batch of scanner candidates and queue actionable ones for approval.
+
+    Args:
+        candidates:  List of scanner candidate dicts (HIGH/MEDIUM priority)
+        max_per_run: Max candidates to analyze (limits inference time)
+
+    Returns:
+        List of analyst recommendation dicts
+    """
+    from agents.analyst import analyze_batch
+    from agents.market_regime import get_cached_regime
+    import os
+    from alpaca.trading.client import TradingClient
+
+    regime = get_cached_regime()
+    log.info(f"Processing {len(candidates)} candidates in {regime.get('regime')} regime")
+
+    # Only analyze HIGH priority and top MEDIUM
+    high     = [c for c in candidates if c.get("priority") == "HIGH"]
+    medium   = [c for c in candidates if c.get("priority") == "MEDIUM"]
+    to_analyze = (high + medium)[:max_per_run]
+
+    if not to_analyze:
+        log.info("No candidates to analyze")
+        return []
+
+    results = analyze_batch(to_analyze, regime_packet=regime)
+
+    try:
+        client = TradingClient(os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_API_SECRET"), paper=True)
+    except Exception as e:
+        log.warning(f"Could not init Alpaca client for routing: {e}")
+        client = None
+
+    for result in results:
+        if result.get("pass_to_risk") and client:
+            _route_to_approval(result, regime, client)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Risk sizing + approval queue
+# ---------------------------------------------------------------------------
+
+def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
+    """
+    Run risk sizing on an analyst recommendation and queue it for human approval.
+    Sends a Telegram message with Approve / Reject buttons.
+    """
+    from risk_manager import RiskManager
+    import db
+    import alerts as alert_module
+
+    ticker     = result["ticker"]
+    conviction = result["conviction"]
+    bucket     = result["thesis_bucket"]
+    regime_str = regime.get("regime", "Neutral")
+
+    try:
+        rm = RiskManager(trading_client)
+    except Exception as e:
+        log.error(f"[{ticker}] RiskManager init failed: {e}")
+        return
+
+    # Get current price
+    price = _get_price(ticker, trading_client)
+    if not price:
+        log.warning(f"[{ticker}] Could not determine price — skipping approval queue")
+        return
+
+    # Size the position
+    sizing = rm.size_position(ticker, conviction, bucket, regime_str, price)
+    if sizing.get("shares_initial", 0) <= 0:
+        flags = sizing.get("flags", [])
+        log.info(f"[{ticker}] Risk sizing returned 0 shares: {flags}")
+        return
+
+    # Concentration check
+    conc = rm.check_concentration(ticker, sizing["position_size_pct"])
+    if not conc["passed"]:
+        log.info(f"[{ticker}] Concentration check failed: {conc['flags']}")
+        # Still queue but with a flag in entry_strategy
+        sizing["flags"].extend(conc["flags"])
+
+    # Correlation check
+    corr = rm.check_correlation(ticker)
+    if corr["reduce_by"] > 0:
+        log.info(f"[{ticker}] Correlation adjustment: reducing size 25% ({corr['note']})")
+        sizing["shares_initial"] = max(1, int(sizing["shares_initial"] * 0.75))
+        sizing["initial_dollar"] = round(sizing["initial_dollar"] * 0.75, 2)
+
+    entry_strategy = (
+        f"{sizing['initial_entry_pct']:.0%} initial ({sizing['shares_initial']} shares @ ~${price:.2f}). "
+        f"Add on thesis confirmation. Flags: {', '.join(sizing['flags']) or 'none'}."
+    )
+
+    # Log to pending_approvals
+    approval_id = db.log_pending_approval(
+        ticker=ticker,
+        action=result["action"],
+        conviction=conviction,
+        bucket=bucket,
+        size_pct=sizing["position_size_pct"],
+        stop_price=sizing.get("stop_loss_price"),
+        entry_strategy=entry_strategy,
+        reasoning=result.get("reasoning", ""),
+        analyst_json=result,
+        risk_json=sizing,
+    )
+
+    if approval_id < 0:
+        log.error(f"[{ticker}] Failed to log pending approval")
+        return
+
+    # Send Telegram approval request
+    msg_id = alert_module.send_approval_request(
+        approval_id=approval_id,
+        ticker=ticker,
+        action=result["action"],
+        conviction=conviction,
+        bucket=bucket,
+        size_pct=sizing["position_size_pct"],
+        stop_price=sizing.get("stop_loss_price"),
+        entry_strategy=entry_strategy,
+        reasoning=result.get("reasoning", ""),
+    )
+
+    if msg_id:
+        db.set_approval_telegram_id(approval_id, msg_id)
+        log.info(f"[{ticker}] Approval #{approval_id} queued — Telegram msg_id={msg_id}")
+    else:
+        log.info(f"[{ticker}] Approval #{approval_id} queued (Telegram not configured)")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _get_positions(client) -> dict:
+    try:
+        positions = {}
+        for p in client.get_all_positions():
             entry   = float(p.avg_entry_price)
             current = float(p.current_price or entry)
             positions[p.symbol] = {
-                "qty":           float(p.qty),
-                "entry_price":   entry,
+                "qty":          float(p.qty),
+                "entry_price":  entry,
                 "current_price": current,
-                "pl_pct":        (current - entry) / entry,
-                "market_value":  float(p.market_value),
+                "pl_pct":       (current - entry) / entry,
+                "market_value": float(p.market_value),
             }
-    except Exception as e:
-        log.warning(f"Could not fetch positions: {e}")
-
-    # ── Step 4: Assemble situation brief ──────────────────────────────────────
-    brief = assemble_brief(event, positions, trading_client)
-
-    # ── Step 5: 72B Analyst ───────────────────────────────────────────────────
-    thesis = analyze(brief, event, screening)
-
-    # ── Step 6: Log signal ────────────────────────────────────────────────────
-    if db_module:
-        try:
-            db_module.log_signal(
-                symbol=thesis.get("ticker", ticker),
-                signal=thesis.get("signal", "HOLD"),
-                confidence=thesis.get("conviction", 0.0),
-                reasoning=thesis.get("thesis", ""),
-            )
-        except Exception as e:
-            log.error(f"Signal logging failed: {e}")
-
-    # ── Step 7: Execute if conviction is high enough ──────────────────────────
-    signal     = thesis.get("signal", "HOLD")
-    conviction = thesis.get("conviction", 0.0)
-    act_ticker = thesis.get("ticker", ticker)
-
-    if signal in ("BUY", "SELL") and conviction >= MIN_CONVICTION_TO_TRADE:
-        _execute_thesis(
-            thesis=thesis,
-            act_ticker=act_ticker,
-            signal=signal,
-            trading_client=trading_client,
-            risk_manager=risk_manager,
-            positions=positions,
-            db_module=db_module,
-            alerts_module=alerts_module,
-        )
-    else:
-        reason = (
-            f"conviction {conviction:.0%} below threshold {MIN_CONVICTION_TO_TRADE:.0%}"
-            if conviction < MIN_CONVICTION_TO_TRADE
-            else "signal is HOLD/WATCH"
-        )
-        log.info(f"No trade executed: {reason}")
-
-    return thesis
+        return positions
+    except Exception:
+        return {}
 
 
-def _execute_thesis(
-    thesis, act_ticker, signal, trading_client, risk_manager,
-    positions, db_module, alerts_module,
-) -> None:
-    """Validates with risk manager and submits order to Alpaca."""
-    from alpaca.trading.enums import OrderSide, TimeInForce
-    from alpaca.trading.requests import MarketOrderRequest
-
+def _get_price(ticker: str, client) -> float | None:
     try:
         from ingestion.polygon_stream import get_snapshot
-        snap = get_snapshot(act_ticker)
-        price = snap.get("price") or 0
+        snap = get_snapshot(ticker)
+        if snap.get("price"):
+            return float(snap["price"])
     except Exception:
-        price = 0
-
-    if not price:
-        # Fall back to Alpaca last trade price
-        try:
-            from market_data import get_latest_quotes
-            quotes = get_latest_quotes([act_ticker])
-            price = quotes.get(act_ticker, {}).get("mid", 0)
-        except Exception:
-            log.error(f"Could not determine price for {act_ticker} — skipping execution")
-            return
-
-    if signal == "BUY":
-        qty = risk_manager.shares_affordable(act_ticker, price)
-        side = OrderSide.BUY
-    else:
-        if act_ticker not in positions:
-            log.info(f"SELL signal for {act_ticker} but no position — skipping")
-            return
-        qty = int(positions[act_ticker]["qty"])
-        if not risk_manager.check_sell_allowed(act_ticker, qty):
-            return
-        side = OrderSide.SELL
-
-    if qty <= 0:
-        log.info(f"Risk manager returned 0 shares for {act_ticker} — skipping")
-        return
-
+        pass
     try:
-        trading_client.submit_order(
-            MarketOrderRequest(
-                symbol=act_ticker,
-                qty=qty,
-                side=side,
-                time_in_force=TimeInForce.DAY,
-            )
-        )
-        side_str = signal
-        reason = f"AI thesis (conviction={thesis.get('conviction'):.0%}): {thesis.get('thesis','')[:100]}"
-        log.info(f"ORDER {side_str} {qty} {act_ticker} @ ~${price:.2f} | {reason}")
-
-        if db_module:
-            db_module.log_trade(act_ticker, side_str, qty, price, reason)
-        if alerts_module:
-            alerts_module.send_trade_alert(act_ticker, side_str, qty, price, reason)
-
-    except Exception as e:
-        log.error(f"Order submission failed: {e}")
+        from market_data import get_latest_quotes
+        quotes = get_latest_quotes([ticker])
+        mid = quotes.get(ticker, {}).get("mid")
+        if mid:
+            return float(mid)
+    except Exception:
+        pass
+    return None
 
 
 def _event_to_collection(event: dict) -> str:
-    """Maps event source to ChromaDB collection name."""
     source_map = {
         "sec_filing":    "filings",
         "sec_form4":     "insider",

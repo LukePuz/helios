@@ -196,6 +196,38 @@ def store_arxiv(paper: dict) -> None:
     )
 
 
+def prune_old_documents(collection: str, max_age_days: int = 90) -> int:
+    """
+    Delete documents older than max_age_days from a collection.
+    Uses the 'timestamp' metadata field set by store().
+    Returns count of documents deleted.
+    """
+    from datetime import timedelta
+    col = _get_collection(collection)
+    if col.count() == 0:
+        return 0
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
+
+    try:
+        # Fetch all document IDs and their timestamps
+        all_docs = col.get(include=["metadatas"])
+        ids_to_delete = []
+        for doc_id, meta in zip(all_docs["ids"], all_docs["metadatas"]):
+            ts = meta.get("timestamp") or meta.get("date") or ""
+            if ts and ts < cutoff:
+                ids_to_delete.append(doc_id)
+
+        if ids_to_delete:
+            col.delete(ids=ids_to_delete)
+            log.info(f"Pruned {len(ids_to_delete)} docs from '{collection}' (>{max_age_days}d old)")
+
+        return len(ids_to_delete)
+    except Exception as e:
+        log.warning(f"prune_old_documents failed for '{collection}': {e}")
+        return 0
+
+
 def collection_stats() -> dict[str, int]:
     """Returns document count per collection."""
     stats = {}

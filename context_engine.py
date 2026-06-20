@@ -1,0 +1,205 @@
+"""
+Context Assembly Engine — the brain before the brain.
+
+Before every model call, this assembles a complete "situation brief":
+a structured document containing everything the 72B model needs to
+reason about an event in relation to our current portfolio.
+
+The model never sees raw data — it always sees this assembled context.
+"""
+
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from dotenv import load_dotenv
+
+load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+
+log = logging.getLogger(__name__)
+
+ET = ZoneInfo("America/New_York")
+
+
+def _safe_import(module_name: str):
+    """Imports a module, returns None if unavailable (missing API key etc)."""
+    try:
+        return __import__(module_name, fromlist=[""])
+    except Exception:
+        return None
+
+
+def assemble_brief(
+    event: dict,
+    positions: dict[str, dict],
+    trading_client=None,
+) -> str:
+    """
+    Builds a complete situation brief for the 72B model.
+
+    Args:
+        event:          The triggering event (filing, news, options spike, etc.)
+        positions:      Current open positions {symbol: {qty, entry_price, pl_pct}}
+        trading_client: Alpaca TradingClient for live account data
+
+    Returns:
+        A formatted string ready to be injected into the model prompt.
+    """
+    now = datetime.now(ET).strftime("%A %B %d, %Y %I:%M %p ET")
+    ticker = event.get("ticker", "UNKNOWN")
+    sections = []
+
+    # ── Header ──────────────────────────────────────────────────────────────
+    sections.append(f"""=== SITUATION BRIEF ===
+Generated: {now}
+Triggering Event: {event.get('source', 'unknown').upper()} — {ticker}
+Event Type: {event.get('form', event.get('type', 'unknown'))}
+Event Title: {event.get('title', 'N/A')}""")
+
+    # ── Event Content ────────────────────────────────────────────────────────
+    event_text = event.get("text", "")
+    if event_text:
+        sections.append(f"""
+=== EVENT CONTENT ===
+{event_text[:3000]}
+{'[Content truncated — see full filing at ' + event.get('url','') + ']' if len(event_text) > 3000 else ''}""")
+
+    # ── Current Portfolio ────────────────────────────────────────────────────
+    if positions:
+        pos_lines = ["=== CURRENT PORTFOLIO ==="]
+        for sym, pos in positions.items():
+            pl_str = f"{pos.get('pl_pct', 0):+.1%}"
+            pos_lines.append(
+                f"  {sym:<6} {pos.get('qty', 0):>6.0f} shares | "
+                f"Entry: ${pos.get('entry_price', 0):.2f} | "
+                f"Current: ${pos.get('current_price', 0):.2f} | "
+                f"P&L: {pl_str} | "
+                f"Value: ${pos.get('market_value', 0):,.0f}"
+            )
+        sections.append("\n".join(pos_lines))
+    else:
+        sections.append("=== CURRENT PORTFOLIO ===\nNo open positions.")
+
+    # ── Account State ────────────────────────────────────────────────────────
+    if trading_client:
+        try:
+            account = trading_client.get_account()
+            sections.append(f"""=== ACCOUNT STATE ===
+Portfolio Value: ${float(account.portfolio_value):,.2f}
+Cash Available:  ${float(account.cash):,.2f}
+Buying Power:    ${float(account.buying_power):,.2f}""")
+        except Exception as e:
+            log.warning(f"Could not fetch account for brief: {e}")
+
+    # ── Macro Environment ────────────────────────────────────────────────────
+    macro_mod = _safe_import("ingestion.macro")
+    if macro_mod:
+        try:
+            sections.append(macro_mod.get_macro_summary_text())
+        except Exception as e:
+            log.warning(f"Macro data unavailable: {e}")
+
+    # ── Technical Picture ────────────────────────────────────────────────────
+    polygon_mod = _safe_import("ingestion.polygon_stream")
+    if polygon_mod:
+        try:
+            sections.append(polygon_mod.get_technicals_summary(ticker))
+        except Exception as e:
+            log.warning(f"Technicals unavailable for {ticker}: {e}")
+
+    # ── Options Flow ─────────────────────────────────────────────────────────
+    options_mod = _safe_import("ingestion.options_flow")
+    if options_mod:
+        try:
+            flow = options_mod.get_flow_summary(ticker)
+            sections.append(f"""=== OPTIONS FLOW — {ticker} ===
+{flow['summary']}""")
+        except Exception as e:
+            log.warning(f"Options flow unavailable: {e}")
+
+    # ── Semantic Memory (ChromaDB) ────────────────────────────────────────────
+    try:
+        import vector_store
+        query = f"{ticker} {event.get('title', '')} {event.get('text', '')[:200]}"
+
+        # Search for relevant history across all collections
+        history = vector_store.search_all_collections(query, n_results=4)
+        if history:
+            mem_lines = ["=== RELEVANT HISTORICAL CONTEXT (from memory) ==="]
+            for h in history:
+                score = h["score"]
+                source = h.get("collection", "unknown")
+                meta = h.get("metadata", {})
+                date = meta.get("date", meta.get("timestamp", ""))
+                mem_lines.append(
+                    f"[{source.upper()} | score={score:.2f} | {date[:10]}]\n"
+                    f"{h['text'][:400]}\n"
+                )
+            sections.append("\n".join(mem_lines))
+        else:
+            sections.append("=== RELEVANT HISTORICAL CONTEXT ===\nNo prior history found for this event.")
+    except Exception as e:
+        log.warning(f"Vector store search failed: {e}")
+
+    # ── Related Symbols ──────────────────────────────────────────────────────
+    from config import SYMBOLS
+    related = _find_related_symbols(ticker, SYMBOLS)
+    if related:
+        sections.append(f"""=== RELATED SYMBOLS IN WATCHLIST ===
+{ticker} may have indirect effects on: {', '.join(related)}
+Consider second-order impact on these positions.""")
+
+    # ── Final Assembly ───────────────────────────────────────────────────────
+    return "\n\n".join(sections)
+
+
+def _find_related_symbols(ticker: str, all_symbols: list[str]) -> list[str]:
+    """
+    Returns symbols that are likely affected by events in ticker.
+    Based on supply chain, sector, and competitive relationships.
+    """
+    relationships: dict[str, list[str]] = {
+        # Semiconductor supply chain
+        "ASML":  ["NVDA", "AMD", "INTC", "IONQ", "QBTS", "RGTI"],
+        "AMAT":  ["NVDA", "AMD", "MU", "IONQ"],
+        "LRCX":  ["NVDA", "AMD", "MU"],
+        "KLAC":  ["NVDA", "AMD", "MU"],
+        "MU":    ["NVDA", "AMD", "QCOM"],
+        # AI hyperscaler effects
+        "NVDA":  ["AMD", "AVGO", "AMAT", "MU", "IONQ"],
+        "MSFT":  ["NVDA", "PLTR", "NOW", "CRM", "NET"],
+        "GOOGL": ["NVDA", "META", "NET", "SNOW"],
+        "AMZN":  ["NVDA", "NET", "SNOW", "DDOG"],
+        # Quantum ecosystem
+        "IONQ":  ["RGTI", "QBTS", "QUBT", "ARQQ", "IBM"],
+        "RGTI":  ["IONQ", "QBTS", "QUBT"],
+        "QBTS":  ["IONQ", "RGTI", "QUBT"],
+        # Macro-sensitive
+        "META":  ["GOOGL", "SNAP", "PINS"],
+    }
+    related = relationships.get(ticker, [])
+    return [s for s in related if s in all_symbols]
+
+
+if __name__ == "__main__":
+    import logging
+    logging.basicConfig(level=logging.INFO)
+
+    # Test with a fake filing event
+    test_event = {
+        "source":  "sec_filing",
+        "ticker":  "IONQ",
+        "form":    "8-K",
+        "title":   "IonQ Announces Strategic Partnership with US Department of Defense",
+        "text":    "IonQ Inc. today announced a contract worth $54.5 million with the "
+                   "United States Department of Defense to provide quantum computing "
+                   "services across multiple branches of the armed forces...",
+        "url":     "https://www.sec.gov/Archives/example",
+    }
+    test_positions = {
+        "IONQ": {"qty": 100, "entry_price": 14.20, "current_price": 15.10, "pl_pct": 0.063, "market_value": 1510},
+        "NVDA": {"qty": 5,   "entry_price": 890.0, "current_price": 910.0, "pl_pct": 0.022, "market_value": 4550},
+    }
+    brief = assemble_brief(test_event, test_positions)
+    print(brief)

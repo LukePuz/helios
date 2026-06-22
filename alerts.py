@@ -220,3 +220,19 @@ def send_stop_triggered(ticker: str, current_price: float, stop_price: float, re
         f"Stop:    ${stop_price:.2f}\n"
         f"Reason:  {reason}"
     )
+
+
+def send_catalyst_conflict(
+    ticker: str,
+    event_type: str,
+    window_start: str | None,
+    window_end: str | None,
+    note: str | None = None,
+) -> None:
+    window = f"{window_start} to {window_end}" if window_start and window_end else "date unresolved"
+    _send(
+        f"<b>CATALYST CONFLICT - {ticker}</b>\n"
+        f"Type:   {event_type}\n"
+        f"Window: {window}\n"
+        f"{note or 'Resolve before any catalyst-based trade gating relies on it.'}"
+    )

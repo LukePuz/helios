@@ -1,0 +1,2 @@
+"""Catalyst calendar service package."""
+

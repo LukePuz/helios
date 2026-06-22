@@ -12,6 +12,7 @@ BASE_DIR = Path(__file__).parent
 PID_FILE = BASE_DIR / ".processes.json"
 PYTHON   = str(BASE_DIR / "venv" / "Scripts" / "python.exe")
 CELERY   = str(BASE_DIR / "venv" / "Scripts" / "celery.exe")
+UVICORN  = str(BASE_DIR / "venv" / "Scripts" / "uvicorn.exe")
 
 LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
@@ -26,6 +27,11 @@ SERVICES: dict[str, dict] = {
         "label": "Celery Beat",
         "cmd":   [CELERY, "-A", "tasks", "beat", "--loglevel=info"],
         "log":   LOG_DIR / "celery_beat.log",
+    },
+    "catalyst_service": {
+        "label": "Catalyst Service",
+        "cmd":   [UVICORN, "catalyst_service.main:app", "--host", "127.0.0.1", "--port", "8001"],
+        "log":   LOG_DIR / "catalyst_service.log",
     },
 }
 
@@ -82,9 +88,9 @@ def ollama_status() -> tuple[bool, str]:
 
 def redis_ok() -> bool:
     try:
-        import redis
-        r = redis.Redis(host="localhost", port=6379, socket_timeout=1)
-        return bool(r.ping())
+        import socket
+        with socket.create_connection(("127.0.0.1", 6379), timeout=0.25):
+            return True
     except Exception:
         return False
 

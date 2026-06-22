@@ -1,9 +1,16 @@
 .env
 *.log
-*.txt
 __pycache__/
 *.pyc
 *.pyo
 .vscode/
 venv/
 .chromadb/
+catalyst_calendar.db
+
+# Runtime state
+.processes.json
+celerybeat-schedule.bak
+celerybeat-schedule.dat
+celerybeat-schedule.dir
+trading_bot.code-workspace

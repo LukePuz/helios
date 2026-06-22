@@ -9,7 +9,7 @@ Refresh weekly (Monday 8 AM ET via Celery beat).
 """
 import logging
 import time
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -58,6 +58,29 @@ def refresh_all_earnings() -> int:
             d = get_next_earnings(ticker)
             if d:
                 db.upsert_earnings_date(ticker, d, confirmed=True)
+                try:
+                    from catalyst_service.storage import upsert_earnings_from_sources
+                    from knowledge_loader import get_watchlist_entry
+
+                    entry = get_watchlist_entry(ticker) or {}
+                    tier = entry.get("tier")
+                    role = entry.get("role")
+                    bucket_relevance = "tail" if tier == "Speculative" or role == "Moonshot" else "core"
+                    upsert_earnings_from_sources(
+                        ticker=ticker,
+                        aggregator_dates=[d],
+                        sources=[
+                            {
+                                "name": "yfinance",
+                                "url": f"https://finance.yahoo.com/quote/{ticker}",
+                                "retrieved_at": datetime.now(timezone.utc).isoformat(),
+                                "reported_date": d.isoformat(),
+                            }
+                        ],
+                        bucket_relevance=bucket_relevance,
+                    )
+                except Exception as e:
+                    log.warning(f"[{ticker}] catalyst calendar write failed: {e}")
                 count += 1
                 log.debug(f"[{ticker}] Next earnings: {d}")
         except Exception as e:

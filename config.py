@@ -121,3 +121,10 @@ import os
 OLLAMA_HOST      = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 SCREENER_MODEL   = os.getenv("SCREENER_MODEL", "qwen2.5:7b")
 ANALYST_MODEL    = os.getenv("ANALYST_MODEL", "qwen2.5:72b")
+
+# ---------------------------------------------------------------------------
+# Interactive Brokers connection
+# ---------------------------------------------------------------------------
+IB_HOST      = os.getenv("IB_HOST",      "127.0.0.1")
+IB_PORT      = int(os.getenv("IB_PORT",      "7497"))   # 7497=paper, 7496=live
+IB_CLIENT_ID = int(os.getenv("IB_CLIENT_ID", "1"))

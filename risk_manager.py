@@ -15,10 +15,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import requests
 from dotenv import load_dotenv
-from alpaca.trading.client import TradingClient
-from alpaca.trading.models import TradeAccount
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
@@ -66,20 +63,10 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 def _fetch_bars_for_atr(ticker: str, days: int = 20) -> list[dict]:
-    api_key    = os.getenv("ALPACA_API_KEY", "")
-    api_secret = os.getenv("ALPACA_API_SECRET", "")
-    if not api_key:
-        return []
-
-    end   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    start = (datetime.now(timezone.utc) - timedelta(days=days + 5)).strftime("%Y-%m-%d")
-    url   = f"https://data.alpaca.markets/v2/stocks/{ticker}/bars"
-    hdrs  = {"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": api_secret}
-    params = {"timeframe": "1Day", "start": start, "end": end, "limit": days + 5, "feed": "iex"}
     try:
-        resp = requests.get(url, headers=hdrs, params=params, timeout=10)
-        resp.raise_for_status()
-        return [{"h": b["h"], "l": b["l"], "c": b["c"]} for b in resp.json().get("bars", [])]
+        from ibkr import get_historical_bars
+        bars = get_historical_bars(ticker, duration=f"{days + 5} D", bar_size="1 day")
+        return [{"h": b["high"], "l": b["low"], "c": b["close"]} for b in bars]
     except Exception as e:
         log.debug(f"ATR bar fetch failed for {ticker}: {e}")
         return []
@@ -118,12 +105,15 @@ def _conviction_band(conviction: int) -> int:
 # ---------------------------------------------------------------------------
 
 class RiskManager:
-    def __init__(self, client: TradingClient, start_value: float | None = None):
+    def __init__(self, client: object | None = None, start_value: float | None = None):
+        if client is None:
+            from ibkr import get_client
+            client = get_client()
         self._client = client
         account = self._get_account()
         self.start_value: float = start_value or float(account.portfolio_value)
 
-    def _get_account(self) -> TradeAccount:
+    def _get_account(self) -> object:
         return self._client.get_account()
 
     def portfolio_value(self) -> float:
@@ -454,14 +444,7 @@ if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
-    api_key    = os.getenv("ALPACA_API_KEY")
-    api_secret = os.getenv("ALPACA_API_SECRET")
-
-    if not api_key or not api_secret:
-        raise EnvironmentError("ALPACA credentials not found in .env")
-
-    client = TradingClient(api_key, api_secret, paper=True)
-    rm     = RiskManager(client)
+    rm = RiskManager()
 
     pv = rm.portfolio_value()
     print(f"Portfolio value: ${pv:,.2f}")

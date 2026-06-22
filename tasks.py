@@ -98,6 +98,11 @@ app.conf.beat_schedule = {
         "task":     "tasks.refresh_earnings_calendar",
         "schedule": crontab(hour=8, minute=0, day_of_week="mon"),
     },
+    # Catalyst conflicts - weekdays 8:10 AM ET
+    "alert-catalyst-conflicts": {
+        "task":     "tasks.alert_catalyst_conflicts",
+        "schedule": crontab(hour=8, minute=10, day_of_week="mon-fri"),
+    },
     # Portfolio drawdown circuit breaker — every 30 minutes
     "check-drawdown": {
         "task":     "tasks.check_portfolio_drawdown",
@@ -117,12 +122,9 @@ app.conf.beat_schedule = {
 
 
 def _get_client():
-    """Lazy-loads Alpaca client."""
-    import os
-    from alpaca.trading.client import TradingClient
-    api_key    = os.getenv("ALPACA_API_KEY")
-    api_secret = os.getenv("ALPACA_API_SECRET")
-    return TradingClient(api_key, api_secret, paper=True)
+    """Lazy-loads IBKR client adapter."""
+    from ibkr import get_client
+    return get_client()
 
 
 # ── New tasks: regime + scanner + stop monitor ────────────────────────────────
@@ -324,14 +326,7 @@ def take_portfolio_snapshot(self):
     """Takes a portfolio snapshot and logs to Supabase for the dashboard."""
     try:
         import db
-        from alpaca.trading.client import TradingClient
-        import os
-
-        client = TradingClient(
-            os.getenv("ALPACA_API_KEY"),
-            os.getenv("ALPACA_API_SECRET"),
-            paper=True,
-        )
+        client    = _get_client()
         account   = client.get_account()
         positions = client.get_all_positions()
 
@@ -382,6 +377,32 @@ def refresh_earnings_calendar(self):
         raise self.retry(exc=e, countdown=300)
 
 
+@app.task(name="tasks.alert_catalyst_conflicts", bind=True, max_retries=2)
+def alert_catalyst_conflicts(self):
+    """Ping Telegram for unresolved catalyst conflicts inside the next 10 days."""
+    try:
+        from datetime import date, timedelta
+        import alerts
+        from catalyst_service.storage import query_events
+
+        today = date.today().isoformat()
+        end = (date.today() + timedelta(days=10)).isoformat()
+        conflicts = query_events(start=today, end=end, confidence="conflicting")
+        for event in conflicts:
+            alerts.send_catalyst_conflict(
+                ticker=event["ticker"],
+                event_type=event["event_type"],
+                window_start=event.get("window_start"),
+                window_end=event.get("window_end"),
+                note=event.get("thesis_note"),
+            )
+        if conflicts:
+            log.warning(f"Catalyst conflicts alerted: {len(conflicts)}")
+    except Exception as e:
+        log.error(f"alert_catalyst_conflicts failed: {e}")
+        raise self.retry(exc=e, countdown=300)
+
+
 @app.task(name="tasks.check_portfolio_drawdown", bind=True, max_retries=2)
 def check_portfolio_drawdown(self):
     """Alert if portfolio drawdown exceeds MAX_DRAWDOWN_PCT. Does not halt automatically."""
@@ -390,8 +411,8 @@ def check_portfolio_drawdown(self):
         import alerts
         from config import START_VALUE, MAX_DRAWDOWN_PCT
 
-        client  = _get_client()
-        pv      = float(client.get_account().portfolio_value)
+        client   = _get_client()
+        pv       = float(client.get_account().portfolio_value)
         drawdown = (START_VALUE - pv) / START_VALUE
 
         if drawdown >= MAX_DRAWDOWN_PCT:

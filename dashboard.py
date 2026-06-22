@@ -1,5 +1,8 @@
+import math
 import os
+import socket
 import subprocess
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -14,23 +17,162 @@ import db
 import process_manager as pm
 from config import SYMBOLS, START_VALUE
 from market_data import get_latest_quotes
-from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.trading.requests import MarketOrderRequest
-
-API_KEY    = os.getenv("ALPACA_API_KEY")
-API_SECRET = os.getenv("ALPACA_API_SECRET")
+from ibkr import IBKRClient, place_market_order
 
 st.set_page_config(page_title="Trading Bot", layout="wide", page_icon="📈")
 
 
-
 @st.cache_resource
-def _client() -> TradingClient:
-    return TradingClient(API_KEY, API_SECRET, paper=True)
+def _client() -> IBKRClient:
+    return IBKRClient()
 
 
 client = _client()
+
+
+# ── Workflow helpers ──────────────────────────────────────────────────────────
+
+_WORKFLOW_NODES: list[tuple[str, str, str]] = [
+    ("redis",     "Redis",       "Message Broker"),
+    ("db",        "Supabase",    "Database"),
+    ("ollama",    "Ollama",      "AI Engine"),
+    ("beat",      "Scheduler",   "Celery Beat"),
+    ("worker",    "Ingestion",   "Celery Worker"),
+    ("catalyst",  "Catalyst",    "Calendar API"),
+    ("screener",  "Screener",    "Event Filter"),
+    ("analyst",   "Analyst",     "Thesis + Conviction"),
+    ("risk",      "Risk Mgr",    "Position Sizing"),
+    ("execution", "Execution",   "Telegram → IBKR"),
+]
+
+
+@st.cache_data(ttl=4)
+def _get_workflow_status() -> dict[str, bool]:
+    svc = pm.get_status()
+    ollama_ok, _ = pm.ollama_status()
+
+    # Supabase: fast socket probe (avoids opening a full DB connection)
+    supabase_host = os.getenv("SUPABASE_HOST", "")
+    db_ok = False
+    if supabase_host:
+        try:
+            with socket.create_connection((supabase_host, 5432), timeout=2):
+                db_ok = True
+        except Exception:
+            db_ok = False
+
+    # IBKR TWS: socket probe on paper port
+    ib_port = int(os.getenv("IB_PORT", "7497"))
+    try:
+        with socket.create_connection(("127.0.0.1", ib_port), timeout=0.5):
+            ibkr_ok = True
+    except Exception:
+        ibkr_ok = False
+
+    telegram_ok = bool(os.getenv("TELEGRAM_BOT_TOKEN"))
+    pipeline_ok = svc.get("celery_worker", False) and ollama_ok
+
+    return {
+        "redis":     svc.get("redis", False),
+        "db":        db_ok,
+        "ollama":    ollama_ok,
+        "beat":      svc.get("celery_beat", False),
+        "worker":    svc.get("celery_worker", False),
+        "catalyst":  svc.get("catalyst_service", False),
+        "screener":  pipeline_ok,
+        "analyst":   pipeline_ok,
+        "risk":      pipeline_ok,
+        "execution": telegram_ok and ibkr_ok,
+    }
+
+
+def _build_workflow_figure(statuses: dict[str, bool]) -> go.Figure:
+    n      = len(_WORKFLOW_NODES)
+    R      = 3.4    # node ring radius
+    R_lb   = R + 1.2  # label ring radius
+    angles = [math.pi / 2 - 2 * math.pi * i / n for i in range(n)]
+    xs     = [R    * math.cos(a) for a in angles]
+    ys     = [R    * math.sin(a) for a in angles]
+    lxs    = [R_lb * math.cos(a) for a in angles]
+    lys    = [R_lb * math.sin(a) for a in angles]
+
+    fig = go.Figure()
+
+    # --- Arrows between consecutive nodes ---
+    node_r = 0.43
+    for i in range(n):
+        j = (i + 1) % n
+        xA, yA = xs[i], ys[i]
+        xB, yB = xs[j], ys[j]
+        dx, dy = xB - xA, yB - yA
+        dist   = math.sqrt(dx ** 2 + dy ** 2)
+        ux, uy = dx / dist, dy / dist
+        fig.add_annotation(
+            x=xB - ux * node_r,   y=yB - uy * node_r,
+            ax=xA + ux * node_r,  ay=yA + uy * node_r,
+            xref="x", yref="y", axref="x", ayref="y",
+            showarrow=True, arrowhead=3,
+            arrowsize=1.2, arrowwidth=1.8, arrowcolor="#4a4a5a",
+            text="",
+        )
+
+    # --- Node circles ---
+    node_colors = [
+        "#00cc88" if statuses.get(nid, False) else "#cc2222"
+        for nid, _, _ in _WORKFLOW_NODES
+    ]
+    node_hover = [
+        (
+            f"<b>{label}</b> — {sub}<br>"
+            f"{'✅ Active' if statuses.get(nid) else '🔴 Offline'}"
+        )
+        for nid, label, sub in _WORKFLOW_NODES
+    ]
+    fig.add_trace(go.Scatter(
+        x=xs, y=ys,
+        mode="markers",
+        marker=dict(
+            size=54,
+            color=node_colors,
+            line=dict(width=3, color="rgba(255,255,255,0.18)"),
+            opacity=0.92,
+        ),
+        hovertext=node_hover,
+        hoverinfo="text",
+    ))
+
+    # --- Labels outside the ring ---
+    for i, (nid, label, sub) in enumerate(_WORKFLOW_NODES):
+        active    = statuses.get(nid, False)
+        dot_color = "#00cc88" if active else "#cc2222"
+        status_lbl = "● Active" if active else "● Offline"
+        fig.add_annotation(
+            x=lxs[i], y=lys[i],
+            text=(
+                f"<b>{label}</b><br>"
+                f"<span style='color:#aaa;font-size:10px'>{sub}</span><br>"
+                f"<span style='color:{dot_color};font-size:10px'>{status_lbl}</span>"
+            ),
+            showarrow=False,
+            font=dict(size=11, color="white"),
+            align="center",
+            bgcolor="rgba(14,17,23,0.90)",
+            bordercolor=dot_color,
+            borderwidth=1,
+            borderpad=5,
+        )
+
+    fig.update_layout(
+        height=660,
+        paper_bgcolor="#0e1117",
+        plot_bgcolor="#0e1117",
+        showlegend=False,
+        margin=dict(l=20, r=20, t=50, b=20),
+        xaxis=dict(range=[-6.4, 6.4], showgrid=False, zeroline=False, showticklabels=False),
+        yaxis=dict(range=[-6.4, 6.4], showgrid=False, zeroline=False, showticklabels=False, scaleanchor="x"),
+        title=dict(text="Live System Workflow", font=dict(size=18, color="#ccc"), x=0.5),
+    )
+    return fig
 
 
 # ── Sidebar: System Control ───────────────────────────────────────────────────
@@ -64,9 +206,24 @@ with st.sidebar:
 
     st.divider()
 
+    # One-click start/stop all services
+    col_all1, col_all2 = st.columns(2)
+    if col_all1.button("▶ Start All", use_container_width=True, type="primary"):
+        for _name in pm.SERVICES:
+            pm.start(_name)
+        st.session_state["startup_time"] = time.time()
+        st.toast("All services started.")
+        st.rerun()
+    if col_all2.button("⏹ Stop All", use_container_width=True):
+        for _name in pm.SERVICES:
+            pm.stop(_name)
+        st.toast("All services stopped.")
+        st.rerun()
+
     _SERVICE_INFO = {
         "celery_worker": "Runs the background ingestion tasks — pulls SEC filings, FRED macro data, arXiv quantum/AI papers, options flow, congressional trades, and insider filings. Each event gets stored in the vector database and routed to the AI pipeline.",
         "celery_beat": "The scheduler. Fires each ingestion task on a timer: options flow every 5 min, SEC filings every 10 min, macro data every hour, congressional trades every 6 hours, arXiv papers once daily at 9 AM ET. Also triggers daily regime assessment at 9:30 AM and scanner at 9:35 AM ET.",
+        "catalyst_service": "Shared catalyst calendar API for earnings, conferences, indirect read-throughs, and conflict flags.",
     }
 
     for name, svc in pm.SERVICES.items():
@@ -117,9 +274,49 @@ with st.sidebar:
 
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_portfolio, tab_regime, tab_approvals, tab_outcomes, tab_macro, tab_technicals, tab_signals, tab_trade, tab_logs = st.tabs([
-    "Portfolio", "Market Regime", "Pending Approvals", "Outcomes", "Macro", "Technicals", "Signal Log", "Manual Trade", "Logs",
+tab_workflow, tab_portfolio, tab_regime, tab_approvals, tab_outcomes, tab_macro, tab_technicals, tab_signals, tab_trade, tab_logs = st.tabs([
+    "Workflow", "Portfolio", "Market Regime", "Pending Approvals", "Outcomes", "Macro", "Technicals", "Signal Log", "Manual Trade", "Logs",
 ])
+
+
+# ── Tab 0: Workflow ───────────────────────────────────────────────────────────
+with tab_workflow:
+    st.header("System Workflow")
+
+    # During the 45 s after clicking Start All, auto-refresh every 2 s so
+    # nodes light up in real time as each service comes online.
+    _startup_t = st.session_state.get("startup_time")
+    _in_startup = _startup_t is not None and (time.time() - _startup_t) < 45
+    if _in_startup:
+        from streamlit_autorefresh import st_autorefresh
+        st_autorefresh(interval=2000, key="wf_autorefresh")
+        _secs_left = max(0, int(45 - (time.time() - _startup_t)))
+        st.info(f"Services starting — refreshing every 2 s ({_secs_left}s remaining).")
+
+    _wf_status = _get_workflow_status()
+    st.plotly_chart(_build_workflow_figure(_wf_status), use_container_width=True)
+
+    st.divider()
+
+    # Status table beneath the diagram
+    _active_count = sum(1 for v in _wf_status.values() if v)
+    _total_count  = len(_WORKFLOW_NODES)
+    c1, c2 = st.columns([1, 3])
+    c1.metric("Services Online", f"{_active_count} / {_total_count}")
+
+    _rows = [
+        {
+            "Service": f"{'🟢' if _wf_status.get(nid) else '🔴'} {label}",
+            "Role":    sub,
+            "Status":  "Active" if _wf_status.get(nid) else "Offline",
+        }
+        for nid, label, sub in _WORKFLOW_NODES
+    ]
+    st.dataframe(pd.DataFrame(_rows), use_container_width=True, hide_index=True)
+
+    if c2.button("↺ Refresh Status", key="wf_refresh"):
+        st.cache_data.clear()
+        st.rerun()
 
 
 # ── Tab 1: Portfolio ──────────────────────────────────────────────────────────
@@ -630,7 +827,7 @@ with tab_logs:
 # ── Tab 5: Manual Trade ───────────────────────────────────────────────────────
 with tab_trade:
     st.header("Manual Trade")
-    st.warning("Paper trading only — executes on Alpaca paper account.")
+    st.warning("Paper trading only — executes on IBKR paper account (TWS must be running).")
 
     col_form, col_confirm = st.columns(2)
 
@@ -665,14 +862,8 @@ with tab_trade:
 
         if st.button("Submit Order", type="primary", disabled=not confirmed):
             try:
-                side = OrderSide.BUY if trade_side == "BUY" else OrderSide.SELL
-                client.submit_order(MarketOrderRequest(
-                    symbol=trade_symbol,
-                    qty=trade_qty,
-                    side=side,
-                    time_in_force=TimeInForce.DAY,
-                ))
-                reason = f"Manual trade from dashboard"
+                place_market_order(trade_symbol, trade_side, trade_qty)
+                reason = "Manual trade from dashboard"
                 db.log_trade(trade_symbol, trade_side, trade_qty, est_price, reason)
                 alerts.send_trade_alert(trade_symbol, trade_side, trade_qty, est_price, reason)
                 st.success(f"Order submitted: {trade_side} {trade_qty} x {trade_symbol}")

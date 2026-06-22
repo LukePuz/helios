@@ -1,6 +1,8 @@
 # Broker & market data
 alpaca-py>=0.28.0
 polygon-api-client>=1.13.0
+ib_insync>=0.9.86
+nest_asyncio>=1.6.0
 
 # Environment & config
 python-dotenv>=1.0.0
@@ -27,3 +29,5 @@ pandas>=2.2.0
 
 # HTTP
 requests>=2.32.0
+fastapi>=0.111.0
+uvicorn>=0.30.0

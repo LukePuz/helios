@@ -93,74 +93,56 @@ def _edit_message(message_id: int, text: str) -> None:
 
 def _execute_approved_order(approval: dict) -> bool:
     """
-    Submit the approved order to Alpaca, log the trade and stop.
+    Submit the approved order to IBKR via TWS, log the trade and stop.
     Returns True on success.
     """
-    ticker   = approval["ticker"]
-    action   = approval["action"]
-    risk_json= approval.get("risk_json") or {}
+    ticker    = approval["ticker"]
+    action    = approval["action"]
+    risk_json = approval.get("risk_json") or {}
 
     try:
-        from alpaca.trading.client import TradingClient
-        from alpaca.trading.requests import MarketOrderRequest
-        from alpaca.trading.enums import OrderSide, TimeInForce
+        import ibkr
         import db
         import alerts as alert_module
 
-        api_key    = os.getenv("ALPACA_API_KEY")
-        api_secret = os.getenv("ALPACA_API_SECRET")
-        client = TradingClient(api_key, api_secret, paper=True)
-
-        # Determine shares and side
         shares = risk_json.get("shares_initial", 0)
         if shares <= 0:
             log.error(f"[{ticker}] No shares_initial in risk_json — cannot execute")
             return False
 
         if action in ("OPEN", "ADD"):
-            side = OrderSide.BUY
+            side = "BUY"
         elif action in ("TRIM", "EXIT"):
-            side = OrderSide.SELL
-            # For EXIT: sell all; for TRIM: use shares from risk calc
+            side = "SELL"
             if action == "EXIT":
-                try:
-                    pos    = client.get_open_position(ticker)
-                    shares = int(pos.qty)
-                except Exception:
+                qty = ibkr.get_client().get_open_position(ticker).qty
+                shares = int(abs(qty))
+                if shares <= 0:
                     log.error(f"[{ticker}] EXIT requested but no position found")
                     return False
         else:
             log.info(f"[{ticker}] Action {action} does not require order submission")
             return True
 
-        # Submit order
-        order_req = MarketOrderRequest(
-            symbol=ticker,
-            qty=shares,
-            side=side,
-            time_in_force=TimeInForce.DAY,
-        )
-        order = client.submit_order(order_req)
-        log.info(f"[{ticker}] Order submitted: {side.value} {shares} shares (id={order.id})")
+        # Submit market order
+        order_result = ibkr.place_market_order(ticker, side, shares)
+        log.info(f"[{ticker}] Order submitted: {side} {shares} shares (id={order_result['order_id']})")
 
-        # Get fill price (use last known or estimate)
-        try:
-            current_price = float(client.get_latest_trade(ticker).price)
-        except Exception:
-            current_price = risk_json.get("stop_loss_price", 0) * 1.3 or 0  # rough estimate
+        # Get fill price
+        current_price = ibkr.get_latest_price(ticker) or risk_json.get("stop_loss_price", 0) * 1.3
 
         # Log trade
         db.log_trade(
             symbol=ticker,
-            side=side.value,
+            side=side,
             quantity=shares,
             price=current_price,
-            reason=f"{action} — approved via Telegram (conviction={approval['conviction']}/10)",
+            reason=f"{action} approved via Telegram (conviction={approval['conviction']}/10)",
         )
 
-        # Log stop level
+        # Log stop level and place stop order with IBKR
         stop_price = approval.get("stop_loss_price") or risk_json.get("stop_loss_price")
-        if stop_price and side == OrderSide.BUY:
+        if stop_price and side == "BUY":
             db.upsert_position_stop(
                 ticker=ticker,
                 entry_price=current_price,
@@ -170,6 +152,10 @@ def _execute_approved_order(approval: dict) -> bool:
                 conviction=approval.get("conviction", 5),
                 trail_distance_pct=risk_json.get("trailing_stop_distance_pct"),
             )
+            try:
+                ibkr.place_stop_order(ticker, shares, float(stop_price))
+            except Exception as e:
+                log.warning(f"[{ticker}] Stop order placement failed (logged to DB): {e}")
 
         # Log outcome record for feedback loop
         db.log_trade_outcome(
@@ -184,7 +170,7 @@ def _execute_approved_order(approval: dict) -> bool:
         # Send trade alert
         alert_module.send_trade_alert(
             symbol=ticker,
-            side=side.value,
+            side=side,
             qty=shares,
             price=current_price,
             reason=f"{action} approved",
@@ -227,7 +213,7 @@ def _handle_callback(update: dict) -> None:
             _answer_callback(cq_id, "Approval not found.")
             return
 
-        if approval["status"] != "PENDING":
+        if approval["status"] not in ("PENDING", "PROCESSING"):
             _answer_callback(cq_id, f"Already {approval['status']}.")
             return
 
@@ -249,6 +235,10 @@ def _handle_callback(update: dict) -> None:
         action = approval["action"]
 
         if decision == "approve":
+            # Atomic claim — only one callback wins the race
+            if not db.claim_approval_for_execution(approval_id):
+                _answer_callback(cq_id, "Already being processed.")
+                return
             log.info(f"[{ticker}] Approval #{approval_id} approved by @{user}")
             _answer_callback(cq_id, "Processing order...")
 

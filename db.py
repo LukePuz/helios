@@ -155,11 +155,19 @@ def _put_conn(conn) -> None:
     _get_pool().putconn(conn)
 
 
+_MIGRATIONS = """
+ALTER TABLE pending_approvals ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+ALTER TABLE pending_approvals ADD COLUMN IF NOT EXISTS decided_at TIMESTAMPTZ;
+ALTER TABLE pending_approvals ADD COLUMN IF NOT EXISTS telegram_message_id BIGINT;
+"""
+
+
 def init_db() -> None:
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(_CREATE_TABLES)
+            cur.execute(_MIGRATIONS)
         conn.commit()
         logging.info("Database tables ready.")
     except Exception:
@@ -384,6 +392,31 @@ def log_pending_approval(
         conn.rollback()
         logging.error(f"log_pending_approval failed: {e}")
         return -1
+    finally:
+        _put_conn(conn)
+
+
+def claim_approval_for_execution(approval_id: int) -> bool:
+    """
+    Atomically transition status PENDING → PROCESSING.
+    Returns True only if THIS call won the race (exactly one row updated).
+    Any concurrent duplicate callback will get False and skip execution.
+    """
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE pending_approvals SET status='PROCESSING', decided_at=NOW() "
+                "WHERE id=%s AND status='PENDING' RETURNING id",
+                (approval_id,),
+            )
+            claimed = cur.fetchone() is not None
+        conn.commit()
+        return claimed
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"claim_approval_for_execution failed: {e}")
+        return False
     finally:
         _put_conn(conn)
 

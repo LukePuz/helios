@@ -76,15 +76,15 @@ def process_event(event: dict) -> dict:
 
     # ── Assemble situation brief ──────────────────────────────────────────────
     try:
-        import os
-        from alpaca.trading.client import TradingClient
-        client = TradingClient(os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_API_SECRET"), paper=True)
+        from ibkr import IBKRClient
+        client = IBKRClient()
         positions = _get_positions(client)
         brief = assemble_brief(event, positions, client)
     except Exception as e:
         log.warning(f"[{ticker}] Brief assembly failed: {e}")
         brief = f"Event: {event.get('title', '')}\n{event.get('text', '')[:1000]}"
         positions = {}
+        client = None
 
     # Build a candidate-like dict from the event (for analyst interface)
     from knowledge_loader import get_watchlist_entry
@@ -125,8 +125,6 @@ def process_candidates(candidates: list[dict], max_per_run: int = 5) -> list[dic
     """
     from agents.analyst import analyze_batch
     from agents.market_regime import get_cached_regime
-    import os
-    from alpaca.trading.client import TradingClient
 
     regime = get_cached_regime()
     log.info(f"Processing {len(candidates)} candidates in {regime.get('regime')} regime")
@@ -143,9 +141,10 @@ def process_candidates(candidates: list[dict], max_per_run: int = 5) -> list[dic
     results = analyze_batch(to_analyze, regime_packet=regime)
 
     try:
-        client = TradingClient(os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_API_SECRET"), paper=True)
+        from ibkr import IBKRClient
+        client = IBKRClient()
     except Exception as e:
-        log.warning(f"Could not init Alpaca client for routing: {e}")
+        log.warning(f"Could not init IBKR client for routing: {e}")
         client = None
 
     for result in results:
@@ -172,6 +171,25 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
     conviction = result["conviction"]
     bucket     = result["thesis_bucket"]
     regime_str = regime.get("regime", "Neutral")
+
+    try:
+        from catalyst_service.gates import catalyst_gate_check
+        catalyst_gate = catalyst_gate_check(ticker, days_ahead=45)
+        if not catalyst_gate.get("approved"):
+            reason = catalyst_gate.get("reason", "unresolved catalyst calendar risk")
+            log.warning(f"[{ticker}] Approval blocked by catalyst gate: {reason}")
+            try:
+                db.log_signal(ticker, "CATALYST_BLOCKED", 0.0, reason)
+                alert_module._send(
+                    f"CATALYST BLOCKED - {ticker}\n"
+                    f"{reason}\n"
+                    "Resolve the catalyst calendar entry before approval routing."
+                )
+            except Exception:
+                pass
+            return
+    except Exception as e:
+        log.warning(f"[{ticker}] Catalyst gate skipped: {e}")
 
     try:
         rm = RiskManager(trading_client)

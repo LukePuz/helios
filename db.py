@@ -366,6 +366,24 @@ def get_latest_regime() -> dict | None:
 # Pending approvals
 # ---------------------------------------------------------------------------
 
+def has_active_approval(ticker: str) -> bool:
+    """Return True if this ticker already has a PENDING or PROCESSING approval."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM pending_approvals "
+                "WHERE ticker=%s AND status IN ('PENDING','PROCESSING') LIMIT 1",
+                (ticker,),
+            )
+            return cur.fetchone() is not None
+    except Exception as e:
+        logging.error(f"has_active_approval failed: {e}")
+        return False
+    finally:
+        _put_conn(conn)
+
+
 def log_pending_approval(
     ticker: str,
     action: str,

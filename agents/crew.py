@@ -339,7 +339,12 @@ def _get_price(ticker: str, client) -> float | None:
         info = t.fast_info
         price = getattr(info, "last_price", None) or getattr(info, "previous_close", None)
         if price:
-            return float(price)
+            p = float(price)
+            # Sanity check: reject anything above $5,000 or below $0.01
+            # yfinance occasionally returns split-adjusted historical prices or garbage
+            if 0.01 <= p <= 5000.0:
+                return p
+            log.warning(f"[{ticker}] yfinance returned implausible price ${p:.2f} — discarding")
     except Exception:
         pass
     return None

@@ -192,7 +192,8 @@ def _handle_callback(update: dict) -> None:
     cq_id   = cq.get("id", "")
     data    = cq.get("data", "")
     msg_id  = cq.get("message", {}).get("message_id")
-    user    = cq.get("from", {}).get("username", "unknown")
+    from_   = cq.get("from", {})
+    user    = from_.get("username") or from_.get("first_name") or str(from_.get("id", "unknown"))
 
     if not data or ":" not in data:
         return

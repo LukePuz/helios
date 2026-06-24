@@ -127,7 +127,7 @@ def get_historical_bars(
 # Order execution
 # ---------------------------------------------------------------------------
 
-def place_market_order(ticker: str, side: str, qty: int) -> dict:
+def place_market_order(ticker: str, side: str, qty: float) -> dict:
     """
     Place a market order. side = 'BUY' or 'SELL'.
     Returns dict with order_id, status.
@@ -156,7 +156,7 @@ def place_market_order(ticker: str, side: str, qty: int) -> dict:
     }
 
 
-def place_stop_order(ticker: str, qty: int, stop_price: float) -> dict:
+def place_stop_order(ticker: str, qty: float, stop_price: float) -> dict:
     """Place a sell stop-loss order."""
     ib = get_ib()
     contract = _stock(ticker)

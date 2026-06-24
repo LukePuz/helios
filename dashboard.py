@@ -274,8 +274,8 @@ with st.sidebar:
 
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_workflow, tab_portfolio, tab_regime, tab_approvals, tab_outcomes, tab_macro, tab_technicals, tab_signals, tab_trade, tab_logs = st.tabs([
-    "Workflow", "Portfolio", "Market Regime", "Pending Approvals", "Outcomes", "Macro", "Technicals", "Signal Log", "Manual Trade", "Logs",
+tab_workflow, tab_activity, tab_portfolio, tab_regime, tab_approvals, tab_outcomes, tab_macro, tab_technicals, tab_signals, tab_trade, tab_logs = st.tabs([
+    "Workflow", "Activity", "Portfolio", "Market Regime", "Pending Approvals", "Outcomes", "Macro", "Technicals", "Signal Log", "Manual Trade", "Logs",
 ])
 
 
@@ -319,7 +319,106 @@ with tab_workflow:
         st.rerun()
 
 
-# ── Tab 1: Portfolio ──────────────────────────────────────────────────────────
+# ── Tab: Activity Feed ───────────────────────────────────────────────────────
+with tab_activity:
+    from streamlit_autorefresh import st_autorefresh
+    st_autorefresh(interval=5000, key="activity_autorefresh")
+
+    st.header("Live Activity Feed")
+    st.caption("Real-time commentary from every pipeline stage — auto-refreshes every 5 seconds.")
+
+    _SENTIMENT_COLOR = {
+        "bullish": "#00cc88",
+        "bearish": "#cc4444",
+        "alert":   "#ff8800",
+        "neutral": "#888888",
+    }
+    _STAGE_ICONS = {
+        "screener":  "🔍",
+        "analyst":   "🧠",
+        "risk":      "📊",
+        "telegram":  "📱",
+        "execution": "✅",
+        "system":    "⚙️",
+        "edgar":     "📄",
+        "options":   "📈",
+        "macro":     "🌐",
+        "insider":   "👤",
+    }
+
+    try:
+        _feed_rows = db.get_activity_feed(limit=120)
+    except Exception as _e:
+        _feed_rows = []
+        st.error(f"Could not load feed: {_e}")
+
+    if not _feed_rows:
+        st.info("No activity yet — the feed will populate as the pipeline processes events.")
+    else:
+        # Summary metrics strip
+        _mc1, _mc2, _mc3, _mc4 = st.columns(4)
+        _bullish_n = sum(1 for r in _feed_rows if r["sentiment"] == "bullish")
+        _alert_n   = sum(1 for r in _feed_rows if r["sentiment"] == "alert")
+        _tickers   = list(dict.fromkeys(r["ticker"] for r in _feed_rows if r["ticker"]))
+        _mc1.metric("Events (last 120)", len(_feed_rows))
+        _mc2.metric("Bullish signals", _bullish_n)
+        _mc3.metric("Alerts", _alert_n)
+        _mc4.metric("Tickers seen", len(_tickers))
+
+        st.divider()
+
+        # Filter controls
+        _fcol1, _fcol2 = st.columns([2, 2])
+        _stage_filter = _fcol1.multiselect(
+            "Filter by stage",
+            options=["screener", "analyst", "risk", "telegram", "execution", "system"],
+            default=[],
+            key="feed_stage_filter",
+        )
+        _ticker_filter = _fcol2.multiselect(
+            "Filter by ticker",
+            options=_tickers,
+            default=[],
+            key="feed_ticker_filter",
+        )
+
+        _visible = _feed_rows
+        if _stage_filter:
+            _visible = [r for r in _visible if r["stage"] in _stage_filter]
+        if _ticker_filter:
+            _visible = [r for r in _visible if r["ticker"] in _ticker_filter]
+
+        # Render each row as a styled card
+        for _row in _visible:
+            _icon      = _STAGE_ICONS.get(_row["stage"], "•")
+            _color     = _SENTIMENT_COLOR.get(_row["sentiment"], "#888888")
+            _ts        = _row["ts"]
+            _ts_str    = _ts.strftime("%H:%M:%S") if hasattr(_ts, "strftime") else str(_ts)[:19]
+            _ticker_lbl = f"**{_row['ticker']}**" if _row["ticker"] else ""
+            _stage_lbl  = _row["stage"].upper()
+
+            st.markdown(
+                f"""<div style="
+                    border-left: 3px solid {_color};
+                    padding: 6px 12px;
+                    margin-bottom: 4px;
+                    background: rgba(255,255,255,0.03);
+                    border-radius: 0 4px 4px 0;
+                    font-size: 13px;
+                ">
+                <span style="color:#666;font-size:11px">{_ts_str}</span>
+                &nbsp;
+                <span style="color:{_color};font-weight:600">{_icon} {_stage_lbl}</span>
+                &nbsp;
+                <span style="color:#ccc">{_ticker_lbl}</span>
+                &nbsp;—&nbsp;
+                <span style="color:#eee">{_row['message']}</span>
+                </div>""",
+                unsafe_allow_html=True,
+            )
+
+
+# ── Tab: Portfolio ────────────────────────────────────────────────────────────
 with tab_portfolio:
     st.header("Portfolio Overview")
 

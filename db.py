@@ -113,6 +113,18 @@ CREATE TABLE IF NOT EXISTS position_stops (
     updated_at          TIMESTAMPTZ DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS activity_feed (
+    id          SERIAL PRIMARY KEY,
+    ts          TIMESTAMPTZ DEFAULT NOW(),
+    stage       VARCHAR(20),
+    ticker      VARCHAR(10),
+    message     TEXT,
+    sentiment   VARCHAR(10) DEFAULT 'neutral',
+    extra_json  JSONB
+);
+
+CREATE INDEX IF NOT EXISTS activity_feed_ts_idx ON activity_feed (ts DESC);
+
 CREATE TABLE IF NOT EXISTS scanner_candidates (
     id                      SERIAL PRIMARY KEY,
     timestamp               TIMESTAMPTZ DEFAULT NOW(),
@@ -455,6 +467,54 @@ def set_approval_telegram_id(approval_id: int, telegram_message_id: int) -> None
     except Exception as e:
         conn.rollback()
         logging.error(f"set_approval_telegram_id failed: {e}")
+    finally:
+        _put_conn(conn)
+
+
+# ---------------------------------------------------------------------------
+# Activity feed
+# ---------------------------------------------------------------------------
+
+def log_activity(
+    stage:     str,
+    ticker:    str,
+    message:   str,
+    sentiment: str = "neutral",
+    extra:     dict | None = None,
+) -> None:
+    """Insert one row into the live activity feed."""
+    import json as _json
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO activity_feed (stage, ticker, message, sentiment, extra_json)
+                   VALUES (%s, %s, %s, %s, %s)""",
+                (stage, ticker or "", message, sentiment,
+                 _json.dumps(extra) if extra else None),
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"log_activity failed: {e}")
+    finally:
+        _put_conn(conn)
+
+
+def get_activity_feed(limit: int = 120) -> list[dict]:
+    """Return the most recent activity feed rows, newest first."""
+    conn = _get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, ts, stage, ticker, message, sentiment, extra_json "
+                "FROM activity_feed ORDER BY ts DESC LIMIT %s",
+                (limit,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        logging.error(f"get_activity_feed failed: {e}")
+        return []
     finally:
         _put_conn(conn)
 

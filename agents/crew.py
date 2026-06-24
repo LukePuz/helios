@@ -173,11 +173,18 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
     regime_str = regime.get("regime", "Neutral")
 
     try:
+        from feed import emit as _feed_emit
+    except Exception:
+        _feed_emit = None
+
+    try:
         from catalyst_service.gates import catalyst_gate_check
         catalyst_gate = catalyst_gate_check(ticker, days_ahead=45)
         if not catalyst_gate.get("approved"):
             reason = catalyst_gate.get("reason", "unresolved catalyst calendar risk")
             log.warning(f"[{ticker}] Approval blocked by catalyst gate: {reason}")
+            if _feed_emit:
+                _feed_emit("risk", ticker, f"Blocked by catalyst gate — {reason}", "alert")
             try:
                 db.log_signal(ticker, "CATALYST_BLOCKED", 0.0, reason)
                 alert_module._send(
@@ -263,8 +270,20 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
     if msg_id:
         db.set_approval_telegram_id(approval_id, msg_id)
         log.info(f"[{ticker}] Approval #{approval_id} queued — Telegram msg_id={msg_id}")
+        if _feed_emit:
+            _feed_emit("risk", ticker,
+                       f"Sized {sizing['shares_initial']} shares @ ~${price:.2f} "
+                       f"({sizing['position_size_pct']:.1%} portfolio) | "
+                       f"stop ${sizing.get('stop_loss_price', 0):.2f} | "
+                       f"{bucket} bucket — approval request sent to Telegram",
+                       "bullish")
     else:
         log.info(f"[{ticker}] Approval #{approval_id} queued (Telegram not configured)")
+        if _feed_emit:
+            _feed_emit("risk", ticker,
+                       f"Sized {sizing['shares_initial']} shares @ ~${price:.2f} — "
+                       f"approval #{approval_id} logged (Telegram not configured)",
+                       "neutral")
 
 
 # ---------------------------------------------------------------------------

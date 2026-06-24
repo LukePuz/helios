@@ -240,11 +240,24 @@ def _handle_callback(update: dict) -> None:
                 _answer_callback(cq_id, "Already being processed.")
                 return
             log.info(f"[{ticker}] Approval #{approval_id} approved by @{user}")
+            try:
+                from feed import emit as _fe
+                _fe("telegram", ticker, f"Approved by @{user} — executing {action} {ticker}", "bullish")
+            except Exception:
+                pass
             _answer_callback(cq_id, "Processing order...")
 
             success = _execute_approved_order(approval)
             status  = "APPROVED" if success else "FAILED"
             db.update_approval_status(approval_id, status)
+            try:
+                from feed import emit as _fe
+                if success:
+                    _fe("execution", ticker, f"Order executed: {action} {ticker} — filled", "bullish")
+                else:
+                    _fe("execution", ticker, f"Order FAILED: {action} {ticker} — check logs", "alert")
+            except Exception:
+                pass
 
             now = datetime.now(timezone.utc)
             if msg_id:
@@ -260,6 +273,11 @@ def _handle_callback(update: dict) -> None:
             log.info(f"[{ticker}] Approval #{approval_id} rejected by @{user}")
             _answer_callback(cq_id, "Recommendation rejected.")
             db.update_approval_status(approval_id, "REJECTED")
+            try:
+                from feed import emit as _fe
+                _fe("telegram", ticker, f"Rejected by @{user} — {action} {ticker} skipped", "bearish")
+            except Exception:
+                pass
 
             now = datetime.now(timezone.utc)
             if msg_id:

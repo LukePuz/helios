@@ -177,6 +177,14 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
     except Exception:
         _feed_emit = None
 
+    # Skip if this ticker already has an open approval waiting for decision
+    try:
+        if db.has_active_approval(ticker):
+            log.info(f"[{ticker}] Active approval already pending — skipping duplicate")
+            return
+    except Exception:
+        pass
+
     try:
         from catalyst_service.gates import catalyst_gate_check
         catalyst_gate = catalyst_gate_check(ticker, days_ahead=45)

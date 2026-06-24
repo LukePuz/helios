@@ -204,7 +204,7 @@ class RiskManager:
         dollar_amount  = pv * remaining
         initial_pct    = 0.55  # 55% initial tranche (midpoint of 50-60%)
         initial_dollar = dollar_amount * initial_pct
-        shares_initial = max(1, int(initial_dollar // price))
+        shares_initial = round(max(0.01, initial_dollar / price), 4)
 
         # Stop loss
         stop_price, stop_method = self.calculate_stop(ticker, price, bucket)
@@ -365,12 +365,12 @@ class RiskManager:
         position_cap = pv * 0.20
         held         = self.current_position_value(symbol)
         budget       = min(trade_cap, max(0, position_cap - held))
-        return int(budget // price)
+        return round(budget / price, 4) if price else 0.0
 
-    def check_sell_allowed(self, symbol: str, shares: int) -> bool:
+    def check_sell_allowed(self, symbol: str, shares: float) -> bool:
         try:
             position = self._client.get_open_position(symbol)
-            owned = int(position.qty)
+            owned = float(position.qty)
             if shares > owned:
                 log.warning(f"Sell rejected — only {owned} shares of {symbol} owned")
                 return False

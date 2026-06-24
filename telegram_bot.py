@@ -116,7 +116,7 @@ def _execute_approved_order(approval: dict) -> bool:
             side = "SELL"
             if action == "EXIT":
                 qty = ibkr.get_client().get_open_position(ticker).qty
-                shares = int(abs(qty))
+                shares = round(abs(float(qty)), 4)
                 if shares <= 0:
                     log.error(f"[{ticker}] EXIT requested but no position found")
                     return False

@@ -135,11 +135,23 @@ def screen(event: dict) -> dict:
 
     Always returns a valid dict regardless of model availability.
     """
+    ticker = event.get("ticker", "?")
+    source = event.get("source", "unknown")
+    title  = event.get("title", "")
+
+    try:
+        from feed import emit
+        emit("screener", ticker,
+             f"Reading {source.upper()} — {title[:70]}{'…' if len(title) > 70 else ''}",
+             "neutral")
+    except Exception:
+        pass
+
     prompt = _SCREENER_PROMPT.format(
         symbols=", ".join(SYMBOLS),
-        source=event.get("source", "unknown"),
-        ticker=event.get("ticker", "N/A"),
-        title=event.get("title", "N/A"),
+        source=source,
+        ticker=ticker,
+        title=title,
         content=event.get("text", "")[:500],
     )
 
@@ -159,11 +171,26 @@ def screen(event: dict) -> dict:
             result = _keyword_fallback(event)
 
     log.info(
-        f"Screened [{event.get('source','?')}] {event.get('ticker','?')}: "
+        f"Screened [{source}] {ticker}: "
         f"relevant={result['relevant']} urgency={result['urgency']} "
         f"tickers={result.get('affected_tickers',[])} "
         f"model={result.get('model_used','?')}"
     )
+
+    try:
+        from feed import emit
+        reason = result.get("reason", "")[:100]
+        if result.get("relevant"):
+            urgency = result.get("urgency", "low")
+            sentiment = "alert" if urgency == "immediate" else "neutral"
+            emit("screener", ticker,
+                 f"Relevant ({urgency}) — {reason}",
+                 sentiment)
+        else:
+            emit("screener", ticker, f"Filtered out — {reason}", "neutral")
+    except Exception:
+        pass
+
     return result
 
 

@@ -211,6 +211,11 @@ def _extract_json(raw: str) -> dict | None:
 def _stub_recommendation(candidate: dict, reason: str) -> dict:
     ticker = candidate.get("ticker", "UNKNOWN")
     log.warning(f"[{ticker}] Stub recommendation — {reason}")
+    try:
+        from feed import emit
+        emit("analyst", ticker, f"Model unavailable ({reason}) — skipping", "neutral")
+    except Exception:
+        pass
     return {
         "ticker":         ticker,
         "action":         "WATCH",
@@ -264,6 +269,12 @@ def analyze(
     """
     ticker = candidate.get("ticker", "UNKNOWN")
     log.info(f"[{ticker}] Analyzing with {ANALYST_MODEL}...")
+
+    try:
+        from feed import emit
+        emit("analyst", ticker, f"Starting deep analysis with {ANALYST_MODEL}…", "neutral")
+    except Exception:
+        pass
 
     if regime_packet is None:
         try:
@@ -350,6 +361,23 @@ def analyze(
         f"[{ticker}] → {action} | conviction={conviction}/10 | "
         f"UDR={udr:.1f} | pass_to_risk={result['pass_to_risk']}"
     )
+
+    try:
+        from feed import emit
+        reasoning_snip = result.get("reasoning", "")[:140]
+        if action in ("OPEN", "ADD"):
+            sentiment = "bullish"
+        elif action in ("TRIM", "EXIT"):
+            sentiment = "bearish"
+        else:
+            sentiment = "neutral"
+        pass_flag = " — sending to Risk Manager" if result["pass_to_risk"] else ""
+        emit("analyst", ticker,
+             f"{action} | conviction {conviction}/10 | UDR {udr:.1f}x{pass_flag} — {reasoning_snip}",
+             sentiment)
+    except Exception:
+        pass
+
     return result
 
 

@@ -7,6 +7,7 @@ into the model prompt before every reasoning call.
 Uses sentence-transformers (runs on CPU, no GPU needed yet).
 Model: all-MiniLM-L6-v2 (~90MB, fast, accurate for finance text)
 """
+from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone

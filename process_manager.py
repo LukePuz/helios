@@ -116,7 +116,12 @@ def start(name: str) -> str:
     svc = SERVICES[name]
     try:
         flags    = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
-        env      = {**__import__("os").environ, "PYTHONPATH": str(BASE_DIR)}
+        extra    = {"PYTHONPATH": str(BASE_DIR)}
+        # Celery worker uses clientId=3 so it doesn't conflict with main
+        # process (clientId=1) or dashboard (clientId=2) for IBKR connections.
+        if name == "celery_worker":
+            extra["IB_CLIENT_ID"] = "3"
+        env      = {**__import__("os").environ, **extra}
         log_file = open(svc["log"], "a", encoding="utf-8")
         proc = subprocess.Popen(
             svc["cmd"],

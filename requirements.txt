@@ -3,6 +3,7 @@ alpaca-py>=0.28.0
 polygon-api-client>=1.13.0
 ib_insync>=0.9.86
 nest_asyncio>=1.6.0
+yfinance>=0.2.40
 
 # Environment & config
 python-dotenv>=1.0.0

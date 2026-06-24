@@ -62,6 +62,10 @@ HEADERS = {"User-Agent": "trading-bot 245081114+LukePuz@users.noreply.github.com
 
 _seen_filings: set[str] = set()
 
+# Only process filings published within this window — prevents old annual
+# reports and quarterly filings from flooding the pipeline on every restart.
+_MAX_AGE_HOURS = 48
+
 
 def _fetch_filing_text(filing_url: str) -> str:
     """Downloads the actual text of a filing from SEC EDGAR."""
@@ -97,6 +101,8 @@ def _get_recent_filings(ticker: str, cik: str, form: str) -> list[dict]:
     try:
         root = ET.fromstring(resp.text)
         ns = {"atom": "http://www.w3.org/2005/Atom"}
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=_MAX_AGE_HOURS)
+
         for entry in root.findall("atom:entry", ns):
             filing_id = entry.findtext("atom:id", namespaces=ns) or ""
             if filing_id in _seen_filings:
@@ -106,6 +112,16 @@ def _get_recent_filings(ticker: str, cik: str, form: str) -> list[dict]:
             updated = entry.findtext("atom:updated",  namespaces=ns) or ""
             link_el = entry.find("atom:link",         namespaces=ns)
             url     = link_el.get("href", "") if link_el is not None else ""
+
+            # Skip filings older than _MAX_AGE_HOURS regardless of seen state
+            if updated:
+                try:
+                    filed_at = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+                    if filed_at < cutoff:
+                        _seen_filings.add(filing_id)  # mark so we don't re-check
+                        continue
+                except ValueError:
+                    pass
 
             _seen_filings.add(filing_id)
             text = _fetch_filing_text(url) if url else ""

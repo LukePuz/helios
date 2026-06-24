@@ -305,6 +305,16 @@ def _get_price(ticker: str, client) -> float | None:
             return float(mid)
     except Exception:
         pass
+    # Final fallback: yfinance (no API key, always available)
+    try:
+        import yfinance as yf
+        t = yf.Ticker(ticker)
+        info = t.fast_info
+        price = getattr(info, "last_price", None) or getattr(info, "previous_close", None)
+        if price:
+            return float(price)
+    except Exception:
+        pass
     return None
 
 

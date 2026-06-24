@@ -336,13 +336,17 @@ def _get_price(ticker: str, client) -> float | None:
     try:
         import yfinance as yf
         t = yf.Ticker(ticker)
-        info = t.fast_info
-        price = getattr(info, "last_price", None) or getattr(info, "previous_close", None)
+        # Prefer extended-hours price so sizing reflects what we'd actually pay
+        full = t.info
+        price = (
+            full.get("postMarketPrice")
+            or full.get("preMarketPrice")
+            or full.get("regularMarketPrice")
+            or getattr(t.fast_info, "last_price", None)
+        )
         if price:
             p = float(price)
-            # Sanity check: reject anything above $5,000 or below $0.01
-            # yfinance occasionally returns split-adjusted historical prices or garbage
-            if 0.01 <= p <= 5000.0:
+            if 0.01 <= p <= 50000.0:
                 return p
             log.warning(f"[{ticker}] yfinance returned implausible price ${p:.2f} — discarding")
     except Exception:

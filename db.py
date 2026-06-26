@@ -1,5 +1,6 @@
 import logging
 import os
+import time as _time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -145,18 +146,40 @@ CREATE TABLE IF NOT EXISTS scanner_candidates (
 
 def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
     global _pool
-    if _pool is None:
-        _pool = psycopg2.pool.ThreadedConnectionPool(
-            minconn=1,
-            maxconn=5,
-            host=os.getenv("SUPABASE_HOST"),
-            port=int(os.getenv("SUPABASE_PORT", "5432")),
-            dbname=os.getenv("SUPABASE_DB", "postgres"),
-            user=os.getenv("SUPABASE_USER", "postgres"),
-            password=os.getenv("SUPABASE_PASSWORD"),
-            sslmode="require",
-        )
-    return _pool
+    if _pool is not None:
+        # Health check: verify the pool can still serve a live connection
+        try:
+            conn = _pool.getconn()
+            conn.cursor().execute("SELECT 1")
+            _pool.putconn(conn)
+            return _pool
+        except Exception:
+            logging.warning("DB pool health check failed — recreating pool.")
+            try:
+                _pool.closeall()
+            except Exception:
+                pass
+            _pool = None
+
+    for attempt in range(1, 4):
+        try:
+            _pool = psycopg2.pool.ThreadedConnectionPool(
+                minconn=1,
+                maxconn=5,
+                host=os.getenv("SUPABASE_HOST"),
+                port=int(os.getenv("SUPABASE_PORT", "5432")),
+                dbname=os.getenv("SUPABASE_DB", "postgres"),
+                user=os.getenv("SUPABASE_USER", "postgres"),
+                password=os.getenv("SUPABASE_PASSWORD"),
+                sslmode="require",
+            )
+            logging.info("DB connection pool created.")
+            return _pool
+        except Exception as e:
+            logging.warning(f"DB pool creation attempt {attempt}/3 failed: {e}")
+            if attempt < 3:
+                _time.sleep(2 ** attempt)  # 2s, 4s
+    raise RuntimeError("Could not connect to PostgreSQL after 3 attempts.")
 
 
 def _get_conn():
@@ -747,6 +770,20 @@ def get_all_position_stops() -> list[dict]:
     except Exception as e:
         logging.error(f"get_all_position_stops failed: {e}")
         return []
+    finally:
+        _put_conn(conn)
+
+
+def get_open_position_symbols() -> set[str]:
+    """Returns the set of tickers that have active stop records (proxy for open positions)."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT ticker FROM position_stops")
+            return {row[0] for row in cur.fetchall()}
+    except Exception as e:
+        logging.error(f"get_open_position_symbols failed: {e}")
+        return set()
     finally:
         _put_conn(conn)
 

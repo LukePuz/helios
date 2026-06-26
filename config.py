@@ -94,7 +94,7 @@ MIN_COMPOSITE_SCORE_MEDIUM = 50    # scanner score threshold for MEDIUM priority
 # ---------------------------------------------------------------------------
 # Market regime
 # ---------------------------------------------------------------------------
-REGIME_CACHE_TTL_SECONDS = 3600   # 1 hour
+REGIME_CACHE_TTL_SECONDS = 1800   # 30 minutes — allows mid-session regime refresh
 
 REGIME_THRESHOLDS: dict[str, tuple[float, float]] = {
     "Strong Risk-On": (75, 100),

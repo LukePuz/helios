@@ -100,6 +100,24 @@ def _execute_approved_order(approval: dict) -> bool:
     action    = approval["action"]
     risk_json = approval.get("risk_json") or {}
 
+    # Pre-flight: verify IBKR is reachable before touching the market
+    try:
+        import ibkr as _ibkr_check
+        _ibkr_check.get_ib()  # retries 3× internally
+    except Exception as conn_err:
+        log.error(f"[{ticker}] IBKR not connected — cannot execute order: {conn_err}")
+        try:
+            import alerts as _al
+            _al._send(
+                f"⚠️ IBKR CONNECTION FAILED\n"
+                f"Could not execute approved order for <b>{ticker}</b>.\n"
+                f"Error: {conn_err}\n"
+                f"Manual execution required."
+            )
+        except Exception:
+            pass
+        return False
+
     try:
         import ibkr
         import db

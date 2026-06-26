@@ -40,13 +40,27 @@ _ib: ibi.IB | None = None
 # Connection
 # ---------------------------------------------------------------------------
 
-def get_ib() -> ibi.IB:
+def get_ib(max_attempts: int = 3) -> ibi.IB:
     global _ib
-    if _ib is None or not _ib.isConnected():
-        _ib = ibi.IB()
-        _ib.connect(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID, readonly=False)
-        log.info(f"Connected to IBKR TWS at {IB_HOST}:{IB_PORT} (clientId={IB_CLIENT_ID})")
-    return _ib
+    import time
+    for attempt in range(1, max_attempts + 1):
+        try:
+            if _ib is None:
+                _ib = ibi.IB()
+            if not _ib.isConnected():
+                _ib.connect(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID,
+                            readonly=False, timeout=10)
+            log.info(f"Connected to IBKR TWS at {IB_HOST}:{IB_PORT} (clientId={IB_CLIENT_ID})")
+            return _ib
+        except Exception as e:
+            log.warning(f"IBKR connect attempt {attempt}/{max_attempts} failed: {e}")
+            _ib = None  # force fresh IB() on next attempt
+            if attempt < max_attempts:
+                time.sleep(3 * attempt)  # 3s, 6s backoff
+    raise ConnectionError(
+        f"Could not connect to IBKR TWS at {IB_HOST}:{IB_PORT} after {max_attempts} attempts. "
+        "Ensure TWS or IB Gateway is running with API connections enabled."
+    )
 
 
 def disconnect() -> None:
@@ -141,6 +155,7 @@ def place_market_order(ticker: str, side: str, qty: float) -> dict:
     ib.sleep(1)
 
     order = ibi.MarketOrder(side.upper(), qty)
+    order.tif = "GTC"  # prevent Error 10349 from TWS DAY-order preset override
     trade = ib.placeOrder(contract, order)
     ib.sleep(1)
 

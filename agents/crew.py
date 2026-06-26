@@ -99,7 +99,15 @@ def process_event(event: dict) -> dict:
 
     # ── Analyze ────────────────────────────────────────────────────────────────
     regime = get_cached_regime()
-    result = analyze(candidate, situation_brief=brief, regime_packet=regime)
+    try:
+        result = analyze(candidate, situation_brief=brief, regime_packet=regime)
+    except Exception as exc:
+        log.error(f"[{ticker}] analyze() raised an unhandled exception: {exc}", exc_info=True)
+        result = {
+            "action": "SKIP", "ticker": ticker, "conviction": 0,
+            "pass_to_risk": False,
+            "reasoning": f"Analysis failed with exception: {exc}",
+        }
 
     # ── Route to approval queue if actionable ─────────────────────────────────
     if result.get("pass_to_risk"):

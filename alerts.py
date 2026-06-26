@@ -5,6 +5,7 @@ Includes approval-request messages with inline buttons for human approval gate.
 
 import logging
 import os
+import time as _time
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -26,50 +27,58 @@ _BASE    = f"https://api.telegram.org/bot{_TOKEN}"
 # Core send helpers
 # ---------------------------------------------------------------------------
 
-def _send(text: str) -> int | None:
-    """Send a plain text message. Returns message_id or None."""
+def _send(text: str, _max_attempts: int = 3) -> int | None:
+    """Send a plain text message. Returns message_id or None. Retries up to 3× on failure."""
     if not _TOKEN or not _CHAT_ID:
         log.debug("Telegram not configured — alert skipped.")
         return None
-    try:
-        resp = requests.post(
-            f"{_BASE}/sendMessage",
-            json={"chat_id": _CHAT_ID, "text": text, "parse_mode": "HTML"},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        return resp.json().get("result", {}).get("message_id")
-    except Exception as e:
-        log.warning(f"Telegram send failed: {e}")
-        return None
+    for attempt in range(1, _max_attempts + 1):
+        try:
+            resp = requests.post(
+                f"{_BASE}/sendMessage",
+                json={"chat_id": _CHAT_ID, "text": text, "parse_mode": "HTML"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            return resp.json().get("result", {}).get("message_id")
+        except Exception as e:
+            log.warning(f"Telegram send attempt {attempt}/{_max_attempts} failed: {e}")
+            if attempt < _max_attempts:
+                _time.sleep(2 ** attempt)  # 2s, 4s
+    log.error(f"Telegram send failed after {_max_attempts} attempts — message lost.")
+    return None
 
 
-def _send_with_buttons(text: str, buttons: list[list[dict]]) -> int | None:
+def _send_with_buttons(text: str, buttons: list[list[dict]], _max_attempts: int = 3) -> int | None:
     """
     Send a message with an InlineKeyboardMarkup.
     buttons is a list of rows, each row is a list of button dicts:
         {"text": "Label", "callback_data": "action:id"}
-    Returns message_id or None.
+    Returns message_id or None. Retries up to 3× on failure.
     """
     if not _TOKEN or not _CHAT_ID:
         log.debug("Telegram not configured — approval request skipped.")
         return None
-    try:
-        resp = requests.post(
-            f"{_BASE}/sendMessage",
-            json={
-                "chat_id":    _CHAT_ID,
-                "text":       text,
-                "parse_mode": "HTML",
-                "reply_markup": {"inline_keyboard": buttons},
-            },
-            timeout=10,
-        )
-        resp.raise_for_status()
-        return resp.json().get("result", {}).get("message_id")
-    except Exception as e:
-        log.warning(f"Telegram button message failed: {e}")
-        return None
+    for attempt in range(1, _max_attempts + 1):
+        try:
+            resp = requests.post(
+                f"{_BASE}/sendMessage",
+                json={
+                    "chat_id":      _CHAT_ID,
+                    "text":         text,
+                    "parse_mode":   "HTML",
+                    "reply_markup": {"inline_keyboard": buttons},
+                },
+                timeout=10,
+            )
+            resp.raise_for_status()
+            return resp.json().get("result", {}).get("message_id")
+        except Exception as e:
+            log.warning(f"Telegram button send attempt {attempt}/{_max_attempts} failed: {e}")
+            if attempt < _max_attempts:
+                _time.sleep(2 ** attempt)  # 2s, 4s
+    log.error(f"Telegram button send failed after {_max_attempts} attempts — approval message lost.")
+    return None
 
 
 def _edit_message(message_id: int, new_text: str) -> None:

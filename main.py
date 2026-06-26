@@ -22,7 +22,7 @@ from pathlib import Path
 
 
 def _setup_logging() -> None:
-    log_path = Path(__file__).parent / "trading_bot.log"
+    log_path = Path(__file__).parent / "helios.log"
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-8s %(message)s",
@@ -35,35 +35,94 @@ def _setup_logging() -> None:
 
 
 def _try_start_redis() -> None:
-    """Start the Redis Docker container, creating it if needed."""
-    try:
-        # Try to start an existing container named 'redis'
-        result = subprocess.run(
-            ["docker", "start", "redis"],
-            capture_output=True, text=True, timeout=15,
-        )
-        if result.returncode == 0:
-            logging.info("Redis container started.")
+    """Try to start Redis via: remote URL passthrough → systemctl → redis-server → Docker."""
+    import shutil
+    import os as _os
+
+    redis_url = _os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+
+    # If REDIS_URL points somewhere non-local, skip local startup entirely
+    if "localhost" not in redis_url and "127.0.0.1" not in redis_url:
+        logging.info(f"Using remote Redis ({redis_url}) — skipping local startup.")
+        return
+
+    # Strategy 1: systemctl (Linux systemd service)
+    if shutil.which("systemctl"):
+        r = subprocess.run(["systemctl", "is-active", "--quiet", "redis"],
+                           capture_output=True)
+        if r.returncode == 0:
+            logging.info("Redis: already running via systemd.")
             return
-        # Container doesn't exist yet — create it
-        result2 = subprocess.run(
-            ["docker", "run", "-d", "--name", "redis", "-p", "6379:6379", "redis:alpine"],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result2.returncode == 0:
-            logging.info("Redis container created and started.")
-        else:
-            logging.warning(
-                f"Could not start Redis via Docker: {result2.stderr.strip()}\n"
-                "Make sure Docker Desktop is running, then retry."
+        r2 = subprocess.run(["systemctl", "is-active", "--quiet", "redis-server"],
+                             capture_output=True)
+        if r2.returncode == 0:
+            logging.info("Redis: already running via systemd (redis-server).")
+            return
+
+    # Strategy 2: native redis-server binary (apt/brew installed)
+    if shutil.which("redis-server"):
+        try:
+            subprocess.Popen(
+                ["redis-server", "--daemonize", "yes"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
-    except FileNotFoundError:
-        logging.warning(
-            "Docker not found in PATH. Start Redis manually: "
-            "docker run -d --name redis -p 6379:6379 redis:alpine"
-        )
+            logging.info("Redis: started via redis-server.")
+            return
+        except Exception as e:
+            logging.warning(f"redis-server start failed: {e}")
+
+    # Strategy 3: Docker
+    if shutil.which("docker"):
+        try:
+            r = subprocess.run(
+                ["docker", "start", "redis"],
+                capture_output=True, text=True, timeout=15,
+            )
+            if r.returncode == 0:
+                logging.info("Redis: started via Docker (existing container).")
+                return
+            r2 = subprocess.run(
+                ["docker", "run", "-d", "--name", "redis", "-p", "6379:6379", "redis:alpine"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if r2.returncode == 0:
+                logging.info("Redis: container created and started via Docker.")
+                return
+            logging.warning(f"Docker Redis failed: {r2.stderr.strip()}")
+        except Exception as e:
+            logging.warning(f"Docker Redis error: {e}")
+
+    logging.warning(
+        "Could not start Redis automatically. "
+        "If Celery fails to connect, run:  sudo systemctl start redis  "
+        "OR  docker start redis"
+    )
+
+
+def _reconcile_positions() -> None:
+    """Compare DB-recorded positions against live IBKR holdings. Logs discrepancies only."""
+    try:
+        from ibkr import get_client
+        import db
+
+        client   = get_client()
+        ibkr_pos = {p.symbol: float(p.qty) for p in client.get_all_positions()}
+        db_pos   = db.get_open_position_symbols()
+
+        in_ibkr_not_db = {s: q for s, q in ibkr_pos.items() if s not in db_pos}
+        in_db_not_ibkr = {s for s in db_pos if s not in ibkr_pos}
+
+        if in_ibkr_not_db or in_db_not_ibkr:
+            logging.warning("=== POSITION RECONCILIATION DISCREPANCY ===")
+            if in_ibkr_not_db:
+                logging.warning(f"  In IBKR but NOT in DB stops table: {in_ibkr_not_db}")
+            if in_db_not_ibkr:
+                logging.warning(f"  In DB stops table but NOT in IBKR: {in_db_not_ibkr}")
+            logging.warning("  Review required — no auto-correction applied.")
+        else:
+            logging.info("Position reconciliation: DB and IBKR agree.")
     except Exception as e:
-        logging.warning(f"Redis auto-start failed: {e}")
+        logging.warning(f"Position reconciliation skipped: {e}")
 
 
 def _check_ollama() -> None:
@@ -143,7 +202,7 @@ def main() -> None:
     _setup_logging()
 
     print("\n" + "=" * 55)
-    print("  Trading Bot — Long-Duration Compounding System")
+    print("  Helios Hedgefund")
     print("=" * 55)
 
     # 1. Redis
@@ -167,6 +226,10 @@ def main() -> None:
     # 5. Telegram bot
     print("  [5/6] Starting Telegram bot...")
     _start_telegram_bot()
+
+    # 5b. Position reconciliation (non-fatal — warns if DB and IBKR disagree)
+    print("  [5b] Reconciling positions with IBKR...")
+    _reconcile_positions()
 
     # 6. Dashboard
     print("  [6/6] Starting dashboard + services...")
@@ -199,7 +262,7 @@ def main() -> None:
 
     print()
     print("  Dashboard  -> http://localhost:8501")
-    print("  Logs       -> trading_bot.log")
+    print("  Logs       -> helios.log")
     print()
     print("  All services starting automatically...")
     print("  Press Ctrl+C to stop everything.")

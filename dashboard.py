@@ -19,7 +19,7 @@ from config import SYMBOLS, START_VALUE
 from market_data import get_latest_quotes
 from ibkr import IBKRClient, place_market_order
 
-st.set_page_config(page_title="Trading Bot", layout="wide", page_icon="📈")
+st.set_page_config(page_title="Helios Hedgefund", layout="wide", page_icon="☀️")
 
 
 @st.cache_resource
@@ -177,7 +177,7 @@ def _build_workflow_figure(statuses: dict[str, bool]) -> go.Figure:
 
 # ── Sidebar: System Control ───────────────────────────────────────────────────
 with st.sidebar:
-    st.title("System Control")
+    st.title("Helios Hedgefund")
     st.caption("Paper trading only")
 
 
@@ -347,7 +347,10 @@ with tab_activity:
     }
 
     try:
-        _feed_rows = db.get_activity_feed(limit=120)
+        # Reload db module so new functions are visible even in a stale process
+        import importlib, db as _db_mod
+        importlib.reload(_db_mod)
+        _feed_rows = _db_mod.get_activity_feed(limit=120)
     except Exception as _e:
         _feed_rows = []
         st.error(f"Could not load feed: {_e}")

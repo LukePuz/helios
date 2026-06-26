@@ -10,9 +10,19 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).parent
 PID_FILE = BASE_DIR / ".processes.json"
-PYTHON   = str(BASE_DIR / "venv" / "Scripts" / "python.exe")
-CELERY   = str(BASE_DIR / "venv" / "Scripts" / "celery.exe")
-UVICORN  = str(BASE_DIR / "venv" / "Scripts" / "uvicorn.exe")
+
+if sys.platform == "win32":
+    _BIN    = BASE_DIR / "venv" / "Scripts"
+    PYTHON  = str(_BIN / "python.exe")
+    CELERY  = str(_BIN / "celery.exe")
+    UVICORN = str(_BIN / "uvicorn.exe")
+else:
+    _BIN    = BASE_DIR / "venv" / "bin"
+    PYTHON  = str(_BIN / "python")
+    CELERY  = str(_BIN / "celery")
+    UVICORN = str(_BIN / "uvicorn")
+
+_CELERY_POOL_ARGS = ["--pool=solo"] if sys.platform == "win32" else ["--pool=prefork", "-c", "2"]
 
 LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
@@ -20,7 +30,7 @@ LOG_DIR.mkdir(exist_ok=True)
 SERVICES: dict[str, dict] = {
     "celery_worker": {
         "label": "Celery Worker",
-        "cmd":   [CELERY, "-A", "tasks", "worker", "--loglevel=info", "--pool=solo"],
+        "cmd":   [CELERY, "-A", "tasks", "worker", "--loglevel=info"] + _CELERY_POOL_ARGS,
         "log":   LOG_DIR / "celery_worker.log",
     },
     "celery_beat": {

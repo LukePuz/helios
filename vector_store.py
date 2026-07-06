@@ -69,8 +69,18 @@ def _get_collection(name: str) -> chromadb.Collection:
 
 
 def embed(text: str) -> list[float]:
-    """Converts text to embedding vector."""
-    return _get_embedder().encode(text, convert_to_list=True)
+    """
+    Converts text to embedding vector.
+    NOTE: `.encode(..., convert_to_list=True)` was silently broken by a
+    sentence-transformers version bump — that kwarg no longer exists for
+    this model, and .encode() raised on every call, meaning every
+    vector_store.store() call (news, filings, arxiv, macro, congressional,
+    self-reviews) was silently failing since store()'s callers all wrap it
+    in a broad try/except. .encode() returns a numpy array; ChromaDB needs
+    a plain list.
+    """
+    result = _get_embedder().encode(text)
+    return result.tolist() if hasattr(result, "tolist") else list(result)
 
 
 def store(

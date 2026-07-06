@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import time as _time
@@ -141,6 +142,76 @@ CREATE TABLE IF NOT EXISTS scanner_candidates (
     passed_to_analyst       BOOLEAN,
     regime_at_scan          VARCHAR(20)
 );
+
+CREATE TABLE IF NOT EXISTS system_state (
+    key         VARCHAR(50) PRIMARY KEY,
+    value       TEXT,
+    updated_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS seen_items (
+    id           SERIAL PRIMARY KEY,
+    source       VARCHAR(30) NOT NULL,
+    external_id  TEXT NOT NULL,
+    first_seen   TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (source, external_id)
+);
+
+CREATE TABLE IF NOT EXISTS ingestion_health (
+    source           VARCHAR(30) PRIMARY KEY,
+    last_success_at  TIMESTAMPTZ,
+    last_item_count  INTEGER,
+    last_error       TEXT,
+    last_error_at    TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS fundamentals (
+    ticker              VARCHAR(10) PRIMARY KEY,
+    updated_at          TIMESTAMPTZ DEFAULT NOW(),
+    revenue_growth_yoy  DECIMAL,
+    gross_margin        DECIMAL,
+    fcf_margin          DECIMAL,
+    price_to_sales      DECIMAL,
+    ev_to_ebitda        DECIMAL,
+    forward_pe          DECIMAL,
+    market_cap          DECIMAL,
+    raw_json            JSONB
+);
+
+CREATE TABLE IF NOT EXISTS price_history (
+    ticker      VARCHAR(10),
+    date        DATE,
+    open        DECIMAL,
+    high        DECIMAL,
+    low         DECIMAL,
+    close       DECIMAL,
+    volume      BIGINT,
+    PRIMARY KEY (ticker, date)
+);
+
+CREATE INDEX IF NOT EXISTS price_history_ticker_date_idx ON price_history (ticker, date DESC);
+
+CREATE TABLE IF NOT EXISTS orders (
+    id                SERIAL PRIMARY KEY,
+    broker_order_id   BIGINT,
+    ticker            VARCHAR(10),
+    side              VARCHAR(4),
+    order_type        VARCHAR(20),
+    qty               DECIMAL,
+    limit_price       DECIMAL,
+    stop_price        DECIMAL,
+    decision_price    DECIMAL,
+    fill_price        DECIMAL,
+    filled_qty        DECIMAL,
+    slippage_pct      DECIMAL,
+    status            VARCHAR(20) DEFAULT 'submitted',
+    approval_id       INTEGER REFERENCES pending_approvals(id),
+    parent_order_id   BIGINT,
+    created_at        TIMESTAMPTZ DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS orders_ticker_idx ON orders (ticker, created_at DESC);
 """
 
 
@@ -190,10 +261,33 @@ def _put_conn(conn) -> None:
     _get_pool().putconn(conn)
 
 
-_MIGRATIONS = """
-ALTER TABLE pending_approvals ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
-ALTER TABLE pending_approvals ADD COLUMN IF NOT EXISTS decided_at TIMESTAMPTZ;
-ALTER TABLE pending_approvals ADD COLUMN IF NOT EXISTS telegram_message_id BIGINT;
+# ---------------------------------------------------------------------------
+# Versioned migrations
+#
+# Each entry is (version, sql). Applied in order, tracked in schema_version
+# so re-running init_db() (every process start) is a no-op after the first
+# time instead of re-executing every ALTER on every boot. All statements
+# remain idempotent (IF NOT EXISTS) as a second line of defense, but the
+# version table means `python setup_db.py` / init_db() logs exactly which
+# migrations are new versus already-applied, instead of that being invisible.
+# ---------------------------------------------------------------------------
+_MIGRATIONS: list[tuple[int, str]] = [
+    (1, "ALTER TABLE pending_approvals ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;"),
+    (2, "ALTER TABLE pending_approvals ADD COLUMN IF NOT EXISTS decided_at TIMESTAMPTZ;"),
+    (3, "ALTER TABLE pending_approvals ADD COLUMN IF NOT EXISTS telegram_message_id BIGINT;"),
+    (4, "ALTER TABLE position_stops ADD COLUMN IF NOT EXISTS broker_order_id BIGINT;"),
+    (5, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS entry_benchmark_price DECIMAL;"),
+    (6, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS exit_benchmark_price DECIMAL;"),
+    (7, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS benchmark_return_pct DECIMAL;"),
+    (8, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS alpha_pct DECIMAL;"),
+    (9, "ALTER TABLE portfolio_snapshots ADD COLUMN IF NOT EXISTS benchmark_json JSONB;"),
+]
+
+_SCHEMA_VERSION_TABLE = """
+CREATE TABLE IF NOT EXISTS schema_version (
+    version     INTEGER PRIMARY KEY,
+    applied_at  TIMESTAMPTZ DEFAULT NOW()
+);
 """
 
 
@@ -202,8 +296,25 @@ def init_db() -> None:
     try:
         with conn.cursor() as cur:
             cur.execute(_CREATE_TABLES)
-            cur.execute(_MIGRATIONS)
+            cur.execute(_SCHEMA_VERSION_TABLE)
         conn.commit()
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT version FROM schema_version")
+            applied = {row[0] for row in cur.fetchall()}
+
+        newly_applied = []
+        for version, sql in _MIGRATIONS:
+            if version in applied:
+                continue
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                cur.execute("INSERT INTO schema_version (version) VALUES (%s)", (version,))
+            conn.commit()
+            newly_applied.append(version)
+
+        if newly_applied:
+            logging.info(f"Applied migrations: {newly_applied}")
         logging.info("Database tables ready.")
     except Exception:
         conn.rollback()
@@ -244,13 +355,21 @@ def log_signal(symbol: str, signal: str, confidence: float, reasoning: str) -> N
         _put_conn(conn)
 
 
-def log_snapshot(total_value: float, cash: float, positions: dict) -> None:
+def log_snapshot(total_value: float, cash: float, positions: dict,
+                 benchmark: dict | None = None) -> None:
+    """
+    benchmark: optional {"SPY": price, "QQQ": price} snapshot taken at the
+    same moment, so the equity curve can be rebased against a real benchmark
+    instead of only a flat $-start-value line.
+    """
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO portfolio_snapshots (total_value, cash, positions_json) VALUES (%s,%s,%s)",
-                (total_value, cash, psycopg2.extras.Json(positions)),
+                "INSERT INTO portfolio_snapshots (total_value, cash, positions_json, benchmark_json) "
+                "VALUES (%s,%s,%s,%s)",
+                (total_value, cash, psycopg2.extras.Json(positions),
+                 psycopg2.extras.Json(benchmark) if benchmark else None),
             )
         conn.commit()
     except Exception as e:
@@ -308,13 +427,14 @@ def get_portfolio_history(limit: int = 288) -> list[dict]:
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT timestamp, total_value, cash FROM portfolio_snapshots "
+                "SELECT timestamp, total_value, cash, benchmark_json FROM portfolio_snapshots "
                 "ORDER BY timestamp DESC LIMIT %s",
                 (limit,),
             )
             rows = cur.fetchall()
         return [
-            {"timestamp": r[0], "total_value": float(r[1]), "cash": float(r[2])}
+            {"timestamp": r[0], "total_value": float(r[1]), "cash": float(r[2]),
+             "benchmark": r[3] or {}}
             for r in reversed(rows)
         ]
     except Exception as e:
@@ -753,7 +873,7 @@ def get_all_position_stops() -> list[dict]:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT ticker, entry_price, stop_price, stop_method, trailing_active, "
-                "trailing_high, trail_distance_pct, thesis_bucket, conviction "
+                "trailing_high, trail_distance_pct, thesis_bucket, conviction, broker_order_id "
                 "FROM position_stops ORDER BY ticker"
             )
             rows = cur.fetchall()
@@ -764,6 +884,7 @@ def get_all_position_stops() -> list[dict]:
                 "trailing_high": float(r[5]) if r[5] else None,
                 "trail_distance_pct": float(r[6]) if r[6] else None,
                 "thesis_bucket": r[7], "conviction": r[8],
+                "broker_order_id": int(r[9]) if r[9] else None,
             }
             for r in rows
         ]
@@ -788,6 +909,494 @@ def get_open_position_symbols() -> set[str]:
         _put_conn(conn)
 
 
+def set_stop_broker_order_id(ticker: str, broker_order_id: int | None) -> None:
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE position_stops SET broker_order_id=%s, updated_at=NOW() WHERE ticker=%s",
+                (broker_order_id, ticker),
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"set_stop_broker_order_id failed: {e}")
+    finally:
+        _put_conn(conn)
+
+
+# ---------------------------------------------------------------------------
+# System state (persisted key-value store shared by all processes)
+# ---------------------------------------------------------------------------
+
+def get_state(key: str, default: str | None = None) -> str | None:
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM system_state WHERE key=%s", (key,))
+            row = cur.fetchone()
+        return row[0] if row else default
+    except Exception as e:
+        logging.error(f"get_state({key}) failed: {e}")
+        return default
+    finally:
+        _put_conn(conn)
+
+
+def set_state(key: str, value: str) -> None:
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO system_state (key, value, updated_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
+                """,
+                (key, value),
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"set_state({key}) failed: {e}")
+    finally:
+        _put_conn(conn)
+
+
+# ---------------------------------------------------------------------------
+# Persistent dedupe (survives restarts — replaces in-memory _seen_* sets)
+# ---------------------------------------------------------------------------
+
+def is_seen(source: str, external_id: str) -> bool:
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM seen_items WHERE source=%s AND external_id=%s",
+                (source, external_id),
+            )
+            return cur.fetchone() is not None
+    except Exception as e:
+        logging.error(f"is_seen({source}, {external_id}) failed: {e}")
+        return False  # fail open: worst case is a duplicate event, not a missed one
+    finally:
+        _put_conn(conn)
+
+
+def mark_seen(source: str, external_id: str) -> None:
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO seen_items (source, external_id) VALUES (%s, %s) "
+                "ON CONFLICT (source, external_id) DO NOTHING",
+                (source, external_id),
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"mark_seen({source}, {external_id}) failed: {e}")
+    finally:
+        _put_conn(conn)
+
+
+# ---------------------------------------------------------------------------
+# Ingestion health (heartbeat per source — detects "dead" vs "quiet")
+# ---------------------------------------------------------------------------
+
+def record_ingestion_success(source: str, item_count: int) -> None:
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO ingestion_health (source, last_success_at, last_item_count)
+                VALUES (%s, NOW(), %s)
+                ON CONFLICT (source) DO UPDATE SET
+                    last_success_at = NOW(),
+                    last_item_count = EXCLUDED.last_item_count
+                """,
+                (source, item_count),
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"record_ingestion_success({source}) failed: {e}")
+    finally:
+        _put_conn(conn)
+
+
+def record_ingestion_error(source: str, error: str) -> None:
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO ingestion_health (source, last_error, last_error_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (source) DO UPDATE SET
+                    last_error    = EXCLUDED.last_error,
+                    last_error_at = NOW()
+                """,
+                (source, error[:2000]),
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"record_ingestion_error({source}) failed: {e}")
+    finally:
+        _put_conn(conn)
+
+
+def get_ingestion_health() -> list[dict]:
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT source, last_success_at, last_item_count, last_error, last_error_at "
+                "FROM ingestion_health ORDER BY source"
+            )
+            rows = cur.fetchall()
+        return [
+            {
+                "source": r[0], "last_success_at": r[1], "last_item_count": r[2],
+                "last_error": r[3], "last_error_at": r[4],
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        logging.error(f"get_ingestion_health failed: {e}")
+        return []
+    finally:
+        _put_conn(conn)
+
+
+# ---------------------------------------------------------------------------
+# Fundamentals (free, via yfinance)
+# ---------------------------------------------------------------------------
+
+def upsert_fundamentals(ticker: str, metrics: dict) -> None:
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO fundamentals
+                    (ticker, updated_at, revenue_growth_yoy, gross_margin, fcf_margin,
+                     price_to_sales, ev_to_ebitda, forward_pe, market_cap, raw_json)
+                VALUES (%s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (ticker) DO UPDATE SET
+                    updated_at         = NOW(),
+                    revenue_growth_yoy = EXCLUDED.revenue_growth_yoy,
+                    gross_margin       = EXCLUDED.gross_margin,
+                    fcf_margin         = EXCLUDED.fcf_margin,
+                    price_to_sales     = EXCLUDED.price_to_sales,
+                    ev_to_ebitda       = EXCLUDED.ev_to_ebitda,
+                    forward_pe         = EXCLUDED.forward_pe,
+                    market_cap         = EXCLUDED.market_cap,
+                    raw_json           = EXCLUDED.raw_json
+                """,
+                (
+                    ticker,
+                    metrics.get("revenue_growth_yoy"),
+                    metrics.get("gross_margin"),
+                    metrics.get("fcf_margin"),
+                    metrics.get("price_to_sales"),
+                    metrics.get("ev_to_ebitda"),
+                    metrics.get("forward_pe"),
+                    metrics.get("market_cap"),
+                    json.dumps(metrics.get("raw", {})),
+                ),
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"upsert_fundamentals({ticker}) failed: {e}")
+    finally:
+        _put_conn(conn)
+
+
+def get_fundamentals(ticker: str) -> dict | None:
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ticker, updated_at, revenue_growth_yoy, gross_margin, fcf_margin, "
+                "price_to_sales, ev_to_ebitda, forward_pe, market_cap "
+                "FROM fundamentals WHERE ticker=%s",
+                (ticker,),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "ticker": row[0], "updated_at": row[1],
+            "revenue_growth_yoy": float(row[2]) if row[2] is not None else None,
+            "gross_margin":       float(row[3]) if row[3] is not None else None,
+            "fcf_margin":         float(row[4]) if row[4] is not None else None,
+            "price_to_sales":     float(row[5]) if row[5] is not None else None,
+            "ev_to_ebitda":       float(row[6]) if row[6] is not None else None,
+            "forward_pe":         float(row[7]) if row[7] is not None else None,
+            "market_cap":         float(row[8]) if row[8] is not None else None,
+        }
+    except Exception as e:
+        logging.error(f"get_fundamentals({ticker}) failed: {e}")
+        return None
+    finally:
+        _put_conn(conn)
+
+
+def upsert_price_bars(ticker: str, bars: list[dict]) -> int:
+    """
+    bars: list of {date (YYYY-MM-DD str or date), open, high, low, close, volume}.
+    Returns count upserted.
+    """
+    if not bars:
+        return 0
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            for b in bars:
+                cur.execute(
+                    """
+                    INSERT INTO price_history (ticker, date, open, high, low, close, volume)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (ticker, date) DO UPDATE SET
+                        open=EXCLUDED.open, high=EXCLUDED.high, low=EXCLUDED.low,
+                        close=EXCLUDED.close, volume=EXCLUDED.volume
+                    """,
+                    (ticker, b["date"], b["open"], b["high"], b["low"], b["close"], b["volume"]),
+                )
+        conn.commit()
+        return len(bars)
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"upsert_price_bars({ticker}) failed: {e}")
+        return 0
+    finally:
+        _put_conn(conn)
+
+
+def get_price_history(ticker: str, days: int = 260) -> list[dict]:
+    """Returns up to `days` most recent daily bars for ticker, oldest first."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT date, open, high, low, close, volume FROM price_history "
+                "WHERE ticker=%s ORDER BY date DESC LIMIT %s",
+                (ticker, days),
+            )
+            rows = cur.fetchall()
+        rows.reverse()
+        return [
+            {"date": str(r[0]), "open": float(r[1]), "high": float(r[2]),
+             "low": float(r[3]), "close": float(r[4]), "volume": int(r[5])}
+            for r in rows
+        ]
+    except Exception as e:
+        logging.error(f"get_price_history({ticker}) failed: {e}")
+        return []
+    finally:
+        _put_conn(conn)
+
+
+def get_price_history_bulk(tickers: list[str], days: int = 260) -> dict[str, list[dict]]:
+    """
+    Same as get_price_history but for many tickers in one round trip.
+    `days` is the number of most-recent TRADING bars per ticker (matching
+    get_price_history's semantics) — NOT a calendar-date cutoff. An earlier
+    version used `date >= CURRENT_DATE - days`, which under-counts by ~30%+
+    once weekends/holidays are factored in (e.g. 251 cached trading days
+    span ~350 calendar days, so a 210-calendar-day cutoff returned only
+    ~150 bars — silently starving the 200-bar breadth/correlation checks).
+    """
+    if not tickers:
+        return {}
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT ticker, date, close FROM (
+                    SELECT ticker, date, close,
+                           ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date DESC) AS rn
+                    FROM price_history
+                    WHERE ticker = ANY(%s)
+                ) ranked
+                WHERE rn <= %s
+                ORDER BY ticker, date ASC
+                """,
+                (tickers, days),
+            )
+            rows = cur.fetchall()
+        result: dict[str, list[dict]] = {}
+        for ticker, d, close in rows:
+            result.setdefault(ticker, []).append({"date": str(d), "close": float(close)})
+        return result
+    except Exception as e:
+        logging.error(f"get_price_history_bulk failed: {e}")
+        return {}
+    finally:
+        _put_conn(conn)
+
+
+def log_order(
+    ticker: str,
+    side: str,
+    order_type: str,
+    qty: float,
+    broker_order_id: int | None = None,
+    limit_price: float | None = None,
+    stop_price: float | None = None,
+    decision_price: float | None = None,
+    approval_id: int | None = None,
+    parent_order_id: int | None = None,
+    status: str = "submitted",
+) -> int:
+    """Logs a newly-placed order. Returns the local orders.id (-1 on failure)."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO orders
+                    (broker_order_id, ticker, side, order_type, qty, limit_price,
+                     stop_price, decision_price, approval_id, parent_order_id, status)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                RETURNING id
+                """,
+                (broker_order_id, ticker, side, order_type, qty, limit_price,
+                 stop_price, decision_price, approval_id, parent_order_id, status),
+            )
+            order_id = cur.fetchone()[0]
+        conn.commit()
+        return order_id
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"log_order failed: {e}")
+        return -1
+    finally:
+        _put_conn(conn)
+
+
+def compute_slippage_pct(decision_price: float | None, fill_price: float | None,
+                         side: str) -> float | None:
+    """
+    Pure function, no DB access — kept separate from update_order_fill so it
+    can be unit-tested without a database connection.
+    Positive slippage = paid more than the decision-time price (BUY) or
+    received less than it (SELL) — i.e. slippage is always "cost" signed.
+    """
+    if not decision_price or not fill_price:
+        return None
+    raw = (fill_price - decision_price) / decision_price
+    return raw if side == "BUY" else -raw
+
+
+def update_order_fill(order_id: int, fill_price: float, filled_qty: float, status: str) -> None:
+    """Records the fill and computes slippage_pct vs decision_price if one was logged."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT decision_price, side FROM orders WHERE id=%s", (order_id,))
+            row = cur.fetchone()
+            slippage_pct = None
+            if row:
+                decision_price = float(row[0]) if row[0] else None
+                slippage_pct = compute_slippage_pct(decision_price, fill_price, row[1])
+
+            cur.execute(
+                "UPDATE orders SET fill_price=%s, filled_qty=%s, status=%s, "
+                "slippage_pct=%s, updated_at=NOW() WHERE id=%s",
+                (fill_price, filled_qty, status, slippage_pct, order_id),
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"update_order_fill failed: {e}")
+    finally:
+        _put_conn(conn)
+
+
+def get_recent_orders(limit: int = 50) -> list[dict]:
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, broker_order_id, ticker, side, order_type, qty, limit_price, "
+                "stop_price, decision_price, fill_price, filled_qty, slippage_pct, status, "
+                "created_at FROM orders ORDER BY created_at DESC LIMIT %s",
+                (limit,),
+            )
+            rows = cur.fetchall()
+        return [
+            {
+                "id": r[0], "broker_order_id": r[1], "ticker": r[2], "side": r[3],
+                "order_type": r[4], "qty": float(r[5]) if r[5] is not None else None,
+                "limit_price": float(r[6]) if r[6] is not None else None,
+                "stop_price": float(r[7]) if r[7] is not None else None,
+                "decision_price": float(r[8]) if r[8] is not None else None,
+                "fill_price": float(r[9]) if r[9] is not None else None,
+                "filled_qty": float(r[10]) if r[10] is not None else None,
+                "slippage_pct": float(r[11]) if r[11] is not None else None,
+                "status": r[12], "created_at": r[13],
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        logging.error(f"get_recent_orders failed: {e}")
+        return []
+    finally:
+        _put_conn(conn)
+
+
+def get_slippage_summary() -> dict:
+    """Average slippage_pct and count, for the weekly review / dashboard."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*), AVG(slippage_pct) FROM orders WHERE slippage_pct IS NOT NULL"
+            )
+            count, avg = cur.fetchone()
+        return {"count": count or 0, "avg_slippage_pct": round(float(avg), 4) if avg else None}
+    except Exception as e:
+        logging.error(f"get_slippage_summary failed: {e}")
+        return {"count": 0, "avg_slippage_pct": None}
+    finally:
+        _put_conn(conn)
+
+
+def get_fundamentals_all() -> list[dict]:
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ticker, revenue_growth_yoy, gross_margin, fcf_margin, "
+                "price_to_sales, ev_to_ebitda, forward_pe, market_cap FROM fundamentals"
+            )
+            rows = cur.fetchall()
+        return [
+            {
+                "ticker": r[0],
+                "revenue_growth_yoy": float(r[1]) if r[1] is not None else None,
+                "gross_margin":       float(r[2]) if r[2] is not None else None,
+                "fcf_margin":         float(r[3]) if r[3] is not None else None,
+                "price_to_sales":     float(r[4]) if r[4] is not None else None,
+                "ev_to_ebitda":       float(r[5]) if r[5] is not None else None,
+                "forward_pe":         float(r[6]) if r[6] is not None else None,
+                "market_cap":         float(r[7]) if r[7] is not None else None,
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        logging.error(f"get_fundamentals_all failed: {e}")
+        return []
+    finally:
+        _put_conn(conn)
+
+
 # ---------------------------------------------------------------------------
 # Scanner candidates
 # ---------------------------------------------------------------------------
@@ -804,19 +1413,161 @@ def log_trade_outcome(
     bucket: str,
     entry_price: float,
 ) -> None:
+    # Stamp the SPY price at entry so we can compute alpha (return vs. benchmark)
+    # when the trade eventually closes.
+    entry_benchmark_price = None
+    try:
+        import yfinance as yf
+        spy_price = yf.Ticker("SPY").fast_info.last_price
+        if spy_price:
+            entry_benchmark_price = float(spy_price)
+    except Exception as e:
+        logging.debug(f"log_trade_outcome: SPY benchmark price fetch failed: {e}")
+
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO trade_outcomes "
-                "(approval_id, ticker, action, conviction, thesis_bucket, entry_price) "
-                "VALUES (%s,%s,%s,%s,%s,%s)",
-                (approval_id, ticker, action, conviction, bucket, entry_price),
+                "(approval_id, ticker, action, conviction, thesis_bucket, entry_price, "
+                " entry_benchmark_price) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                (approval_id, ticker, action, conviction, bucket, entry_price,
+                 entry_benchmark_price),
             )
         conn.commit()
     except Exception as e:
         conn.rollback()
         logging.error(f"log_trade_outcome failed: {e}")
+    finally:
+        _put_conn(conn)
+
+
+def compute_outcome_metrics(
+    entry_price: float,
+    exit_price: float,
+    entry_benchmark_price: float | None,
+    exit_benchmark_price: float | None,
+) -> dict:
+    """
+    Pure function, no DB access — kept separate from close_trade_outcome so
+    the outcome/alpha math can be unit-tested without a database connection.
+    """
+    outcome_pct = (exit_price - entry_price) / entry_price if entry_price else None
+    was_correct = (outcome_pct is not None) and (outcome_pct > 0)
+
+    benchmark_return_pct = None
+    alpha_pct = None
+    if entry_benchmark_price and exit_benchmark_price:
+        benchmark_return_pct = (exit_benchmark_price - entry_benchmark_price) / entry_benchmark_price
+        if outcome_pct is not None:
+            alpha_pct = outcome_pct - benchmark_return_pct
+
+    return {
+        "outcome_pct": outcome_pct,
+        "was_correct": was_correct,
+        "benchmark_return_pct": benchmark_return_pct,
+        "alpha_pct": alpha_pct,
+    }
+
+
+def close_trade_outcome(ticker: str, exit_price: float, exit_date=None) -> bool:
+    """
+    Closes the most recent still-open (exit_date IS NULL) trade_outcomes row
+    for this ticker: computes outcome_pct, was_correct, and alpha vs. SPY over
+    the same holding window. Called after a confirmed EXIT fill.
+    Returns True if a row was closed.
+    """
+    from datetime import datetime, timezone as _tz
+
+    exit_date = exit_date or datetime.now(_tz.utc)
+
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, entry_price, entry_benchmark_price FROM trade_outcomes "
+                "WHERE ticker=%s AND exit_date IS NULL "
+                "ORDER BY entry_date DESC LIMIT 1",
+                (ticker,),
+            )
+            row = cur.fetchone()
+            if not row:
+                logging.warning(f"close_trade_outcome: no open outcome row for {ticker}")
+                return False
+
+            outcome_id, entry_price, entry_benchmark_price = row
+            entry_price = float(entry_price)
+            entry_benchmark_price = float(entry_benchmark_price) if entry_benchmark_price else None
+
+            exit_benchmark_price = None
+            try:
+                import yfinance as yf
+                spy_price = yf.Ticker("SPY").fast_info.last_price
+                if spy_price:
+                    exit_benchmark_price = float(spy_price)
+            except Exception as e:
+                logging.debug(f"close_trade_outcome: SPY exit price fetch failed: {e}")
+
+            metrics = compute_outcome_metrics(
+                entry_price, exit_price, entry_benchmark_price, exit_benchmark_price
+            )
+            outcome_pct          = metrics["outcome_pct"]
+            was_correct          = metrics["was_correct"]
+            benchmark_return_pct = metrics["benchmark_return_pct"]
+            alpha_pct            = metrics["alpha_pct"]
+
+            cur.execute(
+                "UPDATE trade_outcomes SET exit_price=%s, exit_date=%s, outcome_pct=%s, "
+                "was_correct=%s, exit_benchmark_price=%s, benchmark_return_pct=%s, alpha_pct=%s "
+                "WHERE id=%s",
+                (exit_price, exit_date, outcome_pct, was_correct, exit_benchmark_price,
+                 benchmark_return_pct, alpha_pct, outcome_id),
+            )
+        conn.commit()
+        logging.info(
+            f"[{ticker}] Outcome closed: {outcome_pct:+.1%} "
+            f"(alpha vs SPY: {alpha_pct:+.1%})" if outcome_pct is not None and alpha_pct is not None
+            else f"[{ticker}] Outcome closed: outcome_pct={outcome_pct}"
+        )
+        return True
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"close_trade_outcome failed: {e}")
+        return False
+    finally:
+        _put_conn(conn)
+
+
+def get_conviction_calibration() -> list[dict]:
+    """
+    Realized win-rate and average alpha grouped by the conviction the analyst
+    stated at entry. Used to show the model its own track record.
+    """
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT conviction, COUNT(*) AS total, "
+                "  COUNT(*) FILTER (WHERE was_correct = TRUE) AS wins, "
+                "  AVG(outcome_pct) AS avg_pct, AVG(alpha_pct) AS avg_alpha "
+                "FROM trade_outcomes "
+                "WHERE outcome_pct IS NOT NULL "
+                "GROUP BY conviction ORDER BY conviction DESC"
+            )
+            rows = cur.fetchall()
+        return [
+            {
+                "conviction": r[0], "total": r[1], "wins": r[2],
+                "win_rate": round(r[2] / r[1], 3) if r[1] else 0,
+                "avg_outcome_pct": round(float(r[3]), 4) if r[3] else None,
+                "avg_alpha_pct": round(float(r[4]), 4) if r[4] else None,
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        logging.error(f"get_conviction_calibration failed: {e}")
+        return []
     finally:
         _put_conn(conn)
 
@@ -877,7 +1628,7 @@ def get_all_outcomes(limit: int = 100) -> list[dict]:
             cur.execute(
                 "SELECT approval_id, ticker, action, conviction, thesis_bucket, "
                 "entry_price, entry_date, review_30d_price, review_60d_price, review_90d_price, "
-                "exit_price, exit_date, outcome_pct, was_correct "
+                "exit_price, exit_date, outcome_pct, was_correct, alpha_pct "
                 "FROM trade_outcomes ORDER BY entry_date DESC LIMIT %s",
                 (limit,),
             )
@@ -895,6 +1646,7 @@ def get_all_outcomes(limit: int = 100) -> list[dict]:
                 "exit_date": r[11],
                 "outcome_pct": float(r[12]) if r[12] else None,
                 "was_correct": r[13],
+                "alpha_pct": float(r[14]) if r[14] is not None else None,
             }
             for r in rows
         ]
@@ -932,6 +1684,50 @@ def get_outcomes_summary() -> dict:
     except Exception as e:
         logging.error(f"get_outcomes_summary failed: {e}")
         return {}
+    finally:
+        _put_conn(conn)
+
+
+def get_bucket_attribution() -> list[dict]:
+    """
+    Approximate realized dollar P&L contribution per bucket: joins closed
+    trade_outcomes to the pending_approvals row that sized them and reads
+    the dollar amount actually invested (risk_json->>'initial_dollar') at
+    entry, then applies outcome_pct. This is an approximation — it doesn't
+    account for later adds/trims to the same position — but it's the first
+    time this system can answer "is the Moonshot bucket paying for its risk?"
+    with real numbers instead of a guess.
+    """
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    o.thesis_bucket,
+                    COUNT(*) AS closed_trades,
+                    SUM((pa.risk_json->>'initial_dollar')::DECIMAL * o.outcome_pct) AS dollar_pnl,
+                    SUM((pa.risk_json->>'initial_dollar')::DECIMAL) AS dollar_deployed
+                FROM trade_outcomes o
+                JOIN pending_approvals pa ON pa.id = o.approval_id
+                WHERE o.outcome_pct IS NOT NULL
+                  AND pa.risk_json ? 'initial_dollar'
+                GROUP BY o.thesis_bucket
+                ORDER BY dollar_pnl DESC NULLS LAST
+                """
+            )
+            rows = cur.fetchall()
+        return [
+            {
+                "thesis_bucket": r[0], "closed_trades": r[1],
+                "dollar_pnl": round(float(r[2]), 2) if r[2] is not None else 0.0,
+                "dollar_deployed": round(float(r[3]), 2) if r[3] is not None else 0.0,
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        logging.error(f"get_bucket_attribution failed: {e}")
+        return []
     finally:
         _put_conn(conn)
 

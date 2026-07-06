@@ -60,11 +60,27 @@ EDGAR_RSS = "https://www.sec.gov/cgi-bin/browse-edgar"
 EDGAR_DOC = "https://www.sec.gov"
 HEADERS = {"User-Agent": "trading-bot 245081114+LukePuz@users.noreply.github.com"}  # SEC requires this
 
-_seen_filings: set[str] = set()
+_SOURCE = "edgar"
 
 # Only process filings published within this window — prevents old annual
 # reports and quarterly filings from flooding the pipeline on every restart.
 _MAX_AGE_HOURS = 48
+
+
+def _is_seen(filing_id: str) -> bool:
+    try:
+        import db
+        return db.is_seen(_SOURCE, filing_id)
+    except Exception:
+        return False  # DB unavailable — fail open rather than silently drop filings
+
+
+def _mark_seen(filing_id: str) -> None:
+    try:
+        import db
+        db.mark_seen(_SOURCE, filing_id)
+    except Exception as e:
+        log.debug(f"mark_seen failed for {filing_id}: {e}")
 
 
 def _fetch_filing_text(filing_url: str) -> str:
@@ -105,7 +121,7 @@ def _get_recent_filings(ticker: str, cik: str, form: str) -> list[dict]:
 
         for entry in root.findall("atom:entry", ns):
             filing_id = entry.findtext("atom:id", namespaces=ns) or ""
-            if filing_id in _seen_filings:
+            if _is_seen(filing_id):
                 continue
 
             title   = entry.findtext("atom:title",   namespaces=ns) or ""
@@ -118,12 +134,12 @@ def _get_recent_filings(ticker: str, cik: str, form: str) -> list[dict]:
                 try:
                     filed_at = datetime.fromisoformat(updated.replace("Z", "+00:00"))
                     if filed_at < cutoff:
-                        _seen_filings.add(filing_id)  # mark so we don't re-check
+                        _mark_seen(filing_id)  # mark so we don't re-check
                         continue
                 except ValueError:
                     pass
 
-            _seen_filings.add(filing_id)
+            _mark_seen(filing_id)
             text = _fetch_filing_text(url) if url else ""
 
             filings.append({

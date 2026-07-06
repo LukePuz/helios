@@ -211,6 +211,56 @@ def send_daily_summary(portfolio_value: float, daily_pl: float, start_value: flo
     )
 
 
+def send_daily_digest(
+    portfolio_value: float,
+    day_pl: float,
+    day_pl_pct: float,
+    spy_pl_pct: float | None,
+    positions_text: list[str],
+    catalysts_text: list[str],
+    pending_count: int,
+    halted: bool,
+    ingestion_issues: list[str],
+) -> None:
+    """
+    Richer post-close digest — day P&L vs SPY, open positions with stop
+    distances, tomorrow's catalysts, pending approvals, ingestion health,
+    and halt status. send_daily_summary() (above) existed but nothing ever
+    scheduled it; this replaces it on the beat schedule.
+    """
+    date = datetime.now(_ET).strftime("%b %d, %Y")
+    sign = "+" if day_pl >= 0 else ""
+
+    lines = [f"📊 <b>Daily Digest — {date}</b>", "━━━━━━━━━━━━━━━━━━━━━━━━━"]
+    lines.append(f"Portfolio: ${portfolio_value:,.2f}")
+    lines.append(f"Today's P&amp;L: {sign}${day_pl:,.2f} ({sign}{day_pl_pct:.2%})")
+    if spy_pl_pct is not None:
+        alpha = day_pl_pct - spy_pl_pct
+        alpha_sign = "+" if alpha >= 0 else ""
+        lines.append(f"SPY today: {spy_pl_pct:+.2%}  (alpha: {alpha_sign}{alpha:.2%})")
+
+    if halted:
+        lines.append("\n🛑 <b>TRADING HALTED</b> — send /resume to lift.")
+
+    if positions_text:
+        lines.append("\n<b>Open Positions:</b>")
+        lines.extend(f"  {p}" for p in positions_text[:15])
+    else:
+        lines.append("\nNo open positions.")
+
+    if catalysts_text:
+        lines.append("\n<b>Tomorrow's Catalysts:</b>")
+        lines.extend(f"  {c}" for c in catalysts_text[:10])
+
+    lines.append(f"\nPending approvals: {pending_count}")
+
+    if ingestion_issues:
+        lines.append("\n⚠️ <b>Ingestion Health:</b>")
+        lines.extend(f"  {i}" for i in ingestion_issues[:8])
+
+    _send("\n".join(lines))
+
+
 def send_halt_alert(current_value: float, start_value: float) -> None:
     drawdown = (start_value - current_value) / start_value
     _send(

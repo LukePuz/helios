@@ -27,10 +27,55 @@ log = logging.getLogger(__name__)
 OLLAMA_HOST   = os.getenv("OLLAMA_HOST",    "http://localhost:11434")
 ANALYST_MODEL = os.getenv("ANALYST_MODEL",  "qwen2.5:72b")
 
+# qwen2.5 3b/7b/72b all support this context length natively — raised from
+# the previous 8192, which risked silent truncation once briefs got large.
+_NUM_CTX = 32768
+
 
 # ---------------------------------------------------------------------------
 # Prompt builder
 # ---------------------------------------------------------------------------
+
+def _build_track_record_text() -> str:
+    """
+    Realized win-rate and alpha-vs-SPY by conviction level, so the model can
+    weigh its own stated confidence against how it has actually performed.
+    Returns "" when there isn't enough closed-trade history yet.
+    """
+    try:
+        import db
+        calibration = db.get_conviction_calibration()
+    except Exception:
+        return ""
+
+    rows = [c for c in calibration if c.get("total")]
+    if not rows:
+        return ""
+
+    lines = ["Historical calibration — realized outcome by conviction you stated at entry:"]
+    for c in rows:
+        alpha = c.get("avg_alpha_pct")
+        alpha_str = f"{alpha:+.1%} alpha vs SPY" if alpha is not None else "alpha unknown"
+        lines.append(
+            f"  Conviction {c['conviction']}/10: {c['total']} closed trades, "
+            f"{c['win_rate']:.0%} win rate, {alpha_str}"
+        )
+    lines.append(
+        "Weigh this record when you state your own conviction — if past conviction-9 calls "
+        "realized a much lower win rate than 9/10 implies, that overconfidence should be corrected now."
+    )
+    return "\n".join(lines)
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough heuristic (~4 chars/token) — good enough for a budget guard, not exact."""
+    return len(text) // 4
+
+
+# Reserved for the model's own output (num_predict) plus a safety margin so
+# the budget check doesn't cut it razor-thin.
+_OUTPUT_TOKEN_RESERVE = 1200 + 300
+
 
 def _build_prompt(
     candidate: dict,
@@ -38,6 +83,7 @@ def _build_prompt(
     thesis_text: str,
     regime_packet: dict,
     philosophy_text: str,
+    num_ctx: int = _NUM_CTX,
 ) -> str:
     ticker = candidate.get("ticker", "UNKNOWN")
     role   = candidate.get("role",   "Accelerator")
@@ -47,10 +93,16 @@ def _build_prompt(
     regime    = regime_packet.get("regime",   "Neutral")
     reg_score = regime_packet.get("score",    50)
 
-    thesis_excerpt     = thesis_text[:3000]     if len(thesis_text) > 3000     else thesis_text
-    philosophy_excerpt = philosophy_text[:1500] if len(philosophy_text) > 1500 else philosophy_text
+    # Generous caps — num_ctx was raised from 8192, and the budget loop below
+    # trims further if the assembled prompt still doesn't fit.
+    thesis_excerpt      = thesis_text[:6000]
+    philosophy_excerpt  = philosophy_text[:2000]
+    brief_text          = situation_brief[:8000] if situation_brief else "No additional context available."
+    track_record        = _build_track_record_text()
 
-    return f"""You are a disciplined investment analyst evaluating whether to open, add, hold, trim, exit, or pass on a stock position.
+    def _render() -> str:
+        track_record_section = f"\n=== YOUR TRACK RECORD ===\n{track_record}\n" if track_record else ""
+        return f"""You are a disciplined investment analyst evaluating whether to open, add, hold, trim, exit, or pass on a stock position.
 
 === PORTFOLIO PHILOSOPHY (excerpt) ===
 {philosophy_excerpt}
@@ -61,7 +113,7 @@ def _build_prompt(
 === MARKET REGIME ===
 Current Regime: {regime} (score: {reg_score}/100)
 {regime_packet.get("reasoning", "")[:500]}
-
+{track_record_section}
 === CANDIDATE DETAILS ===
 Ticker: {ticker}
 Portfolio Role: {role}
@@ -70,7 +122,7 @@ Sector: {sector}
 Scanner composite score: {candidate.get("composite_score", 0)}/100
 
 === SITUATION BRIEF ===
-{situation_brief[:4000] if situation_brief else "No additional context available."}
+{brief_text}
 
 === YOUR TASK ===
 Evaluate {ticker} and produce a structured investment recommendation.
@@ -81,6 +133,13 @@ Answer these questions in order:
 3. What is the specific catalyst? When? What happens if it disappoints?
 4. Is the upside/downside ratio at least 2:1?
 5. What are the top 2-3 risks?
+
+Valuation grounding: if the situation brief includes a FUNDAMENTALS section
+with real numbers, derive "current_multiple", "peer_range", and the
+upside/downside estimates FROM THOSE FIGURES — do not invent a multiple.
+If the FUNDAMENTALS section says data isn't cached yet, say so explicitly
+in your reasoning and cap conviction at 6 for OPEN/ADD, since the valuation
+call would otherwise be an unsupported guess.
 
 Then output ONLY valid JSON in exactly this format (no markdown, no explanation outside the JSON):
 
@@ -120,15 +179,48 @@ Rules:
 - Set pass_to_risk to true ONLY if action is OPEN, ADD, TRIM, or EXIT AND conviction >= 5 AND upside_downside_ratio >= 2.0
 - For Moonshot tickers: conviction >= 7 required to recommend OPEN; never exceed 2% position
 - In {regime} regime: {'be selective, raise threshold to conviction 7+ for new positions' if regime in ('Neutral', 'Risk-Off', 'Strong Risk-Off') else 'normal conviction thresholds apply'}
+{'- Your stated conviction has a track record above — calibrate against it, not against how confident you feel' if track_record else ''}
 - Output ONLY the JSON object, nothing else
 """
+
+    prompt = _render()
+
+    # Token-budget guard: if the assembled prompt won't fit num_ctx minus the
+    # output reserve, trim the lowest-priority sections first — the situation
+    # brief's tail (context_engine builds it with the most important sections
+    # first, so its tail is the least critical), then the thesis excerpt,
+    # then the philosophy excerpt. Every trim is logged; nothing is silently
+    # truncated by Ollama without us knowing.
+    budget = num_ctx - _OUTPUT_TOKEN_RESERVE
+    est = _estimate_tokens(prompt)
+    if est > budget:
+        original_est = est
+        for _ in range(20):
+            if est <= budget:
+                break
+            if len(brief_text) > 500:
+                brief_text = brief_text[: int(len(brief_text) * 0.75)]
+            elif len(thesis_excerpt) > 500:
+                thesis_excerpt = thesis_excerpt[: int(len(thesis_excerpt) * 0.75)]
+            elif len(philosophy_excerpt) > 300:
+                philosophy_excerpt = philosophy_excerpt[: int(len(philosophy_excerpt) * 0.75)]
+            else:
+                break
+            prompt = _render()
+            est = _estimate_tokens(prompt)
+        log.warning(
+            f"[{ticker}] Prompt trimmed to fit context budget: "
+            f"~{original_est} -> ~{est} tokens (budget {budget})"
+        )
+
+    return prompt
 
 
 # ---------------------------------------------------------------------------
 # Ollama call
 # ---------------------------------------------------------------------------
 
-def _call_ollama(prompt: str) -> str | None:
+def _call_ollama(prompt: str, num_ctx: int = _NUM_CTX) -> str | None:
     payload = {
         "model":   ANALYST_MODEL,
         "prompt":  prompt,
@@ -136,7 +228,7 @@ def _call_ollama(prompt: str) -> str | None:
         "options": {
             "temperature":    0.2,
             "num_predict":    1200,
-            "num_ctx":        8192,
+            "num_ctx":        num_ctx,
             "repeat_penalty": 1.1,
         },
     }
@@ -322,6 +414,20 @@ def analyze(
         action = "WATCH"
         parsed["pass_to_risk"] = False
 
+    # Deterministic guardrail for ungrounded valuation: the prompt instructs
+    # the model to cap its own conviction at 6 when fundamentals aren't
+    # cached, but a prompt instruction isn't reliable enough on its own —
+    # enforce it here too so an OPEN/ADD can't ride on an invented multiple.
+    try:
+        import db
+        fund = db.get_fundamentals(ticker)
+        fundamentals_missing = not fund or fund.get("market_cap") is None
+    except Exception:
+        fundamentals_missing = True
+    if fundamentals_missing and action in ("OPEN", "ADD") and conviction > 6:
+        log.info(f"[{ticker}] No cached fundamentals — capping conviction {conviction} -> 6")
+        conviction = 6
+
     # Validate pass_to_risk
     actionable = action in ("OPEN", "ADD", "TRIM", "EXIT")
     if parsed.get("pass_to_risk") and not (actionable and conviction >= 5):
@@ -385,10 +491,18 @@ def analyze_batch(
     candidates: list[dict],
     regime_packet: dict | None = None,
     max_candidates: int = 10,
+    positions: dict[str, dict] | None = None,
+    trading_client=None,
 ) -> list[dict]:
     """
     Analyze a batch of scanner candidates.
     Limits to max_candidates to control inference time on smaller models.
+
+    Each candidate gets a full situation brief (context_engine.build_scan_brief)
+    — macro, technicals, options flow, fundamentals, and vector-memory
+    retrieval — the same context quality the rare event-triggered path gets.
+    Previously this called analyze() with no brief at all, so the daily scan
+    (the main decision flow) ran on scanner scores alone.
     """
     top = sorted(
         candidates[:max_candidates],
@@ -398,11 +512,19 @@ def analyze_batch(
 
     results = []
     for candidate in top:
+        ticker = candidate.get("ticker")
+        brief = ""
         try:
-            result = analyze(candidate, regime_packet=regime_packet)
+            from context_engine import build_scan_brief
+            brief = build_scan_brief(ticker, positions, trading_client)
+        except Exception as e:
+            log.warning(f"[{ticker}] Scan brief build failed, analyzing without it: {e}")
+
+        try:
+            result = analyze(candidate, situation_brief=brief, regime_packet=regime_packet)
             results.append(result)
         except Exception as e:
-            log.error(f"[{candidate.get('ticker')}] Analyze failed: {e}")
+            log.error(f"[{ticker}] Analyze failed: {e}")
             results.append(_stub_recommendation(candidate, f"Exception: {e}"))
 
     return results

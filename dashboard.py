@@ -274,8 +274,8 @@ with st.sidebar:
 
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_workflow, tab_activity, tab_portfolio, tab_regime, tab_approvals, tab_outcomes, tab_macro, tab_technicals, tab_signals, tab_trade, tab_logs = st.tabs([
-    "Workflow", "Activity", "Portfolio", "Market Regime", "Pending Approvals", "Outcomes", "Macro", "Technicals", "Signal Log", "Manual Trade", "Logs",
+tab_workflow, tab_activity, tab_portfolio, tab_regime, tab_approvals, tab_outcomes, tab_performance, tab_macro, tab_technicals, tab_signals, tab_trade, tab_logs = st.tabs([
+    "Workflow", "Activity", "Portfolio", "Market Regime", "Pending Approvals", "Outcomes", "Performance", "Macro", "Technicals", "Signal Log", "Manual Trade", "Logs",
 ])
 
 
@@ -477,7 +477,8 @@ with tab_portfolio:
         try:
             quotes = get_latest_quotes(SYMBOLS)
             rows = [
-                {"Symbol": sym, "Bid": f"${q['bid']:.2f}", "Ask": f"${q['ask']:.2f}", "Mid": f"${q['mid']:.2f}"}
+                {"Symbol": sym, "Price": f"${q['mid']:.2f}",
+                 "Fresh": "✅" if not q.get("is_stale") else "⏳ stale"}
                 for sym, q in quotes.items()
             ]
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
@@ -718,6 +719,7 @@ with tab_outcomes:
                     "60d":       f"${float(o['review_60d_price']):.2f}" if o.get("review_60d_price") else "—",
                     "90d":       f"${float(o['review_90d_price']):.2f}" if o.get("review_90d_price") else "—",
                     "Outcome %": f"{float(o['outcome_pct']):.1%}" if o.get("outcome_pct") else "Pending",
+                    "Alpha vs SPY": f"{float(o['alpha_pct']):+.1%}" if o.get("alpha_pct") is not None else "—",
                 })
             st.dataframe(pd.DataFrame(outcome_rows), use_container_width=True, hide_index=True)
 
@@ -755,6 +757,158 @@ with tab_outcomes:
 
     except Exception as e:
         st.warning(f"Could not load outcomes: {e}")
+
+
+# ── Tab: Performance ──────────────────────────────────────────────────────────
+with tab_performance:
+    st.header("Performance vs Benchmark")
+    st.caption(
+        "Before this tab existed, there was no way to answer \"are we actually beating "
+        "the market?\" — the only comparison was a flat line at the $100k starting value."
+    )
+
+    if st.button("Refresh", key="perf_refresh"):
+        st.rerun()
+
+    try:
+        history = db.get_portfolio_history(limit=2000)
+        if not history:
+            st.info("No history yet — appears after the first snapshot.")
+        else:
+            df = pd.DataFrame(history)
+            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+            df["spy"] = df["benchmark"].apply(lambda b: b.get("SPY") if isinstance(b, dict) else None)
+            df["qqq"] = df["benchmark"].apply(lambda b: b.get("QQQ") if isinstance(b, dict) else None)
+
+            has_benchmark = df["spy"].notna().any()
+
+            st.subheader("Equity Curve vs Benchmark")
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=df["timestamp"], y=df["total_value"],
+                mode="lines", name="Portfolio", line=dict(color="#00cc88", width=2),
+            ))
+            if has_benchmark:
+                base_value = df["total_value"].iloc[0]
+                for col, name, color in (("spy", "SPY (rebased)", "#3399ff"),
+                                         ("qqq", "QQQ (rebased)", "#ff9900")):
+                    sub = df[df[col].notna()]
+                    if len(sub) < 2:
+                        continue
+                    base_price = sub[col].iloc[0]
+                    rebased = base_value * (sub[col] / base_price)
+                    fig.add_trace(go.Scatter(
+                        x=sub["timestamp"], y=rebased, mode="lines",
+                        name=name, line=dict(color=color, width=1.5, dash="dot"),
+                    ))
+            else:
+                fig.add_hline(y=START_VALUE, line_dash="dot", line_color="#888",
+                              annotation_text=f"Start ${START_VALUE:,.0f}")
+                st.caption("Benchmark data not yet available — will appear as snapshots accumulate "
+                          "(requires the Phase 5 take_portfolio_snapshot update to have run).")
+            fig.update_layout(height=320, margin=dict(l=0, r=0, t=10, b=0),
+                              yaxis=dict(tickprefix="$", tickformat=",.0f"))
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.subheader("Drawdown")
+            running_max = df["total_value"].cummax()
+            drawdown_pct = (df["total_value"] - running_max) / running_max
+            fig_dd = go.Figure()
+            fig_dd.add_trace(go.Scatter(
+                x=df["timestamp"], y=drawdown_pct * 100, mode="lines",
+                line=dict(color="#cc4444", width=1.5),
+                fill="tozeroy", fillcolor="rgba(204,68,68,0.15)",
+            ))
+            fig_dd.update_layout(height=200, margin=dict(l=0, r=0, t=10, b=0),
+                                 yaxis=dict(ticksuffix="%"), showlegend=False)
+            st.plotly_chart(fig_dd, use_container_width=True)
+            st.caption(f"Max drawdown observed: {drawdown_pct.min():.1%}")
+
+            # Daily-resampled returns for Sharpe/Sortino/alpha — the raw
+            # series is 5-min ticks, which overstates volatility if used
+            # directly for an annualized ratio.
+            daily = df.set_index("timestamp").resample("1D").last().dropna(subset=["total_value"])
+            if len(daily) >= 5:
+                daily_returns = daily["total_value"].pct_change().dropna()
+                sharpe = (daily_returns.mean() / daily_returns.std() * (252 ** 0.5)
+                         if daily_returns.std() > 0 else None)
+                downside = daily_returns[daily_returns < 0]
+                sortino = (daily_returns.mean() / downside.std() * (252 ** 0.5)
+                          if len(downside) > 1 and downside.std() > 0 else None)
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Annualized Sharpe", f"{sharpe:.2f}" if sharpe is not None else "—")
+                c2.metric("Annualized Sortino", f"{sortino:.2f}" if sortino is not None else "—")
+
+                if has_benchmark and daily["spy"].notna().sum() >= 5:
+                    spy_returns = daily["spy"].pct_change().dropna()
+                    aligned = pd.concat([daily_returns, spy_returns], axis=1, join="inner")
+                    aligned.columns = ["portfolio", "spy"]
+                    if len(aligned) >= 5 and aligned["spy"].var() > 0:
+                        beta = aligned["portfolio"].cov(aligned["spy"]) / aligned["spy"].var()
+                        alpha_annualized = (aligned["portfolio"].mean() - beta * aligned["spy"].mean()) * 252
+                        c3.metric("Beta vs SPY", f"{beta:.2f}")
+                        st.caption(f"Annualized alpha vs SPY (CAPM): {alpha_annualized:+.1%}")
+            else:
+                st.caption("Need at least 5 days of snapshots to compute Sharpe/Sortino/beta.")
+    except Exception as e:
+        st.warning(f"Could not load performance chart: {e}")
+
+    st.divider()
+
+    col_attr, col_slip = st.columns(2)
+    with col_attr:
+        st.subheader("Bucket Attribution")
+        st.caption("Approximate — see get_bucket_attribution() docstring for the method.")
+        try:
+            attribution = db.get_bucket_attribution()
+            if not attribution:
+                st.info("No closed trades with sizing data yet.")
+            else:
+                rows = [
+                    {
+                        "Bucket": a["thesis_bucket"],
+                        "Closed Trades": a["closed_trades"],
+                        "$ P&L": f"${a['dollar_pnl']:+,.2f}",
+                        "$ Deployed": f"${a['dollar_deployed']:,.2f}",
+                        "Return on Deployed": (f"{a['dollar_pnl']/a['dollar_deployed']:+.1%}"
+                                               if a["dollar_deployed"] else "—"),
+                    }
+                    for a in attribution
+                ]
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.warning(f"Could not load attribution: {e}")
+
+    with col_slip:
+        st.subheader("Execution Quality")
+        try:
+            slippage = db.get_slippage_summary()
+            st.metric("Orders with recorded slippage", slippage.get("count", 0))
+            avg = slippage.get("avg_slippage_pct")
+            st.metric("Average slippage (cost)", f"{avg:+.2%}" if avg is not None else "—")
+        except Exception as e:
+            st.warning(f"Could not load execution stats: {e}")
+
+    st.divider()
+    st.subheader("Ingestion Health")
+    try:
+        health = db.get_ingestion_health()
+        if not health:
+            st.info("No ingestion heartbeats recorded yet.")
+        else:
+            rows = []
+            for h in health:
+                last_ok = h.get("last_success_at")
+                rows.append({
+                    "Source": h["source"],
+                    "Last Success": last_ok.strftime("%m/%d %H:%M") if last_ok else "never",
+                    "Last Item Count": h.get("last_item_count"),
+                    "Last Error": (h.get("last_error") or "")[:80],
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.warning(f"Could not load ingestion health: {e}")
 
 
 # ── Tab 5: Macro ───────────────────────────────────────────────────────────────

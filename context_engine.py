@@ -30,6 +30,52 @@ def _safe_import(module_name: str):
         return None
 
 
+def _fundamentals_section(ticker: str) -> str:
+    """
+    Real revenue growth, margins, FCF, and valuation multiples (see
+    ingestion/fundamentals.py). Before this existed, the analyst LLM had
+    nothing to ground upside/downside or valuation estimates in — it was
+    self-reporting multiples from nothing. Explicitly says when data isn't
+    cached yet rather than silently omitting the section.
+    """
+    try:
+        import db
+        from ingestion.fundamentals import get_peer_percentile
+        fund = db.get_fundamentals(ticker)
+        if not fund or fund.get("market_cap") is None:
+            return (f"=== FUNDAMENTALS — {ticker} ===\n"
+                    "Not yet cached (nightly refresh pending) — treat valuation "
+                    "and upside/downside estimates as lower-confidence and say so.")
+
+        def _pct(v):
+            return f"{v:+.1%}" if v is not None else "n/a"
+        def _num(v):
+            return f"{v:.2f}x" if v is not None else "n/a"
+
+        gm_pctile = get_peer_percentile(ticker, "gross_margin")
+        ps_pctile = get_peer_percentile(ticker, "price_to_sales")
+        pctile_note = ""
+        if gm_pctile is not None or ps_pctile is not None:
+            parts = []
+            if gm_pctile is not None:
+                parts.append(f"gross margin at the {gm_pctile:.0%} percentile of the watchlist")
+            if ps_pctile is not None:
+                parts.append(f"P/S at the {ps_pctile:.0%} percentile of the watchlist")
+            pctile_note = "\nPeer-relative: " + "; ".join(parts)
+
+        return f"""=== FUNDAMENTALS — {ticker} ===
+Revenue growth (YoY): {_pct(fund['revenue_growth_yoy'])}
+Gross margin: {_pct(fund['gross_margin'])}
+FCF margin: {_pct(fund['fcf_margin'])}
+Price/Sales: {_num(fund['price_to_sales'])}
+EV/EBITDA: {_num(fund['ev_to_ebitda'])}
+Forward P/E: {_num(fund['forward_pe'])}
+Market cap: ${fund['market_cap']:,.0f}{pctile_note}"""
+    except Exception as e:
+        log.debug(f"Fundamentals section unavailable for {ticker}: {e}")
+        return ""
+
+
 def assemble_brief(
     event: dict,
     positions: dict[str, dict],
@@ -118,6 +164,11 @@ Buying Power:    ${float(account.buying_power):,.2f}""")
         except Exception as e:
             log.warning(f"Options flow unavailable: {e}")
 
+    # ── Fundamentals ─────────────────────────────────────────────────────────
+    fund_section = _fundamentals_section(ticker)
+    if fund_section:
+        sections.append(fund_section)
+
     # ── Semantic Memory (ChromaDB) ────────────────────────────────────────────
     try:
         import vector_store
@@ -154,6 +205,117 @@ Consider second-order impact on these positions.""")
     return "\n\n".join(sections)
 
 
+def build_scan_brief(
+    ticker: str,
+    positions: dict[str, dict] | None = None,
+    trading_client=None,
+) -> str:
+    """
+    Situation brief for the SCANNER-driven path (daily candidate analysis).
+
+    Before this function existed, agents.analyst.analyze_batch() called
+    analyze() with no situation_brief at all — so the DAILY scan, which is
+    the main decision flow of the whole system, ran with zero vector-memory
+    retrieval, zero macro/technicals/options context, and zero fundamentals.
+    Only the rare event-triggered path (assemble_brief, above) got a brief.
+    This gives scanner candidates the same context quality, built around the
+    ticker itself rather than a triggering event.
+    """
+    positions = positions or {}
+    now = datetime.now(ET).strftime("%A %B %d, %Y %I:%M %p ET")
+    sections = [f"""=== SITUATION BRIEF (daily scan) ===
+Generated: {now}
+Ticker: {ticker}"""]
+
+    # ── Current Portfolio ────────────────────────────────────────────────────
+    if positions:
+        pos_lines = ["=== CURRENT PORTFOLIO ==="]
+        for sym, pos in positions.items():
+            pl_str = f"{pos.get('pl_pct', 0):+.1%}"
+            pos_lines.append(
+                f"  {sym:<6} {pos.get('qty', 0):>6.0f} shares | "
+                f"Entry: ${pos.get('entry_price', 0):.2f} | "
+                f"Current: ${pos.get('current_price', 0):.2f} | "
+                f"P&L: {pl_str} | "
+                f"Value: ${pos.get('market_value', 0):,.0f}"
+            )
+        sections.append("\n".join(pos_lines))
+    else:
+        sections.append("=== CURRENT PORTFOLIO ===\nNo open positions.")
+
+    # ── Account State ────────────────────────────────────────────────────────
+    if trading_client:
+        try:
+            account = trading_client.get_account()
+            sections.append(f"""=== ACCOUNT STATE ===
+Portfolio Value: ${float(account.portfolio_value):,.2f}
+Cash Available:  ${float(account.cash):,.2f}
+Buying Power:    ${float(account.buying_power):,.2f}""")
+        except Exception as e:
+            log.warning(f"Could not fetch account for scan brief: {e}")
+
+    # ── Macro Environment ────────────────────────────────────────────────────
+    macro_mod = _safe_import("ingestion.macro")
+    if macro_mod:
+        try:
+            sections.append(macro_mod.get_macro_summary_text())
+        except Exception as e:
+            log.warning(f"Macro data unavailable: {e}")
+
+    # ── Technical Picture ────────────────────────────────────────────────────
+    polygon_mod = _safe_import("ingestion.polygon_stream")
+    if polygon_mod:
+        try:
+            sections.append(polygon_mod.get_technicals_summary(ticker))
+        except Exception as e:
+            log.warning(f"Technicals unavailable for {ticker}: {e}")
+
+    # ── Options Flow ─────────────────────────────────────────────────────────
+    options_mod = _safe_import("ingestion.options_flow")
+    if options_mod:
+        try:
+            flow = options_mod.get_flow_summary(ticker)
+            sections.append(f"""=== OPTIONS FLOW — {ticker} ===
+{flow['summary']}""")
+        except Exception as e:
+            log.warning(f"Options flow unavailable: {e}")
+
+    # ── Fundamentals ─────────────────────────────────────────────────────────
+    fund_section = _fundamentals_section(ticker)
+    if fund_section:
+        sections.append(fund_section)
+
+    # ── Semantic Memory (ChromaDB) ────────────────────────────────────────────
+    try:
+        import vector_store
+        query = f"{ticker} recent news developments catalysts"
+        history = vector_store.search_all_collections(query, n_results=4)
+        if history:
+            mem_lines = ["=== RELEVANT HISTORICAL CONTEXT (from memory) ==="]
+            for h in history:
+                score = h["score"]
+                source = h.get("collection", "unknown")
+                meta = h.get("metadata", {})
+                date = meta.get("date", meta.get("timestamp", ""))
+                mem_lines.append(
+                    f"[{source.upper()} | score={score:.2f} | {date[:10]}]\n"
+                    f"{h['text'][:400]}\n"
+                )
+            sections.append("\n".join(mem_lines))
+    except Exception as e:
+        log.warning(f"Vector store search failed for {ticker}: {e}")
+
+    # ── Related Symbols ──────────────────────────────────────────────────────
+    from config import SYMBOLS
+    related = _find_related_symbols(ticker, SYMBOLS)
+    if related:
+        sections.append(f"""=== RELATED SYMBOLS IN WATCHLIST ===
+{ticker} may have indirect effects on: {', '.join(related)}
+Consider second-order impact on these positions.""")
+
+    return "\n\n".join(s for s in sections if s)
+
+
 def _find_related_symbols(ticker: str, all_symbols: list[str]) -> list[str]:
     """
     Returns symbols that are likely affected by events in ticker.
@@ -169,14 +331,17 @@ def _find_related_symbols(ticker: str, all_symbols: list[str]) -> list[str]:
         # AI hyperscaler effects
         "NVDA":  ["AMD", "AVGO", "AMAT", "MU", "IONQ"],
         "MSFT":  ["NVDA", "PLTR", "NOW", "CRM", "NET"],
-        "GOOGL": ["NVDA", "META", "NET", "SNOW"],
+        # NOTE: watchlist.md lists Alphabet as "GOOG" (not "GOOGL") — this key
+        # must match that exactly, or the relationship can never fire since
+        # `related` is filtered against config.SYMBOLS/watchlist tickers below.
+        "GOOG":  ["NVDA", "META", "NET", "SNOW"],
         "AMZN":  ["NVDA", "NET", "SNOW", "DDOG"],
         # Quantum ecosystem
         "IONQ":  ["RGTI", "QBTS", "QUBT", "ARQQ", "IBM"],
         "RGTI":  ["IONQ", "QBTS", "QUBT"],
         "QBTS":  ["IONQ", "RGTI", "QUBT"],
         # Macro-sensitive
-        "META":  ["GOOGL", "SNAP", "PINS"],
+        "META":  ["GOOG", "SNAP", "PINS"],
     }
     related = relationships.get(ticker, [])
     return [s for s in related if s in all_symbols]

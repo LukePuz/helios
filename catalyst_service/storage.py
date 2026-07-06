@@ -359,8 +359,15 @@ def list_conflicts() -> list[dict[str, Any]]:
     return query_events(confidence="conflicting")
 
 
-def blocking_events(ticker: str, end: str) -> list[dict[str, Any]]:
-    events = query_events(ticker=ticker, end=end)
+def blocking_events(ticker: str, end: str, start: str | None = None) -> list[dict[str, Any]]:
+    """
+    start defaults to today — without it, a catalyst event dated in the past
+    (e.g. an earnings date that already happened but was never refreshed)
+    would block trades indefinitely instead of aging out.
+    """
+    if start is None:
+        start = date.today().isoformat()
+    events = query_events(ticker=ticker, start=start, end=end)
     blocked = []
     for event in events:
         flags = event.get("action_flags") or {}

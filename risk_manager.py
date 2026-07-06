@@ -88,6 +88,37 @@ def _compute_atr(bars: list[dict]) -> float | None:
 # Conviction band lookup
 # ---------------------------------------------------------------------------
 
+def _price_correlation(bars_a: list[dict], bars_b: list[dict]) -> float | None:
+    """
+    Pearson correlation of daily returns between two {date, close} bar series,
+    aligned by date (only dates present in both series are used).
+    Returns None if fewer than 10 overlapping return observations exist.
+    """
+    a_by_date = {b["date"]: b["close"] for b in bars_a}
+    b_by_date = {b["date"]: b["close"] for b in bars_b}
+    common_dates = sorted(set(a_by_date) & set(b_by_date))
+    if len(common_dates) < 15:  # need >= 15 prices for >= 14 daily returns
+        return None
+
+    a_prices = [a_by_date[d] for d in common_dates]
+    b_prices = [b_by_date[d] for d in common_dates]
+
+    a_returns = [(a_prices[i] - a_prices[i - 1]) / a_prices[i - 1]
+                 for i in range(1, len(a_prices)) if a_prices[i - 1]]
+    b_returns = [(b_prices[i] - b_prices[i - 1]) / b_prices[i - 1]
+                 for i in range(1, len(b_prices)) if b_prices[i - 1]]
+    if len(a_returns) < 10 or len(a_returns) != len(b_returns):
+        return None
+
+    try:
+        import numpy as np
+        corr = np.corrcoef(a_returns, b_returns)[0, 1]
+        return float(corr) if corr == corr else None  # NaN check
+    except Exception as e:
+        log.debug(f"Correlation computation failed: {e}")
+        return None
+
+
 def _conviction_band(conviction: int) -> int:
     """Maps conviction (1-10) to the nearest lower band key (9,7,5,3)."""
     if conviction >= 9:
@@ -127,14 +158,49 @@ class RiskManager:
     # ------------------------------------------------------------------
 
     def is_halted(self) -> bool:
+        """
+        Halt if (a) the persisted manual/auto halt flag is set, or
+        (b) drawdown from the persisted high-water mark exceeds the limit.
+        Baselines live in the system_state table so every process agrees.
+        """
+        # Persisted halt flag (set manually via /halt or by the drawdown task)
+        try:
+            import db
+            if db.get_state("trading_halted", "false") == "true":
+                log.warning("HALT — trading_halted flag is set in system_state")
+                return True
+            hwm_str = db.get_state("high_water_mark")
+        except Exception as e:
+            log.warning(f"Halt state read failed ({e}) — falling back to instance baseline")
+            hwm_str = None
+
         current  = self.portfolio_value()
-        drawdown = (self.start_value - current) / self.start_value
+        baseline = float(hwm_str) if hwm_str else self.start_value
+        if baseline <= 0:
+            return False
+
+        drawdown = (baseline - current) / baseline
         if drawdown >= DRAWDOWN_HALT_PCT:
             log.warning(
                 f"DRAWDOWN HALT — drawdown {drawdown:.1%} exceeds {DRAWDOWN_HALT_PCT:.0%} "
-                f"(start=${self.start_value:,.2f}, current=${current:,.2f})"
+                f"(high-water=${baseline:,.2f}, current=${current:,.2f})"
             )
+            try:
+                import db
+                db.set_state("trading_halted", "true")
+                db.set_state("halt_reason",
+                             f"Auto: drawdown {drawdown:.1%} from HWM ${baseline:,.2f}")
+            except Exception:
+                pass
             return True
+
+        # Ratchet the high-water mark up as the portfolio grows
+        try:
+            import db
+            if current > baseline:
+                db.set_state("high_water_mark", str(current))
+        except Exception:
+            pass
         return False
 
     # ------------------------------------------------------------------
@@ -201,10 +267,19 @@ class RiskManager:
             return {"position_size_pct": 0, "dollar_amount": 0, "shares_initial": 0,
                     "flags": [f"Position already at/near target ({held_pct:.1%} held)"]}
 
+        if not price or price <= 0:
+            return {"position_size_pct": 0, "dollar_amount": 0, "shares_initial": 0,
+                    "flags": [f"Invalid price ({price!r}) — cannot size position"]}
+
         dollar_amount  = pv * remaining
         initial_pct    = 0.55  # 55% initial tranche (midpoint of 50-60%)
         initial_dollar = dollar_amount * initial_pct
-        shares_initial = round(max(0.01, initial_dollar / price), 4)
+        # Whole shares only — IBKR rejects fractional stock orders on most tickers
+        shares_initial = int(initial_dollar / price)
+        if shares_initial < 1:
+            return {"position_size_pct": 0, "dollar_amount": 0, "shares_initial": 0,
+                    "flags": [f"Allocation ${initial_dollar:,.2f} buys less than 1 share "
+                              f"of {ticker} at ${price:,.2f} — skipping"]}
 
         # Stop loss
         stop_price, stop_method = self.calculate_stop(ticker, price, bucket)
@@ -262,9 +337,21 @@ class RiskManager:
 
         atr = self.get_atr(ticker)
         if atr is None or atr == 0:
-            # Fallback: use % of entry
             fallback_pct = 0.08 if bucket == "Compounder" else 0.05
             stop = round(entry_price * (1 - fallback_pct), 2)
+            log.warning(
+                f"[{ticker}] ATR unavailable — using flat {fallback_pct:.0%} fallback stop ${stop:.2f}. "
+                "Stop accuracy may be poor; verify manually."
+            )
+            try:
+                import alerts as _al
+                _al._send(
+                    f"⚠️ ATR Fallback Stop — {ticker}\n"
+                    f"Could not compute ATR-based stop. Using flat <b>{fallback_pct:.0%}</b> stop "
+                    f"(${stop:.2f}). Verify this is appropriate before approving."
+                )
+            except Exception:
+                pass
             return stop, f"Fallback stop ({fallback_pct:.0%} below entry — ATR unavailable)"
 
         mult_lo, mult_hi = ATR_STOP_MULTIPLIER.get(bucket, (1.5, 2.0))
@@ -276,16 +363,22 @@ class RiskManager:
     # Concentration and correlation checks
     # ------------------------------------------------------------------
 
-    def check_concentration(self, ticker: str, proposed_size_pct: float) -> dict:
+    def check_concentration(self, ticker: str, proposed_size_pct: float,
+                            bucket: str | None = None) -> dict:
         """
         Checks if adding ticker at proposed_size_pct would breach any limit.
         Returns {passed, flags, ai_infrastructure_total}.
+        FAIL-CLOSED: an errored check counts as failed so a broken data feed
+        can never wave a trade through unchecked.
         """
         try:
             positions = self._client.get_all_positions()
             pv = self.portfolio_value()
         except Exception as e:
-            return {"passed": True, "flags": [f"Concentration check skipped: {e}"],
+            log.error(f"Concentration check ERRORED for {ticker}: {e}")
+            return {"passed": False,
+                    "flags": [f"RISK CHECK FAILED — could not verify concentration: {e}. "
+                              "Verify manually before approving."],
                     "ai_infrastructure_total": 0}
 
         flags: list[str] = []
@@ -300,10 +393,10 @@ class RiskManager:
         pos_values[ticker] = pos_values.get(ticker, 0) + proposed_size_pct
 
         # AI infrastructure tickers (approximate)
-        ai_infra_keywords = {"NVDA", "AMD", "ARM", "INTC", "MSFT", "AMZN", "GOOG", "META",
-                             "AVGO", "ANET", "CRDO", "MRVL", "ASML", "SNPS", "KLAC", "LRCX",
-                             "AMAT", "MU", "CRWV", "ORCL", "CLS", "PLTR", "SNOW", "DDOG",
-                             "VRT", "PWR", "GEV", "CEG"}
+        ai_infra_keywords = {"NVDA", "AMD", "ARM", "INTC", "MSFT", "AMZN", "GOOG", "GOOGL",
+                             "META", "AVGO", "ANET", "CRDO", "MRVL", "ASML", "SNPS", "KLAC",
+                             "LRCX", "AMAT", "MU", "CRWV", "ORCL", "CLS", "PLTR", "SNOW",
+                             "DDOG", "VRT", "PWR", "GEV", "CEG"}
         ai_infra_total = sum(v for t, v in pos_values.items() if t in ai_infra_keywords)
 
         if ai_infra_total > MAX_AI_INFRA_PCT:
@@ -312,36 +405,121 @@ class RiskManager:
         if pos_values.get(ticker, 0) > MAX_POSITION_PCT_COMPOUNDER:
             flags.append(f"{ticker} position {pos_values[ticker]:.1%} exceeds Compounder cap {MAX_POSITION_PCT_COMPOUNDER:.0%}")
 
+        # Theme concentration — positions sharing the proposed ticker's sector
+        try:
+            from knowledge_loader import load_watchlist
+            watchlist = load_watchlist()
+            sector = watchlist.get(ticker, {}).get("sector", "")
+            if sector:
+                theme_total = sum(
+                    v for t, v in pos_values.items()
+                    if watchlist.get(t, {}).get("sector", "") == sector
+                )
+                if theme_total > MAX_SINGLE_THEME_PCT:
+                    flags.append(f"'{sector}' theme exposure {theme_total:.1%} exceeds "
+                                 f"{MAX_SINGLE_THEME_PCT:.0%} limit")
+        except Exception as e:
+            log.warning(f"Theme concentration sub-check unavailable: {e}")
+
+        # Total moonshot exposure
+        if bucket == "Moonshot":
+            try:
+                from knowledge_loader import load_watchlist
+                watchlist = load_watchlist()
+                moonshot_total = sum(
+                    v for t, v in pos_values.items()
+                    if watchlist.get(t, {}).get("role", "") == "Moonshot"
+                )
+                if moonshot_total > MAX_MOONSHOT_TOTAL_PCT:
+                    flags.append(f"Total moonshot exposure {moonshot_total:.1%} exceeds "
+                                 f"{MAX_MOONSHOT_TOTAL_PCT:.0%} limit")
+            except Exception as e:
+                log.warning(f"Moonshot concentration sub-check unavailable: {e}")
+
         return {
             "passed": len(flags) == 0,
             "flags":  flags,
             "ai_infrastructure_total": round(ai_infra_total, 4),
         }
 
-    def check_correlation(self, ticker: str) -> dict:
+    def check_correlation(self, ticker: str, corr_threshold: float = 0.7,
+                          min_history_days: int = 30) -> dict:
         """
-        Simple correlation check: flag if 3+ existing positions share the same
-        primary sector as the proposed ticker.
+        Real return-series correlation against currently held positions, using
+        the price_history cache (ingestion/price_history.py, refreshed
+        nightly). Previously this only counted positions sharing the same
+        watchlist sector STRING — no actual price relationship was ever
+        computed, so e.g. two stocks in different "sectors" that move in
+        lockstep were invisible to it.
+
+        Falls back to the old sector-heuristic when cached price history isn't
+        available yet (e.g. immediately after a fresh install, before the
+        first nightly refresh has run) so this never breaks sizing outright.
         """
+        try:
+            positions = self._client.get_all_positions()
+        except Exception as e:
+            log.error(f"Correlation check ERRORED for {ticker}: {e}")
+            return {"shared_catalyst_count": 0,
+                    "note": f"RISK CHECK FAILED — correlation unverifiable ({e}); "
+                            "size reduced 25% as a precaution",
+                    "reduce_by": 0.25}
+
+        held_symbols = [p.symbol for p in positions]
+        if not held_symbols:
+            return {"shared_catalyst_count": 0, "note": "No open positions", "reduce_by": 0}
+
+        try:
+            import db
+            bulk = db.get_price_history_bulk([ticker] + held_symbols, days=90)
+        except Exception as e:
+            log.warning(f"Price history unavailable for correlation check: {e}")
+            bulk = {}
+
+        if ticker not in bulk or len(bulk[ticker]) < min_history_days:
+            return self._check_correlation_sector_fallback(ticker, positions)
+
+        correlated: list[tuple[str, float]] = []
+        for sym in held_symbols:
+            if sym not in bulk or len(bulk[sym]) < min_history_days:
+                continue
+            corr = _price_correlation(bulk[ticker], bulk[sym])
+            if corr is not None and corr >= corr_threshold:
+                correlated.append((sym, round(corr, 2)))
+
+        reduce_by = 0.25 if len(correlated) >= 2 else 0
+        note = (
+            f"Return-correlated (r>={corr_threshold}) with {len(correlated)} held "
+            f"position(s): {correlated}" if correlated
+            else f"No high return-correlation (r>={corr_threshold}) with current holdings"
+        )
+        return {
+            "shared_catalyst_count": len(correlated),
+            "note": note,
+            "reduce_by": reduce_by,
+            "correlations": dict(correlated),
+        }
+
+    def _check_correlation_sector_fallback(self, ticker: str, positions: list) -> dict:
+        """Sector-string fallback used only when price history isn't cached yet."""
         try:
             from knowledge_loader import load_watchlist
             watchlist = load_watchlist()
-            positions = self._client.get_all_positions()
         except Exception as e:
-            return {"shared_catalyst_count": 0, "note": f"Correlation check skipped: {e}", "reduce_by": 0}
+            return {"shared_catalyst_count": 0,
+                    "note": f"Correlation check skipped: {e}", "reduce_by": 0}
 
-        ticker_entry  = watchlist.get(ticker, {})
-        ticker_sector = ticker_entry.get("sector", "")
-
+        ticker_sector = watchlist.get(ticker, {}).get("sector", "")
         shared = sum(
             1 for p in positions
             if watchlist.get(p.symbol, {}).get("sector", "") == ticker_sector
         )
-
-        reduce_by = 0.25 if shared >= 2 else 0  # reduce 25% if 3+ positions same sector
+        reduce_by = 0.25 if shared >= 2 else 0
         return {
             "shared_catalyst_count": shared,
-            "note": f"{shared} existing positions in {ticker_sector}" if ticker_sector else "Sector unknown",
+            "note": (f"[price history not yet cached — sector fallback] "
+                     f"{shared} existing positions in {ticker_sector}") if ticker_sector
+                    else "Sector unknown",
             "reduce_by": reduce_by,
         }
 
@@ -427,15 +605,58 @@ class RiskManager:
 
             if activate_at and gain_pct >= activate_at and trail_lo:
                 trail_dist = (trail_lo + trail_hi) / 2
-                new_stop   = round(current * (1 - trail_dist), 2)
-                prev_high  = stop_record.get("trailing_high") or entry
+                already_trailing = bool(stop_record.get("trailing_active"))
 
-                if current > prev_high:
+                if not already_trailing:
+                    # ONE-TIME conversion to a native IBKR TRAIL order. After
+                    # this, the broker ratchets the stop itself on every tick
+                    # — no more cancel/replace round-trips, and no window
+                    # where the position is briefly unprotected between
+                    # cancelling the old stop and placing the new one.
+                    new_stop = round(current * (1 - trail_dist), 2)
                     try:
+                        import ibkr
+                        qty = round(abs(float(pos.qty)), 4)
+                        trail_pct = round(trail_dist * 100, 2)
+                        ibkr.cancel_stop_orders_for(ticker)
+                        result = ibkr.place_trailing_stop_order(ticker, qty, trail_pct)
+                        db.set_stop_broker_order_id(ticker, result["order_id"])
                         db.update_trailing_stop(ticker, new_stop, current)
-                        log.info(f"[{ticker}] Trailing stop updated to ${new_stop:.2f} (high=${current:.2f})")
+                        log.info(f"[{ticker}] Converted to native TRAIL stop ({trail_pct}%), "
+                                f"orderId={result['order_id']}")
                     except Exception as e:
-                        log.warning(f"Failed to update trailing stop for {ticker}: {e}")
+                        log.error(f"[{ticker}] Native TRAIL conversion failed — falling back to "
+                                 f"one-shot cancel/replace: {e}")
+                        prev_high = stop_record.get("trailing_high") or entry
+                        if current > prev_high and new_stop > stop_px:
+                            try:
+                                import ibkr
+                                ibkr.cancel_stop_orders_for(ticker)
+                                qty = round(abs(float(pos.qty)), 4)
+                                result = ibkr.place_stop_order(ticker, qty, new_stop)
+                                db.set_stop_broker_order_id(ticker, result["order_id"])
+                                db.update_trailing_stop(ticker, new_stop, current)
+                                log.info(f"[{ticker}] Broker stop moved to ${new_stop:.2f} (fallback path)")
+                            except Exception as e2:
+                                log.error(f"[{ticker}] Fallback stop move also failed: {e2}")
+                                alerts.append({
+                                    "ticker":        ticker,
+                                    "action":        "FIX_STOP",
+                                    "current_price": current,
+                                    "stop_price":    new_stop,
+                                    "reason":        f"Trailing stop should be ${new_stop:.2f} but "
+                                                     f"broker order update FAILED — fix manually in TWS",
+                                })
+                else:
+                    # Already converted to a native TRAIL order — the broker
+                    # is ratcheting it automatically. Just track the new high
+                    # in DB for dashboard visibility; no order action needed.
+                    prev_high = stop_record.get("trailing_high") or entry
+                    if current > prev_high:
+                        try:
+                            db.update_trailing_stop(ticker, stop_px, current)
+                        except Exception as e:
+                            log.warning(f"Failed to update trailing high for {ticker}: {e}")
 
         return alerts
 

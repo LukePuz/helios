@@ -1,22 +1,45 @@
-import os
-from pathlib import Path
-from dotenv import load_dotenv
-from alpaca.trading.client import TradingClient
+"""
+Quick broker connectivity smoke test.
+Usage: python test_connection.py
 
-# Anchor to script directory so load_dotenv works regardless of cwd
-load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+Requires TWS or IB Gateway running with API access enabled (see ibkr.py's
+module docstring for port/config details). This used to test an Alpaca
+connection — execution moved to Interactive Brokers a while back and this
+was never updated, so it was silently checking a broker the system no
+longer trades through.
+"""
 
-API_KEY = os.getenv("ALPACA_API_KEY")
-API_SECRET = os.getenv("ALPACA_API_SECRET")
+import sys
 
-if not API_KEY or not API_SECRET:
-    raise EnvironmentError("ALPACA_API_KEY or ALPACA_API_SECRET not found in .env")
+import ibkr
 
-client = TradingClient(API_KEY, API_SECRET, paper=True)
-account = client.get_account()
 
-print(f"Account ID:      {account.id}")
-print(f"Cash:            ${float(account.cash):,.2f}")
-print(f"Portfolio Value: ${float(account.portfolio_value):,.2f}")
-print(f"Buying Power:    ${float(account.buying_power):,.2f}")
-print(f"Status:          {account.status}")
+def main() -> None:
+    print(f"Connecting to IBKR TWS/Gateway at {ibkr.IB_HOST}:{ibkr.IB_PORT} "
+          f"(clientId={ibkr.IB_CLIENT_ID})...")
+    try:
+        client = ibkr.get_client()
+        account = client.get_account()
+    except Exception as e:
+        print(f"FAILED to connect: {e}")
+        print("Make sure TWS or IB Gateway is running with API connections enabled.")
+        sys.exit(1)
+
+    print(f"Portfolio Value: ${account.portfolio_value:,.2f}")
+    print(f"Cash:            ${account.cash:,.2f}")
+    print(f"Buying Power:    ${account.buying_power:,.2f}")
+
+    positions = client.get_all_positions()
+    if positions:
+        print(f"\nOpen positions ({len(positions)}):")
+        for p in positions:
+            print(f"  {p.symbol:<6} {p.qty:>8.2f} shares  "
+                 f"unrealized P&L ${p.unrealized_pl:+,.2f}")
+    else:
+        print("\nNo open positions.")
+
+    print("\nConnection OK.")
+
+
+if __name__ == "__main__":
+    main()

@@ -100,7 +100,18 @@ def _try_start_redis() -> None:
 
 
 def _reconcile_positions() -> None:
-    """Compare DB-recorded positions against live IBKR holdings. Logs discrepancies only."""
+    """
+    Compare DB-recorded positions against live IBKR holdings and ACT on
+    discrepancies instead of only logging them:
+      - An IBKR position with no DB stop record is invisible to the trailing-
+        stop monitor (which reads db.get_all_position_stops(), not the
+        broker directly). This adopts it: computes a conservative stop,
+        places it at the broker, records it in the DB, and alerts that the
+        bucket/conviction/stop were guessed and need human review.
+      - A DB stop record with no matching IBKR position is left for the
+        periodic `reconcile_stop_orders` Celery task (every 15 min) to clean
+        up — this startup pass only reports it.
+    """
     try:
         from ibkr import get_client
         import db
@@ -112,15 +123,54 @@ def _reconcile_positions() -> None:
         in_ibkr_not_db = {s: q for s, q in ibkr_pos.items() if s not in db_pos}
         in_db_not_ibkr = {s for s in db_pos if s not in ibkr_pos}
 
-        if in_ibkr_not_db or in_db_not_ibkr:
-            logging.warning("=== POSITION RECONCILIATION DISCREPANCY ===")
-            if in_ibkr_not_db:
-                logging.warning(f"  In IBKR but NOT in DB stops table: {in_ibkr_not_db}")
-            if in_db_not_ibkr:
-                logging.warning(f"  In DB stops table but NOT in IBKR: {in_db_not_ibkr}")
-            logging.warning("  Review required — no auto-correction applied.")
-        else:
+        if not in_ibkr_not_db and not in_db_not_ibkr:
             logging.info("Position reconciliation: DB and IBKR agree.")
+            return
+
+        logging.warning("=== POSITION RECONCILIATION DISCREPANCY ===")
+        if in_db_not_ibkr:
+            logging.warning(
+                f"  In DB stops table but NOT in IBKR: {in_db_not_ibkr} "
+                "(periodic reconcile_stop_orders task will clean these up)"
+            )
+
+        if in_ibkr_not_db:
+            from risk_manager import RiskManager
+            from ibkr import place_stop_order
+            rm = RiskManager(client)
+            adopted: list[str] = []
+            for symbol, qty in in_ibkr_not_db.items():
+                try:
+                    pos = client.get_open_position(symbol)
+                    entry_price = float(pos.avg_entry_price)
+                    stop_price, stop_method = rm.calculate_stop(symbol, entry_price, "Accelerator")
+                    db.upsert_position_stop(
+                        ticker=symbol, entry_price=entry_price, stop_price=stop_price,
+                        stop_method=f"AUTO-ADOPTED ({stop_method}) — verify bucket/stop manually",
+                        bucket="Accelerator", conviction=5, trail_distance_pct=None,
+                    )
+                    try:
+                        stop_result = place_stop_order(symbol, abs(qty), stop_price)
+                        db.set_stop_broker_order_id(symbol, stop_result["order_id"])
+                        adopted.append(f"{symbol} ({qty} shares, stop placed @ ${stop_price:.2f})")
+                    except Exception as e:
+                        adopted.append(f"{symbol} ({qty} shares, DB stop ${stop_price:.2f} — "
+                                       f"BROKER STOP PLACEMENT FAILED: {e})")
+                except Exception as e:
+                    logging.error(f"Could not adopt orphaned position {symbol}: {e}")
+
+            if adopted:
+                logging.warning(f"  Adopted into monitoring (bucket/stop GUESSED — verify manually): {adopted}")
+                try:
+                    import alerts
+                    alerts._send(
+                        "🔧 <b>Position Reconciliation — Auto-Adopted</b>\n"
+                        "These IBKR positions had no stop record. A conservative stop has been "
+                        "computed and placed automatically — verify the bucket, conviction, and "
+                        "stop level are appropriate:\n" + "\n".join(f"• {a}" for a in adopted)
+                    )
+                except Exception:
+                    pass
     except Exception as e:
         logging.warning(f"Position reconciliation skipped: {e}")
 
@@ -151,11 +201,11 @@ def _init_regime() -> None:
         logging.warning(f"Initial regime assessment failed: {e}")
 
 
-def _start_telegram_bot() -> threading.Thread:
+def _start_telegram_bot() -> list[threading.Thread]:
     from telegram_bot import start_polling
-    t = start_polling()
-    logging.info("Telegram bot polling thread started.")
-    return t
+    threads = start_polling()
+    logging.info("Telegram bot polling + worker threads started.")
+    return threads
 
 
 def _start_dashboard() -> subprocess.Popen:

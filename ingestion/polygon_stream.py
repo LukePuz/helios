@@ -55,9 +55,22 @@ def get_snapshot(ticker: str) -> dict:
     day  = ticker_data.get("day", {})
     prev = ticker_data.get("prevDay", {})
 
+    # after_hours previously read lastQuote.P, which is the current ASK
+    # price, not a trade — mislabeling a quote as an after-hours print.
+    # The last TRADE price is the correct value to show as "after hours"
+    # when the market is closed; during RTH the concept doesn't apply.
+    last_trade_price = ticker_data.get("lastTrade", {}).get("p")
+    after_hours = None
+    try:
+        from market_data import _is_market_hours
+        if not _is_market_hours():
+            after_hours = last_trade_price
+    except Exception:
+        pass
+
     return {
         "ticker":        ticker,
-        "price":         ticker_data.get("lastTrade", {}).get("p"),
+        "price":         last_trade_price,
         "vwap":          day.get("vw"),
         "volume":        day.get("v"),
         "open":          day.get("o"),
@@ -65,16 +78,26 @@ def get_snapshot(ticker: str) -> dict:
         "low":           day.get("l"),
         "prev_close":    prev.get("c"),
         "change_pct":    ticker_data.get("todaysChangePerc"),
-        "after_hours":   ticker_data.get("lastQuote", {}).get("P"),
+        "after_hours":   after_hours,
     }
 
 
 def get_short_interest(ticker: str) -> dict:
-    """Returns short interest data — high short float can signal squeeze potential."""
-    end   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    start = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
-    data  = _get(f"/v2/reference/financials/{ticker}", {"from": start, "to": end})
-    return data
+    """
+    Short interest is NOT available from this endpoint — the previous
+    implementation hit /v2/reference/financials/{ticker}, which returns
+    fundamentals data, not short interest, and silently produced unusable
+    results. Polygon's paid tiers don't expose short interest either; FINRA
+    publishes it for free on a ~2-week lag via a fixed-width text file, but
+    without a validated working URL/format for that feed this returns an
+    explicit "unavailable" stub rather than guessing at a wrong endpoint.
+    """
+    return {
+        "ticker": ticker,
+        "available": False,
+        "reason": "No validated free short-interest source configured "
+                  "(FINRA biweekly file integration not yet implemented).",
+    }
 
 
 def get_rsi(ticker: str, window: int = 14) -> float | None:

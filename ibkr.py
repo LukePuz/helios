@@ -50,6 +50,9 @@ def get_ib(max_attempts: int = 3) -> ibi.IB:
             if not _ib.isConnected():
                 _ib.connect(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID,
                             readonly=False, timeout=10)
+            # Heartbeat — reqCurrentTime() round-trips to TWS and catches stale connections
+            # that report isConnected()=True but are no longer communicating.
+            _ib.reqCurrentTime()
             log.info(f"Connected to IBKR TWS at {IB_HOST}:{IB_PORT} (clientId={IB_CLIENT_ID})")
             return _ib
         except Exception as e:
@@ -141,10 +144,11 @@ def get_historical_bars(
 # Order execution
 # ---------------------------------------------------------------------------
 
-def place_market_order(ticker: str, side: str, qty: float) -> dict:
+def place_market_order(ticker: str, side: str, qty: float, fill_timeout: float = 30.0) -> dict:
     """
-    Place a market order. side = 'BUY' or 'SELL'.
-    Returns dict with order_id, status.
+    Place a market order and wait for the fill. side = 'BUY' or 'SELL'.
+    Returns dict with order_id, status, fill_price (None if unfilled at timeout),
+    and filled_qty.
     """
     ib = get_ib()
     contract = _stock(ticker)
@@ -155,31 +159,283 @@ def place_market_order(ticker: str, side: str, qty: float) -> dict:
     ib.sleep(1)
 
     order = ibi.MarketOrder(side.upper(), qty)
-    order.tif = "GTC"  # prevent Error 10349 from TWS DAY-order preset override
+    order.tif = "DAY"  # market orders must not persist across sessions
     trade = ib.placeOrder(contract, order)
-    ib.sleep(1)
+
+    # Wait for the real fill instead of guessing the price afterwards
+    waited = 0.0
+    while not trade.isDone() and waited < fill_timeout:
+        ib.waitOnUpdate(timeout=1)
+        waited += 1
 
     ib.cancelMktData(contract)
 
-    log.info(f"Order placed: {side.upper()} {qty} {ticker} (orderId={trade.order.orderId})")
+    fill_price = float(trade.orderStatus.avgFillPrice or 0) or None
+    filled_qty = float(trade.orderStatus.filled or 0)
+    status     = trade.orderStatus.status
+
+    if fill_price:
+        log.info(f"Order FILLED: {side.upper()} {filled_qty} {ticker} @ ${fill_price:.2f} "
+                 f"(orderId={trade.order.orderId})")
+    else:
+        log.warning(f"Order not confirmed filled after {fill_timeout:.0f}s: "
+                    f"{side.upper()} {qty} {ticker} status={status} "
+                    f"(orderId={trade.order.orderId}) — fill will need reconciliation")
+
     return {
-        "order_id": trade.order.orderId,
-        "ticker":   ticker,
-        "side":     side.upper(),
-        "qty":      qty,
-        "status":   trade.orderStatus.status,
+        "order_id":   trade.order.orderId,
+        "ticker":     ticker,
+        "side":       side.upper(),
+        "qty":        qty,
+        "filled_qty": filled_qty,
+        "fill_price": fill_price,
+        "status":     status,
     }
 
 
+def _compute_marketable_limit(ib: ibi.IB, contract: ibi.Stock, side: str,
+                              offset_pct: float = 0.001) -> float:
+    """
+    Snapshots bid/ask and returns a limit price aggressive enough to fill
+    like a market order but bounded — ask+offset for BUY, bid-offset for
+    SELL. Falls back to last trade price if bid/ask aren't available
+    (illiquid name / data permissions).
+    """
+    ib.reqMarketDataType(3)
+    md = ib.reqMktData(contract, "", False, False)
+    ib.sleep(2)
+    bid  = md.bid  if md.bid  and md.bid  > 0 else None
+    ask  = md.ask  if md.ask  and md.ask  > 0 else None
+    last = md.last if md.last and md.last > 0 else None
+    ib.cancelMktData(contract)
+
+    if side.upper() == "BUY":
+        base = ask or last
+    else:
+        base = bid or last
+    if base is None:
+        raise ValueError(f"No price data available to compute a marketable limit for {contract.symbol}")
+
+    return base * (1 + offset_pct) if side.upper() == "BUY" else base * (1 - offset_pct)
+
+
+def place_limit_order(
+    ticker: str,
+    side: str,
+    qty: float,
+    limit_price: float | None = None,
+    tif: str = "DAY",
+    fill_timeout: float = 30.0,
+) -> dict:
+    """
+    Place a limit order. If limit_price is None, computes a marketable limit
+    (aggressive enough to fill promptly, capped so a fast-moving market can't
+    fill at an arbitrarily bad price the way a market order can).
+    Unfilled-at-timeout orders are NOT cancelled here — the caller decides
+    whether to cancel-and-retry or leave it working (DAY orders expire with
+    the session; the reconciliation task catches anything left dangling).
+    """
+    ib = get_ib()
+    contract = _stock(ticker)
+
+    if limit_price is None:
+        limit_price = _compute_marketable_limit(ib, contract, side)
+    limit_price = round(limit_price, 2)
+
+    order = ibi.LimitOrder(side.upper(), qty, limit_price)
+    order.tif = tif
+    trade = ib.placeOrder(contract, order)
+
+    waited = 0.0
+    while not trade.isDone() and waited < fill_timeout:
+        ib.waitOnUpdate(timeout=1)
+        waited += 1
+
+    fill_price = float(trade.orderStatus.avgFillPrice or 0) or None
+    filled_qty = float(trade.orderStatus.filled or 0)
+    status     = trade.orderStatus.status
+
+    if fill_price:
+        log.info(f"Limit order FILLED: {side.upper()} {filled_qty} {ticker} @ ${fill_price:.2f} "
+                 f"(limit=${limit_price:.2f}, orderId={trade.order.orderId})")
+    else:
+        log.warning(f"Limit order not filled after {fill_timeout:.0f}s: "
+                    f"{side.upper()} {qty} {ticker} @ ${limit_price:.2f} status={status} "
+                    f"(orderId={trade.order.orderId})")
+
+    return {
+        "order_id":    trade.order.orderId,
+        "ticker":      ticker,
+        "side":        side.upper(),
+        "qty":         qty,
+        "limit_price": limit_price,
+        "filled_qty":  filled_qty,
+        "fill_price":  fill_price,
+        "status":      status,
+    }
+
+
+def place_bracket_order(
+    ticker: str,
+    side: str,
+    qty: float,
+    stop_loss_price: float,
+    entry_type: str = "LIMIT",
+    limit_price: float | None = None,
+    take_profit_price: float | None = None,
+    tif: str = "DAY",
+) -> dict:
+    """
+    Native parent/child bracket: entry order + stop-loss child (+ optional
+    take-profit child). TWS enforces the entry/stop pairing atomically via
+    parentId linkage — if the entry never fills, the stop never activates;
+    if one exit child fills, TWS cancels its sibling. This makes the whole
+    class of "orphaned stop after a manual exit" bugs structurally
+    impossible for NEW positions opened this way (existing positions still
+    rely on the Phase 0 manual lifecycle + reconciliation as a backstop).
+
+    Only the LAST order in the chain is submitted with transmit=True — until
+    then TWS holds the whole bracket un-transmitted, so partial submission
+    isn't possible.
+    """
+    if not stop_loss_price:
+        raise ValueError("place_bracket_order requires a stop_loss_price")
+
+    ib = get_ib()
+    contract = _stock(ticker)
+    action = side.upper()
+    reverse_action = "SELL" if action == "BUY" else "BUY"
+
+    if entry_type == "MARKET":
+        parent = ibi.MarketOrder(action, qty)
+    else:
+        if limit_price is None:
+            limit_price = _compute_marketable_limit(ib, contract, action)
+        parent = ibi.LimitOrder(action, qty, round(limit_price, 2))
+    parent.orderId  = ib.client.getReqId()
+    parent.tif      = tif
+    parent.transmit = False
+
+    stop = ibi.StopOrder(reverse_action, qty, round(stop_loss_price, 2))
+    stop.orderId  = ib.client.getReqId()
+    stop.parentId = parent.orderId
+    stop.tif      = "GTC"
+    stop.transmit = take_profit_price is None  # last child transmits the whole bracket
+
+    children = [stop]
+    tp = None
+    if take_profit_price:
+        tp = ibi.LimitOrder(reverse_action, qty, round(take_profit_price, 2))
+        tp.orderId  = ib.client.getReqId()
+        tp.parentId = parent.orderId
+        tp.tif      = "GTC"
+        tp.transmit = True
+        children.append(tp)
+
+    for o in [parent] + children:
+        ib.placeOrder(contract, o)
+    ib.sleep(1)
+
+    log.info(
+        f"Bracket order placed: {action} {qty} {ticker} "
+        f"(parent={parent.orderId}, stop={stop.orderId}"
+        + (f", take_profit={tp.orderId}" if tp else "") + ")"
+    )
+
+    return {
+        "parent_order_id":      parent.orderId,
+        "stop_order_id":        stop.orderId,
+        "take_profit_order_id": tp.orderId if tp else None,
+        "limit_price":          limit_price if entry_type != "MARKET" else None,
+    }
+
+
+def place_trailing_stop_order(ticker: str, qty: float, trail_percent: float) -> dict:
+    """
+    Native IBKR TRAIL order — the broker ratchets the stop price itself as
+    the position gains, so no cancel/replace round-trip (and the gap that
+    creates between "old stop cancelled" and "new stop live") is needed once
+    a position's trailing stop has activated.
+    """
+    ib = get_ib()
+    contract = _stock(ticker)
+    order = ibi.Order(
+        action="SELL", totalQuantity=qty, orderType="TRAIL",
+        trailingPercent=trail_percent, tif="GTC",
+    )
+    trade = ib.placeOrder(contract, order)
+    ib.sleep(1)
+    log.info(f"Native trailing stop placed: SELL {qty} {ticker} trailing {trail_percent}% "
+             f"(orderId={trade.order.orderId})")
+    return {"order_id": trade.order.orderId, "trail_percent": trail_percent}
+
+
 def place_stop_order(ticker: str, qty: float, stop_price: float) -> dict:
-    """Place a sell stop-loss order."""
+    """Place a GTC sell stop-loss order. Returns order_id for lifecycle tracking."""
     ib = get_ib()
     contract = _stock(ticker)
     order    = ibi.StopOrder("SELL", qty, stop_price, tif="GTC")
     trade    = ib.placeOrder(contract, order)
     ib.sleep(1)
-    log.info(f"Stop order placed: SELL {qty} {ticker} @ ${stop_price:.2f}")
+    log.info(f"Stop order placed: SELL {qty} {ticker} @ ${stop_price:.2f} "
+             f"(orderId={trade.order.orderId})")
     return {"order_id": trade.order.orderId, "stop_price": stop_price}
+
+
+def cancel_order(order_id: int) -> bool:
+    """Cancel an open order by orderId. Returns True if a cancel was sent."""
+    ib = get_ib()
+    for trade in ib.openTrades():
+        if trade.order.orderId == order_id:
+            ib.cancelOrder(trade.order)
+            ib.sleep(1)
+            log.info(f"Cancel sent for orderId={order_id} "
+                     f"({trade.order.action} {trade.order.totalQuantity} "
+                     f"{trade.contract.symbol})")
+            return True
+    log.warning(f"cancel_order: orderId={order_id} not found among open orders")
+    return False
+
+
+def get_open_orders() -> list[dict]:
+    """
+    Returns all open orders as dicts:
+    {order_id, ticker, action, order_type, qty, stop_price, status}
+    """
+    ib = get_ib()
+    ib.reqAllOpenOrders()
+    ib.sleep(1)
+    results = []
+    for trade in ib.openTrades():
+        o = trade.order
+        results.append({
+            "order_id":   o.orderId,
+            "ticker":     trade.contract.symbol,
+            "action":     o.action,
+            "order_type": o.orderType,
+            "qty":        float(o.totalQuantity),
+            "stop_price": float(getattr(o, "auxPrice", 0) or 0) or None,
+            "status":     trade.orderStatus.status,
+        })
+    return results
+
+
+def cancel_stop_orders_for(ticker: str) -> int:
+    """Cancel all open SELL stop orders for a ticker. Returns count cancelled."""
+    ib = get_ib()
+    cancelled = 0
+    for trade in ib.openTrades():
+        o = trade.order
+        if (trade.contract.symbol == ticker
+                and o.action == "SELL"
+                and o.orderType in ("STP", "STP LMT", "TRAIL")):
+            ib.cancelOrder(o)
+            cancelled += 1
+            log.info(f"[{ticker}] Cancelled stop orderId={o.orderId} "
+                     f"(qty={o.totalQuantity} @ ${getattr(o, 'auxPrice', 0)})")
+    if cancelled:
+        ib.sleep(1)
+    return cancelled
 
 
 # ---------------------------------------------------------------------------

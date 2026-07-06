@@ -25,7 +25,23 @@ BASE_URL = "https://api.quiverquant.com/beta"
 
 from config import SYMBOLS
 
-_seen_trades: set[str] = set()
+_SOURCE = "congressional"
+
+
+def _is_seen(trade_id: str) -> bool:
+    try:
+        import db
+        return db.is_seen(_SOURCE, trade_id)
+    except Exception:
+        return False
+
+
+def _mark_seen(trade_id: str) -> None:
+    try:
+        import db
+        db.mark_seen(_SOURCE, trade_id)
+    except Exception as e:
+        log.debug(f"mark_seen failed for {trade_id}: {e}")
 
 
 def _get_congressional_trades(ticker: str) -> list[dict]:
@@ -56,9 +72,9 @@ def poll_once() -> list[dict]:
         trades = _get_congressional_trades(ticker)
         for trade in trades[:5]:  # most recent 5 per ticker
             trade_id = f"{ticker}_{trade.get('TransactionDate','')}_{trade.get('Representative','')}"
-            if trade_id in _seen_trades:
+            if _is_seen(trade_id):
                 continue
-            _seen_trades.add(trade_id)
+            _mark_seen(trade_id)
 
             side = trade.get("Transaction", "").upper()
             rep  = trade.get("Representative", "Unknown")

@@ -115,12 +115,25 @@ APPROVAL_EXPIRY_HOURS = 6     # pending approvals auto-expire after 6 hours
 MAX_DRAWDOWN_PCT = 0.15       # alert at 15% drawdown from START_VALUE
 
 # ---------------------------------------------------------------------------
+# Execution
+# ---------------------------------------------------------------------------
+# When True, new BUY entries use a native IBKR bracket order (entry + stop
+# linked by parentId) instead of a market order followed by a separate stop
+# placement. This makes the "orphaned stop after a manual exit" class of bug
+# structurally impossible for new positions — but it's new code that hasn't
+# been exercised against a live TWS session yet, so it ships OFF by default.
+# Flip on only after verifying place_bracket_order in paper trading.
+import os as _os
+USE_BRACKET_ORDERS = _os.getenv("USE_BRACKET_ORDERS", "false").lower() == "true"
+
+# ---------------------------------------------------------------------------
 # Ollama model config
 # ---------------------------------------------------------------------------
 import os
 OLLAMA_HOST      = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 SCREENER_MODEL   = os.getenv("SCREENER_MODEL", "qwen2.5:7b")
 ANALYST_MODEL    = os.getenv("ANALYST_MODEL", "qwen2.5:72b")
+CHAT_MODEL       = os.getenv("CHAT_MODEL",    "qwen2.5:3b")   # never use 72b — must not be interrupted
 
 # ---------------------------------------------------------------------------
 # Interactive Brokers connection

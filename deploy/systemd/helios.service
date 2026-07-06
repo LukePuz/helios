@@ -1,0 +1,32 @@
+[Unit]
+Description=Helios Hedgefund trading bot
+# Redis/Postgres are external (Supabase is remote; Redis may be local or
+# remote per REDIS_URL) — Requires/After only what's realistically local.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# EDIT THESE THREE PATHS for your install location and user:
+User=%i
+WorkingDirectory=/opt/helios
+ExecStart=/opt/helios/venv/bin/python /opt/helios/main.py
+
+# main.py itself starts Celery worker/beat, the catalyst FastAPI service,
+# and the Streamlit dashboard as child processes (see process_manager.py) —
+# one systemd unit wrapping main.py mirrors the same single-entry-point
+# design launch.bat and launch.sh already use. Restart the whole stack
+# together rather than trying to supervise the children independently.
+Restart=on-failure
+RestartSec=10
+
+# main.py loads its own .env via python-dotenv; EnvironmentFile is optional
+# and only needed if you want systemd itself to see the values (e.g. for
+# substituting %i above, or for other units that depend on them).
+# EnvironmentFile=/opt/helios/.env
+
+StandardOutput=append:/opt/helios/helios-systemd.log
+StandardError=append:/opt/helios/helios-systemd.log
+
+[Install]
+WantedBy=multi-user.target

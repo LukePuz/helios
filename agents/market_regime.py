@@ -99,15 +99,31 @@ def _score_trend(spy_bars: list[dict]) -> tuple[int, str]:
     return _SCORE[score_label], notes
 
 
-def _score_volatility(vix: float | None) -> tuple[int, str]:
+def _score_volatility(
+    vix: float | None,
+    trend_raw: int | None = None,
+    breadth_raw: int | None = None,
+) -> tuple[int, str]:
     """
-    VIX-based regime signal. Contrarian at extreme fear (>40).
+    VIX-based regime signal. Contrarian at extreme fear (>40) — but per
+    knowledge/market_regime_rules.md: "Apply only when trend and breadth
+    signals are not simultaneously Very Bearish. A VIX > 40 during a Death
+    Cross environment may indicate more downside, not a bottom." The
+    previous implementation applied Very Bullish unconditionally, ignoring
+    that guard entirely.
     """
     if vix is None:
         return _SCORE["Neutral"], "VIX data unavailable"
 
     if vix > 40:
-        # Contrarian — capitulation may signal bottom, BUT apply carefully
+        both_very_bearish = (trend_raw is not None and breadth_raw is not None
+                              and trend_raw <= -5 and breadth_raw <= -5)
+        if both_very_bearish:
+            return _SCORE["Bearish"], (
+                f"VIX={vix:.1f}: extreme fear, but trend AND breadth are both "
+                f"Very Bearish (Death Cross posture) — contrarian bullish signal "
+                f"suppressed per regime rules, treating as continued stress"
+            )
         return _SCORE["Very Bullish"], f"VIX={vix:.1f}: extreme fear / capitulation signal (contrarian bullish)"
     elif vix > 25:
         return _SCORE["Bearish"], f"VIX={vix:.1f}: elevated fear"
@@ -277,6 +293,34 @@ def _score_volume(spy_bars: list[dict]) -> tuple[int, str]:
 
 
 # ---------------------------------------------------------------------------
+# Watchlist breadth sample (uses the price_history cache)
+# ---------------------------------------------------------------------------
+
+def _fetch_watchlist_bars_for_breadth(sample_size: int = 30) -> list[list[dict]]:
+    """
+    Returns cached daily-bar series for a sample of watchlist tickers, in the
+    {"close": ...} shape _score_breadth expects. This was previously always
+    called with an empty list (dead code) because fetching bars live for the
+    whole watchlist on every regime check was too slow; the nightly
+    price_history cache (ingestion/price_history.py) makes it cheap.
+    Returns [] if the cache is empty (e.g. before the first nightly refresh
+    has run) so the caller falls back to ETF flows / the SPY proxy.
+    """
+    try:
+        import db
+        from knowledge_loader import get_all_tickers
+
+        tickers = get_all_tickers()[:sample_size]
+        bulk = db.get_price_history_bulk(tickers, days=210)
+        # Require enough history for a real 200DMA — otherwise this ticker
+        # can't contribute to breadth and would just look artificially bearish.
+        return [bars for bars in bulk.values() if len(bars) >= 200]
+    except Exception as e:
+        log.debug(f"Watchlist breadth sample unavailable: {e}")
+        return []
+
+
+# ---------------------------------------------------------------------------
 # SPY bar fetcher (uses Alpaca via env — already available)
 # ---------------------------------------------------------------------------
 
@@ -341,17 +385,25 @@ def assess_regime() -> dict:
     vix = macro.get("VIXCLS", {}).get("value")
 
     # --- Score each signal ---
+    # Trend and breadth are computed before volatility because the VIX>40
+    # contrarian-bullish signal must be suppressed when both are Very Bearish
+    # (Death Cross posture) — see _score_volatility's docstring.
     trend_raw,      trend_notes      = _score_trend(spy_bars)
-    volatility_raw, volatility_notes = _score_volatility(vix)
+
+    watchlist_bars = _fetch_watchlist_bars_for_breadth()
+    if watchlist_bars:
+        breadth_raw, breadth_notes = _score_breadth(spy_bars, watchlist_bars)
+    else:
+        try:
+            from ingestion.options_flow import get_etf_flows
+            etf_flows = get_etf_flows()
+            breadth_raw, breadth_notes = _score_etf_flows(etf_flows)
+        except Exception:
+            breadth_raw, breadth_notes = _score_breadth(spy_bars, [])
+
+    volatility_raw, volatility_notes = _score_volatility(vix, trend_raw, breadth_raw)
     liquidity_raw,  liquidity_notes  = _score_liquidity(macro)
     credit_raw,     credit_notes     = _score_credit(macro)
-    # Use ETF flow data for breadth if Unusual Whales key available; fall back to price-based
-    try:
-        from ingestion.options_flow import get_etf_flows
-        etf_flows = get_etf_flows()
-        breadth_raw, breadth_notes = _score_etf_flows(etf_flows)
-    except Exception:
-        breadth_raw, breadth_notes = _score_breadth(spy_bars, [])
     volume_raw,     volume_notes     = _score_volume(spy_bars)
 
     # --- Apply weights ---
@@ -506,6 +558,21 @@ def get_cached_regime() -> dict:
 
     # Nothing fresh — run fresh assessment
     return assess_regime()
+
+
+def get_intraday_vix() -> float | None:
+    """
+    Live VIX via yfinance ^VIX — FRED's VIXCLS is end-of-day and lags by a
+    full session, which is too stale to drive an "intraday" reassessment
+    trigger (poll_macro was comparing yesterday's close against itself).
+    """
+    try:
+        import yfinance as yf
+        price = yf.Ticker("^VIX").fast_info.last_price
+        return float(price) if price else None
+    except Exception as e:
+        log.debug(f"Intraday VIX fetch failed: {e}")
+        return None
 
 
 def should_reassess(new_vix: float) -> bool:

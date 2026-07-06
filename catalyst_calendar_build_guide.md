@@ -1,3 +1,4 @@
+
 # Catalyst Calendar Service — Build Guide
 
 A shared service that collects, scores, and serves thesis-relevant catalyst data

@@ -43,11 +43,30 @@ else
     echo "WARNING: ollama not found — AI agents will use keyword fallback."
 fi
 
+# --- IBKR TWS / IB Gateway ---
+# Unlike Windows (launch.bat launches a known tws.exe path), there's no
+# single canonical binary/location for TWS or IB Gateway on Linux — it's
+# typically run headless via IBC (github.com/IbcAlpha/IBC) or in a VNC
+# session, and the setup varies enough per-user that auto-launching it here
+# would be more likely to guess wrong than to help. Start it yourself before
+# (or after) this script — the bot retries the connection on its own.
+if ! (echo > /dev/tcp/127.0.0.1/7497) 2>/dev/null; then
+    echo "NOTE: Nothing is listening on port 7497 (paper) yet — start TWS or"
+    echo "      IB Gateway with API connections enabled before approving trades."
+fi
+
 echo ""
 echo "Starting Helios..."
 echo "  Dashboard -> http://localhost:8501"
-echo "  Logs      -> trading_bot.log"
+echo "  Logs      -> helios.log"
 echo "  Press Ctrl+C to stop."
 echo ""
+
+# Best-effort browser open once the dashboard is likely up — skipped
+# entirely on a headless server (no DISPLAY, no xdg-open) rather than
+# erroring out.
+if command -v xdg-open &>/dev/null && [ -n "${DISPLAY:-}" ]; then
+    ( sleep 14 && xdg-open "http://localhost:8501" &>/dev/null & )
+fi
 
 python main.py

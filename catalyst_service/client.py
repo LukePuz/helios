@@ -33,15 +33,17 @@ def query_events(**params) -> list[dict[str, Any]]:
 
 
 def blocking_events_for_horizon(ticker: str, days_ahead: int = 45) -> list[dict[str, Any]]:
+    start = date.today().isoformat()
     end = (date.today() + timedelta(days=days_ahead)).isoformat()
     if SERVICE_URL:
-        events = query_events(ticker=ticker, end=end)
+        # start=today so a stale past-dated event can't block trades forever
+        events = query_events(ticker=ticker, start=start, end=end)
         return [
             e for e in events
             if (e.get("action_flags") or {}).get("halt_auto_execution")
             or e.get("confidence") in {"conflicting", "rumored"}
         ]
-    return storage.blocking_events(ticker, end=end)
+    return storage.blocking_events(ticker, end=end, start=start)
 
 
 def nearest_event(ticker: str, days_ahead: int = 120) -> dict[str, Any] | None:

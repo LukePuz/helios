@@ -108,6 +108,11 @@ app.conf.beat_schedule = {
         "task":     "tasks.check_portfolio_drawdown",
         "schedule": 1800,
     },
+    # Stop-order reconciliation — every 15 minutes (orphan detection/cleanup)
+    "reconcile-stops": {
+        "task":     "tasks.reconcile_stop_orders",
+        "schedule": 900,
+    },
     # 30/60/90-day outcome price reviews — weekdays 4:30 PM ET
     "review-outcomes": {
         "task":     "tasks.review_trade_outcomes",
@@ -117,6 +122,36 @@ app.conf.beat_schedule = {
     "prune-vector-store": {
         "task":     "tasks.prune_vector_store",
         "schedule": crontab(hour=3, minute=0, day_of_week="sun"),
+    },
+    # News (yfinance + Google News RSS) — every 15 minutes
+    "poll-news": {
+        "task":     "tasks.poll_news",
+        "schedule": 900,
+    },
+    # Fundamentals refresh — nightly at 2:00 AM (off-hours, yfinance is slow per-ticker)
+    "refresh-fundamentals": {
+        "task":     "tasks.refresh_fundamentals",
+        "schedule": crontab(hour=2, minute=0),
+    },
+    # Price history cache refresh — nightly at 1:30 AM (before fundamentals)
+    "refresh-price-history": {
+        "task":     "tasks.refresh_price_history",
+        "schedule": crontab(hour=1, minute=30),
+    },
+    # Ingestion health check — hourly
+    "check-ingestion-health": {
+        "task":     "tasks.check_ingestion_health",
+        "schedule": 3600,
+    },
+    # Daily digest — weekdays 4:15 PM ET (after market close)
+    "daily-digest": {
+        "task":     "tasks.send_daily_digest",
+        "schedule": crontab(hour=16, minute=15, day_of_week="mon-fri"),
+    },
+    # Weekly self-review — Sunday 6:00 PM ET
+    "weekly-self-review": {
+        "task":     "tasks.weekly_self_review",
+        "schedule": crontab(hour=18, minute=0, day_of_week="sun"),
     },
 }
 
@@ -187,6 +222,22 @@ def check_trailing_stops(self):
 
 # ── Existing tasks (updated call signatures) ──────────────────────────────────
 
+def _heartbeat_ok(source: str, count: int) -> None:
+    try:
+        import db
+        db.record_ingestion_success(source, count)
+    except Exception:
+        pass
+
+
+def _heartbeat_fail(source: str, error: str) -> None:
+    try:
+        import db
+        db.record_ingestion_error(source, error)
+    except Exception:
+        pass
+
+
 @app.task(name="tasks.poll_edgar", bind=True, max_retries=3)
 def poll_edgar(self):
     """Polls SEC EDGAR for new filings and routes through agent pipeline."""
@@ -198,21 +249,32 @@ def poll_edgar(self):
         log.info(f"EDGAR: {len(filings)} new filing(s)")
         for filing in filings:
             process_event(filing)
+        _heartbeat_ok("edgar", len(filings))
     except Exception as e:
         log.error(f"poll_edgar failed: {e}")
+        _heartbeat_fail("edgar", str(e))
         raise self.retry(exc=e, countdown=60)
 
 
 @app.task(name="tasks.poll_options_flow", bind=True, max_retries=3)
 def poll_options_flow(self):
-    """Checks for unusual options activity across all symbols."""
+    """Checks for unusual options activity across all symbols (Unusual Whales,
+    falls back to the free yfinance-based options_free module when no key is set)."""
     try:
-        from ingestion.options_flow import get_all_flow_summaries
         from agents.crew import process_event
 
+        import os
+        if os.getenv("UNUSUAL_WHALES_API_KEY", "").startswith("your_"):
+            from ingestion.options_free import get_all_flow_summaries
+            log.info("UNUSUAL_WHALES_API_KEY not configured — using free yfinance options proxy")
+        else:
+            from ingestion.options_flow import get_all_flow_summaries
+
         summaries = get_all_flow_summaries()
+        unusual_count = 0
         for ticker, flow in summaries.items():
             if flow.get("unusual"):
+                unusual_count += 1
                 event = {
                     "source": "options",
                     "ticker": ticker,
@@ -220,8 +282,10 @@ def poll_options_flow(self):
                     "text":   flow["summary"],
                 }
                 process_event(event)
+        _heartbeat_ok("options_flow", unusual_count)
     except Exception as e:
         log.error(f"poll_options_flow failed: {e}")
+        _heartbeat_fail("options_flow", str(e))
         raise self.retry(exc=e, countdown=60)
 
 
@@ -243,18 +307,23 @@ def poll_macro(self):
         )
         log.info("Macro snapshot stored.")
 
-        # Reassess regime if macro conditions changed significantly
+        # Reassess regime if macro conditions changed significantly.
+        # Uses live ^VIX (yfinance), not FRED's VIXCLS — FRED is end-of-day
+        # and lags a full session, which defeats the point of an "intraday"
+        # reassessment trigger (it would just compare yesterday to itself).
         try:
-            from agents.market_regime import should_reassess, assess_regime
-            vix = snap.get("VIXCLS", {}).get("value")
-            if vix and should_reassess(float(vix)):
+            from agents.market_regime import should_reassess, assess_regime, get_intraday_vix
+            vix = get_intraday_vix()
+            if vix and should_reassess(vix):
                 log.info(f"Intraday VIX shift detected ({vix:.1f}) — reassessing market regime")
                 assess_regime()
         except Exception as e:
             log.debug(f"Intraday regime check skipped: {e}")
 
+        _heartbeat_ok("macro", 1)
     except Exception as e:
         log.error(f"poll_macro failed: {e}")
+        _heartbeat_fail("macro", str(e))
         raise self.retry(exc=e, countdown=120)
 
 
@@ -269,8 +338,10 @@ def poll_arxiv(self):
         log.info(f"arXiv: {len(papers)} new paper(s)")
         for paper in papers:
             vector_store.store_arxiv(paper)
+        _heartbeat_ok("arxiv", len(papers))
     except Exception as e:
         log.error(f"poll_arxiv failed: {e}")
+        _heartbeat_fail("arxiv", str(e))
         raise self.retry(exc=e, countdown=300)
 
 
@@ -295,40 +366,219 @@ def poll_congressional(self):
                     text=trade["text"],
                     metadata={"ticker": trade["ticker"], "side": trade.get("side", "")},
                 )
+        _heartbeat_ok("congressional", len(trades))
     except Exception as e:
         log.error(f"poll_congressional failed: {e}")
+        _heartbeat_fail("congressional", str(e))
         raise self.retry(exc=e, countdown=300)
 
 
 @app.task(name="tasks.poll_insider", bind=True, max_retries=3)
 def poll_insider(self):
-    """Polls Form 4 insider trades. Buys by C-suite are processed as full events."""
+    """
+    Polls Form 4 insider filings. insider.poll_once() now only returns
+    filings containing an actual open-market purchase (transaction code "P"),
+    so every result here is a genuine buy signal and goes through the full
+    analyst pipeline like EDGAR filings and congressional purchases.
+    """
     try:
         from ingestion.insider import poll_once
-        import vector_store
+        from agents.crew import process_event
 
         filings = poll_once()
-        log.info(f"Insider: {len(filings)} new filing(s)")
+        log.info(f"Insider: {len(filings)} new open-market buy filing(s)")
         for filing in filings:
-            vector_store.store(
-                collection="insider",
-                doc_id=filing.get("url", filing.get("title", "")),
-                text=filing["text"],
-                metadata={"ticker": filing["ticker"]},
-            )
+            process_event(filing)
+        _heartbeat_ok("insider", len(filings))
     except Exception as e:
         log.error(f"poll_insider failed: {e}")
+        _heartbeat_fail("insider", str(e))
         raise self.retry(exc=e, countdown=120)
+
+
+@app.task(name="tasks.poll_news", bind=True, max_retries=3)
+def poll_news(self):
+    """Polls free news sources (yfinance + Google News RSS) for the watchlist."""
+    try:
+        from ingestion.news import poll_once
+        from agents.crew import process_event
+
+        items = poll_once()
+        log.info(f"News: {len(items)} new item(s)")
+        for item in items:
+            process_event(item)
+        _heartbeat_ok("news", len(items))
+    except Exception as e:
+        log.error(f"poll_news failed: {e}")
+        _heartbeat_fail("news", str(e))
+        raise self.retry(exc=e, countdown=120)
+
+
+@app.task(name="tasks.refresh_price_history", bind=True, max_retries=2)
+def refresh_price_history(self):
+    """Nightly refresh of the price_history cache (watchlist + SPY/QQQ)."""
+    try:
+        from ingestion.price_history import refresh_all_price_history
+        count = refresh_all_price_history()
+        log.info(f"Price history refreshed: {count} tickers updated")
+        _heartbeat_ok("price_history", count)
+    except Exception as e:
+        log.error(f"refresh_price_history failed: {e}")
+        _heartbeat_fail("price_history", str(e))
+        raise self.retry(exc=e, countdown=300)
+
+
+@app.task(name="tasks.refresh_fundamentals", bind=True, max_retries=2)
+def refresh_fundamentals(self):
+    """Nightly refresh of fundamental metrics for the watchlist (free, via yfinance)."""
+    try:
+        from ingestion.fundamentals import refresh_all_fundamentals
+        count = refresh_all_fundamentals()
+        log.info(f"Fundamentals refreshed: {count} tickers updated")
+        _heartbeat_ok("fundamentals", count)
+    except Exception as e:
+        log.error(f"refresh_fundamentals failed: {e}")
+        _heartbeat_fail("fundamentals", str(e))
+        raise self.retry(exc=e, countdown=300)
+
+
+def _get_stale_ingestion_sources() -> list[str]:
+    """Shared by check_ingestion_health and send_daily_digest."""
+    import db
+    from datetime import datetime, timezone
+
+    # Expected max gap per source, generously above its beat schedule interval
+    expected_minutes = {
+        "edgar": 20, "options_flow": 15, "macro": 90, "arxiv": 1560,
+        "congressional": 400, "insider": 60, "news": 30, "fundamentals": 1560,
+        "price_history": 1560,
+    }
+
+    stale = []
+    now = datetime.now(timezone.utc)
+    health = {h["source"]: h for h in db.get_ingestion_health()}
+    for source, max_gap in expected_minutes.items():
+        rec = health.get(source)
+        if not rec or not rec.get("last_success_at"):
+            stale.append(f"{source}: never succeeded")
+            continue
+        age_min = (now - rec["last_success_at"]).total_seconds() / 60
+        if age_min > max_gap:
+            stale.append(f"{source}: last success {age_min:.0f}min ago (expected <{max_gap}min)")
+    return stale
+
+
+@app.task(name="tasks.check_ingestion_health", bind=True, max_retries=1)
+def check_ingestion_health(self):
+    """Alerts when an ingestion source hasn't succeeded within its expected cadence."""
+    try:
+        import alerts
+
+        stale = _get_stale_ingestion_sources()
+        if stale:
+            log.warning("Ingestion health issues: " + " | ".join(stale))
+            alerts._send("⚠️ <b>Ingestion Health Check</b>\n" + "\n".join(f"• {s}" for s in stale))
+    except Exception as e:
+        log.error(f"check_ingestion_health failed: {e}")
+        raise self.retry(exc=e, countdown=300)
+
+
+@app.task(name="tasks.send_daily_digest", bind=True, max_retries=2)
+def send_daily_digest(self):
+    """
+    Post-close daily digest — day P&L vs SPY, open positions with stop
+    distances, tomorrow's catalysts, pending approvals, ingestion health,
+    and halt status. alerts.send_daily_summary() existed but nothing ever
+    scheduled it; this is its replacement on the beat schedule.
+    """
+    try:
+        import db
+        import alerts
+        from datetime import date, timedelta
+
+        client  = _get_client()
+        account = client.get_account()
+        pv      = float(account.portfolio_value)
+
+        # Day P&L: compare against the first snapshot recorded today
+        history = db.get_portfolio_history(limit=500)
+        today_str = date.today().isoformat()
+        todays = [h for h in history if h["timestamp"].date().isoformat() == today_str]
+        start_of_day_value = todays[0]["total_value"] if todays else pv
+        day_pl = pv - start_of_day_value
+        day_pl_pct = day_pl / start_of_day_value if start_of_day_value else 0.0
+
+        spy_pl_pct = None
+        try:
+            import yfinance as yf
+            spy_hist = yf.Ticker("SPY").history(period="2d")
+            if len(spy_hist) >= 2:
+                prev_close, last_close = spy_hist["Close"].iloc[-2], spy_hist["Close"].iloc[-1]
+                spy_pl_pct = float((last_close - prev_close) / prev_close)
+        except Exception as e:
+            log.debug(f"SPY comparison unavailable for digest: {e}")
+
+        positions = client.get_all_positions()
+        stops = {s["ticker"]: s for s in db.get_all_position_stops()}
+        positions_text = []
+        for p in positions:
+            stop_rec = stops.get(p.symbol)
+            dist = ""
+            current = float(p.current_price or 0)
+            if stop_rec and current:
+                d = (current - stop_rec["stop_price"]) / current
+                dist = f", stop {d:+.1%} away"
+            positions_text.append(
+                f"{p.symbol}: {p.qty:.0f}sh, P&L ${float(p.unrealized_pl):+,.0f}{dist}"
+            )
+
+        catalysts_text = []
+        try:
+            from catalyst_service.client import query_events
+            tomorrow = (date.today() + timedelta(days=1)).isoformat()
+            events = query_events(start=tomorrow, end=tomorrow)
+            catalysts_text = [f"{e.get('ticker')}: {e.get('event_type')}" for e in events]
+        except Exception as e:
+            log.debug(f"Catalyst lookup unavailable for digest: {e}")
+
+        pending_count = len(db.get_pending_approvals())
+        halted = db.get_state("trading_halted", "false") == "true"
+        ingestion_issues = _get_stale_ingestion_sources()
+
+        alerts.send_daily_digest(
+            portfolio_value=pv, day_pl=day_pl, day_pl_pct=day_pl_pct,
+            spy_pl_pct=spy_pl_pct, positions_text=positions_text,
+            catalysts_text=catalysts_text, pending_count=pending_count,
+            halted=halted, ingestion_issues=ingestion_issues,
+        )
+    except Exception as e:
+        log.error(f"send_daily_digest failed: {e}")
+        raise self.retry(exc=e, countdown=300)
 
 
 @app.task(name="tasks.take_portfolio_snapshot", bind=True, max_retries=3)
 def take_portfolio_snapshot(self):
-    """Takes a portfolio snapshot and logs to Supabase for the dashboard."""
+    """
+    Takes a portfolio snapshot and logs to Supabase for the dashboard.
+    Also snapshots SPY/QQQ (via yfinance — free, no extra IBKR market data
+    lines) alongside it, so the equity curve can be compared to a real
+    benchmark instead of only a flat starting-dollar-value line.
+    """
     try:
         import db
         client    = _get_client()
         account   = client.get_account()
         positions = client.get_all_positions()
+
+        benchmark = {}
+        try:
+            import yfinance as yf
+            for sym in ("SPY", "QQQ"):
+                price = yf.Ticker(sym).fast_info.last_price
+                if price:
+                    benchmark[sym] = float(price)
+        except Exception as e:
+            log.debug(f"Benchmark snapshot fetch failed (non-critical): {e}")
 
         db.log_snapshot(
             total_value=float(account.portfolio_value),
@@ -342,6 +592,7 @@ def take_portfolio_snapshot(self):
                 }
                 for p in positions
             },
+            benchmark=benchmark or None,
         )
     except Exception as e:
         log.error(f"take_portfolio_snapshot failed: {e}")
@@ -405,19 +656,34 @@ def alert_catalyst_conflicts(self):
 
 @app.task(name="tasks.check_portfolio_drawdown", bind=True, max_retries=2)
 def check_portfolio_drawdown(self):
-    """Alert if portfolio drawdown exceeds MAX_DRAWDOWN_PCT. Does not halt automatically."""
+    """
+    Circuit breaker: sets the persisted trading_halted flag when drawdown
+    from the high-water mark exceeds MAX_DRAWDOWN_PCT, and maintains the HWM.
+    """
     try:
         import db
         import alerts
         from config import START_VALUE, MAX_DRAWDOWN_PCT
 
-        client   = _get_client()
-        pv       = float(client.get_account().portfolio_value)
-        drawdown = (START_VALUE - pv) / START_VALUE
+        client = _get_client()
+        pv     = float(client.get_account().portfolio_value)
+
+        # Maintain the persisted high-water mark (seed from START_VALUE)
+        hwm = float(db.get_state("high_water_mark") or START_VALUE)
+        if pv > hwm:
+            db.set_state("high_water_mark", str(pv))
+            hwm = pv
+
+        drawdown = (hwm - pv) / hwm if hwm > 0 else 0
 
         if drawdown >= MAX_DRAWDOWN_PCT:
-            log.critical(f"DRAWDOWN LIMIT HIT: {drawdown:.1%} — manual review required")
-            alerts.send_halt_alert(pv, START_VALUE)
+            already_halted = db.get_state("trading_halted", "false") == "true"
+            db.set_state("trading_halted", "true")
+            db.set_state("halt_reason",
+                         f"Auto: drawdown {drawdown:.1%} from HWM ${hwm:,.2f}")
+            log.critical(f"DRAWDOWN LIMIT HIT: {drawdown:.1%} — trading HALTED")
+            if not already_halted:
+                alerts.send_halt_alert(pv, hwm)
         else:
             log.debug(f"Drawdown: {drawdown:.1%} (limit: {MAX_DRAWDOWN_PCT:.0%})")
     except Exception as e:
@@ -425,9 +691,73 @@ def check_portfolio_drawdown(self):
         raise self.retry(exc=e, countdown=60)
 
 
+@app.task(name="tasks.reconcile_stop_orders", bind=True, max_retries=2)
+def reconcile_stop_orders(self):
+    """
+    Safety net: diff broker-side sell-stop orders against actual positions.
+    - Cancels orphaned stops (stop exists, position doesn't) → prevents
+      accidental short positions.
+    - Deletes stale DB stop records with no matching position.
+    - Alerts on positions that have NO protective stop at the broker.
+    Every corrective action is reported to Telegram.
+    """
+    try:
+        import db
+        import ibkr
+        import alerts
+
+        client    = ibkr.get_client()
+        held      = {p.symbol: round(abs(float(p.qty)), 4)
+                     for p in client.get_all_positions()}
+        open_ords = ibkr.get_open_orders()
+        stops     = [o for o in open_ords
+                     if o["action"] == "SELL" and o["order_type"] in ("STP", "STP LMT", "TRAIL")]
+        actions: list[str] = []
+
+        # 1. Orphaned broker stops — stop order with no position → cancel
+        for o in stops:
+            if o["ticker"] not in held:
+                if ibkr.cancel_order(o["order_id"]):
+                    actions.append(
+                        f"Cancelled ORPHANED stop: SELL {o['qty']} {o['ticker']} "
+                        f"@ ${o['stop_price'] or 0:.2f} (no position held — would have shorted)"
+                    )
+
+        # 2. Stale DB stop records with no position → delete
+        for rec in db.get_all_position_stops():
+            if rec["ticker"] not in held:
+                db.delete_position_stop(rec["ticker"])
+                actions.append(f"Deleted stale DB stop record for {rec['ticker']} (no position)")
+
+        # 3. Positions with no protective stop at the broker → alert
+        stopped_tickers = {o["ticker"] for o in stops}
+        for ticker, qty in held.items():
+            if ticker not in stopped_tickers:
+                actions.append(
+                    f"⚠️ {ticker} ({qty} shares) has NO protective stop at the broker"
+                )
+
+        if actions:
+            log.warning("Stop reconciliation actions: " + " | ".join(actions))
+            alerts._send(
+                "🔧 <b>Stop Order Reconciliation</b>\n" + "\n".join(f"• {a}" for a in actions)
+            )
+        else:
+            log.info("Stop reconciliation: broker and DB in sync.")
+    except Exception as e:
+        log.error(f"reconcile_stop_orders failed: {e}")
+        raise self.retry(exc=e, countdown=120)
+
+
 @app.task(name="tasks.review_trade_outcomes", bind=True, max_retries=2)
 def review_trade_outcomes(self):
-    """Check and record 30/60/90-day prices for open trade outcomes."""
+    """
+    Record 30/60/90-day prices for open trade outcomes.
+    Uses >= threshold (not an exact-day match) so a missed run — scheduler
+    downtime, a holiday, the box being off — doesn't permanently skip a
+    checkpoint; each checkpoint is only ever written once (guarded by the
+    review_Xd_price column already being NULL).
+    """
     try:
         import db
         import yfinance as yf
@@ -438,14 +768,29 @@ def review_trade_outcomes(self):
             if not o.get("entry_date"):
                 continue
             days_held = (date.today() - o["entry_date"].date()).days
-            if days_held in (30, 60, 90):
-                try:
-                    price = yf.Ticker(o["ticker"]).fast_info.last_price
-                    if price:
-                        db.update_outcome_price(o["approval_id"], days_held, price)
-                        log.info(f"[{o['ticker']}] {days_held}d review: ${price:.2f}")
-                except Exception as e:
-                    log.warning(f"[{o['ticker']}] price fetch failed: {e}")
+
+            pending_checkpoints = [
+                days for days, col in (
+                    (30, "review_30d_price"),
+                    (60, "review_60d_price"),
+                    (90, "review_90d_price"),
+                )
+                if days_held >= days and o.get(col) is None
+            ]
+            if not pending_checkpoints:
+                continue
+
+            try:
+                price = yf.Ticker(o["ticker"]).fast_info.last_price
+            except Exception as e:
+                log.warning(f"[{o['ticker']}] price fetch failed: {e}")
+                continue
+            if not price:
+                continue
+
+            for days in pending_checkpoints:
+                db.update_outcome_price(o["approval_id"], days, price)
+                log.info(f"[{o['ticker']}] {days}d checkpoint (held {days_held}d): ${price:.2f}")
     except Exception as e:
         log.error(f"review_trade_outcomes failed: {e}")
         raise self.retry(exc=e, countdown=120)
@@ -476,3 +821,113 @@ def prune_vector_store(self):
     except Exception as e:
         log.error(f"prune_vector_store failed: {e}")
         raise self.retry(exc=e, countdown=300)
+
+
+@app.task(name="tasks.weekly_self_review", bind=True, max_retries=1)
+def weekly_self_review(self):
+    """
+    Weekly performance self-review: closed-trade outcomes + alpha, conviction
+    calibration, bucket attribution, slippage, ingestion health — synthesized
+    into a narrative by the analyst model, sent to Telegram and stored in
+    ChromaDB. This is the closest a solo operator gets to an institutional
+    performance-review cadence; the human reads it and adjusts
+    knowledge/*.md or config.py accordingly.
+    """
+    try:
+        import db
+        import alerts
+        from datetime import datetime, timedelta, timezone
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+        all_outcomes = db.get_all_outcomes(limit=500)
+        week_closed = [
+            o for o in all_outcomes
+            if o.get("exit_date") and o["exit_date"] >= cutoff
+        ]
+        wins = sum(1 for o in week_closed if o.get("was_correct"))
+        alphas = [o["alpha_pct"] for o in week_closed if o.get("alpha_pct") is not None]
+        avg_alpha = sum(alphas) / len(alphas) if alphas else None
+
+        calibration = db.get_conviction_calibration()
+        attribution = db.get_bucket_attribution()
+        slippage = db.get_slippage_summary()
+        ingestion_issues = _get_stale_ingestion_sources()
+
+        context_lines = [
+            f"=== WEEK OF {datetime.now(timezone.utc).strftime('%Y-%m-%d')} ===",
+            f"Closed trades this week: {len(week_closed)}, wins: {wins}"
+            + (f" ({wins/len(week_closed):.0%} win rate)" if week_closed else ""),
+        ]
+        if avg_alpha is not None:
+            context_lines.append(f"Average alpha vs SPY on closed trades: {avg_alpha:+.1%}")
+        for o in week_closed[:15]:
+            context_lines.append(
+                f"  {o['ticker']}: {o['action']} conviction={o['conviction']}, "
+                f"outcome={o.get('outcome_pct')}, alpha={o.get('alpha_pct')}"
+            )
+
+        context_lines.append("\n=== CONVICTION CALIBRATION (all-time) ===")
+        for c in calibration:
+            context_lines.append(
+                f"  Conviction {c['conviction']}/10: {c['total']} trades, "
+                f"{c['win_rate']:.0%} win rate, avg alpha {c.get('avg_alpha_pct')}"
+            )
+
+        context_lines.append("\n=== BUCKET ATTRIBUTION (all-time) ===")
+        for a in attribution:
+            context_lines.append(
+                f"  {a['thesis_bucket']}: {a['closed_trades']} trades, "
+                f"${a['dollar_pnl']:+,.2f} P&L on ${a['dollar_deployed']:,.2f} deployed"
+            )
+
+        context_lines.append(f"\n=== EXECUTION ===\nSlippage: {slippage}")
+        if ingestion_issues:
+            context_lines.append(f"\n=== DATA HEALTH ISSUES ===\n" + "\n".join(ingestion_issues))
+
+        context = "\n".join(context_lines)
+
+        prompt = (
+            "You are reviewing this trading system's performance for the past week. "
+            "Write a concise, honest self-review (under 250 words) covering: "
+            "1) What worked and what didn't this week, 2) whether conviction calibration "
+            "looks accurate or overconfident, 3) whether any bucket is not paying for its risk, "
+            "4) one concrete, specific suggestion for the human operator to consider adjusting "
+            "(e.g. a knowledge file, a config threshold, or a data source). "
+            "Be specific and numeric where the data supports it. Do not pad with generic advice.\n\n"
+            f"{context}"
+        )
+
+        summary = None
+        try:
+            import requests
+            from config import ANALYST_MODEL, OLLAMA_HOST
+            resp = requests.post(
+                f"{OLLAMA_HOST}/api/generate",
+                json={"model": ANALYST_MODEL, "prompt": prompt, "stream": False,
+                      "options": {"temperature": 0.3, "num_predict": 500, "num_ctx": 8192}},
+                timeout=180,
+            )
+            resp.raise_for_status()
+            summary = resp.json().get("response", "").strip()
+        except Exception as e:
+            log.warning(f"Weekly self-review LLM call failed, sending raw stats instead: {e}")
+
+        if not summary:
+            summary = context[:1500]
+
+        alerts._send(f"🗓️ <b>Weekly Self-Review</b>\n\n{summary}")
+
+        try:
+            import vector_store
+            vector_store.store(
+                collection="self_review",
+                doc_id=f"self_review_{datetime.now(timezone.utc).strftime('%Y%m%d')}",
+                text=summary,
+                metadata={"type": "weekly_self_review"},
+            )
+        except Exception as e:
+            log.warning(f"Could not store weekly self-review in vector memory: {e}")
+
+    except Exception as e:
+        log.error(f"weekly_self_review failed: {e}")
+        raise self.retry(exc=e, countdown=600)

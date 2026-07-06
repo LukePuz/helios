@@ -26,6 +26,17 @@ BASE_URL = "https://api.unusualwhales.com/api"
 
 from config import SYMBOLS
 
+# Placeholder-key detection — the .env ships with a literal placeholder
+# string rather than leaving the var unset, so an empty check isn't enough.
+_KEY_CONFIGURED = bool(API_KEY) and not API_KEY.startswith("your_")
+
+if not _KEY_CONFIGURED:
+    log.info(
+        "UNUSUAL_WHALES_API_KEY not configured — options flow, dark pool, and "
+        "ETF flow calls will degrade to the free yfinance-based proxy "
+        "(ingestion.options_free) instead of silently returning empty stubs."
+    )
+
 
 def _get_flow(ticker: str) -> list[dict]:
     """Fetches recent unusual options flow for a ticker."""
@@ -65,7 +76,12 @@ def get_flow_summary(ticker: str) -> dict:
     """
     Returns a structured summary of current options flow for a ticker.
     Used by context_engine to populate situation brief.
+    Falls back to the free yfinance-based proxy when no API key is set.
     """
+    if not _KEY_CONFIGURED:
+        from ingestion.options_free import get_flow_summary as _free_summary
+        return _free_summary(ticker)
+
     flows = _get_flow(ticker)
     if not flows:
         return {"ticker": ticker, "unusual": False, "summary": "No options flow data."}
@@ -105,9 +121,9 @@ def get_flow_summary(ticker: str) -> dict:
 
 def get_all_flow_summaries() -> dict[str, dict]:
     """Returns flow summary for every symbol. Used in context assembly."""
-    if not API_KEY:
-        log.debug("UNUSUAL_WHALES_API_KEY not set — options flow skipped.")
-        return {s: {"ticker": s, "unusual": False, "summary": "API key not configured."} for s in SYMBOLS}
+    if not _KEY_CONFIGURED:
+        from ingestion.options_free import get_all_flow_summaries as _free_all
+        return _free_all()
 
     summaries = {}
     for ticker in SYMBOLS:
@@ -123,8 +139,9 @@ def get_darkpool_activity(ticker: str) -> dict:
     Returns stub with has_significant_print=False on error or missing key.
     """
     stub = {"ticker": ticker, "has_significant_print": False, "total_value": 0, "largest_print": 0, "summary": ""}
-    if not API_KEY:
-        return stub
+    if not _KEY_CONFIGURED:
+        from ingestion.options_free import get_darkpool_activity as _free_dp
+        return _free_dp(ticker)
     try:
         resp = requests.get(
             f"{BASE_URL}/darkpool/{ticker}",
@@ -167,7 +184,11 @@ def get_etf_flows(etf_tickers: list[str] | None = None) -> dict:
     if etf_tickers is None:
         etf_tickers = ["SPY", "QQQ", "SOXX", "XLK", "ARKK"]
 
-    if not API_KEY:
+    if not _KEY_CONFIGURED:
+        # No good free source for ETF options flow — explicitly degrade rather
+        # than silently return {}. Callers (market_regime breadth signal) must
+        # fall back to their own proxy when this is empty.
+        log.debug("get_etf_flows: no free alternative available — returning {}")
         return {}
 
     results = {}

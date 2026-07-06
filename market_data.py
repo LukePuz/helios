@@ -1,26 +1,93 @@
 """
 Market data access via Interactive Brokers (ib_insync).
 TWS must be running on port 7497 (paper) or 7496 (live).
+
+Central price authority: every quote carries a bar timestamp and staleness
+metadata so consumers (drift guards, stop monitors) can refuse to act on
+last-RTH prices hours after the close.
 """
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, time as dtime, timezone
 
 from ibkr import get_latest_price, get_historical_bars
 from config import SYMBOLS
 
 log = logging.getLogger(__name__)
 
+# A 1-min bar older than this is considered stale for execution decisions
+STALE_AFTER_MINUTES = 20
+
+
+def _is_market_hours(now_utc: datetime | None = None) -> bool:
+    """Rough US regular-trading-hours check (Mon-Fri 13:30-20:00 UTC)."""
+    now = now_utc or datetime.now(timezone.utc)
+    if now.weekday() >= 5:
+        return False
+    return dtime(13, 30) <= now.time() <= dtime(20, 0)
+
+
+def get_priced_quote(ticker: str) -> dict | None:
+    """
+    Returns {price, bar_time, age_minutes, is_stale, market_open} or None.
+    price comes from the last 1-min bar (RTH); is_stale is True whenever the
+    bar is older than STALE_AFTER_MINUTES — i.e. always true outside RTH.
+    """
+    try:
+        bars = get_historical_bars(ticker, duration="1 D", bar_size="1 min")
+        if not bars:
+            bars = get_historical_bars(ticker, duration="2 D", bar_size="1 day")
+        if not bars:
+            return None
+        last = bars[-1]
+        price = float(last["close"])
+
+        bar_time = None
+        age_min: float | None = None
+        try:
+            # IBKR bar dates: '20260706 15:59:00 US/Eastern' or date-only for daily
+            raw = str(last["time"]).split(" US/")[0]
+            for fmt in ("%Y%m%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y%m%d", "%Y-%m-%d"):
+                try:
+                    bar_time = datetime.strptime(raw, fmt)
+                    break
+                except ValueError:
+                    continue
+            if bar_time:
+                # Bar times arrive in exchange-local time; treat as UTC-approx
+                # for age purposes (error is bounded by tz offset and only
+                # makes the check MORE conservative during RTH).
+                age_min = (datetime.now(timezone.utc)
+                           - bar_time.replace(tzinfo=timezone.utc)).total_seconds() / 60
+        except Exception:
+            pass
+
+        market_open = _is_market_hours()
+        is_stale = (age_min is None) or (age_min > STALE_AFTER_MINUTES) or not market_open
+
+        return {
+            "price":       price,
+            "bar_time":    bar_time,
+            "age_minutes": round(age_min, 1) if age_min is not None else None,
+            "is_stale":    is_stale,
+            "market_open": market_open,
+        }
+    except Exception as e:
+        log.warning(f"get_priced_quote({ticker}) failed: {e}")
+        return None
+
 
 def get_latest_quotes(symbols: list[str]) -> dict[str, dict]:
-    """Returns latest price for each symbol."""
+    """
+    Returns latest known price per symbol with staleness metadata.
+    NOTE: bid/ask are NOT available from bar data — do not fabricate them.
+    """
     result = {}
     for ticker in symbols:
-        price = get_latest_price(ticker)
-        if price:
+        q = get_priced_quote(ticker)
+        if q:
             result[ticker] = {
-                "bid":       price,
-                "ask":       price,
-                "mid":       price,
+                "mid":       q["price"],
+                "is_stale":  q["is_stale"],
                 "timestamp": datetime.now(timezone.utc),
             }
     return result
@@ -40,7 +107,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     print(f"Fetching quotes via IBKR at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n")
     quotes = get_latest_quotes(SYMBOLS[:5])
-    print(f"{'Symbol':<8} {'Price':>10}")
-    print("-" * 20)
+    print(f"{'Symbol':<8} {'Price':>10} {'Stale':>6}")
+    print("-" * 28)
     for symbol, q in quotes.items():
-        print(f"{symbol:<8} ${q['mid']:>9.2f}")
+        print(f"{symbol:<8} ${q['mid']:>9.2f} {str(q['is_stale']):>6}")

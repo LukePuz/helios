@@ -36,7 +36,23 @@ SEARCH_QUERIES = [
     'ti:"neural processing unit" OR ti:"AI accelerator" OR ti:"CUDA"',
 ]
 
-_seen_papers: set[str] = set()
+_SOURCE = "arxiv"
+
+
+def _is_seen(paper_id: str) -> bool:
+    try:
+        import db
+        return db.is_seen(_SOURCE, paper_id)
+    except Exception:
+        return False
+
+
+def _mark_seen(paper_id: str) -> None:
+    try:
+        import db
+        db.mark_seen(_SOURCE, paper_id)
+    except Exception as e:
+        log.debug(f"mark_seen failed for {paper_id}: {e}")
 
 
 def _search(query: str, max_results: int = 10) -> list[dict]:
@@ -61,7 +77,7 @@ def _search(query: str, max_results: int = 10) -> list[dict]:
         root = ET.fromstring(resp.text)
         for entry in root.findall("atom:entry", ns):
             paper_id = entry.findtext("atom:id", namespaces=ns) or ""
-            if paper_id in _seen_papers:
+            if _is_seen(paper_id):
                 continue
 
             title   = (entry.findtext("atom:title",   namespaces=ns) or "").strip().replace("\n", " ")
@@ -73,7 +89,7 @@ def _search(query: str, max_results: int = 10) -> list[dict]:
                 for a in entry.findall("atom:author", namespaces=ns)
             ]
 
-            _seen_papers.add(paper_id)
+            _mark_seen(paper_id)
             papers.append({
                 "source":    "arxiv",
                 "paper_id":  paper_id,

@@ -146,14 +146,19 @@ def process_candidates(candidates: list[dict], max_per_run: int = 5) -> list[dic
         log.info("No candidates to analyze")
         return []
 
-    results = analyze_batch(to_analyze, regime_packet=regime)
-
+    # Built BEFORE analyze_batch (not after, as before) so each candidate's
+    # situation brief can include live portfolio/account context.
     try:
         from ibkr import IBKRClient
         client = IBKRClient()
+        positions = _get_positions(client)
     except Exception as e:
-        log.warning(f"Could not init IBKR client for routing: {e}")
+        log.warning(f"Could not init IBKR client for brief/routing: {e}")
         client = None
+        positions = {}
+
+    results = analyze_batch(to_analyze, regime_packet=regime,
+                            positions=positions, trading_client=client)
 
     for result in results:
         if result.get("pass_to_risk") and client:
@@ -226,15 +231,16 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
         log.warning(f"[{ticker}] Could not determine price — skipping approval queue")
         return
 
-    # Size the position
+    # Size the position — stamp the price used so execution can validate freshness
     sizing = rm.size_position(ticker, conviction, bucket, regime_str, price)
+    sizing["price_at_sizing"] = price
     if sizing.get("shares_initial", 0) <= 0:
         flags = sizing.get("flags", [])
         log.info(f"[{ticker}] Risk sizing returned 0 shares: {flags}")
         return
 
     # Concentration check
-    conc = rm.check_concentration(ticker, sizing["position_size_pct"])
+    conc = rm.check_concentration(ticker, sizing["position_size_pct"], bucket=bucket)
     if not conc["passed"]:
         log.info(f"[{ticker}] Concentration check failed: {conc['flags']}")
         # Still queue but with a flag in entry_strategy

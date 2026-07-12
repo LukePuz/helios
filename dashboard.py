@@ -2,6 +2,7 @@ import math
 import os
 import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -202,7 +203,7 @@ with st.sidebar:
     if ollama_ok:
         st.caption(ollama_info)
     else:
-        st.caption("Ollama not running — start it from the system tray")
+        st.caption("Ollama not running — run 'ollama serve' (or check its systemd service)")
 
     st.divider()
 
@@ -576,6 +577,17 @@ with tab_regime:
                 c3.metric("Last Updated", pd.to_datetime(rts, utc=True).strftime("%b %d %I:%M %p UTC"))
 
             st.progress(rscore / 100)
+
+            # Markov persistence signal (guarded — older DB rows predate this key)
+            _markov = (regime_data.get("signals_json") or {}).get("markov") or {}
+            _mstate = _markov.get("state")
+            _mstick = _markov.get("stickiness")
+            _msig   = _markov.get("signal")
+            if _mstate is not None and _mstick is not None and _msig is not None:
+                st.caption(
+                    f"SPY Markov state: **{_mstate}** "
+                    f"(stickiness {_mstick:.0%}, directional signal {_msig:+.2f})"
+                )
 
             # Portfolio impact guidance
             impact = regime_data.get("portfolio_impact_json") or {}
@@ -1071,13 +1083,21 @@ with tab_logs:
     with agent_tabs[-1]:
         ollama_ok, ollama_info = pm.ollama_status()
         st.caption(f"Status: {'🟢 Running' if ollama_ok else '🔴 Not running'} — {ollama_info}")
-        ollama_log = Path(os.path.expanduser("~")) / "AppData" / "Local" / "Ollama" / "server.log"
+        if sys.platform == "win32":
+            ollama_log = Path(os.path.expanduser("~")) / "AppData" / "Local" / "Ollama" / "server.log"
+        else:
+            # launch.sh redirects `ollama serve` here; a systemd-managed
+            # install instead logs to `journalctl -u ollama`.
+            ollama_log = Path(__file__).parent / "logs" / "ollama.log"
         if ollama_log.exists():
             lines = st.slider("Lines", 20, 300, 80, key="logslider_ollama")
             text = ollama_log.read_text(encoding="utf-8", errors="replace").splitlines()
             st.code("\n".join(text[-lines:]), language=None)
-        else:
+        elif sys.platform == "win32":
             st.info("Ollama log not found. Check system tray to confirm Ollama is running.")
+        else:
+            st.info(f"Ollama log not found at {ollama_log}. If Ollama runs as a systemd "
+                     "service, check `journalctl -u ollama` instead.")
 
 
 # ── Tab 5: Manual Trade ───────────────────────────────────────────────────────

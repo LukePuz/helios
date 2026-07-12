@@ -20,14 +20,14 @@ sentence-transformers>=3.0.0
 celery>=5.4.0
 redis>=5.0.0
 
-# Agent framework (install manually: pip install crewai)
-# crewai — add when Python 3.12 venv is active
-
 # Dashboard & visualization
 streamlit>=1.35.0
 streamlit-autorefresh>=1.0.1
 plotly>=5.22.0
 pandas>=2.2.0
+
+# Process lifecycle (dashboard start/stop/status for celery/uvicorn services)
+psutil>=5.9.0
 
 # HTTP
 requests>=2.32.0

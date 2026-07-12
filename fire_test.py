@@ -4,7 +4,7 @@ every stage: Screen → Analyst → Risk Manager → DB → Telegram.
 
 Forces each stage through even if it would normally be filtered out.
 Run with:
-    venv\Scripts\python.exe fire_test.py
+    venv/bin/python fire_test.py
 """
 
 import logging

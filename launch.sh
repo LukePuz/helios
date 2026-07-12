@@ -33,7 +33,8 @@ fi
 # --- Ollama ---
 if command -v ollama &>/dev/null; then
     if ! pgrep -x ollama &>/dev/null; then
-        ollama serve &>/dev/null &
+        mkdir -p logs
+        ollama serve &>>logs/ollama.log &
         sleep 2
         echo "Ollama: started"
     else

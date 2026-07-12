@@ -41,7 +41,7 @@ except ImportError:
 # Signal scoring constants (from market_regime_rules.md)
 # ---------------------------------------------------------------------------
 _SCORE = {"Very Bullish": 5, "Bullish": 2, "Neutral": 0, "Bearish": -2, "Very Bearish": -5}
-_WEIGHTS = {"trend": 1, "volatility": 2, "liquidity": 2, "credit": 2, "breadth": 1, "volume": 1}
+_WEIGHTS = {"trend": 1, "volatility": 2, "liquidity": 2, "credit": 2, "breadth": 1, "volume": 1, "markov": 1}
 
 # Min/max possible weighted raw score (for normalization)
 _MAX_RAW = sum(5 * w for w in _WEIGHTS.values())   # all Very Bullish
@@ -292,6 +292,42 @@ def _score_volume(spy_bars: list[dict]) -> tuple[int, str]:
         return _SCORE["Neutral"], f"Mixed volume: {ratio:.0%} on up days"
 
 
+def _score_markov(packet: dict) -> tuple[int, str]:
+    """
+    Empirical Markov transition-persistence signal for SPY 20-day return
+    states. See agents/markov_regime.py for the transition-matrix estimation
+    and knowledge/market_regime_rules.md for the threshold rationale.
+    """
+    if not packet.get("available"):
+        return _SCORE["Neutral"], packet.get("notes") or "Markov data unavailable"
+
+    state = packet.get("state", "unknown")
+    row_samples = packet.get("row_samples", 0)
+    if row_samples < 10:
+        return _SCORE["Neutral"], (
+            f"Markov signal suppressed — only {row_samples} historical samples "
+            f"for state '{state}'"
+        )
+
+    signal     = packet.get("signal", 0.0)
+    stickiness = packet.get("stickiness", 0.0)
+    notes = (
+        f"SPY Markov state={state}, stickiness={stickiness:.0%}, "
+        f"signal={signal:+.2f} (n={row_samples})"
+    )
+
+    if signal >= 0.30:
+        return _SCORE["Very Bullish"], notes
+    elif signal >= 0.10:
+        return _SCORE["Bullish"], notes
+    elif signal > -0.10:
+        return _SCORE["Neutral"], notes
+    elif signal > -0.30:
+        return _SCORE["Bearish"], notes
+    else:
+        return _SCORE["Very Bearish"], notes
+
+
 # ---------------------------------------------------------------------------
 # Watchlist breadth sample (uses the price_history cache)
 # ---------------------------------------------------------------------------
@@ -406,6 +442,14 @@ def assess_regime() -> dict:
     credit_raw,     credit_notes     = _score_credit(macro)
     volume_raw,     volume_notes     = _score_volume(spy_bars)
 
+    try:
+        from agents.markov_regime import get_markov_packet
+        markov_packet = get_markov_packet()
+    except Exception as e:
+        log.warning(f"Markov regime fetch failed: {e}")
+        markov_packet = {"available": False, "notes": str(e)}
+    markov_raw, markov_notes = _score_markov(markov_packet)
+
     # --- Apply weights ---
     weighted_raw = (
         trend_raw      * _WEIGHTS["trend"]      +
@@ -413,7 +457,8 @@ def assess_regime() -> dict:
         liquidity_raw  * _WEIGHTS["liquidity"]  +
         credit_raw     * _WEIGHTS["credit"]     +
         breadth_raw    * _WEIGHTS["breadth"]    +
-        volume_raw     * _WEIGHTS["volume"]
+        volume_raw     * _WEIGHTS["volume"]     +
+        markov_raw     * _WEIGHTS["markov"]
     )
 
     score      = _normalize(weighted_raw)
@@ -428,6 +473,7 @@ def assess_regime() -> dict:
         "credit":     (credit_raw,     credit_notes),
         "breadth":    (breadth_raw,    breadth_notes),
         "volume":     (volume_raw,     volume_notes),
+        "markov":     (markov_raw,     markov_notes),
     }
     key_drivers = [
         notes for name, (raw, notes) in scores_map.items() if raw >= 2
@@ -466,6 +512,13 @@ def assess_regime() -> dict:
     }
     portfolio_impact = _impact.get(regime, _impact["Neutral"])
 
+    # --- Markov signal detail (only when the packet was actually available) ---
+    markov_signal = {"score": markov_raw, "notes": markov_notes}
+    if markov_packet.get("available"):
+        markov_signal["state"]      = markov_packet.get("state")
+        markov_signal["stickiness"] = markov_packet.get("stickiness")
+        markov_signal["signal"]     = markov_packet.get("signal")
+
     # --- Build reasoning ---
     signal_lines = "\n".join(
         f"  {name} ({_WEIGHTS[name]}x): score={raw} — {notes}"
@@ -492,6 +545,7 @@ def assess_regime() -> dict:
             "credit":     {"score": credit_raw,     "notes": credit_notes},
             "breadth":    {"score": breadth_raw,    "notes": breadth_notes},
             "volume":     {"score": volume_raw,     "notes": volume_notes},
+            "markov":     markov_signal,
         },
         "portfolio_impact": portfolio_impact,
         "key_drivers": key_drivers,

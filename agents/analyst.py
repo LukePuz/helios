@@ -93,6 +93,14 @@ def _build_prompt(
     regime    = regime_packet.get("regime",   "Neutral")
     reg_score = regime_packet.get("score",    50)
 
+    _markov = regime_packet.get("signals", {}).get("markov", {})
+    markov_line = ""
+    if _markov.get("state") is not None and _markov.get("stickiness") is not None and _markov.get("signal") is not None:
+        markov_line = (
+            f"\nSPY Markov state: {_markov['state']} "
+            f"(stickiness {_markov['stickiness']:.0%}, directional signal {_markov['signal']:+.2f})"
+        )
+
     # Generous caps — num_ctx was raised from 8192, and the budget loop below
     # trims further if the assembled prompt still doesn't fit.
     thesis_excerpt      = thesis_text[:6000]
@@ -111,7 +119,7 @@ def _build_prompt(
 {thesis_excerpt}
 
 === MARKET REGIME ===
-Current Regime: {regime} (score: {reg_score}/100)
+Current Regime: {regime} (score: {reg_score}/100){markov_line}
 {regime_packet.get("reasoning", "")[:500]}
 {track_record_section}
 === CANDIDATE DETAILS ===

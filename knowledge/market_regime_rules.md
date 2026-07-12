@@ -46,6 +46,7 @@ A great thesis in a Risk-Off regime still deserves reduced sizing.
 | Credit | 2x | Leading stress indicator |
 | Breadth | 1x | Participation quality |
 | Volume | 1x | Conviction confirmation |
+| Markov persistence | 1x | Empirical state-transition probabilities — quantifies trend stickiness |
 
 ### Weighted Score Formula
 
@@ -119,6 +120,42 @@ Require at least one other confirming signal before treating as Very Bullish.
 | Strong accumulation (high volume on up days) | Bullish | +2 |
 | Mixed / no clear pattern | Neutral | 0 |
 | Distribution (high volume on down days) | Bearish | -2 |
+
+### Markov Persistence Signals (1x weight)
+
+Classifies each trading day's trailing 20-day SPY return into a state:
+
+| Condition | State |
+|---|---|
+| 20-day return > +5% | bull |
+| 20-day return in [-5%, +5%] | sideways |
+| 20-day return < -5% | bear |
+
+An empirical first-order transition matrix, P(next state \| current state),
+is estimated from the historical state sequence sampled at **non-overlapping**
+20-day strides (sampling every day would make consecutive states share 19 of
+20 underlying closes and artificially inflate measured stickiness).
+
+The directional signal is:
+
+```
+signal = P(next = bull | current state) - P(next = bear | current state)
+```
+
+which ranges from -1 (strongly bearish continuation) to +1 (strongly bullish
+continuation).
+
+| Condition | Signal | Score |
+|---|---|---|
+| signal >= +0.30 | Very Bullish | +5 |
+| signal >= +0.10 | Bullish | +2 |
+| signal > -0.10 | Neutral | 0 |
+| signal > -0.30 | Bearish | -2 |
+| signal <= -0.30 | Very Bearish | -5 |
+
+**Low-sample suppression:** if the current state has fewer than 10 historical
+non-overlapping transition samples, the signal is unreliable and is forced to
+Neutral regardless of its computed value.
 
 ---
 

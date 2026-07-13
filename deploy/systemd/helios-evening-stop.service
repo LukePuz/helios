@@ -1,0 +1,14 @@
+[Unit]
+Description=Stop Helios + IBKR for the night, then suspend the PC
+
+[Service]
+Type=oneshot
+# Order matters: stop the bot before yanking its broker connection out from
+# under it, then IBC/TWS, then the virtual display it ran in. Suspending
+# last (not poweroff) so the RTC-wake timers below can bring it back —
+# WakeSystem= on helios-start.timer only works from suspend, not from a
+# fully powered-off machine.
+ExecStart=/usr/bin/systemctl stop helios-local.service
+ExecStart=/usr/bin/systemctl stop ibc.service
+ExecStart=/usr/bin/systemctl stop xvfb.service
+ExecStart=/usr/bin/systemctl suspend

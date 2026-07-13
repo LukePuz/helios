@@ -1,0 +1,20 @@
+[Unit]
+Description=Wake the PC and start Helios each weekday premarket
+
+[Timer]
+# 8:45 AM ET — 45 min before the 9:30 open, enough time for IBC/TWS login,
+# Ollama model warm-up, and the initial regime assessment to finish before
+# the 9:30 assess-regime / 9:35 scan Celery tasks fire. Adjust the time if
+# your machine needs longer (slower TWS login, cold model load, etc).
+OnCalendar=Mon..Fri 08:45:00 America/New_York
+# WakeSystem is what actually wakes the machine from suspend for this —
+# systemd arms the RTC to this timer's next elapse whenever the system
+# suspends, regardless of what triggered the suspend.
+WakeSystem=true
+# If the machine was off/suspended-past-this-time for some other reason,
+# run it as soon as it's next up rather than silently skipping the day.
+Persistent=true
+Unit=helios-local.service
+
+[Install]
+WantedBy=timers.target

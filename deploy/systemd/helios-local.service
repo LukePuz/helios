@@ -1,0 +1,23 @@
+[Unit]
+Description=Helios Hedgefund trading bot (local checkout)
+After=network-online.target ibc.service
+Wants=network-online.target
+Requires=ibc.service
+
+[Service]
+Type=simple
+User=luke-puzenski
+WorkingDirectory=/home/luke-puzenski/Desktop/trading_bot
+# Blocks startup until TWS's API port actually accepts connections — IBC's
+# headless login can take well over a minute; without this, main.py's own
+# retry logic would be racing IBC on every cold morning start.
+ExecStartPre=/home/luke-puzenski/Desktop/trading_bot/deploy/systemd/wait-for-ibkr.sh 180
+ExecStart=/home/luke-puzenski/Desktop/trading_bot/venv/bin/python /home/luke-puzenski/Desktop/trading_bot/main.py
+Restart=on-failure
+RestartSec=10
+
+StandardOutput=append:/home/luke-puzenski/Desktop/trading_bot/helios-systemd.log
+StandardError=append:/home/luke-puzenski/Desktop/trading_bot/helios-systemd.log
+
+[Install]
+WantedBy=multi-user.target

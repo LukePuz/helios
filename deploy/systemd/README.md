@@ -50,3 +50,36 @@ tail -f /opt/helios/helios.log    # the bot's own application log
   headless via [IBC](https://github.com/IbcAlpha/IBC) in its own systemd
   unit or container — set that up separately and make sure it's listening
   on the port in `.env` (`IB_PORT`) before Helios starts placing orders.
+
+## Fully unattended: wake, login, run, sleep on a schedule
+
+For a machine that should power itself up premarket, log into TWS with no
+one at the keyboard, run the bot through the session, and put itself back
+to sleep a few hours after close — see `install-auto-schedule.sh` in this
+directory. It wires together:
+
+- `xvfb.service` / `ibc.service` — [IBC](https://github.com/IbcAlpha/IBC)
+  driving TWS on a virtual display (`:1`), so login happens with no real
+  desktop session involved. **IBC is a third-party tool, not from IBKR** —
+  it works by typing your credentials into the TWS login dialog on IBC's
+  behalf, which means those credentials live in `~/ibc/config.ini`
+  (`chmod 600`, outside this repo, never commit it). If your account
+  requires 2FA (a phone-tap push notification), this cannot be automated —
+  IBC will hang waiting for a factor no script can provide.
+- `helios-local.service` — waits (`wait-for-ibkr.sh`) for TWS's API port to
+  actually accept connections before starting `main.py`, since IBC's login
+  can take well over a minute.
+- `helios-start.timer` / `helios-evening-stop.timer` — the daily schedule.
+  The start timer uses `WakeSystem=true`, which arms the machine's RTC to
+  wake it from suspend at the scheduled time regardless of what put it to
+  sleep the night before. The evening timer stops everything and calls
+  `systemctl suspend` (not a full shutdown — full poweroff would need a
+  BIOS-level "Power On by RTC Alarm" setting this can't configure
+  remotely; suspend + RTC-wake is software-only and works on most desktops
+  out of the box).
+
+Edit the two `OnCalendar=` times in `helios-start.timer` /
+`helios-evening-stop.timer` before installing if the defaults (8:45 AM /
+7:00 PM America/New_York) don't fit. Note the evening timer suspends the
+*entire machine*, not just the bot — anyone using it for something else
+at that hour will get interrupted.

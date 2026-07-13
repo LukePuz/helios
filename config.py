@@ -28,9 +28,16 @@ def _load_symbols() -> list[str]:
 SYMBOLS: list[str] = _load_symbols()
 
 # ---------------------------------------------------------------------------
-# Portfolio baseline
-# ---------------------------------------------------------------------------
-START_VALUE = 100_000.0
+# Portfolio baseline — must match this account's actual starting net
+# liquidation value, not an arbitrary round number. Used as the P&L=0 line
+# on the dashboard and as the fallback high-water-mark seed for the
+# drawdown-halt circuit breaker (tasks.check_portfolio_drawdown) the first
+# time it ever runs against a given database. IBKR paper accounts seed at
+# $1,000,000 by default, not $100k — a mismatch here either makes the
+# dashboard show a fake multi-hundred-thousand-dollar "profit," or, worse,
+# could false-trigger the drawdown halt on first run if the real balance is
+# ever *below* this constant.
+START_VALUE = 1_001_433.51
 POLL_INTERVAL_SECONDS = 300  # 5 minutes (portfolio snapshots)
 
 # ---------------------------------------------------------------------------

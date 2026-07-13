@@ -1,9 +1,11 @@
 """
-Interactive Brokers connection module via ib_insync.
+Interactive Brokers connection module via ib_async (the maintained fork of
+ib_insync — the original is unmaintained and its asyncio internals break on
+Python 3.13+ with "Timeout should be used inside a task").
 Replaces Alpaca for order execution, account data, and market data.
 
 Requirements:
-  pip install ib_insync nest_asyncio
+  pip install ib_async
 
 TWS must be running with API enabled:
   - Paper trading port: 7497  (IB_PORT=7497)
@@ -19,10 +21,10 @@ import os
 from pathlib import Path
 from typing import Any
 
-import nest_asyncio
-nest_asyncio.apply()
-
-import ib_insync as ibi
+# NOTE: do not re-add nest_asyncio.apply() here — its loop patching is broken
+# on Python 3.13+ and makes every connect fail with "Timeout should be used
+# inside a task". ib_async manages its own per-thread event loops.
+import ib_async as ibi
 from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
@@ -34,6 +36,10 @@ IB_PORT      = int(os.getenv("IB_PORT",      "7497"))   # 7497=paper, 7496=live
 IB_CLIENT_ID = int(os.getenv("IB_CLIENT_ID", "1"))
 
 _ib: ibi.IB | None = None
+_last_heartbeat: float = 0.0   # time.monotonic() of last successful heartbeat
+
+_HEARTBEAT_INTERVAL_S = 30
+_HEARTBEAT_TIMEOUT_S  = 8
 
 
 # ---------------------------------------------------------------------------
@@ -41,7 +47,8 @@ _ib: ibi.IB | None = None
 # ---------------------------------------------------------------------------
 
 def get_ib(max_attempts: int = 3) -> ibi.IB:
-    global _ib
+    global _ib, _last_heartbeat
+    import asyncio
     import time
     for attempt in range(1, max_attempts + 1):
         try:
@@ -50,14 +57,32 @@ def get_ib(max_attempts: int = 3) -> ibi.IB:
             if not _ib.isConnected():
                 _ib.connect(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID,
                             readonly=False, timeout=10)
-            # Heartbeat — reqCurrentTime() round-trips to TWS and catches stale connections
-            # that report isConnected()=True but are no longer communicating.
-            _ib.reqCurrentTime()
-            log.info(f"Connected to IBKR TWS at {IB_HOST}:{IB_PORT} (clientId={IB_CLIENT_ID})")
+                _last_heartbeat = 0.0
+                log.info(f"Connected to IBKR TWS at {IB_HOST}:{IB_PORT} (clientId={IB_CLIENT_ID})")
+            # Heartbeat — round-trips to TWS to catch stale connections that
+            # report isConnected()=True but are no longer communicating.
+            # Two constraints discovered the hard way:
+            #   - TWS silently ignores a repeated reqCurrentTime arriving
+            #     within the same second, and ib_async waits for the reply
+            #     with NO timeout — so back-to-back get_ib() calls deadlock.
+            #     Hence the 30s throttle.
+            #   - The asyncio.wait_for bound turns a genuinely dead session
+            #     into an exception that triggers the reconnect below,
+            #     instead of an infinite hang.
+            if time.monotonic() - _last_heartbeat > _HEARTBEAT_INTERVAL_S:
+                ibi.util.run(asyncio.wait_for(
+                    _ib.reqCurrentTimeAsync(), timeout=_HEARTBEAT_TIMEOUT_S))
+                _last_heartbeat = time.monotonic()
             return _ib
         except Exception as e:
             log.warning(f"IBKR connect attempt {attempt}/{max_attempts} failed: {e}")
+            try:
+                if _ib is not None:
+                    _ib.disconnect()
+            except Exception:
+                pass
             _ib = None  # force fresh IB() on next attempt
+            _last_heartbeat = 0.0
             if attempt < max_attempts:
                 time.sleep(3 * attempt)  # 3s, 6s backoff
     raise ConnectionError(

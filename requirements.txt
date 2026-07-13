@@ -2,8 +2,10 @@
 # (execution moved from Alpaca to Interactive Brokers — alpaca-py removed,
 #  nothing in the codebase imports it anymore)
 polygon-api-client>=1.13.0
-ib_insync>=0.9.86
-nest_asyncio>=1.6.0
+# ib_async is the maintained fork of ib_insync (unmaintained; breaks on
+# Python 3.13+ asyncio). Same API, imported as `ib_async` in ibkr.py.
+# nest_asyncio removed for the same reason — broken on 3.13+, not needed.
+ib_async>=2.0.0
 yfinance>=0.2.40
 
 # Environment & config

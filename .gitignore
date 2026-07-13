@@ -10,7 +10,8 @@ catalyst_calendar.db
 
 # Runtime state
 .processes.json
-celerybeat-schedule.bak
-celerybeat-schedule.dat
-celerybeat-schedule.dir
+celerybeat-schedule*
 trading_bot.code-workspace
+
+# Installers (large binaries — download fresh, don't commit)
+tws-latest-standalone-*.sh

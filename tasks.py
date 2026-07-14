@@ -464,7 +464,7 @@ def _get_stale_ingestion_sources() -> list[str]:
             continue
         age_min = (now - rec["last_success_at"]).total_seconds() / 60
         if age_min > max_gap:
-            stale.append(f"{source}: last success {age_min:.0f}min ago (expected <{max_gap}min)")
+            stale.append(f"{source}: last success {age_min:.0f}min ago (expected &lt;{max_gap}min)")
     return stale
 
 
@@ -529,7 +529,7 @@ def send_daily_digest(self):
                 d = (current - stop_rec["stop_price"]) / current
                 dist = f", stop {d:+.1%} away"
             positions_text.append(
-                f"{p.symbol}: {p.qty:.0f}sh, P&L ${float(p.unrealized_pl):+,.0f}{dist}"
+                f"{p.symbol}: {p.qty:.0f}sh, P&amp;L ${float(p.unrealized_pl):+,.0f}{dist}"
             )
 
         catalysts_text = []

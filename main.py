@@ -188,7 +188,7 @@ def _check_ollama() -> None:
         logging.warning(
             "Ollama not running. AI reasoning will use keyword fallback. "
             "Start it with: ollama serve   (or: sudo systemctl start ollama), "
-            "then run: ollama pull qwen2.5:7b"
+            "then run: ollama pull qwen2.5:7b && ollama pull qwen2.5:72b"
         )
 
 

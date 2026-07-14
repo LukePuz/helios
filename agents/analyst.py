@@ -405,8 +405,26 @@ def analyze(
 
     action     = str(parsed.get("action", "WATCH")).upper()
     conviction = max(1, min(10, int(parsed.get("conviction", 1) or 1)))
-    bucket     = parsed.get("thesis_bucket", candidate.get("role", "Accelerator"))
     udr        = float(parsed.get("upside_downside_ratio", 0) or 0)
+
+    # Bucket is watchlist-authoritative, not an LLM call — strategy ("strategy
+    # is data, not code") lives in knowledge/watchlist.md, not in whatever a
+    # given inference happens to output. A DDOG recommendation was sized as
+    # Compounder (wider caps, wider ATR stop) purely because the model said so
+    # in its JSON, despite being told the watchlist role was Accelerator —
+    # silently accepting that let a weak/misconfigured model quietly loosen
+    # risk limits. The LLM's suggestion is kept for audit but never used for
+    # sizing; update the watchlist by hand if a reclassification is deliberate.
+    watchlist_role = candidate.get("role", "Accelerator")
+    llm_bucket     = parsed.get("thesis_bucket", watchlist_role)
+    bucket_mismatch = llm_bucket != watchlist_role
+    if bucket_mismatch:
+        log.warning(
+            f"[{ticker}] Analyst suggested bucket '{llm_bucket}' but watchlist role "
+            f"is '{watchlist_role}' — using the watchlist role for sizing. Update "
+            f"knowledge/watchlist.md if this reclassification should stick."
+        )
+    bucket = watchlist_role
 
     # Enforce minimum UDR for actionable recommendations
     if udr < 2.0 and action in ("OPEN", "ADD"):
@@ -457,6 +475,7 @@ def analyze(
         "action":    action,
         "conviction": conviction,
         "thesis_bucket": bucket,
+        "llm_suggested_bucket": llm_bucket if bucket_mismatch else None,
         "thesis_summary": parsed.get("thesis_summary", ""),
         "expectation_gap": parsed.get("expectation_gap", {}),
         "catalyst":  parsed.get("catalyst", {}),

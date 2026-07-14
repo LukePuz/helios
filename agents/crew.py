@@ -7,8 +7,11 @@ Two entry points:
   2. process_candidates(candidates) — scanner-driven (daily scan output)
      Analyze → Risk Size → Queue for Approval
 
-Human approval (Telegram inline buttons) is the only path to order execution.
-No autonomous trading.
+Paper trading only — recommendations that clear Risk Manager auto-execute
+immediately (see _route_to_approval) and a Telegram trade alert is sent
+after the fact. No human-in-the-loop tap, per explicit user request
+2026-07-14. Every other risk control (drawdown halt, concentration caps,
+price-drift abort, ATR stops) is unchanged.
 """
 
 import logging
@@ -173,8 +176,9 @@ def process_candidates(candidates: list[dict], max_per_run: int = 5) -> list[dic
 
 def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
     """
-    Run risk sizing on an analyst recommendation and queue it for human approval.
-    Sends a Telegram message with Approve / Reject buttons.
+    Run risk sizing on an analyst recommendation and auto-execute it (paper
+    trading only — no human approval gate, see module docstring). Sends a
+    Telegram trade alert after execution instead of an approval request.
     """
     from risk_manager import RiskManager
     import db
@@ -276,36 +280,45 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
         log.error(f"[{ticker}] Failed to log pending approval")
         return
 
-    # Send Telegram approval request
-    msg_id = alert_module.send_approval_request(
-        approval_id=approval_id,
-        ticker=ticker,
-        action=result["action"],
-        conviction=conviction,
-        bucket=bucket,
-        size_pct=sizing["position_size_pct"],
-        stop_price=sizing.get("stop_loss_price"),
-        entry_strategy=entry_strategy,
-        reasoning=result.get("reasoning", ""),
-    )
+    # Paper trading only, no real capital at risk — auto-execute instead of
+    # waiting on a Telegram approval tap. Per explicit user request 2026-07-14
+    # (see CLAUDE.md); every other risk control (drawdown halt, concentration
+    # caps, price-drift abort, ATR stop placement) still applies unchanged,
+    # only the human-in-the-loop tap is removed.
+    from telegram_bot import _execute_approved_order
 
-    if msg_id:
-        db.set_approval_telegram_id(approval_id, msg_id)
-        log.info(f"[{ticker}] Approval #{approval_id} queued — Telegram msg_id={msg_id}")
-        if _feed_emit:
-            _feed_emit("risk", ticker,
-                       f"Sized {sizing['shares_initial']} shares @ ~${price:.2f} "
+    if not db.claim_approval_for_execution(approval_id):
+        log.error(f"[{ticker}] Could not claim approval #{approval_id} for auto-execution")
+        return
+
+    approval = db.get_approval_by_id(approval_id)
+    success = _execute_approved_order(approval)
+    db.update_approval_status(approval_id, "APPROVED" if success else "FAILED")
+    log.info(f"[{ticker}] Approval #{approval_id} auto-{'executed' if success else 'execution FAILED'}")
+
+    if _feed_emit:
+        if success:
+            _feed_emit("execution", ticker,
+                       f"Auto-executed {result['action']} {sizing['shares_initial']} shares @ ~${price:.2f} "
                        f"({sizing['position_size_pct']:.1%} portfolio) | "
-                       f"stop ${sizing.get('stop_loss_price', 0):.2f} | "
-                       f"{bucket} bucket — approval request sent to Telegram",
+                       f"stop ${sizing.get('stop_loss_price', 0):.2f} | {bucket} bucket",
                        "bullish")
-    else:
-        log.info(f"[{ticker}] Approval #{approval_id} queued (Telegram not configured)")
-        if _feed_emit:
-            _feed_emit("risk", ticker,
-                       f"Sized {sizing['shares_initial']} shares @ ~${price:.2f} — "
-                       f"approval #{approval_id} logged (Telegram not configured)",
-                       "neutral")
+        else:
+            _feed_emit("execution", ticker,
+                       f"Auto-execution FAILED for {result['action']} {ticker} — check logs", "alert")
+
+    # _execute_approved_order already sends a Telegram trade alert on success;
+    # only notify separately here on failure, so a broken execution doesn't
+    # fail silently.
+    if not success:
+        try:
+            alert_module._send(
+                f"⚠️ AUTO-EXECUTION FAILED\n"
+                f"<b>{result['action']} {ticker}</b> (approval #{approval_id}) could not be executed.\n"
+                f"Check helios.log for details."
+            )
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

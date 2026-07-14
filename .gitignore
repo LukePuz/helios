@@ -15,3 +15,6 @@ trading_bot.code-workspace
 
 # Installers (large binaries — download fresh, don't commit)
 tws-latest-standalone-*.sh
+
+# Local Claude Code notes (not shared via git)
+CLAUDE.md

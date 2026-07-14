@@ -99,8 +99,14 @@ def disconnect() -> None:
         log.info("Disconnected from IBKR TWS.")
 
 
-def _stock(ticker: str) -> ibi.Stock:
-    return ibi.Stock(ticker, "SMART", "USD")
+def _stock(ib: ibi.IB, ticker: str) -> ibi.Stock:
+    # Must be qualified (conId populated) before use — ib_async hashes
+    # Contract objects internally (market data/order tracking dicts), which
+    # raises "can't be hashed because no 'conId' value exists" on a bare
+    # Stock(). ib_insync tolerated this; ib_async does not.
+    contract = ibi.Stock(ticker, "SMART", "USD")
+    ib.qualifyContracts(contract)
+    return contract
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +146,7 @@ def get_historical_bars(
     """
     try:
         ib = get_ib()
-        contract = _stock(ticker)
+        contract = _stock(ib, ticker)
         bars = ib.reqHistoricalData(
             contract,
             endDateTime="",
@@ -176,7 +182,7 @@ def place_market_order(ticker: str, side: str, qty: float, fill_timeout: float =
     and filled_qty.
     """
     ib = get_ib()
-    contract = _stock(ticker)
+    contract = _stock(ib, ticker)
 
     # Subscribe to delayed data briefly to satisfy TWS precautionary check
     ib.reqMarketDataType(3)
@@ -261,7 +267,7 @@ def place_limit_order(
     the session; the reconciliation task catches anything left dangling).
     """
     ib = get_ib()
-    contract = _stock(ticker)
+    contract = _stock(ib, ticker)
 
     if limit_price is None:
         limit_price = _compute_marketable_limit(ib, contract, side)
@@ -327,7 +333,7 @@ def place_bracket_order(
         raise ValueError("place_bracket_order requires a stop_loss_price")
 
     ib = get_ib()
-    contract = _stock(ticker)
+    contract = _stock(ib, ticker)
     action = side.upper()
     reverse_action = "SELL" if action == "BUY" else "BUY"
 
@@ -383,7 +389,7 @@ def place_trailing_stop_order(ticker: str, qty: float, trail_percent: float) -> 
     a position's trailing stop has activated.
     """
     ib = get_ib()
-    contract = _stock(ticker)
+    contract = _stock(ib, ticker)
     order = ibi.Order(
         action="SELL", totalQuantity=qty, orderType="TRAIL",
         trailingPercent=trail_percent, tif="GTC",
@@ -398,7 +404,7 @@ def place_trailing_stop_order(ticker: str, qty: float, trail_percent: float) -> 
 def place_stop_order(ticker: str, qty: float, stop_price: float) -> dict:
     """Place a GTC sell stop-loss order. Returns order_id for lifecycle tracking."""
     ib = get_ib()
-    contract = _stock(ticker)
+    contract = _stock(ib, ticker)
     order    = ibi.StopOrder("SELL", qty, stop_price, tif="GTC")
     trade    = ib.placeOrder(contract, order)
     ib.sleep(1)

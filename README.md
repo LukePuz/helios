@@ -1,6 +1,6 @@
 # ☀️ Helios Hedgefund
 
-An autonomous **trading research system** that watches markets around the clock, generates AI-scored investment theses, sizes positions under a rule-based risk framework — and never executes a trade without explicit human approval.
+An autonomous **trading research system** that watches markets around the clock, generates AI-scored investment theses, sizes positions under a rule-based risk framework, and auto-executes on a paper account — no capital at risk, no human approval gate.
 
 **Paper trading only.** This is a personal research project studying whether an LLM-driven agent pipeline can make consistently good trading decisions. Every decision, conviction score, and outcome is logged to build a long-term dataset for analysis.
 
@@ -31,12 +31,11 @@ flowchart LR
     end
 
     subgraph Execution["🔒 Execution"]
-        T[Telegram approval<br/><i>human decides</i>]
         IB[IBKR paper account<br/><i>market/bracket orders + stops</i>]
+        T[Telegram alert<br/><i>sent after the fact</i>]
     end
 
-    Ingestion --> S --> B --> A --> R --> T -->|approve| IB
-    T -->|reject / 6h expiry| X[Discarded]
+    Ingestion --> S --> B --> A --> R --> IB --> T
 
     REG[Market Regime Agent<br/><i>6 macro signals + Markov persistence</i>] -.->|gates sizing| R
     REG -.->|context| A
@@ -49,9 +48,8 @@ flowchart LR
 3. **Context Engine** assembles a situation brief: price action, fundamentals, catalyst calendar, prior theses from the vector store.
 4. **Analyst** (large local LLM) writes an investment thesis with a 1–10 conviction score, an upside/downside estimate, and a bucket classification (Compounder / Accelerator / Moonshot). Below conviction 5 or 2:1 upside/downside, it dies here.
 5. **Risk Manager** sizes the position from a bucket × conviction table, scaled by the current market regime multiplier, and computes an ATR-based stop. Concentration caps (per-position, per-theme, total moonshot exposure) are enforced here.
-6. **Telegram** sends the full thesis with Approve / Reject buttons. Unapproved trades expire in 6 hours. **There is no autonomous execution path.**
-7. On approval, the order goes to **Interactive Brokers** (paper), a stop is placed, and the trailing-stop monitor takes over.
-8. At 30/60/90 days, outcomes are recorded against the original thesis — the dataset that makes this research rather than gambling.
+6. **Execution is automatic on the paper account.** As of 2026-07-14, trades that clear the Analyst and Risk Manager gates execute immediately against **Interactive Brokers** (paper) — a stop is placed, the trailing-stop monitor takes over, and a Telegram alert is sent after the fact rather than an approval request beforehand. (Earlier versions of this system gated every trade on a Telegram Approve/Reject tap; that gate was intentionally removed for paper trading, where there's no capital at risk. Drawdown halt, concentration caps, and price-drift-abort checks are all unchanged.)
+7. At 30/60/90 days, outcomes are recorded against the original thesis — the dataset that makes this research rather than gambling.
 
 ---
 
@@ -118,7 +116,7 @@ Verification: `python test_connection.py` (broker), `python smoke_test.py` (mode
 
 ## Design principles
 
-1. **A human approves every trade.** The AI proposes; it never disposes.
-2. **Risk rules are code, not vibes.** Sizing, stops, and concentration limits are deterministic and unit-tested — the LLM cannot override them.
-3. **Measure everything.** Every thesis is scored against its 30/60/90-day outcome. The goal is to learn whether the system's conviction means anything — including the possibility that it doesn't.
-4. **Fail toward safety.** Any data source, model, or service going down degrades the system toward *not trading*, never toward trading blind.
+1. **Risk rules are code, not vibes.** Sizing, stops, and concentration limits are deterministic and unit-tested — the LLM cannot override them.
+2. **Measure everything.** Every thesis is scored against its 30/60/90-day outcome. The goal is to learn whether the system's conviction means anything — including the possibility that it doesn't.
+3. **Fail toward safety.** Any data source, model, or service going down degrades the system toward *not trading*, never toward trading blind.
+4. **Paper only, always.** Auto-execution (below) is safe specifically because this account can never touch real capital — that constraint is not up for negotiation the way the approval gate was.

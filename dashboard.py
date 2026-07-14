@@ -194,12 +194,12 @@ with st.sidebar:
         st.caption("Run: docker start redis")
 
     # Ollama
-    ollama_model = os.getenv("ANALYST_MODEL", "qwen2.5:3b")
+    ollama_model = os.getenv("ANALYST_MODEL", "qwen2.5:72b")
     ollama_ok, ollama_info = pm.ollama_status()
     col1, col2 = st.columns([3, 1])
     col1.markdown(f"{_dot(ollama_ok)} **Ollama** — {ollama_model}")
     with col2.popover("ℹ️"):
-        st.markdown(f"**Current model:** `{ollama_model}`\n\nThe AI reasoning engine. Generates investment theses with conviction scores before any trade executes. Swap to `qwen2.5:72b` when the new build arrives.")
+        st.markdown(f"**Current model:** `{ollama_model}`\n\nThe AI reasoning engine. Generates investment theses with conviction scores before any trade executes.")
     if ollama_ok:
         st.caption(ollama_info)
     else:

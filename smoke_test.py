@@ -40,7 +40,7 @@ print("--- Fix 5: 3b model reachable ---")
 try:
     import requests
     resp = requests.post("http://localhost:11434/api/generate",
-        json={"model": os.getenv("ANALYST_MODEL","qwen2.5:3b"),
+        json={"model": os.getenv("ANALYST_MODEL","qwen2.5:72b"),
               "prompt": "Say OK", "stream": False}, timeout=15)
     if resp.status_code == 200:
         print("  OK: model responded:", resp.json().get("response","")[:40])

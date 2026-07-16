@@ -149,11 +149,19 @@ If the FUNDAMENTALS section says data isn't cached yet, say so explicitly
 in your reasoning and cap conviction at 6 for OPEN/ADD, since the valuation
 call would otherwise be an unsupported guess.
 
+Conviction scale — use the FULL range; most ideas are ordinary and should score in the middle:
+  1-2: thesis broken or contradicted by the evidence in the brief
+  3-4: speculative — plausible story but no concrete supporting evidence yet
+  5-6: solid company, thesis intact, but NO identifiable edge over the market's current pricing (this is the default for "good but fairly priced")
+  7-8: specific, citable mispricing — you can point to evidence in the brief the market is missing, with a dated catalyst to close the gap
+  9-10: exceptional, rare (a few per year) — overwhelming evidence, multiple independent confirmations, asymmetric payoff
+A 7 must be justified by evidence quoted from the situation brief or fundamentals, not by general optimism about the sector.
+
 Then output ONLY valid JSON in exactly this format (no markdown, no explanation outside the JSON):
 
 {{
   "action": "OPEN or ADD or HOLD or TRIM or EXIT or WATCH or PASS",
-  "conviction": 7,
+  "conviction": <integer 1-10 per the scale above>,
   "thesis_bucket": "Compounder or Accelerator or Moonshot",
   "thesis_summary": "One sentence why this position exists.",
   "expectation_gap": {{
@@ -175,7 +183,7 @@ Then output ONLY valid JSON in exactly this format (no markdown, no explanation 
     "bull_case_target": "$X (12 months)",
     "downside_scenario": "$X"
   }},
-  "upside_downside_ratio": 2.5,
+  "upside_downside_ratio": <your computed ratio: bull-case upside percent divided by downside percent>,
   "key_risks": ["Risk 1", "Risk 2", "Risk 3"],
   "options_opportunity": false,
   "options_notes": "Brief note or null",
@@ -450,6 +458,7 @@ def analyze(
         fundamentals_missing = not fund or fund.get("market_cap") is None
     except Exception:
         fundamentals_missing = True
+    conviction_raw = conviction
     if fundamentals_missing and action in ("OPEN", "ADD") and conviction > 6:
         log.info(f"[{ticker}] No cached fundamentals — capping conviction {conviction} -> 6")
         conviction = 6
@@ -474,6 +483,10 @@ def analyze(
         "ticker":    ticker,
         "action":    action,
         "conviction": conviction,
+        # Pre-guardrail conviction as the model stated it — kept for audit and
+        # calibration so a fundamentals-cache outage capping 7s to 6 doesn't
+        # poison the conviction→outcome track record with manufactured 6s.
+        "conviction_raw": conviction_raw,
         "thesis_bucket": bucket,
         "llm_suggested_bucket": llm_bucket if bucket_mismatch else None,
         "thesis_summary": parsed.get("thesis_summary", ""),

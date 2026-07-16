@@ -16,7 +16,7 @@ import ibkr
 
 def main() -> None:
     print(f"Connecting to IBKR TWS/Gateway at {ibkr.IB_HOST}:{ibkr.IB_PORT} "
-          f"(clientId={ibkr.IB_CLIENT_ID})...")
+          f"(clientId={ibkr._get_client_id()})...")
     try:
         client = ibkr.get_client()
         account = client.get_account()

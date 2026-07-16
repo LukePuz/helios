@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS trades (
 CREATE TABLE IF NOT EXISTS signals (
     id          SERIAL PRIMARY KEY,
     symbol      VARCHAR(10),
-    signal      VARCHAR(10),
+    signal      VARCHAR(30),
     confidence  DECIMAL,
     timestamp   TIMESTAMPTZ DEFAULT NOW(),
     reasoning   TEXT
@@ -215,14 +215,29 @@ CREATE INDEX IF NOT EXISTS orders_ticker_idx ON orders (ticker, created_at DESC)
 """
 
 
+_POOL_HEALTH_CHECK_INTERVAL_S = 60
+_last_pool_health_check: float = 0.0
+
+
 def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
-    global _pool
+    global _pool, _last_pool_health_check
     if _pool is not None:
-        # Health check: verify the pool can still serve a live connection
+        # Health check was previously run on EVERY _get_conn() call — an
+        # extra network round-trip to Supabase per query, and the SELECT 1
+        # opened a transaction that was never committed/rolled back before
+        # putconn, so every checkout left a connection "idle in transaction"
+        # (Supabase eventually reaps these, but under concurrent workers it
+        # could exhaust the pool first). Now throttled to once/minute, and
+        # rolled back explicitly.
+        now = _time.monotonic()
+        if now - _last_pool_health_check < _POOL_HEALTH_CHECK_INTERVAL_S:
+            return _pool
         try:
             conn = _pool.getconn()
             conn.cursor().execute("SELECT 1")
+            conn.rollback()
             _pool.putconn(conn)
+            _last_pool_health_check = now
             return _pool
         except Exception:
             logging.warning("DB pool health check failed — recreating pool.")
@@ -232,11 +247,12 @@ def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
                 pass
             _pool = None
 
+    maxconn = int(os.getenv("DB_MAXCONN", "5"))
     for attempt in range(1, 4):
         try:
             _pool = psycopg2.pool.ThreadedConnectionPool(
                 minconn=1,
-                maxconn=5,
+                maxconn=maxconn,
                 host=os.getenv("SUPABASE_HOST"),
                 port=int(os.getenv("SUPABASE_PORT", "5432")),
                 dbname=os.getenv("SUPABASE_DB", "postgres"),
@@ -244,7 +260,8 @@ def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
                 password=os.getenv("SUPABASE_PASSWORD"),
                 sslmode="require",
             )
-            logging.info("DB connection pool created.")
+            logging.info(f"DB connection pool created (maxconn={maxconn}).")
+            _last_pool_health_check = _time.monotonic()
             return _pool
         except Exception as e:
             logging.warning(f"DB pool creation attempt {attempt}/3 failed: {e}")
@@ -281,6 +298,13 @@ _MIGRATIONS: list[tuple[int, str]] = [
     (7, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS benchmark_return_pct DECIMAL;"),
     (8, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS alpha_pct DECIMAL;"),
     (9, "ALTER TABLE portfolio_snapshots ADD COLUMN IF NOT EXISTS benchmark_json JSONB;"),
+    # signal VARCHAR(10) silently rejected every log_signal() call using a
+    # custom signal type longer than 10 chars — CATALYST_BLOCKED (16),
+    # COOLDOWN_SKIPPED (17), SCREENED_OUT (12), SELL_NO_POSITION (17) have
+    # all been failing (caught and logged, not crashing the caller, but
+    # never actually written) since each was introduced. Found 2026-07-16
+    # while testing the screener split.
+    (10, "ALTER TABLE signals ALTER COLUMN signal TYPE VARCHAR(30);"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -523,6 +547,33 @@ def has_active_approval(ticker: str) -> bool:
     except Exception as e:
         logging.error(f"has_active_approval failed: {e}")
         return False
+    finally:
+        _put_conn(conn)
+
+
+def get_last_executed_approval(ticker: str, hours: int) -> dict | None:
+    """Most recent APPROVED OPEN/ADD for this ticker within the lookback
+    window, or None. Used to cool down repeat buys — auto-execute completes
+    a decision within seconds, so has_active_approval's PENDING/PROCESSING
+    check alone doesn't stop the next independent event from re-buying the
+    same ticker minutes later."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT conviction, decided_at FROM pending_approvals "
+                "WHERE ticker=%s AND action IN ('OPEN','ADD') AND status='APPROVED' "
+                "AND decided_at > NOW() - (%s || ' hours')::interval "
+                "ORDER BY decided_at DESC LIMIT 1",
+                (ticker, hours),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            return {"conviction": row[0], "decided_at": row[1]}
+    except Exception as e:
+        logging.error(f"get_last_executed_approval failed: {e}")
+        return None
     finally:
         _put_conn(conn)
 
@@ -996,6 +1047,37 @@ def mark_seen(source: str, external_id: str) -> None:
     except Exception as e:
         conn.rollback()
         logging.error(f"mark_seen({source}, {external_id}) failed: {e}")
+    finally:
+        _put_conn(conn)
+
+
+def prune_seen_items(days: int = 90, source: str | None = None) -> int:
+    """seen_items grows unbounded otherwise — a row per distinct
+    news/filing/insider/options item ever ingested, indefinitely. Pass
+    source to prune only that source with its own horizon (e.g. the
+    options_flow_dispatch dedup keys only need ~7 days). Returns the number
+    of rows deleted."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            if source:
+                cur.execute(
+                    "DELETE FROM seen_items WHERE source=%s "
+                    "AND first_seen < NOW() - (%s || ' days')::interval",
+                    (source, days),
+                )
+            else:
+                cur.execute(
+                    "DELETE FROM seen_items WHERE first_seen < NOW() - (%s || ' days')::interval",
+                    (days,),
+                )
+            deleted = cur.rowcount
+        conn.commit()
+        return deleted
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"prune_seen_items failed: {e}")
+        return 0
     finally:
         _put_conn(conn)
 

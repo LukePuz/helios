@@ -37,7 +37,7 @@ fastapi>=0.111.0
 uvicorn>=0.30.0
 
 # Group chat web search (no API key required)
-duckduckgo-search>=6.0.0
+ddgs>=9.0.0
 
 # Testing
 pytest>=8.0.0

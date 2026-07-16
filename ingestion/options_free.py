@@ -25,9 +25,12 @@ def _nearest_chain(ticker: str):
     expirations = t.options
     if not expirations:
         return None, None
-    calls_df = t.option_chain(expirations[0]).calls
-    puts_df  = t.option_chain(expirations[0]).puts
-    return calls_df, puts_df
+    # Was two separate option_chain() calls for the same expiry (one for
+    # .calls, one for .puts) — each is its own network request, doubling
+    # yfinance load across 75 tickers every 5 minutes. Both come from one
+    # call.
+    chain = t.option_chain(expirations[0])
+    return chain.calls, chain.puts
 
 
 def get_flow_summary(ticker: str) -> dict:

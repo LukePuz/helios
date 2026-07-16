@@ -36,6 +36,7 @@ try:
         MAX_SINGLE_THEME_PCT,
         MAX_AI_INFRA_PCT,
         MAX_MOONSHOT_TOTAL_PCT,
+        MAX_TRADE_PCT_OF_CASH_RESERVE,
     )
 except ImportError:
     DRAWDOWN_HALT_PCT             = 0.10
@@ -56,6 +57,7 @@ except ImportError:
     MAX_SINGLE_THEME_PCT          = 0.35
     MAX_AI_INFRA_PCT              = 0.60
     MAX_MOONSHOT_TOTAL_PCT        = 0.10
+    MAX_TRADE_PCT_OF_CASH_RESERVE = 0.20
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +155,33 @@ class RiskManager:
     def buying_power(self) -> float:
         return float(self._get_account().buying_power)
 
+    def cash(self) -> float:
+        """Raw cash balance (not leveraged buying power) — the actual reserve
+        the per-trade cash cap in size_position() is measured against."""
+        return float(self._get_account().cash)
+
+    def _alert_cash_blocked(self, cash_reserve: float) -> None:
+        """Cash exhaustion used to fail silently — a buy would just come
+        back with 0 shares and crew.py would drop it with a debug log line,
+        with nobody told why the system stopped opening new positions.
+        Throttled to once per calendar day."""
+        try:
+            import db
+            from datetime import date
+            today = date.today().isoformat()
+            if db.get_state("cash_blocked_alert_date") == today:
+                return
+            db.set_state("cash_blocked_alert_date", today)
+            import alerts
+            alerts._send(
+                f"💰 ALL BUYS BLOCKED — cash reserve is ${cash_reserve:,.2f}\n"
+                f"The cash-reserve cap ({MAX_TRADE_PCT_OF_CASH_RESERVE:.0%}/trade) can no "
+                f"longer size any new position. This is expected once the account "
+                f"is close to fully deployed; sells/exits still work normally."
+            )
+        except Exception as e:
+            log.warning(f"_alert_cash_blocked failed: {e}")
+
     # ------------------------------------------------------------------
     # Drawdown halt
     # ------------------------------------------------------------------
@@ -177,6 +206,19 @@ class RiskManager:
         current  = self.portfolio_value()
         baseline = float(hwm_str) if hwm_str else self.start_value
         if baseline <= 0:
+            return False
+
+        # Plausibility guard: a transient broker read of $0 (clientId
+        # collision, cold-morning connection race) would otherwise compute
+        # as a 100% drawdown and latch trading_halted until a manual
+        # /resume. Treat an implausible single-step read as "unknown, don't
+        # halt" rather than as a real drawdown — this is checked on every
+        # buy attempt, not on a timer, so failing open here just means one
+        # sizing call proceeds on stale-but-not-dangerous data; failing
+        # closed would mean one bad read stops all trading indefinitely.
+        if current <= 0 or current < 0.5 * baseline:
+            log.warning(f"Implausible portfolio value ${current:,.2f} "
+                       f"(baseline ${baseline:,.2f}) — skipping halt check")
             return False
 
         drawdown = (baseline - current) / baseline
@@ -274,11 +316,34 @@ class RiskManager:
         dollar_amount  = pv * remaining
         initial_pct    = 0.55  # 55% initial tranche (midpoint of 50-60%)
         initial_dollar = dollar_amount * initial_pct
+
+        flags = []
+
+        # Cash-reserve cap — this trade's actual spend may not exceed a fixed
+        # fraction of *current cash*, not portfolio value. Since the cap
+        # shrinks along with cash, remaining cash decays geometrically toward
+        # zero instead of hitting it outright after a burst of auto-executes.
+        cash_reserve = self.cash()
+        cash_cap = max(cash_reserve, 0) * MAX_TRADE_PCT_OF_CASH_RESERVE
+        cash_capped = initial_dollar > cash_cap
+        if cash_capped:
+            initial_dollar = cash_cap
+            flags.append(
+                f"Capped at {MAX_TRADE_PCT_OF_CASH_RESERVE:.0%} of cash reserve "
+                f"(${cash_reserve:,.0f} available)"
+            )
+
         # Whole shares only — IBKR rejects fractional stock orders on most tickers
         shares_initial = int(initial_dollar / price)
         if shares_initial < 1:
+            if cash_reserve <= 0 or cash_capped:
+                # This is buys silently vanishing at crew.py's "0 shares"
+                # drop with no one told why — surface it, throttled to once
+                # a day so a busy morning doesn't spam the same alert on
+                # every subsequent buy attempt.
+                self._alert_cash_blocked(cash_reserve)
             return {"position_size_pct": 0, "dollar_amount": 0, "shares_initial": 0,
-                    "flags": [f"Allocation ${initial_dollar:,.2f} buys less than 1 share "
+                    "flags": flags + [f"Allocation ${initial_dollar:,.2f} buys less than 1 share "
                               f"of {ticker} at ${price:,.2f} — skipping"]}
 
         # Stop loss
@@ -293,7 +358,6 @@ class RiskManager:
         initial_cost = shares_initial * price
         max_loss = (initial_cost - shares_initial * stop_price) if stop_price else initial_cost * 0.35
 
-        flags = []
         if mult < 1.0:
             flags.append(f"Regime multiplier {mult}x applied ({regime})")
         if target == hard_cap:

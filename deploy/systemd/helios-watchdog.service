@@ -1,0 +1,10 @@
+[Unit]
+Description=Helios external liveness watchdog (one-shot check)
+
+[Service]
+Type=oneshot
+User=YOUR_USER
+WorkingDirectory=/home/YOUR_USER/Desktop/trading_bot
+ExecStart=/home/YOUR_USER/Desktop/trading_bot/venv/bin/python /home/YOUR_USER/Desktop/trading_bot/deploy/watchdog.py
+StandardOutput=append:/home/YOUR_USER/Desktop/trading_bot/logs/watchdog.log
+StandardError=append:/home/YOUR_USER/Desktop/trading_bot/logs/watchdog.log

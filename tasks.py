@@ -34,124 +34,200 @@ app.conf.update(
     enable_utc             = True,
     task_track_started     = True,
     worker_prefetch_multiplier = 1,  # one task at a time — model inference is heavy
+    # Two-lane queue architecture. Everything defaults to "ops" (fast I/O:
+    # pollers, snapshots, stop checks); LLM analysis is dispatched explicitly
+    # to the llm_p* queues and consumed by a dedicated single-concurrency
+    # worker so a 3-minute 72B call can never starve stop monitoring again.
+    task_default_queue     = "ops",
+    # "sorted" makes a worker consuming multiple queues drain them in name
+    # order — llm_p0 (events touching currently-held tickers) strictly before
+    # llm_p1 (everything else). The names are chosen to sort that way.
+    broker_transport_options = {"queue_order_strategy": "sorted"},
 )
 
+# LLM analysis queues — see task_default_queue comment above.
+LLM_QUEUE_HELD = "llm_p0"   # events about tickers we already hold — front of the line
+LLM_QUEUE_BULK = "llm_p1"   # scanner candidates and non-held-ticker events
+
+# Screening (7B, CPU-forced) gets its own queue/worker, separate from the
+# llm_p* queues (72B, GPU-bound) — added 2026-07-16 after a busy news day
+# backed llm_p1 up past 700 items. Before this, screen+analyze ran as one
+# task on the single-concurrency llm worker, so a quick reject still had
+# to wait behind however many ~170s analyses were already ahead of it in
+# queue — the screening *verdict* was as backed up as the analysis itself.
+# Now only genuine survivors (tasks.screen_event -> tasks.deep_analyze_event)
+# ever reach llm_p0/llm_p1; screening runs at its own concurrency and never
+# waits on the 72B stage.
+SCREEN_QUEUE = "screen"
+SCREEN_EVENT_EXPIRES_SECONDS = 2 * 3600
+
+# An event analyzed hours late is analyzing a stale market — discard instead.
+LLM_EVENT_EXPIRES_SECONDS = 4 * 3600
+
 # ── Periodic schedule ─────────────────────────────────────────────────────────
+# Every entry carries "expires": a task not picked up within that window is
+# discarded by the worker instead of executed late. Interval tasks expire
+# after one interval (running a 4-hour-old portfolio snapshot after fresher
+# ones is pure waste — this is what let the queue back up 296 deep on
+# 2026-07-15). Daily/weekly tasks get generous expiries sized to the
+# machine's sleep window (suspended 19:00→08:45 weekdays, all weekend), so
+# beat's catch-up send on wake still executes rather than being discarded.
 app.conf.beat_schedule = {
-    # Market regime — daily at 9:30 AM ET (market open)
+    # Market regime — daily at 9:30 AM ET (market open). LLM-heavy → llm
+    # lane, priority: it gates the day's sizing multiplier.
     "assess-regime": {
         "task":     "tasks.assess_regime_daily",
         "schedule": crontab(hour=9, minute=30, day_of_week="mon-fri"),
+        "options":  {"queue": LLM_QUEUE_HELD, "expires": 6 * 3600},
     },
-    # Daily scanner — 9:35 AM ET (5 min after regime)
+    # Daily scanner — 9:35 AM ET (5 min after regime). The scan itself is
+    # fast (ops); it enqueues analyze_candidates onto the llm lane.
     "daily-scan": {
         "task":     "tasks.run_daily_scan",
         "schedule": crontab(hour=9, minute=35, day_of_week="mon-fri"),
+        "options":  {"expires": 4 * 3600},
     },
     # Check trailing stops — every 30 min during market hours
     "check-stops": {
         "task":     "tasks.check_trailing_stops",
         "schedule": 1800,
+        "options":  {"expires": 1800},
     },
     # SEC filings — every 10 minutes during market hours
     "poll-edgar": {
         "task":     "tasks.poll_edgar",
         "schedule": 600,  # 10 minutes
+        "options":  {"expires": 600},
     },
     # Options flow — every 5 minutes during market hours
     "poll-options": {
         "task":     "tasks.poll_options_flow",
         "schedule": 300,
+        "options":  {"expires": 300},
     },
     # Macro data snapshot — every hour
     "poll-macro": {
         "task":     "tasks.poll_macro",
         "schedule": 3600,
+        "options":  {"expires": 3600},
     },
     # arXiv papers — once per day at 9 AM ET
     "poll-arxiv": {
         "task":     "tasks.poll_arxiv",
         "schedule": crontab(hour=9, minute=0),
+        "options":  {"expires": 24 * 3600},
     },
     # Congressional trades — every 6 hours
     "poll-congressional": {
         "task":     "tasks.poll_congressional",
         "schedule": 21600,
+        "options":  {"expires": 21600},
     },
     # Insider trades — every 30 minutes
     "poll-insider": {
         "task":     "tasks.poll_insider",
         "schedule": 1800,
+        "options":  {"expires": 1800},
     },
     # Portfolio snapshot — every 5 minutes during market hours
     "portfolio-snapshot": {
         "task":     "tasks.take_portfolio_snapshot",
         "schedule": 300,
+        "options":  {"expires": 300},
     },
     # Auto-expire stale approval requests — every 30 minutes
     "expire-approvals": {
         "task":     "tasks.auto_expire_approvals",
         "schedule": 1800,
+        "options":  {"expires": 1800},
     },
-    # Earnings calendar refresh — Monday 8:00 AM ET
+    # Earnings calendar refresh — Monday 8:00 AM ET. Fires while the machine
+    # is still suspended (wake is 8:45); runs via beat catch-up on wake.
     "refresh-earnings": {
         "task":     "tasks.refresh_earnings_calendar",
         "schedule": crontab(hour=8, minute=0, day_of_week="mon"),
+        "options":  {"expires": 24 * 3600},
     },
-    # Catalyst conflicts - weekdays 8:10 AM ET
+    # Catalyst conflicts — weekdays 8:10 AM ET (pre-wake; catch-up on wake)
     "alert-catalyst-conflicts": {
         "task":     "tasks.alert_catalyst_conflicts",
         "schedule": crontab(hour=8, minute=10, day_of_week="mon-fri"),
+        "options":  {"expires": 6 * 3600},
     },
     # Portfolio drawdown circuit breaker — every 30 minutes
     "check-drawdown": {
         "task":     "tasks.check_portfolio_drawdown",
         "schedule": 1800,
+        "options":  {"expires": 1800},
     },
     # Stop-order reconciliation — every 15 minutes (orphan detection/cleanup)
     "reconcile-stops": {
         "task":     "tasks.reconcile_stop_orders",
         "schedule": 900,
+        "options":  {"expires": 900},
     },
     # 30/60/90-day outcome price reviews — weekdays 4:30 PM ET
     "review-outcomes": {
         "task":     "tasks.review_trade_outcomes",
         "schedule": crontab(hour=16, minute=30, day_of_week="mon-fri"),
+        "options":  {"expires": 24 * 3600},
     },
-    # Vector store pruning — Sunday 3:00 AM
+    # Vector store pruning — Sunday 3:00 AM. Machine is suspended all
+    # weekend; actually runs via catch-up Monday 8:45 (~30h later).
     "prune-vector-store": {
         "task":     "tasks.prune_vector_store",
         "schedule": crontab(hour=3, minute=0, day_of_week="sun"),
+        "options":  {"expires": 36 * 3600},
+    },
+    # seen_items dedup table — same slot as vector store pruning, same
+    # suspended-weekend caveat (runs via Monday 08:45 catch-up).
+    "prune-seen-items": {
+        "task":     "tasks.prune_seen_items",
+        "schedule": crontab(hour=3, minute=15, day_of_week="sun"),
+        "options":  {"expires": 36 * 3600},
     },
     # News (yfinance + Google News RSS) — every 15 minutes
     "poll-news": {
         "task":     "tasks.poll_news",
         "schedule": 900,
+        "options":  {"expires": 900},
     },
-    # Fundamentals refresh — nightly at 2:00 AM (off-hours, yfinance is slow per-ticker)
+    # Fundamentals refresh — 5:00 PM ET. Must run inside the awake window:
+    # helios-evening-stop suspends the machine at 19:00 and it doesn't wake
+    # until 08:45, so the old 2:00 AM slot never fired — the fundamentals
+    # table stayed empty forever, which silently capped every analyst
+    # conviction at 6 via the ungrounded-valuation guardrail.
     "refresh-fundamentals": {
         "task":     "tasks.refresh_fundamentals",
-        "schedule": crontab(hour=2, minute=0),
+        "schedule": crontab(hour=17, minute=0, day_of_week="mon-fri"),
+        "options":  {"expires": 2 * 3600},  # must finish before 19:00 suspend
     },
-    # Price history cache refresh — nightly at 1:30 AM (before fundamentals)
+    # Price history cache refresh — 4:45 PM ET (before fundamentals, after
+    # close; same awake-window constraint as above).
     "refresh-price-history": {
         "task":     "tasks.refresh_price_history",
-        "schedule": crontab(hour=1, minute=30),
+        "schedule": crontab(hour=16, minute=45, day_of_week="mon-fri"),
+        "options":  {"expires": 2 * 3600},
     },
     # Ingestion health check — hourly
     "check-ingestion-health": {
         "task":     "tasks.check_ingestion_health",
         "schedule": 3600,
+        "options":  {"expires": 3600},
     },
-    # Daily digest — weekdays 4:15 PM ET (after market close)
+    # Daily digest — weekdays 4:15 PM ET (after market close). A digest
+    # delivered the next morning is noise — short expiry.
     "daily-digest": {
         "task":     "tasks.send_daily_digest",
         "schedule": crontab(hour=16, minute=15, day_of_week="mon-fri"),
+        "options":  {"expires": 3 * 3600},
     },
-    # Weekly self-review — Sunday 6:00 PM ET
+    # Weekly self-review — Sunday 6:00 PM ET (suspended then; catch-up runs
+    # it Monday 8:45). LLM-heavy → llm bulk lane.
     "weekly-self-review": {
         "task":     "tasks.weekly_self_review",
         "schedule": crontab(hour=18, minute=0, day_of_week="sun"),
+        "options":  {"queue": LLM_QUEUE_BULK, "expires": 24 * 3600},
     },
 }
 
@@ -160,6 +236,108 @@ def _get_client():
     """Lazy-loads IBKR client adapter."""
     from ibkr import get_client
     return get_client()
+
+
+# ── LLM analysis dispatch ─────────────────────────────────────────────────────
+# The 72B analyst pipeline used to run inline inside the pollers, so a burst
+# of filings/news pinned both workers on multi-minute inference while stop
+# checks and snapshots queued behind them (296-deep backlog on 2026-07-15).
+# Pollers now enqueue analysis onto dedicated llm_p* queues and return in
+# seconds; a separate single-concurrency worker drains the LLM lanes.
+
+def _held_tickers() -> set[str]:
+    """Tickers currently held, from the latest portfolio snapshot (refreshed
+    every 5 min by take_portfolio_snapshot — fresh enough for routing)."""
+    try:
+        import db
+        conn = db._get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT positions_json FROM portfolio_snapshots "
+                    "ORDER BY timestamp DESC LIMIT 1"
+                )
+                row = cur.fetchone()
+        finally:
+            db._put_conn(conn)
+        return {t.upper() for t in (row[0] or {})} if row else set()
+    except Exception as e:
+        log.warning(f"_held_tickers failed ({e}) — routing to bulk queue")
+        return set()
+
+
+def _dispatch_event(event: dict, seen_source: str | None = None) -> None:
+    """Queue an ingestion event for screening (see SCREEN_QUEUE comment
+    above) — the fast, cheap first stage. Only events that pass go on to
+    the expensive 72B analysis (tasks.screen_event dispatches those
+    itself, routed to llm_p0/llm_p1 by held-ticker status).
+
+    If the event carries "_seen_key" (single key, marked under seen_source
+    or event["source"]) and/or "_seen_keys" (list of (source, key) pairs —
+    for pollers with more than one dedup dimension, e.g. news's per-source
+    id plus a cross-source title hash), they're marked seen here — AFTER
+    the enqueue succeeds — so a Celery retry on a later failure doesn't
+    return an already-seen, silently dropped item.
+    """
+    event = dict(event)  # don't mutate the caller's dict
+    seen_key  = event.pop("_seen_key", None)
+    seen_keys = event.pop("_seen_keys", None) or []
+    if seen_key:
+        seen_keys = [(seen_source or event.get("source", "unknown"), seen_key)] + list(seen_keys)
+    screen_event.apply_async(
+        args=[event], queue=SCREEN_QUEUE, expires=SCREEN_EVENT_EXPIRES_SECONDS,
+    )
+    if seen_keys:
+        try:
+            import db
+            for src, key in seen_keys:
+                db.mark_seen(src, key)
+        except Exception as e:
+            log.warning(f"mark_seen failed for {seen_keys}: {e}")
+
+
+@app.task(name="tasks.screen_event", bind=True, max_retries=1)
+def screen_event(self, event: dict):
+    """Fast 7B relevance screen (own queue/worker, CPU-only, higher
+    concurrency than the 72B stage) — only events that pass are
+    dispatched onward to deep_analyze_event. This is what keeps a busy
+    news day's rejects from queueing behind slow analyses."""
+    try:
+        from agents.crew import screen_event_only
+        result = screen_event_only(event)
+        if not result.get("relevant"):
+            return
+        ticker = str(event.get("ticker") or "").upper()
+        queue = LLM_QUEUE_HELD if ticker and ticker in _held_tickers() else LLM_QUEUE_BULK
+        deep_analyze_event.apply_async(
+            args=[event, result], queue=queue, expires=LLM_EVENT_EXPIRES_SECONDS,
+        )
+    except Exception as e:
+        log.error(f"screen_event failed for {event.get('ticker')}: {e}")
+        raise self.retry(exc=e, countdown=60)
+
+
+@app.task(name="tasks.deep_analyze_event", bind=True, max_retries=1)
+def deep_analyze_event(self, event: dict, screening: dict | None = None):
+    """Full 72B analyst pipeline (LLM lane) for an event that already
+    passed screening — see tasks.screen_event."""
+    try:
+        from agents.crew import deep_analyze
+        deep_analyze(event, screening)
+    except Exception as e:
+        log.error(f"deep_analyze_event failed for {event.get('ticker')}: {e}")
+        raise self.retry(exc=e, countdown=120)
+
+
+@app.task(name="tasks.analyze_candidates", bind=True, max_retries=1)
+def analyze_candidates(self, candidates: list, max_per_run: int = 5):
+    """Run scanner candidates through the analyst pipeline (LLM lane)."""
+    try:
+        from agents.crew import process_candidates
+        process_candidates(candidates, max_per_run=max_per_run)
+    except Exception as e:
+        log.error(f"analyze_candidates failed: {e}")
+        raise self.retry(exc=e, countdown=300)
 
 
 # ── New tasks: regime + scanner + stop monitor ────────────────────────────────
@@ -182,7 +360,6 @@ def run_daily_scan(self):
     try:
         from agents.market_regime import get_cached_regime
         from agents.scanner import run_scan
-        from agents.crew import process_candidates
 
         regime    = get_cached_regime()
         scan_result = run_scan(regime)
@@ -191,15 +368,61 @@ def run_daily_scan(self):
 
         log.info(f"Daily scan: {len(high_medium)} candidates to analyze")
         if high_medium:
-            process_candidates(high_medium, max_per_run=5)
+            analyze_candidates.apply_async(
+                args=[high_medium], kwargs={"max_per_run": 5},
+                queue=LLM_QUEUE_BULK, expires=LLM_EVENT_EXPIRES_SECONDS,
+            )
     except Exception as e:
         log.error(f"run_daily_scan failed: {e}")
         raise self.retry(exc=e, countdown=300)
 
 
+def _execute_backstop_sell(ticker: str, alert: dict) -> bool:
+    """Market-sell the full position when its stop level is breached and no
+    protective stop exists at the broker. This monitor is the last line of
+    defence for exactly that case; the sell only ever reduces exposure."""
+    try:
+        import ibkr
+        import db
+
+        try:
+            pos   = ibkr.get_client().get_open_position(ticker)
+            owned = round(abs(float(pos.qty)), 4)
+        except Exception:
+            owned = 0.0
+        if owned <= 0:
+            # Stale stop record for a position that no longer exists
+            db.delete_position_stop(ticker)
+            return False
+
+        ibkr.cancel_stop_orders_for(ticker)  # belt-and-braces before selling
+        result = ibkr.place_market_order(ticker, "SELL", owned)
+        filled = float(result.get("filled_qty") or 0)
+        if filled <= 0:
+            log.error(f"[{ticker}] Backstop sell submitted but no fill confirmed "
+                      f"(id={result.get('order_id')}) — nothing recorded")
+            return False
+
+        fill_price = result.get("fill_price") or alert["current_price"]
+        db.log_trade(symbol=ticker, side="SELL", quantity=filled, price=fill_price,
+                     reason=f"Backstop stop-breach sell (stop ${alert['stop_price']:.2f})")
+        db.delete_position_stop(ticker)
+        try:
+            db.close_trade_outcome(ticker, exit_price=fill_price)
+        except Exception:
+            pass
+        log.warning(f"[{ticker}] BACKSTOP SELL executed: {filled} shares @ ~${fill_price:.2f}")
+        return True
+    except Exception as e:
+        log.error(f"[{ticker}] Backstop sell FAILED: {e}")
+        return False
+
+
 @app.task(name="tasks.check_trailing_stops", bind=True, max_retries=2)
 def check_trailing_stops(self):
-    """Monitor open positions against their stop levels. Alert on triggers."""
+    """Monitor open positions against their stop levels. Alert on triggers;
+    if the stop level is breached and NO protective stop exists at the
+    broker, execute a market sell (AUTO_EXECUTE_PROTECTIVE_SELLS)."""
     try:
         from risk_manager import RiskManager
         import alerts
@@ -207,13 +430,40 @@ def check_trailing_stops(self):
         client = _get_client()
         rm = RiskManager(client)
         triggered = rm.check_trailing_stops()
+        if not triggered:
+            return
+
+        try:
+            from config import AUTO_EXECUTE_PROTECTIVE_SELLS
+        except ImportError:
+            AUTO_EXECUTE_PROTECTIVE_SELLS = True
+
+        # A live broker stop will fire on its own — never race it with a
+        # market sell. Only backstop tickers with no SELL stop at the broker.
+        import ibkr
+        try:
+            open_stop_tickers = {
+                o["ticker"] for o in ibkr.get_open_orders()
+                if o["action"] == "SELL" and o["order_type"] in ("STP", "STP LMT", "TRAIL")
+            }
+        except Exception as e:
+            log.warning(f"Could not fetch open orders for backstop check: {e}")
+            open_stop_tickers = None  # unknown — don't sell blind
+
         for alert in triggered:
-            log.warning(f"STOP TRIGGERED: {alert['ticker']} — {alert['reason']}")
+            ticker = alert["ticker"]
+            log.warning(f"STOP TRIGGERED: {ticker} — {alert['reason']}")
+            backstopped = False
+            if (alert.get("action") == "EXIT"
+                    and AUTO_EXECUTE_PROTECTIVE_SELLS
+                    and open_stop_tickers is not None
+                    and ticker not in open_stop_tickers):
+                backstopped = _execute_backstop_sell(ticker, alert)
             alerts.send_stop_triggered(
-                ticker=alert["ticker"],
+                ticker=ticker,
                 current_price=alert["current_price"],
                 stop_price=alert["stop_price"],
-                reason=alert["reason"],
+                reason=alert["reason"] + (" — BACKSTOP SELL EXECUTED" if backstopped else ""),
             )
     except Exception as e:
         log.error(f"check_trailing_stops failed: {e}")
@@ -243,12 +493,11 @@ def poll_edgar(self):
     """Polls SEC EDGAR for new filings and routes through agent pipeline."""
     try:
         from ingestion.edgar import poll_once
-        from agents.crew import process_event
 
         filings = poll_once()
         log.info(f"EDGAR: {len(filings)} new filing(s)")
         for filing in filings:
-            process_event(filing)
+            _dispatch_event(filing, seen_source="edgar")
         _heartbeat_ok("edgar", len(filings))
     except Exception as e:
         log.error(f"poll_edgar failed: {e}")
@@ -261,7 +510,14 @@ def poll_options_flow(self):
     """Checks for unusual options activity across all symbols (Unusual Whales,
     falls back to the free yfinance-based options_free module when no key is set)."""
     try:
-        from agents.crew import process_event
+        from market_data import _is_market_hours
+        if not _is_market_hours():
+            # Option chains are stale outside RTH (last-quoted OI/volume,
+            # not live) — this poller ran every 5 min around the clock
+            # during the awake-but-closed windows (08:45-09:30, 16:00-19:00)
+            # for no signal value.
+            log.debug("poll_options_flow: market closed, skipping")
+            return
 
         import os
         if os.getenv("UNUSUAL_WHALES_API_KEY", "").startswith("your_"):
@@ -270,10 +526,21 @@ def poll_options_flow(self):
         else:
             from ingestion.options_flow import get_all_flow_summaries
 
+        import db
+        from datetime import date
+
         summaries = get_all_flow_summaries()
         unusual_count = 0
         for ticker, flow in summaries.items():
             if flow.get("unusual"):
+                # "Unusual" (OI concentration) is persistent state, not a
+                # one-off event — without this dedup the same ticker was
+                # dispatched to the full 72B pipeline every 5 minutes,
+                # indefinitely. One analysis per ticker per day is the right
+                # cadence; this was the single biggest LLM-cost bug found.
+                seen_key = f"{ticker}_{date.today().isoformat()}"
+                if db.is_seen("options_flow_dispatch", seen_key):
+                    continue
                 unusual_count += 1
                 event = {
                     "source": "options",
@@ -281,7 +548,8 @@ def poll_options_flow(self):
                     "title":  f"Unusual options activity: {ticker}",
                     "text":   flow["summary"],
                 }
-                process_event(event)
+                _dispatch_event(event)
+                db.mark_seen("options_flow_dispatch", seen_key)
         _heartbeat_ok("options_flow", unusual_count)
     except Exception as e:
         log.error(f"poll_options_flow failed: {e}")
@@ -305,6 +573,13 @@ def poll_macro(self):
             text=summary,
             metadata={"type": "macro_snapshot"},
         )
+        # Cache for context_engine's brief builder — it was calling
+        # get_macro_summary_text() itself on every single brief (10 FRED
+        # HTTP requests per brief; a 5-candidate scan run made 50 FRED
+        # calls). This runs hourly already; the brief just needs to read it.
+        import db
+        db.set_state("macro_summary_text", summary)
+        db.set_state("macro_summary_at", datetime.now(timezone.utc).isoformat())
         log.info("Macro snapshot stored.")
 
         # Reassess regime if macro conditions changed significantly.
@@ -350,14 +625,16 @@ def poll_congressional(self):
     """Polls congressional trading data and processes high-conviction trades."""
     try:
         from ingestion.congressional import poll_once
-        from agents.crew import process_event
 
         trades = poll_once()
         log.info(f"Congressional: {len(trades)} new trade(s)")
         for trade in trades:
+            seen_key = trade.pop("_seen_key", None)
             # Only send large purchases through the full pipeline
             if trade.get("side", "").upper() == "PURCHASE":
-                process_event(trade)
+                if seen_key:
+                    trade["_seen_key"] = seen_key
+                _dispatch_event(trade, seen_source="congressional")
             else:
                 import vector_store
                 vector_store.store(
@@ -366,6 +643,9 @@ def poll_congressional(self):
                     text=trade["text"],
                     metadata={"ticker": trade["ticker"], "side": trade.get("side", "")},
                 )
+                if seen_key:
+                    import db
+                    db.mark_seen("congressional", seen_key)
         _heartbeat_ok("congressional", len(trades))
     except Exception as e:
         log.error(f"poll_congressional failed: {e}")
@@ -383,12 +663,16 @@ def poll_insider(self):
     """
     try:
         from ingestion.insider import poll_once
-        from agents.crew import process_event
 
         filings = poll_once()
         log.info(f"Insider: {len(filings)} new open-market buy filing(s)")
         for filing in filings:
-            process_event(filing)
+            # insider.py's own is_seen/mark_seen use source="insider", but
+            # each filing's payload carries source="sec_form4" (what the LLM
+            # sees) — must pass the dedup source explicitly or _dispatch_event
+            # would default to the wrong one and the is_seen check would
+            # never match what gets marked.
+            _dispatch_event(filing, seen_source="insider")
         _heartbeat_ok("insider", len(filings))
     except Exception as e:
         log.error(f"poll_insider failed: {e}")
@@ -401,12 +685,11 @@ def poll_news(self):
     """Polls free news sources (yfinance + Google News RSS) for the watchlist."""
     try:
         from ingestion.news import poll_once
-        from agents.crew import process_event
 
         items = poll_once()
         log.info(f"News: {len(items)} new item(s)")
         for item in items:
-            process_event(item)
+            _dispatch_event(item)
         _heartbeat_ok("news", len(items))
     except Exception as e:
         log.error(f"poll_news failed: {e}")
@@ -670,6 +953,18 @@ def check_portfolio_drawdown(self):
 
         # Maintain the persisted high-water mark (seed from START_VALUE)
         hwm = float(db.get_state("high_water_mark") or START_VALUE)
+
+        # Plausibility guard: a transient broker read of $0 (e.g. an IBKR
+        # clientId collision or cold-morning connection race) previously
+        # computed as a 100% drawdown and latched the halt flag until a
+        # manual /resume — reject readings that can't be a real single-step
+        # move instead of trusting them.
+        if pv <= 0 or pv < 0.5 * hwm:
+            log.warning(f"Implausible portfolio value ${pv:,.2f} (HWM ${hwm:,.2f}) — "
+                       f"skipping drawdown check, not updating HWM")
+            db.set_state("drawdown_breach_count", "0")
+            return
+
         if pv > hwm:
             db.set_state("high_water_mark", str(pv))
             hwm = pv
@@ -677,6 +972,15 @@ def check_portfolio_drawdown(self):
         drawdown = (hwm - pv) / hwm if hwm > 0 else 0
 
         if drawdown >= MAX_DRAWDOWN_PCT:
+            # Require 2 consecutive breaching reads (this task runs every 30
+            # min) before halting — a single noisy tick shouldn't be enough,
+            # only a sustained drawdown.
+            breach_count = int(db.get_state("drawdown_breach_count", "0") or 0) + 1
+            db.set_state("drawdown_breach_count", str(breach_count))
+            if breach_count < 2:
+                log.warning(f"Drawdown {drawdown:.1%} breach #1 — waiting for confirmation "
+                           f"before halting")
+                return
             already_halted = db.get_state("trading_halted", "false") == "true"
             db.set_state("trading_halted", "true")
             db.set_state("halt_reason",
@@ -685,6 +989,7 @@ def check_portfolio_drawdown(self):
             if not already_halted:
                 alerts.send_halt_alert(pv, hwm)
         else:
+            db.set_state("drawdown_breach_count", "0")
             log.debug(f"Drawdown: {drawdown:.1%} (limit: {MAX_DRAWDOWN_PCT:.0%})")
     except Exception as e:
         log.error(f"check_portfolio_drawdown failed: {e}")
@@ -820,6 +1125,22 @@ def prune_vector_store(self):
         # arxiv is intentionally not pruned (papers are timeless reference material)
     except Exception as e:
         log.error(f"prune_vector_store failed: {e}")
+        raise self.retry(exc=e, countdown=300)
+
+
+@app.task(name="tasks.prune_seen_items", bind=True, max_retries=1)
+def prune_seen_items(self):
+    """seen_items has no TTL otherwise — a row per distinct news/filing/
+    insider/options item ever ingested (75 tickers x multiple sources,
+    indefinitely) piles up on the Supabase free tier with nothing ever
+    reclaiming it."""
+    try:
+        import db
+        n_general = db.prune_seen_items(days=90)
+        n_options = db.prune_seen_items(days=7, source="options_flow_dispatch")
+        log.info(f"Pruned seen_items: {n_general} general (>90d), {n_options} options dispatch (>7d)")
+    except Exception as e:
+        log.error(f"prune_seen_items failed: {e}")
         raise self.retry(exc=e, countdown=300)
 
 

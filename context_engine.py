@@ -30,6 +30,32 @@ def _safe_import(module_name: str):
         return None
 
 
+_MACRO_CACHE_MAX_AGE_HOURS = 2
+
+
+def _get_macro_summary(macro_mod) -> str:
+    """Reads the macro summary tasks.poll_macro already refreshes hourly,
+    instead of re-fetching live — macro_mod.get_macro_summary_text() issues
+    10 FRED HTTP requests per call, and this section used to call it fresh
+    on every single brief (a 5-candidate daily scan made 50 FRED calls for
+    data that only changes hourly). Falls back to a live fetch if the cache
+    is missing or stale."""
+    try:
+        import db
+        cached_at = db.get_state("macro_summary_at")
+        if cached_at:
+            age_hours = (
+                datetime.now(timezone.utc) - datetime.fromisoformat(cached_at)
+            ).total_seconds() / 3600
+            if age_hours < _MACRO_CACHE_MAX_AGE_HOURS:
+                cached_text = db.get_state("macro_summary_text")
+                if cached_text:
+                    return cached_text
+    except Exception as e:
+        log.debug(f"Macro cache read failed, falling back to live fetch: {e}")
+    return macro_mod.get_macro_summary_text()
+
+
 def _fundamentals_section(ticker: str) -> str:
     """
     Real revenue growth, margins, FCF, and valuation multiples (see
@@ -142,7 +168,7 @@ Buying Power:    ${float(account.buying_power):,.2f}""")
     macro_mod = _safe_import("ingestion.macro")
     if macro_mod:
         try:
-            sections.append(macro_mod.get_macro_summary_text())
+            sections.append(_get_macro_summary(macro_mod))
         except Exception as e:
             log.warning(f"Macro data unavailable: {e}")
 
@@ -258,7 +284,7 @@ Buying Power:    ${float(account.buying_power):,.2f}""")
     macro_mod = _safe_import("ingestion.macro")
     if macro_mod:
         try:
-            sections.append(macro_mod.get_macro_summary_text())
+            sections.append(_get_macro_summary(macro_mod))
         except Exception as e:
             log.warning(f"Macro data unavailable: {e}")
 

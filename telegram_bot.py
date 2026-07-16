@@ -10,6 +10,7 @@ Priority queue levels:
 
 Runs as two daemon threads: _poll_loop (enqueues) and _worker_loop (processes).
 """
+import itertools
 import logging
 import os
 import queue
@@ -32,7 +33,11 @@ _BASE_URL = f"https://api.telegram.org/bot{_TOKEN}"
 
 _POLL_INTERVAL = 2   # seconds between getUpdates calls
 _STOP_EVENT    = threading.Event()
+# Entries are (priority, seq, update). The monotonic seq breaks priority
+# ties — without it heapq falls through to comparing the update dicts and
+# raises TypeError, which killed the poller thread silently.
 _UPDATE_QUEUE: queue.PriorityQueue = queue.PriorityQueue()
+_QUEUE_SEQ = itertools.count()
 
 # Populated at startup via _fetch_bot_username()
 _BOT_USERNAME: str = os.getenv("TELEGRAM_BOT_USERNAME", "")
@@ -136,289 +141,12 @@ def _edit_message(message_id: int, text: str) -> None:
 # ---------------------------------------------------------------------------
 # Order execution
 # ---------------------------------------------------------------------------
-
-def _execute_approved_order(approval: dict) -> bool:
-    """
-    Submit the approved order to IBKR via TWS, log the trade and stop.
-    Returns True on success.
-    """
-    ticker    = approval["ticker"]
-    action    = approval["action"]
-    risk_json = approval.get("risk_json") or {}
-
-    # Pre-flight: verify IBKR is reachable before touching the market
-    try:
-        import ibkr as _ibkr_check
-        _ibkr_check.get_ib()  # retries 3× internally
-    except Exception as conn_err:
-        log.error(f"[{ticker}] IBKR not connected — cannot execute order: {conn_err}")
-        try:
-            import alerts as _al
-            _al._send(
-                f"⚠️ IBKR CONNECTION FAILED\n"
-                f"Could not execute approved order for <b>{ticker}</b>.\n"
-                f"Error: {conn_err}\n"
-                f"Manual execution required."
-            )
-        except Exception:
-            pass
-        return False
-
-    try:
-        import ibkr
-        import db
-        import alerts as alert_module
-
-        shares = risk_json.get("shares_initial", 0)
-        if shares <= 0:
-            log.error(f"[{ticker}] No shares_initial in risk_json — cannot execute")
-            return False
-
-        # Drawdown halt — block new BUY entries if portfolio is in drawdown
-        if action in ("OPEN", "ADD"):
-            try:
-                from risk_manager import RiskManager
-                rm = RiskManager(ibkr.get_client())
-                if rm.is_halted():
-                    log.error(f"[{ticker}] Order blocked — portfolio drawdown halt active")
-                    alert_module._send(
-                        f"🛑 ORDER BLOCKED — Drawdown Halt\n"
-                        f"<b>{ticker}</b> {action} order was approved but cannot execute.\n"
-                        f"Portfolio drawdown limit is active. No new BUY entries allowed.\n"
-                        f"Review and reset the halt flag when drawdown is resolved."
-                    )
-                    return False
-            except Exception as halt_err:
-                log.warning(f"[{ticker}] Drawdown halt check failed: {halt_err}")
-
-        if action in ("OPEN", "ADD"):
-            side = "BUY"
-        elif action in ("TRIM", "EXIT"):
-            side = "SELL"
-            if action == "EXIT":
-                qty = ibkr.get_client().get_open_position(ticker).qty
-                shares = round(abs(float(qty)), 4)
-                if shares <= 0:
-                    log.error(f"[{ticker}] EXIT requested but no position found")
-                    return False
-            # Cancel the existing broker stop BEFORE selling so the fill can't
-            # race the stop and leave an order that would short the account.
-            try:
-                cancelled = ibkr.cancel_stop_orders_for(ticker)
-                if cancelled:
-                    log.info(f"[{ticker}] Cancelled {cancelled} stop order(s) before {action}")
-            except Exception as e:
-                log.warning(f"[{ticker}] Could not cancel existing stops before {action}: {e}")
-        else:
-            log.info(f"[{ticker}] Action {action} does not require order submission")
-            return True
-
-        # Price freshness check — reject if market moved >8% since sizing.
-        # Uses the staleness-aware quote so a last-RTH price hours after the
-        # close can't masquerade as "no drift".
-        price_at_sizing = risk_json.get("price_at_sizing")
-        current_price_pre = None
-        try:
-            from market_data import get_priced_quote
-            pq = get_priced_quote(ticker)
-            if pq:
-                current_price_pre = pq["price"]
-                if pq["is_stale"]:
-                    log.warning(
-                        f"[{ticker}] Price is STALE (age={pq['age_minutes']}min, "
-                        f"market_open={pq['market_open']}) — drift check unreliable"
-                    )
-                    try:
-                        alert_module._send(
-                            f"⚠️ STALE PRICE — {ticker}\n"
-                            f"Latest price ${current_price_pre:.2f} is from a stale bar "
-                            f"(market open: {pq['market_open']}). "
-                            f"Order will proceed but verify the price in TWS."
-                        )
-                    except Exception:
-                        pass
-        except Exception:
-            current_price_pre = ibkr.get_latest_price(ticker)
-        if price_at_sizing and current_price_pre:
-            drift = abs(current_price_pre - price_at_sizing) / price_at_sizing
-            if drift > 0.08:
-                log.error(
-                    f"[{ticker}] Price drift {drift:.1%} since sizing "
-                    f"(was ${price_at_sizing:.2f}, now ${current_price_pre:.2f}) — aborting order"
-                )
-                try:
-                    alert_module._send(
-                        f"⚠️ ORDER ABORTED — Price Drift\n"
-                        f"<b>{ticker}</b> moved {drift:.1%} since recommendation was sized.\n"
-                        f"Sized at: <b>${price_at_sizing:.2f}</b> | Now: <b>${current_price_pre:.2f}</b>\n"
-                        f"Re-run analysis to get fresh sizing before approving."
-                    )
-                except Exception:
-                    pass
-                return False
-
-        stop_price_for_entry = approval.get("stop_loss_price") or risk_json.get("stop_loss_price")
-
-        try:
-            from config import USE_BRACKET_ORDERS
-        except Exception:
-            USE_BRACKET_ORDERS = False
-
-        bracket_used = False
-        if side == "BUY" and USE_BRACKET_ORDERS and stop_price_for_entry:
-            # Native bracket: entry + stop linked by parentId — TWS enforces
-            # the pairing atomically, so this can't produce an orphaned stop.
-            try:
-                bracket_result = ibkr.place_bracket_order(
-                    ticker, side, shares, stop_loss_price=float(stop_price_for_entry),
-                )
-                bracket_used = True
-                order_result = {"order_id": bracket_result["parent_order_id"], "fill_price": None, "filled_qty": None}
-                log.info(f"[{ticker}] Bracket order submitted: {side} {shares} shares "
-                        f"(parent={bracket_result['parent_order_id']}, stop={bracket_result['stop_order_id']})")
-            except Exception as e:
-                log.warning(f"[{ticker}] Bracket order failed, falling back to market+separate stop: {e}")
-                bracket_used = False
-
-        if not bracket_used:
-            # Submit market order — result includes the confirmed fill price
-            order_result = ibkr.place_market_order(ticker, side, shares)
-            log.info(f"[{ticker}] Order submitted: {side} {shares} shares (id={order_result['order_id']})")
-
-        # Real fill price; fall back to latest quote only if fill unconfirmed
-        current_price = order_result.get("fill_price") or ibkr.get_latest_price(ticker) or 0.0
-        filled_qty    = order_result.get("filled_qty") or shares
-
-        # Log trade
-        db.log_trade(
-            symbol=ticker,
-            side=side,
-            quantity=filled_qty,
-            price=current_price,
-            reason=f"{action} approved via Telegram (conviction={approval['conviction']}/10)",
-        )
-
-        # Order-lifecycle + slippage logging (decision price = price used at sizing time)
-        try:
-            local_order_id = db.log_order(
-                ticker=ticker, side=side,
-                order_type="BRACKET" if bracket_used else "MARKET",
-                qty=shares, broker_order_id=order_result.get("order_id"),
-                decision_price=price_at_sizing, approval_id=approval["id"],
-                status="submitted",
-            )
-            if local_order_id > 0 and order_result.get("fill_price"):
-                db.update_order_fill(local_order_id, order_result["fill_price"],
-                                     order_result.get("filled_qty") or shares, "filled")
-        except Exception as e:
-            log.debug(f"[{ticker}] Order/slippage logging failed (non-critical): {e}")
-
-        # Stop lifecycle on SELL: EXIT removes the stop record entirely;
-        # TRIM re-places the stop for the remaining shares.
-        if side == "SELL":
-            if action == "EXIT":
-                db.delete_position_stop(ticker)
-                log.info(f"[{ticker}] Position closed — stop record deleted")
-                # Close the feedback-loop outcome record with the real fill price
-                try:
-                    db.close_trade_outcome(ticker, exit_price=current_price)
-                except Exception as e:
-                    log.warning(f"[{ticker}] close_trade_outcome failed: {e}")
-            else:  # TRIM — re-place stop at same price for remaining quantity
-                try:
-                    remaining = round(abs(float(ibkr.get_client().get_open_position(ticker).qty)), 4)
-                except Exception:
-                    remaining = 0
-                stop_rec = db.get_position_stop(ticker)
-                if remaining > 0 and stop_rec:
-                    try:
-                        new_stop = ibkr.place_stop_order(ticker, remaining, stop_rec["stop_price"])
-                        db.set_stop_broker_order_id(ticker, new_stop["order_id"])
-                        log.info(f"[{ticker}] Stop re-placed for remaining {remaining} shares")
-                    except Exception as e:
-                        log.error(f"[{ticker}] Failed to re-place stop after TRIM: {e}")
-                        alert_module._send(
-                            f"🚨 UNPROTECTED POSITION — {ticker}\n"
-                            f"TRIM filled but stop re-placement failed. "
-                            f"Place stop @ ${stop_rec['stop_price']:.2f} for {remaining} shares manually."
-                        )
-                elif remaining <= 0:
-                    db.delete_position_stop(ticker)
-
-        # Log stop level and place stop order with IBKR.
-        # Skipped when a bracket order already placed the stop atomically —
-        # re-placing it here would create a second, redundant stop.
-        stop_price = approval.get("stop_loss_price") or risk_json.get("stop_loss_price")
-        if stop_price and side == "BUY" and bracket_used:
-            db.upsert_position_stop(
-                ticker=ticker,
-                entry_price=current_price,
-                stop_price=float(stop_price),
-                stop_method=risk_json.get("stop_method", ""),
-                bucket=approval.get("thesis_bucket", "Accelerator"),
-                conviction=approval.get("conviction", 5),
-                trail_distance_pct=risk_json.get("trailing_stop_distance_pct"),
-            )
-            db.set_stop_broker_order_id(ticker, bracket_result["stop_order_id"])
-            log.info(f"[{ticker}] Bracket stop recorded (orderId={bracket_result['stop_order_id']})")
-        elif stop_price and side == "BUY":
-            db.upsert_position_stop(
-                ticker=ticker,
-                entry_price=current_price,
-                stop_price=float(stop_price),
-                stop_method=risk_json.get("stop_method", ""),
-                bucket=approval.get("thesis_bucket", "Accelerator"),
-                conviction=approval.get("conviction", 5),
-                trail_distance_pct=risk_json.get("trailing_stop_distance_pct"),
-            )
-            stop_placed = False
-            for stop_attempt in range(1, 4):
-                try:
-                    stop_result = ibkr.place_stop_order(ticker, filled_qty, float(stop_price))
-                    db.set_stop_broker_order_id(ticker, stop_result["order_id"])
-                    stop_placed = True
-                    break
-                except Exception as e:
-                    log.warning(f"[{ticker}] Stop order attempt {stop_attempt}/3 failed: {e}")
-                    if stop_attempt < 3:
-                        import time as _time
-                        _time.sleep(2 * stop_attempt)
-            if not stop_placed:
-                log.error(f"[{ticker}] CRITICAL — stop order failed after 3 attempts. Position is UNPROTECTED.")
-                try:
-                    alert_module._send(
-                        f"🚨 UNPROTECTED POSITION — ACTION REQUIRED\n"
-                        f"<b>{ticker}</b>: entry order was filled but stop order failed after 3 attempts.\n"
-                        f"Stop target: <b>${float(stop_price):.2f}</b> for {filled_qty} shares.\n"
-                        f"Place stop manually in TWS immediately."
-                    )
-                except Exception:
-                    pass
-
-        # Log outcome record for feedback loop
-        db.log_trade_outcome(
-            approval_id=approval["id"],
-            ticker=ticker,
-            action=action,
-            conviction=approval.get("conviction", 5),
-            bucket=approval.get("thesis_bucket", ""),
-            entry_price=current_price,
-        )
-
-        # Send trade alert
-        alert_module.send_trade_alert(
-            symbol=ticker,
-            side=side,
-            qty=filled_qty,
-            price=current_price,
-            reason=f"{action} approved",
-        )
-
-        return True
-
-    except Exception as e:
-        log.error(f"[{ticker}] Order execution failed: {e}")
-        return False
+# Moved to execution.py — shared by the auto-execute pipeline (crew.py),
+# this module's own callback handler below, !urgent chat commands, and the
+# dashboard's manual trade form, so a fix in one path fixes all four. This
+# name is kept as a thin alias since it's referenced from here and from
+# agents/crew.py.
+from execution import execute_approved as _execute_approved_order
 
 
 # ---------------------------------------------------------------------------
@@ -432,6 +160,29 @@ def _handle_callback(update: dict) -> None:
     msg_id  = cq.get("message", {}).get("message_id")
     from_   = cq.get("from", {})
     user    = from_.get("username") or from_.get("first_name") or str(from_.get("id", "unknown"))
+
+    # Authorization — these buttons execute orders. Mentions are gated on
+    # _ALLOWED_USER_IDS in _handle_mention; callbacks must be too, and they
+    # fail CLOSED when no allowlist is configured (anyone in the chat could
+    # otherwise fire trades).
+    user_id = from_.get("id")
+    if not _ALLOWED_USER_IDS:
+        log.error("Callback rejected — TELEGRAM_ALLOWED_USER_IDS is not set; "
+                  "approval buttons are disabled until it is.")
+        _answer_callback(cq_id, "Approvals disabled: no allowlist configured.")
+        return
+    if user_id not in _ALLOWED_USER_IDS:
+        log.warning(f"Blocked callback from unauthorized user_id={user_id} ({user})")
+        _answer_callback(cq_id, "Not authorized.")
+        return
+    cb_chat_id = cq.get("message", {}).get("chat", {}).get("id")
+    try:
+        if cb_chat_id is not None and _CHAT_ID and int(cb_chat_id) != int(_CHAT_ID):
+            log.warning(f"Blocked callback from unexpected chat_id={cb_chat_id}")
+            _answer_callback(cq_id, "Not authorized.")
+            return
+    except (TypeError, ValueError):
+        pass
 
     if not data or ":" not in data:
         return
@@ -548,23 +299,24 @@ def _execute_chat_order(
     reply_to: int | None,
 ) -> None:
     """
-    Execute a trade from a !urgent chat command.
-    If qty is None, sizes via RiskManager at conviction 7.
-    Places ATR-based stop for BUY orders. Logs to DB.
+    Execute a trade from a !urgent chat command via the shared execution
+    module (execution.execute_manual) — same phantom-fill-safety,
+    owned-qty-clamping, and stop-lifecycle handling as every other trade
+    path. If qty is None, sizes via RiskManager at conviction 7.
     """
     try:
         import ibkr
-        import db
-        import alerts as alert_module
         from risk_manager import RiskManager
         from agents.market_regime import get_cached_regime
+        from execution import execute_manual
 
         rm = RiskManager(ibkr.get_client())
 
         if side == "BUY" and rm.is_halted():
-            _reply(chat_id, f"🛑 <b>Blocked</b> — portfolio drawdown halt is active. No new buys.", reply_to)
+            _reply(chat_id, "🛑 <b>Blocked</b> — portfolio drawdown halt is active. No new buys.", reply_to)
             return
 
+        bucket = "Accelerator"
         if qty is None:
             price = ibkr.get_latest_price(ticker)
             if not price or price <= 0:
@@ -585,88 +337,16 @@ def _execute_chat_order(
                 _reply(chat_id, f"⚠️ Risk manager returned 0 shares for <b>{ticker}</b>: {'; '.join(flags)}", reply_to)
                 return
 
-        if side == "SELL":
-            # Cancel existing stops first so the sell can't leave an orphaned
-            # stop order that would short the account later.
-            try:
-                cancelled = ibkr.cancel_stop_orders_for(ticker)
-                if cancelled:
-                    log.info(f"[{ticker}] Cancelled {cancelled} stop order(s) before !urgent SELL")
-            except Exception as e:
-                log.warning(f"[{ticker}] Could not cancel stops before !urgent SELL: {e}")
+        log.info(f"[CHAT !urgent] {side} {qty} {ticker}")
+        result = execute_manual(ticker, side, qty, reason="!urgent chat command",
+                                bucket=bucket, conviction=7)
 
-        order_result = ibkr.place_market_order(ticker, side, qty)
-        log.info(f"[CHAT !urgent] {side} {qty} {ticker} (id={order_result['order_id']})")
-
-        fill_price = order_result.get("fill_price") or ibkr.get_latest_price(ticker) or 0.0
-        db.log_trade(
-            symbol=ticker, side=side, quantity=order_result.get("filled_qty") or qty,
-            price=fill_price,
-            reason="!urgent chat command",
-        )
-
-        if side == "SELL":
-            # Keep DB stop records in sync with what remains at the broker
-            try:
-                remaining = round(abs(float(ibkr.get_client().get_open_position(ticker).qty)), 4)
-            except Exception:
-                remaining = 0
-            if remaining <= 0:
-                db.delete_position_stop(ticker)
-                try:
-                    db.close_trade_outcome(ticker, exit_price=fill_price)
-                except Exception as e:
-                    log.debug(f"[{ticker}] close_trade_outcome (no open outcome row is expected "
-                             f"for positions not opened via approval): {e}")
-            else:
-                stop_rec = db.get_position_stop(ticker)
-                if stop_rec:
-                    try:
-                        new_stop = ibkr.place_stop_order(ticker, remaining, stop_rec["stop_price"])
-                        db.set_stop_broker_order_id(ticker, new_stop["order_id"])
-                    except Exception as e:
-                        log.error(f"[{ticker}] Failed to re-place stop after !urgent trim: {e}")
-
-        # ATR-based stop for buys
-        stop_info = ""
-        if side == "BUY":
-            stop_price, _ = rm.calculate_stop(ticker, fill_price, bucket if qty is None else "Accelerator")
-            if stop_price:
-                db.upsert_position_stop(
-                    ticker=ticker, entry_price=fill_price,
-                    stop_price=float(stop_price), stop_method="!urgent ATR stop",
-                    bucket="Accelerator", conviction=7, trail_distance_pct=None,
-                )
-                stop_placed = False
-                for attempt in range(1, 4):
-                    try:
-                        stop_result = ibkr.place_stop_order(ticker, qty, float(stop_price))
-                        db.set_stop_broker_order_id(ticker, stop_result["order_id"])
-                        stop_placed = True
-                        break
-                    except Exception as e:
-                        log.warning(f"[{ticker}] Stop attempt {attempt}/3: {e}")
-                        if attempt < 3:
-                            time.sleep(2 * attempt)
-                if stop_placed:
-                    stop_info = f"\nStop placed @ <b>${stop_price:.2f}</b>"
-                else:
-                    stop_info = "\n⚠️ <b>Stop order FAILED — place manually in TWS!</b>"
-                    try:
-                        alert_module._send(
-                            f"🚨 UNPROTECTED POSITION — {ticker}\n"
-                            f"!urgent order filled but stop failed. Place stop @ ${stop_price:.2f} manually."
-                        )
-                    except Exception:
-                        pass
+        if not result["success"]:
+            _reply(chat_id, f"⚠️ <b>{ticker}</b>: {result['message']}", reply_to)
+            return
 
         icon = "🟢" if side == "BUY" else "🔴"
-        _reply(
-            chat_id,
-            f"{icon} <b>{side} {qty} {ticker}</b> executed\n"
-            f"Fill price: ~${fill_price:.2f}{stop_info}",
-            reply_to,
-        )
+        _reply(chat_id, f"{icon} <b>{result['message']}</b> executed", reply_to)
 
     except Exception as e:
         log.error(f"[CHAT !urgent] Order failed for {ticker}: {e}")
@@ -764,24 +444,36 @@ def _poll_loop() -> None:
     offset = 0
 
     while not _STOP_EVENT.is_set():
-        updates = _get_updates(offset)
+        try:
+            updates = _get_updates(offset)
+        except Exception as e:
+            log.error(f"_get_updates failed: {e}")
+            time.sleep(_POLL_INTERVAL)
+            continue
+
         for update in updates:
-            offset = update["update_id"] + 1
+            try:
+                offset = update["update_id"] + 1
 
-            if "callback_query" in update:
-                _UPDATE_QUEUE.put((1, update))
+                if "callback_query" in update:
+                    _UPDATE_QUEUE.put((1, next(_QUEUE_SEQ), update))
 
-            elif "message" in update:
-                msg  = update.get("message", {})
-                text = msg.get("text", "")
-                uid  = msg.get("from", {}).get("id")
-                bot_mention = f"@{_BOT_USERNAME}".lower() if _BOT_USERNAME else None
-                is_mention  = bot_mention and bot_mention in text.lower()
-                log.info(f"[chat] msg from user_id={uid} | mention={is_mention} | text={text[:80]!r}")
-                if is_mention:
-                    is_urgent = "!urgent" in text.lower()
-                    priority  = 0 if is_urgent else 2
-                    _UPDATE_QUEUE.put((priority, update))
+                elif "message" in update:
+                    msg  = update.get("message", {})
+                    text = msg.get("text", "")
+                    uid  = msg.get("from", {}).get("id")
+                    bot_mention = f"@{_BOT_USERNAME}".lower() if _BOT_USERNAME else None
+                    is_mention  = bot_mention and bot_mention in text.lower()
+                    log.info(f"[chat] msg from user_id={uid} | mention={is_mention} | text={text[:80]!r}")
+                    if is_mention:
+                        is_urgent = "!urgent" in text.lower()
+                        priority  = 0 if is_urgent else 2
+                        _UPDATE_QUEUE.put((priority, next(_QUEUE_SEQ), update))
+            except Exception as e:
+                # Never let one malformed update kill the poller thread —
+                # that silently stops the entire approval pipeline until a
+                # manual restart.
+                log.error(f"Failed to process update {update.get('update_id')}: {e}")
 
         if not updates:
             time.sleep(_POLL_INTERVAL)
@@ -793,7 +485,7 @@ def _worker_loop() -> None:
     log.info("Telegram bot worker started.")
     while not _STOP_EVENT.is_set():
         try:
-            priority, update = _UPDATE_QUEUE.get(timeout=1)
+            priority, _seq, update = _UPDATE_QUEUE.get(timeout=1)
         except queue.Empty:
             continue
         try:

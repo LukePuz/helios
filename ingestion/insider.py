@@ -178,7 +178,6 @@ def _search_form4(ticker: str, cik: str) -> list[dict]:
             filing_id = entry.findtext("atom:id", namespaces=ns) or ""
             if _is_seen(filing_id):
                 continue
-            _mark_seen(filing_id)
 
             link_el = entry.find("atom:link", namespaces=ns)
             index_url = link_el.get("href", "") if link_el is not None else ""
@@ -191,7 +190,10 @@ def _search_form4(ticker: str, cik: str) -> list[dict]:
                 continue
             parsed = _parse_form4_transactions(primary_doc)
             if not parsed:
-                continue  # no open-market purchase in this filing — not a buy signal
+                # Not a buy signal — mark seen now so we don't keep
+                # re-fetching/re-parsing this filing on every poll.
+                _mark_seen(filing_id)
+                continue
 
             role = parsed["officer_title"] or ("Director" if parsed["is_director"] else "Insider")
             results.append({
@@ -209,6 +211,9 @@ def _search_form4(ticker: str, cik: str) -> list[dict]:
                     f"{parsed['total_shares_bought']:,.0f} shares worth "
                     f"~${parsed['total_value_bought']:,.0f}. Filed: {filed_at}."
                 ),
+                # Not marked seen yet — tasks.poll_insider marks it after a
+                # successful dispatch, so a Celery retry can't lose it.
+                "_seen_key": filing_id,
             })
     except ET.ParseError as e:
         log.warning(f"Form 4 atom parse error for {ticker}: {e}")

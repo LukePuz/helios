@@ -32,7 +32,10 @@ from config import SYMBOLS
 
 _SCREENER_PROMPT = """\
 You are a financial analyst screening events for a trading system that holds \
-tech, AI, semiconductor, and quantum computing stocks.
+tech, AI, semiconductor, and quantum computing stocks. Every event you mark \
+relevant costs several minutes of expensive 72B-model analysis downstream — \
+be a real filter, not a rubber stamp. On a busy news day this system sees \
+hundreds of events; most should NOT pass.
 
 WATCHLIST: {symbols}
 
@@ -42,23 +45,40 @@ Ticker: {ticker}
 Title: {title}
 Content (first 500 chars): {content}
 
-Your job is to determine if this event is materially relevant to ANY stock \
-in our watchlist — including INDIRECT effects (e.g., a TSMC supply issue \
-affects NVDA even though TSMC isn't in our list).
+Mark relevant ONLY if BOTH are true:
+1. It's materially relevant to a specific watchlist stock — including \
+   INDIRECT effects (e.g., a TSMC supply issue affects NVDA even though \
+   TSMC isn't in our list) — AND
+2. It contains genuinely NEW, specific factual information that could change \
+   a position or thesis (an earnings result, a filing, a contract, a guidance \
+   change, a specific analyst price-target change with a stated reason).
+
+Mark NOT relevant for: opinion/recap pieces ("Is X a buy?", "Why is X stock \
+falling/rising today?"), multi-stock roundup or "stocks that explain the \
+market today" listicles, restatements of information already obviously \
+priced in (a headline just describing today's price move with no new cause), \
+and generic sector commentary with no ticker-specific new fact. These are \
+real content, just not something worth a deep trading analysis every time \
+one is published — being mentioned in a roundup is not the same as being \
+the subject of new information.
+
+If relevant, set urgency. If you would mark urgency "low" (background \
+context, no action needed), mark the event NOT relevant instead — there's \
+no reason to pay for a deep analysis of something you've just said doesn't \
+need action.
 
 Respond ONLY with valid JSON, no other text:
 {{
   "relevant": true or false,
-  "urgency": "immediate" or "eod" or "low",
+  "urgency": "immediate" or "eod",
   "affected_tickers": ["TICK1", "TICK2"],
-  "reason": "one sentence explanation",
+  "reason": "one sentence explanation — if relevant, name the specific new fact",
   "indirect_effects": "brief description of any second-order effects, or null"
 }}
 
-Urgency definitions:
+Urgency definitions (only apply when relevant=true):
 - immediate: market-moving news, act within the hour
 - eod:       relevant for end-of-day review
-- low:       background context, no urgent action needed
 """
 
 
@@ -71,9 +91,21 @@ def _call_ollama(prompt: str) -> str | None:
                 "model":  SCREENER_MODEL,
                 "prompt": prompt,
                 "stream": False,
-                "options": {"temperature": 0.1, "num_predict": 256},
+                "options": {"temperature": 0.1, "num_predict": 256, "num_gpu": 0},
+                # Screening now runs on its own queue/worker at higher
+                # concurrency than the 72B analyst (see tasks.screen_event) —
+                # both GPUs already sit at ~93% VRAM just holding the 72B
+                # model, so a concurrent GPU-bound 7B call would either fail
+                # or force the 72B further onto CPU. Forcing CPU here (same
+                # fix as chat_assistant.py) means screening never contends
+                # with the analyst for VRAM at all.
+                "keep_alive": "30m",
             },
-            timeout=30,
+            # First CPU call after a cold start can take longer than the old
+            # 30s bound (measured ~30s+ cold vs ~28s once warm) — generous
+            # enough to avoid an unnecessary keyword-fallback on every
+            # worker restart, still bounded since screening must stay fast.
+            timeout=60,
         )
         resp.raise_for_status()
         return resp.json().get("response", "")
@@ -100,16 +132,20 @@ def _keyword_fallback(event: dict) -> dict:
         "data breach", "cyberattack", "doj", "antitrust",
     ]
 
-    # Low-signal keywords
-    low_keywords = ["routine", "form 4", "scheduled", "annual report"]
+    # Recap/opinion pieces that shouldn't burn a deep-analysis pass even if
+    # they mention a watchlist ticker by name.
+    low_signal_keywords = [
+        "is it a buy", "should you buy", "why is", "why did", "stocks that explain",
+        "stocks to watch", "top gainers", "top losers", "here's why", "explained",
+    ]
+    if any(kw in text for kw in low_signal_keywords):
+        return {
+            "relevant": False, "urgency": "eod", "affected_tickers": [],
+            "reason": "Keyword heuristic: looks like a recap/opinion piece, not new information",
+            "indirect_effects": None, "model_used": "keyword_fallback",
+        }
 
-    urgency = "low"
-    for kw in urgent_keywords:
-        if kw in text:
-            urgency = "immediate"
-            break
-    if urgency == "low":
-        urgency = "eod"
+    is_urgent = any(kw in text for kw in urgent_keywords)
 
     # Find affected tickers by mention
     affected = [ticker] if ticker in SYMBOLS else []
@@ -117,12 +153,16 @@ def _keyword_fallback(event: dict) -> dict:
         if sym.lower() in text and sym not in affected:
             affected.append(sym)
 
-    relevant = len(affected) > 0 or any(kw in text for kw in urgent_keywords)
+    # Without the model to judge "genuinely new information," the fallback
+    # only fires on an explicit urgent keyword hit — matches the tightened
+    # philosophy of being a real filter, not a rubber stamp for anything
+    # that merely mentions a watchlist ticker.
+    relevant = is_urgent and len(affected) > 0
 
     return {
         "relevant":         relevant,
-        "urgency":          urgency if relevant else "low",
-        "affected_tickers": affected,
+        "urgency":          "immediate" if relevant else "eod",
+        "affected_tickers": affected if relevant else [],
         "reason":           "Keyword heuristic (Ollama not available)",
         "indirect_effects": None,
         "model_used":       "keyword_fallback",

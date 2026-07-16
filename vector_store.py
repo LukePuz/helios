@@ -96,7 +96,13 @@ def store(
     if not text.strip():
         return
     col = _get_collection(collection)
-    embedding = embed(text[:8192])  # cap at 8k chars for embedding
+    # Cap is cosmetic beyond the model's own limit — all-MiniLM-L6-v2
+    # truncates at ~256 tokens (~1k chars) regardless, so a long filing's
+    # embedding is really only ever computed from its first ~1k chars, not
+    # the full 8k this slice suggests. Kept at 8k anyway: it's a cheap
+    # upper bound against pathological huge inputs and costs nothing since
+    # the model truncates further internally.
+    embedding = embed(text[:8192])
     meta = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         **(metadata or {}),
@@ -117,10 +123,15 @@ def search(
     query: str,
     n_results: int = 5,
     where: dict | None = None,
+    query_embedding: list[float] | None = None,
 ) -> list[dict]:
     """
     Semantic search — returns the most relevant documents for a query.
     Used by context_engine to find relevant history before a model call.
+
+    Pass query_embedding to reuse an already-computed embedding (see
+    search_all_collections, which used to embed the identical query string
+    once per collection — 7 CPU embeddings for one logical search).
     """
     col = _get_collection(collection)
     count = col.count()
@@ -128,7 +139,8 @@ def search(
         return []
 
     n_results = min(n_results, count)
-    query_embedding = embed(query)
+    if query_embedding is None:
+        query_embedding = embed(query)
 
     kwargs: dict[str, Any] = {
         "query_embeddings": [query_embedding],
@@ -155,9 +167,12 @@ def search_all_collections(query: str, n_results: int = 3) -> list[dict]:
     Searches every collection and returns the top results across all of them.
     Used for broad context assembly when the event type isn't known.
     """
+    # Embed the query once, not once per collection (this used to run 7
+    # identical CPU embeddings of the same query string per call).
+    query_embedding = embed(query)
     all_results = []
     for collection in COLLECTIONS:
-        results = search(collection, query, n_results=n_results)
+        results = search(collection, query, n_results=n_results, query_embedding=query_embedding)
         for r in results:
             r["collection"] = collection
         all_results.extend(results)

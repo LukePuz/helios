@@ -55,6 +55,13 @@ MAX_SINGLE_THEME_PCT   = 0.35   # 35% per sector/thesis
 MAX_AI_INFRA_PCT       = 0.60   # 60% total AI infrastructure exposure
 MAX_MOONSHOT_TOTAL_PCT = 0.10   # 10% total moonshots
 
+# Cash-reserve cap — a single trade's initial tranche may spend at most this
+# fraction of *current cash on hand*, not portfolio value. Because the cap
+# shrinks along with cash, spend decays geometrically toward zero instead of
+# a burst of same-day auto-executes ever being able to fully drain the
+# account (see agents/crew.py auto-execute, no human tap since 2026-07-14).
+MAX_TRADE_PCT_OF_CASH_RESERVE = 0.20   # 20% of remaining cash per trade
+
 # Sizing table: (bucket, conviction_band) → (min_pct, max_pct) of portfolio
 # conviction_band is the lower bound of the 2-point band
 BUCKET_SIZE_TABLE: dict[str, dict[int, tuple[float, float]]] = {
@@ -89,6 +96,26 @@ TRAILING_STOP_DISTANCE: dict[str, tuple[float, float]] = {
     "Compounder":  (0.15, 0.20),
     "Accelerator": (0.10, 0.15),
 }
+
+# ---------------------------------------------------------------------------
+# Buy cooldown
+# ---------------------------------------------------------------------------
+# Minimum gap between auto-executed OPEN/ADD buys on the same ticker, unless
+# the new signal's conviction exceeds the prior one. has_active_approval only
+# blocks a ticker with a PENDING/PROCESSING row; auto-execute clears that
+# within seconds, so independent event sources (EDGAR/options/news/insider)
+# could each re-buy the same ticker minutes apart — this is what drove the
+# 2026-07-15 10-trade, $0-cash morning.
+REBUY_COOLDOWN_HOURS = 4
+
+# ---------------------------------------------------------------------------
+# Sell behaviour
+# ---------------------------------------------------------------------------
+TRIM_FRACTION = 0.33   # analyst TRIM sells this fraction of the held position
+# When a monitored stop level is breached and NO protective stop exists at
+# the broker, execute a market sell of the full position instead of only
+# alerting. Only ever reduces exposure; set False to fall back to alert-only.
+AUTO_EXECUTE_PROTECTIVE_SELLS = True
 
 # ---------------------------------------------------------------------------
 # Agent pipeline thresholds

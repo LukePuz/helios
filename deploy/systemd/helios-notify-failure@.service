@@ -1,0 +1,8 @@
+[Unit]
+Description=Notify Telegram that %i failed
+
+[Service]
+Type=oneshot
+User=luke-puzenski
+WorkingDirectory=/home/luke-puzenski/Desktop/trading_bot
+ExecStart=/home/luke-puzenski/Desktop/trading_bot/venv/bin/python /home/luke-puzenski/Desktop/trading_bot/deploy/notify_failure.py %i

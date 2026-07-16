@@ -10,7 +10,9 @@ screen → analyze → route pipeline that SEC filings and options flow use,
 so the bot can react to news for the first time.
 """
 
+import hashlib
 import logging
+import re
 import time
 import xml.etree.ElementTree as ET
 from urllib.parse import quote
@@ -21,6 +23,7 @@ import yfinance as yf
 log = logging.getLogger(__name__)
 
 _SOURCE = "news"
+_TITLE_SOURCE = "news_title"   # cross-source dedup: same headline via both feeds
 GOOGLE_NEWS_RSS = "https://news.google.com/rss/search"
 HEADERS = {"User-Agent": "Mozilla/5.0 (trading-bot; +lpuzenski@gmail.com)"}
 
@@ -33,12 +36,21 @@ def _is_seen(item_id: str) -> bool:
         return False
 
 
-def _mark_seen(item_id: str) -> None:
+def _title_key(title: str) -> str:
+    """Normalized-title hash — yfinance dedups by uuid and Google RSS by
+    link, so the identical headline from both sources gets two different
+    IDs under the "news" source and was analyzed twice. This is a second,
+    content-based dedup key shared across both fetchers."""
+    normalized = re.sub(r"\W+", "", title.lower())
+    return hashlib.sha1(normalized.encode()).hexdigest()
+
+
+def _is_seen_title(title: str) -> bool:
     try:
         import db
-        db.mark_seen(_SOURCE, item_id)
-    except Exception as e:
-        log.debug(f"mark_seen failed for {item_id}: {e}")
+        return db.is_seen(_TITLE_SOURCE, _title_key(title))
+    except Exception:
+        return False
 
 
 def _yfinance_news(ticker: str) -> list[dict]:
@@ -56,7 +68,6 @@ def _yfinance_news(ticker: str) -> list[dict]:
         item_id = content.get("uuid") or item.get("uuid") or content.get("title", "")
         if not item_id or _is_seen(item_id):
             continue
-        _mark_seen(item_id)
 
         title   = content.get("title", "")
         summary = content.get("summary", "") or content.get("description", "")
@@ -64,7 +75,7 @@ def _yfinance_news(ticker: str) -> list[dict]:
                   or (content.get("canonicalUrl") or {}).get("url") \
                   or item.get("link", "")
 
-        if not title:
+        if not title or _is_seen_title(title):
             continue
 
         results.append({
@@ -73,6 +84,9 @@ def _yfinance_news(ticker: str) -> list[dict]:
             "title":  title,
             "url":    url,
             "text":   f"{title}\n\n{summary}".strip(),
+            # Not marked seen yet — tasks.poll_news marks both keys after a
+            # successful dispatch, so a Celery retry can't lose the item.
+            "_seen_keys": [(_SOURCE, item_id), (_TITLE_SOURCE, _title_key(title))],
         })
     return results
 
@@ -95,9 +109,8 @@ def _google_news_rss(ticker: str) -> list[dict]:
         link  = (item.findtext("link") or "").strip()
         pub   = (item.findtext("pubDate") or "").strip()
         item_id = link or title
-        if not title or not item_id or _is_seen(item_id):
+        if not title or not item_id or _is_seen(item_id) or _is_seen_title(title):
             continue
-        _mark_seen(item_id)
 
         results.append({
             "source": "news",
@@ -105,6 +118,7 @@ def _google_news_rss(ticker: str) -> list[dict]:
             "title":  title,
             "url":    link,
             "text":   f"{title} (published {pub})",
+            "_seen_keys": [(_SOURCE, item_id), (_TITLE_SOURCE, _title_key(title))],
         })
     return results
 

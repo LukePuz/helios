@@ -3,6 +3,17 @@ Description=Helios Hedgefund trading bot (local checkout)
 After=network-online.target ibc.service
 Wants=network-online.target
 Requires=ibc.service
+# Telegram alert when this unit gives up restarting (see StartLimit* below)
+# — covers the "TWS 2FA hung waiting for a factor no script can provide"
+# case, which previously just retried every 10s forever with nobody told
+# the bot never came up for the trading day.
+OnFailure=helios-notify-failure@%n.service
+# Stop retrying after 5 failures in 10 minutes rather than forever — a
+# genuinely stuck IBKR login (2FA prompt) isn't going to resolve itself on
+# attempt #200, and hitting this limit is what puts the unit into "failed"
+# and fires OnFailure= above.
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=simple

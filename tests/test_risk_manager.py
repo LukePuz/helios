@@ -9,9 +9,16 @@ import pytest
 import risk_manager
 
 
-def _make_client(portfolio_value=100_000.0, positions=None):
+def _make_client(portfolio_value=100_000.0, positions=None, cash=None):
     client = MagicMock()
-    client.get_account.return_value = MagicMock(portfolio_value=portfolio_value)
+    # cash defaults to full portfolio value (no positions held) so existing
+    # sizing tests aren't inadvertently capped to 0 shares by the
+    # cash-reserve cap (MAX_TRADE_PCT_OF_CASH_RESERVE) added 2026-07-15 —
+    # tests that care about cash-cap behavior specifically pass it in.
+    client.get_account.return_value = MagicMock(
+        portfolio_value=portfolio_value,
+        cash=cash if cash is not None else portfolio_value,
+    )
     client.get_all_positions.return_value = positions or []
     return client
 

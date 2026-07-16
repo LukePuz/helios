@@ -71,7 +71,8 @@ def _get_workflow_status() -> dict[str, bool]:
         ibkr_ok = False
 
     telegram_ok = bool(os.getenv("TELEGRAM_BOT_TOKEN"))
-    pipeline_ok = svc.get("celery_worker", False) and ollama_ok
+    pipeline_ok = (svc.get("celery_worker", False) and svc.get("celery_llm_worker", False)
+                   and svc.get("celery_screen_worker", False) and ollama_ok)
 
     return {
         "redis":     svc.get("redis", False),
@@ -222,7 +223,9 @@ with st.sidebar:
         st.rerun()
 
     _SERVICE_INFO = {
-        "celery_worker": "Runs the background ingestion tasks — pulls SEC filings, FRED macro data, arXiv quantum/AI papers, options flow, congressional trades, and insider filings. Each event gets stored in the vector database and routed to the AI pipeline.",
+        "celery_worker": "Runs the background ingestion tasks — pulls SEC filings, FRED macro data, arXiv quantum/AI papers, options flow, congressional trades, and insider filings. Each event gets stored in the vector database and queued for the AI pipeline.",
+        "celery_llm_worker": "Dedicated worker for the 72B analyst — only receives events that already passed screening (see celery_screen_worker). Drains the priority lane (events about currently-held positions) before the bulk lane (new-idea analyses), and runs one inference at a time so the GPU isn't contended.",
+        "celery_screen_worker": "Fast 7B relevance filter, CPU-only, runs several in parallel. Rejects most incoming news/filings/options events cheaply so only genuine survivors reach the expensive 72B worker above.",
         "celery_beat": "The scheduler. Fires each ingestion task on a timer: options flow every 5 min, SEC filings every 10 min, macro data every hour, congressional trades every 6 hours, arXiv papers once daily at 9 AM ET. Also triggers daily regime assessment at 9:30 AM and scanner at 9:35 AM ET.",
         "catalyst_service": "Shared catalyst calendar API for earnings, conferences, indirect read-throughs, and conflict flags.",
     }
@@ -1138,10 +1141,18 @@ with tab_trade:
 
         if st.button("Submit Order", type="primary", disabled=not confirmed):
             try:
-                place_market_order(trade_symbol, trade_side, trade_qty)
-                reason = "Manual trade from dashboard"
-                db.log_trade(trade_symbol, trade_side, trade_qty, est_price, reason)
-                alerts.send_trade_alert(trade_symbol, trade_side, trade_qty, est_price, reason)
-                st.success(f"Order submitted: {trade_side} {trade_qty} x {trade_symbol}")
+                # Routed through execution.execute_manual — previously this
+                # called place_market_order directly, which skipped stop
+                # placement on BUY (the position was invisible to the
+                # trailing-stop monitor), didn't clamp SELL to owned shares
+                # or cancel existing stops first, and logged the trade at
+                # the pre-order estimated price instead of the real fill.
+                from execution import execute_manual
+                result = execute_manual(trade_symbol, trade_side, trade_qty,
+                                        reason="Manual trade from dashboard")
+                if result["success"]:
+                    st.success(f"Order executed: {result['message']}")
+                else:
+                    st.error(f"Order failed: {result['message']}")
             except Exception as e:
                 st.error(f"Order failed: {e}")

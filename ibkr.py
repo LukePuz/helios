@@ -33,13 +33,38 @@ log = logging.getLogger(__name__)
 
 IB_HOST      = os.getenv("IB_HOST",      "127.0.0.1")
 IB_PORT      = int(os.getenv("IB_PORT",      "7497"))   # 7497=paper, 7496=live
-IB_CLIENT_ID = int(os.getenv("IB_CLIENT_ID", "1"))
+_IB_CLIENT_ID_BASE = int(os.getenv("IB_CLIENT_ID", "1"))
 
 _ib: ibi.IB | None = None
+_client_id: int | None = None   # resolved lazily on first connect
 _last_heartbeat: float = 0.0   # time.monotonic() of last successful heartbeat
 
 _HEARTBEAT_INTERVAL_S = 30
 _HEARTBEAT_TIMEOUT_S  = 8
+
+
+def _resolve_client_id() -> int:
+    """A Celery worker started with --pool=prefork -c N forks N child
+    processes that all inherit the same IB_CLIENT_ID from the environment —
+    TWS allows only one connection per clientId, so without this every fork
+    but one gets rejected ("clientId already in use"), silently breaking
+    whichever ops task (stop checks, drawdown, snapshots) lands on a loser
+    fork. Offset by the prefork worker index when running inside one."""
+    try:
+        from billiard import current_process
+        idx = getattr(current_process(), "index", None)
+        if idx is not None:
+            return _IB_CLIENT_ID_BASE + int(idx)
+    except Exception:
+        pass
+    return _IB_CLIENT_ID_BASE
+
+
+def _get_client_id() -> int:
+    global _client_id
+    if _client_id is None:
+        _client_id = _resolve_client_id()
+    return _client_id
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +72,7 @@ _HEARTBEAT_TIMEOUT_S  = 8
 # ---------------------------------------------------------------------------
 
 def get_ib(max_attempts: int = 3) -> ibi.IB:
-    global _ib, _last_heartbeat
+    global _ib, _last_heartbeat, _client_id
     import asyncio
     import time
     for attempt in range(1, max_attempts + 1):
@@ -55,10 +80,26 @@ def get_ib(max_attempts: int = 3) -> ibi.IB:
             if _ib is None:
                 _ib = ibi.IB()
             if not _ib.isConnected():
-                _ib.connect(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID,
-                            readonly=False, timeout=10)
+                cid = _get_client_id()
+                try:
+                    _ib.connect(IB_HOST, IB_PORT, clientId=cid,
+                                readonly=False, timeout=10)
+                except Exception as connect_err:
+                    # Error 326: another process already holds this clientId
+                    # (belt-and-braces on top of _resolve_client_id — covers
+                    # non-Celery processes or an unexpected id collision).
+                    # Fall back to a pid-derived id and retry once.
+                    if "already in use" in str(connect_err) or "326" in str(connect_err):
+                        fallback = 100 + (os.getpid() % 800)
+                        log.warning(f"clientId {cid} already in use — retrying with {fallback}")
+                        _client_id = fallback
+                        _ib.connect(IB_HOST, IB_PORT, clientId=fallback,
+                                    readonly=False, timeout=10)
+                        cid = fallback
+                    else:
+                        raise
                 _last_heartbeat = 0.0
-                log.info(f"Connected to IBKR TWS at {IB_HOST}:{IB_PORT} (clientId={IB_CLIENT_ID})")
+                log.info(f"Connected to IBKR TWS at {IB_HOST}:{IB_PORT} (clientId={cid})")
             # Heartbeat — round-trips to TWS to catch stale connections that
             # report isConnected()=True but are no longer communicating.
             # Two constraints discovered the hard way:

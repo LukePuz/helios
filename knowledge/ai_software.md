@@ -102,7 +102,6 @@ The best position: a company whose data or workflow integration makes them the A
 | Ticker | Company | AI Role | Bucket | Tier |
 |---|---|---|---|---|
 | APP | AppLovin | AI-driven advertising optimization | Accelerator | Watch |
-| CFLT | Confluent | Real-time data streaming for AI | Accelerator | Watch |
 | ESTC | Elastic | Search + AI observability | Accelerator | Watch |
 | NET | Cloudflare | AI inference at edge, network | Accelerator | Watch |
 | ZETA | Zeta Global | AI marketing data platform | Accelerator | Watch |

@@ -156,7 +156,6 @@ Treatment:
 | DDOG | Datadog | Accelerator | Core |
 | MDB | MongoDB | Accelerator | Watch |
 | APP | AppLovin | Accelerator | Watch |
-| CFLT | Confluent | Accelerator | Watch |
 | NET | Cloudflare | Accelerator | Watch |
 
 ### Cyber / AI Security

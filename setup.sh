@@ -19,6 +19,7 @@ if [ ! -f .env ]; then
 else
     echo "  .env already exists — skipping copy."
 fi
+chmod 600 .env   # holds DB password, Telegram token, API keys — owner-only
 
 # Log directory
 echo "[3/4] Creating log directory..."

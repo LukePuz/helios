@@ -22,12 +22,18 @@ from pathlib import Path
 
 
 def _setup_logging() -> None:
+    from logging.handlers import RotatingFileHandler
+
     log_path = Path(__file__).parent / "helios.log"
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-8s %(message)s",
         handlers=[
-            logging.FileHandler(log_path, encoding="utf-8"),
+            # A plain FileHandler grows unbounded — on a machine that runs
+            # every weekday indefinitely this eventually fills the disk,
+            # at which point DB writes and everything else start failing
+            # too. 10MB x 5 backups keeps ~50MB of history on disk.
+            RotatingFileHandler(log_path, maxBytes=10_000_000, backupCount=5, encoding="utf-8"),
             logging.StreamHandler(sys.stdout),
         ],
     )

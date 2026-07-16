@@ -1,0 +1,18 @@
+[Unit]
+Description=Disable USB controller ACPI wake (prevents random early wake from suspend)
+DefaultDependencies=no
+Before=sleep.target
+
+[Service]
+Type=oneshot
+# /proc/acpi/wakeup entries reset every boot, so this needs to (re-)run at
+# every startup, before the machine ever suspends — a one-time manual
+# toggle wouldn't survive a reboot. This is why on the night of
+# 2026-07-15 the machine woke itself 29 minutes into what should have
+# been a ~14hr sleep until the 08:45 premarket start: a USB peripheral
+# (keyboard) sent a spurious wake signal through one of these
+# ACPI-wake-enabled controllers.
+ExecStart=/home/luke-puzenski/Desktop/trading_bot/deploy/systemd/disable-usb-wake.sh
+
+[Install]
+WantedBy=multi-user.target

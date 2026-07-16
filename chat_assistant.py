@@ -1,15 +1,33 @@
 """
-Group chat assistant — handles @mention messages from whitelisted Telegram users.
+Group chat assistant — handles @mention messages from whitelisted Telegram
+users as a genuine tool-calling agent, not a heuristic context-stuffing
+pipeline. Previously this extracted tickers via regex, always injected a
+portfolio snapshot, and only searched the web when the message happened to
+contain a keyword like "news" or "latest" — the model itself never decided
+what it needed. Now the model is handed a real toolset (portfolio, ticker
+detail, trade history, web search, market regime) via Ollama's native
+tool-calling API and decides for itself what to look up, in what order,
+possibly across multiple rounds.
 
 Provides:
   respond(user_message, username) -> str
-      Builds live portfolio/price context, optionally web-searches, then asks
-      the local Ollama 7b model to reply in plain English.
+      Runs the tool-calling agent loop and returns the final natural-
+      language reply.
 
   parse_trade_intent(text) -> dict | None
-      Parses "buy 5 NVDA" / "sell TSLA 10 shares" style commands.
+      Parses "buy 5 NVDA" / "sell TSLA 10 shares" style commands. Used only
+      by the separate, explicit !urgent command path in telegram_bot.py —
+      unrelated to and untouched by the agent rewrite below.
       Returns {"side": "BUY"|"SELL", "qty": float|None, "ticker": str} or None.
+
+Deliberately NOT a tool available to the agent: trade execution. The
+!urgent command path is the only way this bot places real orders — it
+requires explicit syntax and goes through the full risk/safety pipeline
+(execution.py). A natural-language agent must never be able to trigger a
+trade through free-text interpretation ("can you buy me some NVDA" should
+never become a real order because a model decided to call a tool).
 """
+import json
 import logging
 import os
 import re
@@ -40,10 +58,6 @@ _WORD_BLOCKLIST = {
     "OKAY", "YEAH", "COOL", "NICE", "DONE", "ASAP", "CASH",
 }
 
-_SEARCH_KEYWORDS = {"news", "latest", "recent", "search", "find", "happening",
-                    "update", "today", "report", "earnings", "analyst", "target",
-                    "forecast", "outlook", "guidance"}
-
 _TRADE_PATTERN = re.compile(
     r"\b(buy|sell)\b"
     r"(?:\s+(\d+(?:\.\d+)?)\s+(?:shares?\s+of\s+|share\s+of\s+)?)?"
@@ -53,11 +67,9 @@ _TRADE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-_TICKER_PATTERN = re.compile(r"\b([A-Z]{2,5})\b")
-
 
 # ---------------------------------------------------------------------------
-# Trade intent parser
+# Trade intent parser — used only by the separate !urgent command path
 # ---------------------------------------------------------------------------
 
 def parse_trade_intent(text: str) -> Optional[dict]:
@@ -89,16 +101,8 @@ def parse_trade_intent(text: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Ticker extraction
-# ---------------------------------------------------------------------------
-
-def _extract_tickers(text: str) -> list[str]:
-    found = _TICKER_PATTERN.findall(text)
-    return [t for t in found if t not in _WORD_BLOCKLIST]
-
-
-# ---------------------------------------------------------------------------
-# Context fetching
+# Tools — all read-only, callable by the agent. See module docstring for
+# why trade execution is deliberately excluded.
 # ---------------------------------------------------------------------------
 
 def _ibkr_reachable() -> bool:
@@ -106,142 +110,248 @@ def _ibkr_reachable() -> bool:
     try:
         import ibkr as _ibkr_mod
         ib = _ibkr_mod._ib
-        result = ib is not None and ib.isConnected()
-        log.info(f"[chat] _ibkr_reachable={result} (ib={ib})")
-        return result
+        return ib is not None and ib.isConnected()
     except Exception as e:
         log.error(f"[chat] _ibkr_reachable check failed: {e}")
         return False
 
 
-def _fetch_ticker_context(tickers: list[str]) -> str:
-    if not tickers:
-        return ""
+def _tool_get_portfolio(_args: dict) -> str:
+    """Current account value, cash, and every open position."""
     if not _ibkr_reachable():
-        return "(IBKR offline — live position data unavailable)"
-    try:
-        import ibkr as _ibkr_mod
-        ib = _ibkr_mod._ib
-        portfolio = {item.contract.symbol: item for item in ib.portfolio()}
-        lines: list[str] = []
-        for ticker in tickers:
-            item = portfolio.get(ticker)
-            if item:
-                lines.append(
-                    f"{ticker}: {item.position} shares held, avg entry ${item.averageCost:.2f}, "
-                    f"market value ${item.marketValue:,.2f}, unrealized P&L ${item.unrealizedPNL:+.2f}"
-                )
-            else:
-                lines.append(f"{ticker}: not currently held")
-        return "\n".join(lines)
-    except Exception as e:
-        log.error(f"Ticker context fetch failed: {e}")
-        return "(IBKR offline — live position data unavailable)"
-
-
-def _fetch_portfolio_snapshot() -> str:
-    if not _ibkr_reachable():
-        return "(IBKR offline — portfolio data unavailable)"
+        return "IBKR is offline right now — live portfolio data is unavailable."
     try:
         import ibkr as _ibkr_mod
         ib = _ibkr_mod._ib
         vals = {v.tag: v.value for v in ib.accountValues() if v.currency == "USD"}
         net_liq = float(vals.get("NetLiquidation", 0))
+        cash = float(vals.get("CashBalance", 0))
         portfolio = [item for item in ib.portfolio() if float(item.position) != 0]
         if not portfolio:
-            return f"Portfolio value: ${net_liq:,.2f}. No open positions."
-        lines = [f"Portfolio value: ${net_liq:,.2f}. Open positions:"]
+            return f"Portfolio value: ${net_liq:,.2f}. Cash: ${cash:,.2f}. No open positions."
+        lines = [f"Portfolio value: ${net_liq:,.2f}. Cash: ${cash:,.2f}. Open positions:"]
         for item in portfolio:
             lines.append(
-                f"  {item.contract.symbol}: {item.position} shares, "
-                f"market value ${item.marketValue:,.2f}, unrealized P&L ${item.unrealizedPNL:+.2f}"
+                f"  {item.contract.symbol}: {item.position} shares, avg entry "
+                f"${item.averageCost:.2f}, market value ${item.marketValue:,.2f}, "
+                f"unrealized P&L ${item.unrealizedPNL:+.2f}"
             )
         return "\n".join(lines)
     except Exception as e:
-        log.error(f"Portfolio snapshot failed: {e}")
-        return "(IBKR offline — portfolio data unavailable)"
+        log.error(f"[chat] get_portfolio tool failed: {e}")
+        return "Portfolio lookup failed — IBKR may be offline."
 
 
-def _fetch_trade_history(tickers: list[str]) -> str:
-    if not tickers:
-        return ""
+def _tool_get_ticker_details(args: dict) -> str:
+    """Position detail + latest price for one specific ticker."""
+    ticker = str(args.get("ticker", "")).upper().strip()
+    if not ticker:
+        return "No ticker provided."
+    if not _ibkr_reachable():
+        return f"IBKR is offline — can't look up live data for {ticker} right now."
+    try:
+        import ibkr as _ibkr_mod
+        ib = _ibkr_mod._ib
+        portfolio = {item.contract.symbol: item for item in ib.portfolio()}
+        item = portfolio.get(ticker)
+        price = _ibkr_mod.get_latest_price(ticker)
+        price_line = f"Latest price: ${price:.2f}" if price else "Latest price unavailable"
+        if item:
+            return (
+                f"{ticker}: {item.position} shares held, avg entry ${item.averageCost:.2f}, "
+                f"market value ${item.marketValue:,.2f}, unrealized P&L ${item.unrealizedPNL:+.2f}. "
+                f"{price_line}."
+            )
+        return f"{ticker}: not currently held. {price_line}."
+    except Exception as e:
+        log.error(f"[chat] get_ticker_details tool failed for {ticker}: {e}")
+        return f"Lookup failed for {ticker}."
+
+
+def _tool_get_trade_history(args: dict) -> str:
+    """Recent executed trades, optionally filtered to one ticker."""
+    ticker = str(args.get("ticker", "")).upper().strip() or None
+    limit = int(args.get("limit") or 10)
     try:
         import db
-        lines: list[str] = []
-        for ticker in tickers:
-            try:
-                trades = db.get_trades_for_symbol(ticker, limit=5)
-                if trades:
-                    for t in trades:
-                        side = t.get("side", "?")
-                        qty = t.get("quantity", "?")
-                        price = t.get("price", 0)
-                        reason = t.get("reason", "")
-                        ts = str(t.get("executed_at", ""))[:10]
-                        lines.append(f"{ticker} trade ({ts}): {side} {qty} shares @ ${price:.2f} — {reason}")
-            except Exception:
-                pass
+        trades = db.get_recent_trades(limit=50 if ticker else limit)
+        if ticker:
+            trades = [t for t in trades if t.get("symbol") == ticker][:limit]
+        if not trades:
+            scope = f" for {ticker}" if ticker else ""
+            return f"No trade history found{scope}."
+        lines = []
+        for t in trades:
+            ts = str(t.get("timestamp", ""))[:10]
+            lines.append(
+                f"{ts}: {t['side']} {t['quantity']} {t['symbol']} @ ${t['price']:.2f} "
+                f"— {t.get('reason', '')}"
+            )
         return "\n".join(lines)
     except Exception as e:
-        log.debug(f"Trade history fetch failed: {e}")
-        return ""
+        log.error(f"[chat] get_trade_history tool failed: {e}")
+        return "Trade history lookup failed."
 
 
-# ---------------------------------------------------------------------------
-# Web search
-# ---------------------------------------------------------------------------
-
-def _maybe_web_search(text: str, tickers: list[str]) -> str:
-    words = set(text.lower().split())
-    if not words.intersection(_SEARCH_KEYWORDS):
-        return ""
-    query_ticker = tickers[0] if tickers else ""
-    query = f"{query_ticker} stock {text[:120]}" if query_ticker else text[:120]
+def _tool_get_market_regime(_args: dict) -> str:
+    """Current market regime assessment (Risk-On/Neutral/Risk-Off, score, reasoning)."""
     try:
-        from duckduckgo_search import DDGS
+        from agents.market_regime import get_cached_regime
+        regime = get_cached_regime()
+        if not regime:
+            return "No regime assessment available right now."
+        return (
+            f"Regime: {regime.get('regime')} | Score: {regime.get('score')}/100 | "
+            f"Confidence: {regime.get('confidence')}%\n{regime.get('reasoning', '')}"
+        )
+    except Exception as e:
+        log.error(f"[chat] get_market_regime tool failed: {e}")
+        return "Regime lookup failed."
+
+
+def _tool_search_web(args: dict) -> str:
+    """Live web search — the agent decides when it needs current
+    information, instead of the old keyword-triggered heuristic."""
+    query = str(args.get("query", "")).strip()
+    if not query:
+        return "No search query provided."
+    try:
+        # duckduckgo_search was renamed to ddgs upstream — the old package
+        # name is deprecated and was returning zero results in practice,
+        # silently making every web-search tool call a no-op.
+        from ddgs import DDGS
         results = DDGS().text(query, max_results=5)
         if not results:
-            return ""
+            return f"No web results found for: {query}"
         snippets = []
         for r in results:
+            title = r.get("title") or ""
             body = (r.get("body") or "")[:300]
-            title = (r.get("title") or "")
             snippets.append(f"• {title}: {body}")
-        return "Web search results:\n" + "\n".join(snippets)
+        return "\n".join(snippets)
     except Exception as e:
-        log.debug(f"Web search failed: {e}")
-        return ""
+        log.debug(f"[chat] search_web tool failed: {e}")
+        return f"Web search failed for: {query}"
+
+
+_TOOL_FUNCTIONS = {
+    "get_portfolio": _tool_get_portfolio,
+    "get_ticker_details": _tool_get_ticker_details,
+    "get_trade_history": _tool_get_trade_history,
+    "get_market_regime": _tool_get_market_regime,
+    "search_web": _tool_search_web,
+}
+
+_TOOL_SPECS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_portfolio",
+            "description": "Get the current total portfolio value, cash balance, and every open position with P&L.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_ticker_details",
+            "description": "Get position detail (if held) and the latest price for one specific stock ticker.",
+            "parameters": {
+                "type": "object",
+                "properties": {"ticker": {"type": "string", "description": "Stock ticker symbol, e.g. NVDA"}},
+                "required": ["ticker"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_trade_history",
+            "description": "Get recently executed trades, optionally filtered to one ticker.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ticker": {"type": "string", "description": "Optional ticker to filter to"},
+                    "limit": {"type": "integer", "description": "Max trades to return, default 10"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_market_regime",
+            "description": "Get the current market regime assessment (Risk-On/Neutral/Risk-Off), its score, and the reasoning behind it.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_web",
+            "description": "Search the live web for current information — news, prices, events, anything not covered by the other tools.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "Search query"}},
+                "required": ["query"],
+            },
+        },
+    },
+]
+
+_SYSTEM_PROMPT = (
+    "You are Helios, a read-only research assistant for a small private investment fund's "
+    "Telegram group. You have tools to look up live portfolio data, ticker details, trade "
+    "history, the current market regime, and to search the web. Use them whenever they'd "
+    "help answer the question — don't guess at data you can look up. You may use multiple "
+    "tools, including more than once, before giving your final answer. "
+    "Never confirm, suggest, or execute trades — you are informational only; if asked to "
+    "trade, say that trades go through the explicit !urgent command, not chat. "
+    "Keep your final answer concise (under 200 words unless the question needs more) and "
+    "do not add disclaimers about being an AI."
+)
+
+_MAX_TOOL_ITERATIONS = 4
 
 
 # ---------------------------------------------------------------------------
 # Ollama call
 # ---------------------------------------------------------------------------
 
-def _call_ollama(system_prompt: str, user_message: str) -> str:
+def _call_ollama_chat(messages: list[dict], tools: list[dict] | None = None) -> dict | None:
     try:
         from config import OLLAMA_HOST, CHAT_MODEL
     except ImportError:
         OLLAMA_HOST = "http://localhost:11434"
-        CHAT_MODEL  = "qwen2.5:7b"
+        CHAT_MODEL  = "qwen2.5:3b"
+
+    payload = {
+        "model": CHAT_MODEL,
+        "stream": False,
+        "messages": messages,
+        # The 72B analyst can hold ~45GB combined VRAM across both GPUs
+        # (confirmed via `ollama ps`), leaving no room for a concurrently
+        # loaded small model — a chat call without num_gpu=0 measurably
+        # timed out in production while the analyst was busy. Forcing CPU
+        # means this never contends with the analyst for VRAM; keep_alive
+        # keeps it resident so a multi-round tool-calling conversation
+        # doesn't pay reload cost on every round.
+        "options": {"num_gpu": 0},
+        "keep_alive": "30m",
+    }
+    if tools:
+        payload["tools"] = tools
 
     try:
-        resp = requests.post(
-            f"{OLLAMA_HOST}/api/chat",
-            json={
-                "model": CHAT_MODEL,
-                "stream": False,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user",   "content": user_message},
-                ],
-            },
-            timeout=60,
-        )
+        resp = requests.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=90)
         resp.raise_for_status()
-        return resp.json()["message"]["content"].strip()
+        return resp.json().get("message")
+    except requests.exceptions.Timeout:
+        log.error("Ollama chat timed out")
+        return None
     except Exception as e:
         log.error(f"Ollama chat failed: {e}")
-        return "Sorry, I couldn't reach the local AI model right now."
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -250,34 +360,38 @@ def _call_ollama(system_prompt: str, user_message: str) -> str:
 
 def respond(user_message: str, username: str) -> str:
     """
-    Build live context and return a natural-language response via Ollama 7b.
-    Safe to call from the worker thread; no order execution happens here.
+    Runs the tool-calling agent loop and returns the final natural-language
+    reply. Safe to call from the worker thread; no order execution ever
+    happens here (see module docstring).
     """
-    tickers = _extract_tickers(user_message)
+    messages = [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user", "content": f"@{username} asks: {user_message}"},
+    ]
 
-    ticker_ctx   = _fetch_ticker_context(tickers)
-    portfolio    = _fetch_portfolio_snapshot()
-    trade_hist   = _fetch_trade_history(tickers)
-    web_results  = _maybe_web_search(user_message, tickers)
+    for _ in range(_MAX_TOOL_ITERATIONS):
+        msg = _call_ollama_chat(messages, tools=_TOOL_SPECS)
+        if msg is None:
+            return ("The local AI model didn't respond in time — it may be busy running "
+                    "a deep analysis right now. Try again in a minute.")
 
-    context_parts = [portfolio]
-    if ticker_ctx:
-        context_parts.append("Ticker details:\n" + ticker_ctx)
-    if trade_hist:
-        context_parts.append("Recent trade history:\n" + trade_hist)
-    if web_results:
-        context_parts.append(web_results)
+        tool_calls = msg.get("tool_calls")
+        if not tool_calls:
+            content = (msg.get("content") or "").strip()
+            return content or "I didn't get a usable response — try rephrasing the question."
 
-    context = "\n\n".join(p for p in context_parts if p)
+        messages.append(msg)
+        for call in tool_calls:
+            fn_name = call.get("function", {}).get("name", "")
+            fn_args = call.get("function", {}).get("arguments", {}) or {}
+            if isinstance(fn_args, str):
+                try:
+                    fn_args = json.loads(fn_args)
+                except Exception:
+                    fn_args = {}
+            fn = _TOOL_FUNCTIONS.get(fn_name)
+            log.info(f"[chat] tool call: {fn_name}({fn_args})")
+            result = fn(fn_args) if fn else f"Unknown tool: {fn_name}"
+            messages.append({"role": "tool", "content": str(result)})
 
-    system = (
-        "You are Helios, a read-only trading assistant for a small private investment fund. "
-        "You have access to live portfolio data and recent trade history shown below. "
-        "Answer questions clearly and concisely. Never confirm, suggest, or execute trades — "
-        "only describe existing positions and factual information. "
-        "Keep responses short (under 200 words unless the question requires detail). "
-        "Do not add disclaimers about being an AI.\n\n"
-        f"=== LIVE CONTEXT ===\n{context}"
-    )
-
-    return _call_ollama(system, f"@{username} asks: {user_message}")
+    return "I wasn't able to finish looking that up after a few tries — try asking again, maybe more specifically."

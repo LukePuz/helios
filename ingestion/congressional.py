@@ -74,7 +74,6 @@ def poll_once() -> list[dict]:
             trade_id = f"{ticker}_{trade.get('TransactionDate','')}_{trade.get('Representative','')}"
             if _is_seen(trade_id):
                 continue
-            _mark_seen(trade_id)
 
             side = trade.get("Transaction", "").upper()
             rep  = trade.get("Representative", "Unknown")
@@ -97,6 +96,10 @@ def poll_once() -> list[dict]:
                 "committee":   trade.get("Committee", ""),
                 "title":       text,
                 "text":        text,
+                # Not marked seen yet — tasks.poll_congressional marks it
+                # after successfully routing this trade (dispatch or vector
+                # store write), so a Celery retry can't lose it.
+                "_seen_key": trade_id,
             })
         time.sleep(0.2)
     return new_trades

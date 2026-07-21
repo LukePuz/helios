@@ -455,16 +455,28 @@ def place_stop_order(ticker: str, qty: float, stop_price: float) -> dict:
 
 
 def cancel_order(order_id: int) -> bool:
-    """Cancel an open order by orderId. Returns True if a cancel was sent."""
+    """Cancel an open order by orderId. Returns True only if the broker
+    actually confirms the cancel (order status moves to a cancelled/
+    pending-cancel state) — a client that doesn't own the order (wrong
+    clientId) can send cancelOrder() without IBKR raising anything, and
+    the order just stays open. Trusting a clean call here caused
+    reconcile_stop_orders to report the same orphaned stop "cancelled"
+    every 15-minute cycle forever without it ever actually going away."""
     ib = get_ib()
     for trade in ib.openTrades():
         if trade.order.orderId == order_id:
             ib.cancelOrder(trade.order)
             ib.sleep(1)
-            log.info(f"Cancel sent for orderId={order_id} "
-                     f"({trade.order.action} {trade.order.totalQuantity} "
-                     f"{trade.contract.symbol})")
-            return True
+            status = trade.orderStatus.status
+            if status in ("Cancelled", "ApiCancelled", "PendingCancel"):
+                log.info(f"Cancel confirmed for orderId={order_id} "
+                         f"({trade.order.action} {trade.order.totalQuantity} "
+                         f"{trade.contract.symbol}) status={status}")
+                return True
+            log.warning(f"Cancel sent for orderId={order_id} but status is still "
+                        f"'{status}' — broker likely ignored it (owned by a "
+                        f"different clientId); needs manual cancel in TWS")
+            return False
     log.warning(f"cancel_order: orderId={order_id} not found among open orders")
     return False
 

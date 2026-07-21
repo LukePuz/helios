@@ -9,6 +9,8 @@ Model: all-MiniLM-L6-v2 (~90MB, fast, accurate for finance text)
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +24,30 @@ log = logging.getLogger(__name__)
 
 _DB_PATH = Path(__file__).parent / ".chromadb"
 _EMBED_MODEL = "all-MiniLM-L6-v2"
+# ChromaDB's embedded PersistentClient is not safe for concurrent writes
+# from multiple OS processes — celery_screen_worker runs 3 forked children
+# that each open their own PersistentClient against the same .chromadb
+# directory and all write to the "news" collection continuously (by far
+# the highest-volume, highest-concurrency collection). That corrupted its
+# on-disk index badly enough that even a plain col.count() segfaulted the
+# whole process (found 2026-07-17 while testing chat-requested research,
+# which shares this same read path — production's deep_analyze_event does
+# too, so this was silently about to break every analysis, not just the
+# new feature). Cross-process flock serializes the actual write so only
+# one process ever touches the index at a time; reads/embedding aren't
+# locked since only concurrent writes could corrupt the on-disk segments.
+_WRITE_LOCK_PATH = _DB_PATH / ".write.lock"
+
+
+@contextlib.contextmanager
+def _write_lock():
+    _DB_PATH.mkdir(exist_ok=True)
+    with open(_WRITE_LOCK_PATH, "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
 _client: chromadb.PersistentClient | None = None
 _embedder: SentenceTransformer | None = None
@@ -95,14 +121,13 @@ def store(
     """
     if not text.strip():
         return
-    col = _get_collection(collection)
     # Cap is cosmetic beyond the model's own limit — all-MiniLM-L6-v2
     # truncates at ~256 tokens (~1k chars) regardless, so a long filing's
     # embedding is really only ever computed from its first ~1k chars, not
     # the full 8k this slice suggests. Kept at 8k anyway: it's a cheap
     # upper bound against pathological huge inputs and costs nothing since
     # the model truncates further internally.
-    embedding = embed(text[:8192])
+    embedding = embed(text[:8192])  # CPU work — outside the write lock
     meta = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         **(metadata or {}),
@@ -110,12 +135,14 @@ def store(
     # ChromaDB metadata values must be str/int/float/bool
     meta = {k: str(v) if not isinstance(v, (str, int, float, bool)) else v
             for k, v in meta.items()}
-    col.upsert(
-        ids=[doc_id],
-        embeddings=[embedding],
-        documents=[text[:8192]],
-        metadatas=[meta],
-    )
+    with _write_lock():
+        col = _get_collection(collection)
+        col.upsert(
+            ids=[doc_id],
+            embeddings=[embedding],
+            documents=[text[:8192]],
+            metadatas=[meta],
+        )
 
 
 def search(

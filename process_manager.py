@@ -53,8 +53,12 @@ SERVICES: dict[str, dict] = {
     # 700 items with screen+analyze combined in one task.
     "celery_llm_worker": {
         "label": "Celery Worker (LLM)",
+        # llm_p2 (chat-requested "analyze TICKER" research, see
+        # tasks.LLM_QUEUE_RESEARCH) sorts and drains last, behind held-ticker
+        # events and organic news-driven ideas — same worker/concurrency,
+        # just always at the back of the line.
         "cmd":   [CELERY, "-A", "tasks", "worker", "--loglevel=info",
-                  "-Q", "llm_p0,llm_p1", "-n", "llm@%h",
+                  "-Q", "llm_p0,llm_p1,llm_p2", "-n", "llm@%h",
                   "--prefetch-multiplier=1"] + _LLM_POOL_ARGS,
         "log":   LOG_DIR / "celery_llm_worker.log",
     },

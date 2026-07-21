@@ -234,6 +234,38 @@ def _tool_search_web(args: dict) -> str:
         return f"Web search failed for: {query}"
 
 
+def _tool_request_deep_analysis(args: dict, requested_by: str = "") -> str:
+    """Enqueues the real analyst pipeline (situation brief, 72B analysis,
+    conviction scoring) for a ticker — not a web-search summary. Runs
+    async on llm_p2, the lowest-priority analysis queue (always behind
+    held-position and organic news-driven analysis, see
+    tasks.LLM_QUEUE_RESEARCH), and delivers its result back to this chat
+    as a follow-up message rather than blocking the reply. Deliberately
+    read-only: tasks.research_ticker_on_demand -> agents.crew.research_
+    ticker never routes to risk sizing or execution, no matter what the
+    analyst concludes — a chat question must never become a real trade."""
+    ticker = str(args.get("ticker", "")).upper().strip()
+    if not ticker:
+        return "No ticker provided."
+    try:
+        from tasks import research_ticker_on_demand
+        research_ticker_on_demand.apply_async(
+            args=[ticker, requested_by], queue="llm_p2", expires=6 * 3600,
+        )
+        return (
+            f"Submitted {ticker} for full deep analysis — the same 72B model, real "
+            f"data, and conviction scoring used for live trading decisions, not just "
+            f"a web search. It runs behind any analysis already queued for held "
+            f"positions or organic news, so it can take a few minutes or longer "
+            f"during busy periods. I'll send the result here (evidence, reasoning, "
+            f"conviction score) as a follow-up message when it's done. This never "
+            f"places a trade on its own, no matter what it concludes."
+        )
+    except Exception as e:
+        log.error(f"[chat] request_deep_analysis failed to enqueue for {ticker}: {e}")
+        return f"Couldn't submit {ticker} for deep analysis right now — try again shortly."
+
+
 _TOOL_FUNCTIONS = {
     "get_portfolio": _tool_get_portfolio,
     "get_ticker_details": _tool_get_ticker_details,
@@ -289,11 +321,50 @@ _TOOL_SPECS = [
         "type": "function",
         "function": {
             "name": "search_web",
-            "description": "Search the live web for current information — news, prices, events, anything not covered by the other tools.",
+            "description": (
+                "Search the live web for current information — news, prices, events, anything "
+                "not covered by the other tools. A bare ticker or short word is a bad query — "
+                "tickers routinely collide with unrelated things (e.g. 'MU' alone returns the "
+                "Greek letter, a mythical continent, and Mercer University before it returns "
+                "Micron Technology). Fix this by appending 'stock', 'ticker', or 'quote' to the "
+                "ticker itself, e.g. 'MU stock' or 'MU ticker quote' — do NOT try to guess or "
+                "spell out the full company name from the ticker, since that can be wrong (MU "
+                "is Micron Technology, not Microchip Technology — an easy mix-up); the ticker "
+                "plus a disambiguating word like 'stock' is enough and safer."
+            ),
             "parameters": {
                 "type": "object",
-                "properties": {"query": {"type": "string", "description": "Search query"}},
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Ticker + 'stock'/'ticker'/'quote', e.g. 'MU stock' — never a bare ticker, and never a guessed-at company name.",
+                    }
+                },
                 "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "request_deep_analysis",
+            "description": (
+                "Submit a ticker to the real analyst pipeline for a properly researched "
+                "recommendation — situation brief, 72B-model analysis, conviction score "
+                "(1-10), thesis, catalysts, valuation math, and key risks. This is NOT "
+                "instant: it runs in the background (behind held-position and organic-news "
+                "analysis in the queue) and the result arrives as a separate follow-up "
+                "message, not in your current reply. Use this whenever someone asks "
+                "whether a ticker is a good buy/sell/hold, wants a real recommendation, or "
+                "asks for a proper/full/deep analysis — search_web alone only gives news "
+                "snippets, not an actual evaluated recommendation with a conviction score. "
+                "It's fine to also give a quick informal take from search_web in the same "
+                "reply while this runs in the background."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"ticker": {"type": "string", "description": "Stock ticker symbol, e.g. MU"}},
+                "required": ["ticker"],
             },
         },
     },
@@ -305,6 +376,26 @@ _SYSTEM_PROMPT = (
     "history, the current market regime, and to search the web. Use them whenever they'd "
     "help answer the question — don't guess at data you can look up. You may use multiple "
     "tools, including more than once, before giving your final answer. "
+    "get_ticker_details only returns a raw price and position status — it is NOT analysis. "
+    "For any question asking for an opinion, a take, or whether a ticker is a good buy/sell/"
+    "hold, you must also call search_web for recent news and sentiment before answering; "
+    "a price with no context is an incomplete answer to that kind of question. You must ALSO "
+    "call request_deep_analysis for that same ticker in the same turn — search_web only gets "
+    "you a quick informal take, request_deep_analysis is the real, properly-researched "
+    "recommendation with a conviction score, and its result arrives as a separate follow-up "
+    "message. Give your quick search_web-based take now, and tell the user the full analysis "
+    "is on its way. "
+    "search_web results for a short ticker sometimes include unrelated noise (wrong company, "
+    "a person's name, an unrelated topic that happens to share the letters) — silently ignore "
+    "anything in the results that isn't actually about the company in question; never mention "
+    "an irrelevant result in your answer just because it showed up in the search. "
+    "Be concrete, not just persuasive: pull actual numbers out of the search results (price "
+    "moves, revenue/earnings figures, growth rates, analyst price targets — whatever is "
+    "actually in the snippets) instead of vague language like 'strong growth' or 'mixed "
+    "outlook.' Name the source for each claim (e.g. 'per Yahoo Finance' or the article title) "
+    "so it's clear where a number came from. Never state a statistic that isn't actually in "
+    "the tool results — if the search results are thin on hard numbers, say so plainly rather "
+    "than filling the gap with confident-sounding generalities. "
     "Never confirm, suggest, or execute trades — you are informational only; if asked to "
     "trade, say that trades go through the explicit !urgent command, not chat. "
     "Keep your final answer concise (under 200 words unless the question needs more) and "
@@ -358,16 +449,50 @@ def _call_ollama_chat(messages: list[dict], tools: list[dict] | None = None) -> 
 # Public interface
 # ---------------------------------------------------------------------------
 
-def respond(user_message: str, username: str) -> str:
+def respond(user_message: str, username: str, user_id: str | int | None = None) -> str:
     """
     Runs the tool-calling agent loop and returns the final natural-language
     reply. Safe to call from the worker thread; no order execution ever
     happens here (see module docstring).
+
+    user_id keys persisted conversation history (see db.get/append_chat_
+    history) so a follow-up question later has context from what was just
+    discussed — without it (e.g. a direct/test call) each call is stateless,
+    same as before. Keyed on the numeric Telegram user_id rather than the
+    display name, and DB-backed rather than in-memory, so history survives
+    process restarts and is shared between the full pipeline's telegram_bot
+    .py and the overnight standby_bot.py.
     """
+    history: list[dict] = []
+    if user_id is not None:
+        try:
+            import db
+            history = db.get_chat_history(user_id)
+        except Exception as e:
+            log.warning(f"[chat] get_chat_history failed: {e}")
+
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
+        *history,
         {"role": "user", "content": f"@{username} asks: {user_message}"},
     ]
+
+    # request_deep_analysis needs to know who asked (for the eventual
+    # follow-up alert) — the model can't supply that itself, so it's bound
+    # here per-call rather than looked up from the shared _TOOL_FUNCTIONS map.
+    tool_functions = dict(_TOOL_FUNCTIONS)
+    tool_functions["request_deep_analysis"] = (
+        lambda args: _tool_request_deep_analysis(args, requested_by=username)
+    )
+
+    # Tracked so the "quick take" disclaimer below is added deterministically
+    # rather than relying on the (3B, inconsistent) model to remember to say
+    # it every time — found 2026-07-18: a user got a quick take and a full
+    # analysis 15 minutes apart on the same ticker (SNDK) with different
+    # verdicts and no clear signal that the first one was the provisional
+    # one. The model's own wording of this was unreliable; a fixed label
+    # appended here never is.
+    deep_analysis_requested = False
 
     for _ in range(_MAX_TOOL_ITERATIONS):
         msg = _call_ollama_chat(messages, tools=_TOOL_SPECS)
@@ -378,7 +503,23 @@ def respond(user_message: str, username: str) -> str:
         tool_calls = msg.get("tool_calls")
         if not tool_calls:
             content = (msg.get("content") or "").strip()
-            return content or "I didn't get a usable response — try rephrasing the question."
+            reply = content or "I didn't get a usable response — try rephrasing the question."
+            if deep_analysis_requested and content:
+                reply += (
+                    "\n\n⚠️ This is a quick, informal take — not a verdict. The real, "
+                    "properly-researched analysis (conviction score, evidence, sources) "
+                    "is still coming as a separate message."
+                )
+            # Only a genuine, complete exchange goes into history — an error/
+            # timeout reply here would just confuse a later follow-up.
+            if user_id is not None and content:
+                try:
+                    import db
+                    db.append_chat_message(user_id, "user", user_message)
+                    db.append_chat_message(user_id, "assistant", reply)
+                except Exception as e:
+                    log.warning(f"[chat] append_chat_message failed: {e}")
+            return reply
 
         messages.append(msg)
         for call in tool_calls:
@@ -389,7 +530,9 @@ def respond(user_message: str, username: str) -> str:
                     fn_args = json.loads(fn_args)
                 except Exception:
                     fn_args = {}
-            fn = _TOOL_FUNCTIONS.get(fn_name)
+            if fn_name == "request_deep_analysis":
+                deep_analysis_requested = True
+            fn = tool_functions.get(fn_name)
             log.info(f"[chat] tool call: {fn_name}({fn_args})")
             result = fn(fn_args) if fn else f"Unknown tool: {fn_name}"
             messages.append({"role": "tool", "content": str(result)})

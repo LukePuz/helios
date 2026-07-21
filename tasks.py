@@ -46,8 +46,13 @@ app.conf.update(
 )
 
 # LLM analysis queues — see task_default_queue comment above.
-LLM_QUEUE_HELD = "llm_p0"   # events about tickers we already hold — front of the line
-LLM_QUEUE_BULK = "llm_p1"   # scanner candidates and non-held-ticker events
+LLM_QUEUE_HELD     = "llm_p0"   # events about tickers we already hold — front of the line
+LLM_QUEUE_BULK     = "llm_p1"   # scanner candidates and non-held-ticker events
+# Chat-requested "analyze TICKER for me" research (see agents.crew.research_
+# ticker) — always last: a curiosity question must never delay analysis of
+# anything actually held or an organic news-driven idea. Name sorts after
+# llm_p1 under queue_order_strategy=sorted above, same worker/concurrency.
+LLM_QUEUE_RESEARCH = "llm_p2"
 
 # Screening (7B, CPU-forced) gets its own queue/worker, separate from the
 # llm_p* queues (72B, GPU-bound) — added 2026-07-16 after a busy news day
@@ -165,6 +170,32 @@ app.conf.beat_schedule = {
         "task":     "tasks.reconcile_stop_orders",
         "schedule": 900,
         "options":  {"expires": 900},
+    },
+    # Low-frequency overnight-dead-with-no-traffic safety net — every 30
+    # minutes, not 10. The 72B server only handles one request at a time
+    # (-np 1), and this probe occupies that slot for up to 300s each run;
+    # at 10-minute intervals it was itself a meaningful source of the
+    # contention it was meant to catch (found 2026-07-21). The primary
+    # detection path is now agents.analyst._stub_recommendation, which
+    # reacts to real production timeouts instead of adding synthetic load.
+    "check-ollama-gpu": {
+        "task":     "tasks.check_ollama_gpu_health",
+        "schedule": 1800,
+        "options":  {"expires": 1800},
+    },
+    # ChromaDB collection integrity — hourly. The 2026-07-17 write-lock fix
+    # (vector_store._write_lock) stopped concurrent-write races from
+    # corrupting a collection, but a process that crashes/gets killed
+    # mid-write can still leave one corrupted regardless of locking — and
+    # a corrupted collection segfaults the whole process on a bare
+    # col.count(), which is exactly what happened again on 2026-07-21 to
+    # the same "news" collection, three days after the lock fix. This
+    # checks each collection in an isolated subprocess (so a crash there
+    # can't take down a real worker) and auto-rebuilds anything corrupted.
+    "check-vector-store": {
+        "task":     "tasks.check_vector_store_health",
+        "schedule": 3600,
+        "options":  {"expires": 3600},
     },
     # 30/60/90-day outcome price reviews — weekdays 4:30 PM ET
     "review-outcomes": {
@@ -327,6 +358,77 @@ def deep_analyze_event(self, event: dict, screening: dict | None = None):
     except Exception as e:
         log.error(f"deep_analyze_event failed for {event.get('ticker')}: {e}")
         raise self.retry(exc=e, countdown=120)
+
+
+def _format_research_alert(ticker: str, result: dict, requested_by: str) -> str:
+    gap  = result.get("expectation_gap") or {}
+    cat  = result.get("catalyst") or {}
+    val  = result.get("valuation") or {}
+    risks = result.get("key_risks") or []
+
+    lines = [
+        f"🔬 <b>Research: {ticker}</b> (requested by {requested_by or 'chat'})",
+        f"<b>{result.get('action', '?')}</b> · Conviction {result.get('conviction', '?')}/10 "
+        f"· {result.get('thesis_bucket', '?')}",
+        f"Thesis {result.get('thesis_strength', '?')}/5 · Catalyst {result.get('catalyst_quality', '?')}/5 · "
+        f"Valuation {result.get('valuation_risk_reward', '?')}/5 · Data {result.get('data_completeness', '?')}/5",
+        "",
+        result.get("thesis_summary", "") or result.get("reasoning", ""),
+    ]
+    if gap:
+        lines += [
+            "",
+            f"<b>Bull case:</b> {gap.get('bull_case', 'n/a')}",
+            f"<b>Priced in:</b> {gap.get('current_price_implies', 'n/a')}",
+            f"<b>Primary risk:</b> {gap.get('primary_risk', 'n/a')}",
+        ]
+    if cat:
+        lines.append(
+            f"<b>Catalyst:</b> {cat.get('event', 'n/a')} ({cat.get('date', 'n/a')}) — "
+            f"{cat.get('expected_upside_if_positive', '?')} / "
+            f"{cat.get('expected_downside_if_negative', '?')}"
+        )
+    if val:
+        lines.append(
+            f"<b>Valuation:</b> {val.get('current_multiple', 'n/a')} vs peers "
+            f"{val.get('peer_range', 'n/a')} · target {val.get('bull_case_target', 'n/a')} / "
+            f"downside {val.get('downside_scenario', 'n/a')}"
+        )
+    if result.get("upside_downside_ratio") is not None:
+        lines.append(f"<b>Upside/downside ratio:</b> {result['upside_downside_ratio']}")
+    if risks:
+        lines.append("<b>Key risks:</b> " + "; ".join(risks))
+    lines.append("")
+    lines.append(result.get("reasoning", ""))
+    lines.append("")
+    note = ("would have qualified for auto-execution as a live signal — "
+            "this was research only, nothing was traded"
+            if result.get("pass_to_risk") else
+            "research only — not executed")
+    lines.append(f"⚠️ {note}.")
+    return "\n".join(l for l in lines if l is not None)
+
+
+@app.task(name="tasks.research_ticker_on_demand", bind=True, max_retries=1)
+def research_ticker_on_demand(self, ticker: str, requested_by: str = ""):
+    """Chat-triggered (see chat_assistant._tool_request_deep_analysis), read-
+    only run of the full analyst pipeline for one ticker — real brief, real
+    72B analysis, real conviction score, delivered back to Telegram. Runs on
+    llm_p2, the lowest-priority analysis queue (see LLM_QUEUE_RESEARCH), so
+    it never delays anything touching a held position or an organic
+    news-driven idea. Never routes to risk sizing or execution."""
+    try:
+        from agents.crew import research_ticker
+        import alerts
+        result = research_ticker(ticker)
+        alerts._send(_format_research_alert(ticker, result, requested_by))
+    except Exception as e:
+        log.error(f"research_ticker_on_demand failed for {ticker}: {e}")
+        try:
+            import alerts
+            alerts._send(f"⚠️ Deep analysis of {ticker} failed: {e}")
+        except Exception:
+            pass
 
 
 @app.task(name="tasks.analyze_candidates", bind=True, max_retries=1)
@@ -996,6 +1098,29 @@ def check_portfolio_drawdown(self):
         raise self.retry(exc=e, countdown=60)
 
 
+def _reconcile_alert_due(issue_key: str) -> bool:
+    """Gate re-alerting the same unresolved reconciliation issue. A standing
+    condition (e.g. one position missing a stop) used to re-fire every
+    15-minute reconcile cycle — ~96 identical Telegram messages/day. Only
+    the first sighting of an issue_key, or one after the throttle window
+    has elapsed, is "due"; touching the state also resets the window."""
+    import db
+    from datetime import datetime, timezone
+    from config import RECONCILE_ALERT_THROTTLE_HOURS
+    state_key = f"reconcile_alert_{issue_key}"
+    last = db.get_state(state_key)
+    now = datetime.now(timezone.utc)
+    if last:
+        try:
+            if (now - datetime.fromisoformat(last)).total_seconds() < \
+                    RECONCILE_ALERT_THROTTLE_HOURS * 3600:
+                return False
+        except ValueError:
+            pass
+    db.set_state(state_key, now.isoformat())
+    return True
+
+
 @app.task(name="tasks.reconcile_stop_orders", bind=True, max_retries=2)
 def reconcile_stop_orders(self):
     """
@@ -1004,7 +1129,9 @@ def reconcile_stop_orders(self):
       accidental short positions.
     - Deletes stale DB stop records with no matching position.
     - Alerts on positions that have NO protective stop at the broker.
-    Every corrective action is reported to Telegram.
+    Every corrective action is logged; only new/unresolved-and-due issues
+    are sent to Telegram (see _reconcile_alert_due) so a standing condition
+    doesn't re-alert every 15-minute cycle.
     """
     try:
         import db
@@ -1017,41 +1144,233 @@ def reconcile_stop_orders(self):
         open_ords = ibkr.get_open_orders()
         stops     = [o for o in open_ords
                      if o["action"] == "SELL" and o["order_type"] in ("STP", "STP LMT", "TRAIL")]
-        actions: list[str] = []
+        all_actions: list[str] = []   # every cycle, for the debug log
+        new_actions: list[str] = []   # unthrottled — logged as warning + alerted
 
         # 1. Orphaned broker stops — stop order with no position → cancel
         for o in stops:
             if o["ticker"] not in held:
                 if ibkr.cancel_order(o["order_id"]):
-                    actions.append(
-                        f"Cancelled ORPHANED stop: SELL {o['qty']} {o['ticker']} "
-                        f"@ ${o['stop_price'] or 0:.2f} (no position held — would have shorted)"
-                    )
+                    msg = (f"Cancelled ORPHANED stop: SELL {o['qty']} {o['ticker']} "
+                           f"@ ${o['stop_price'] or 0:.2f} (no position held — would have shorted)")
+                    all_actions.append(msg)
+                    new_actions.append(msg)  # real state change — always surface
+                else:
+                    msg = (f"Could NOT cancel orphaned stop: SELL {o['qty']} {o['ticker']} "
+                           f"orderId={o['order_id']} — likely owned by a different clientId, "
+                           f"needs manual cancel in TWS")
+                    all_actions.append(msg)
+                    if _reconcile_alert_due(f"cancel_fail_{o['order_id']}"):
+                        new_actions.append(msg)
 
         # 2. Stale DB stop records with no position → delete
         for rec in db.get_all_position_stops():
             if rec["ticker"] not in held:
                 db.delete_position_stop(rec["ticker"])
-                actions.append(f"Deleted stale DB stop record for {rec['ticker']} (no position)")
+                msg = f"Deleted stale DB stop record for {rec['ticker']} (no position)"
+                all_actions.append(msg)
+                new_actions.append(msg)  # self-resolving, won't repeat next cycle
 
         # 3. Positions with no protective stop at the broker → alert
         stopped_tickers = {o["ticker"] for o in stops}
         for ticker, qty in held.items():
             if ticker not in stopped_tickers:
-                actions.append(
-                    f"⚠️ {ticker} ({qty} shares) has NO protective stop at the broker"
-                )
+                msg = f"⚠️ {ticker} ({qty} shares) has NO protective stop at the broker"
+                all_actions.append(msg)
+                if _reconcile_alert_due(f"no_stop_{ticker}"):
+                    new_actions.append(msg)
 
-        if actions:
-            log.warning("Stop reconciliation actions: " + " | ".join(actions))
-            alerts._send(
-                "🔧 <b>Stop Order Reconciliation</b>\n" + "\n".join(f"• {a}" for a in actions)
-            )
+        if all_actions:
+            log.info("Stop reconciliation status: " + " | ".join(all_actions))
         else:
             log.info("Stop reconciliation: broker and DB in sync.")
+
+        if new_actions:
+            log.warning("Stop reconciliation — new/unthrottled: " + " | ".join(new_actions))
+            alerts._send(
+                "🔧 <b>Stop Order Reconciliation</b>\n" + "\n".join(f"• {a}" for a in new_actions)
+            )
     except Exception as e:
         log.error(f"reconcile_stop_orders failed: {e}")
         raise self.retry(exc=e, countdown=120)
+
+
+_OLLAMA_GPU_CHECK_TIMEOUT_S = 300   # see check_ollama_gpu_health docstring
+_OLLAMA_RESTART_THROTTLE_S  = 1800  # don't restart more than once per 30 min
+
+
+def restart_ollama_and_alert(reason: str) -> bool:
+    """
+    Shared by check_ollama_gpu_health (periodic, low-frequency safety net)
+    and agents.analyst._stub_recommendation (reacts to real production
+    failures — see its own comment for why that path matters more). Both
+    share the same throttle key so they can never double-restart each
+    other. Returns True if a restart was actually performed.
+    """
+    import db
+    from datetime import datetime as _dt, timezone as _tz
+    last = db.get_state("ollama_restart_at")
+    now = _dt.now(_tz.utc)
+    due = True
+    if last:
+        try:
+            due = (now - _dt.fromisoformat(last)).total_seconds() >= _OLLAMA_RESTART_THROTTLE_S
+        except ValueError:
+            pass
+    if not due:
+        log.warning(f"restart_ollama_and_alert: restarted recently, not restarting again yet ({reason})")
+        return False
+    db.set_state("ollama_restart_at", now.isoformat())
+
+    import subprocess
+    result = subprocess.run(
+        ["sudo", "-n", "systemctl", "restart", "ollama.service"],
+        capture_output=True, text=True, timeout=30,
+    )
+    import alerts
+    if result.returncode == 0:
+        alerts._send(
+            f"🔧 <b>Ollama auto-recovery</b>\n{reason} — restarted ollama.service "
+            f"automatically. Next analysis may take a minute longer while it reloads."
+        )
+    else:
+        alerts._send(
+            f"⚠️ <b>Ollama auto-recovery FAILED</b>\n{reason}, and the automatic restart "
+            f"failed (rc={result.returncode}): {result.stderr.strip()[:300]}\n"
+            f"Needs a manual `sudo systemctl restart ollama.service`."
+        )
+    return result.returncode == 0
+
+
+@app.task(name="tasks.check_ollama_gpu_health", bind=True, max_retries=0)
+def check_ollama_gpu_health(self):
+    """
+    Low-frequency safety net for the case where Ollama is stuck with ZERO
+    real traffic to reveal it (e.g. overnight) — the primary detection path
+    is now agents.analyst._stub_recommendation, which reacts to real
+    production timeouts instead of manufacturing synthetic load. This task
+    used to run every 10 minutes and turned out to be part of the problem:
+    each probe occupies the 72B server's single concurrency slot (-np 1)
+    for up to 300s, directly competing with real analyst calls. Found
+    2026-07-21: real calls kept failing all day while this reported "OK"
+    every time (nothing was ever stuck for hours) — the probe itself was
+    adding load to an already-contended resource. Dropped to a 30-minute
+    interval (see beat schedule) to cut that footprint roughly 3x while
+    still catching a fully-dead-overnight scenario.
+
+    Timeout is 300s, not a tight bound — this call can legitimately queue
+    behind a real in-flight analysis (the 72B server only serves one
+    request at a time), and real analyses take ~170-195s when healthy. 300s
+    gives room for that without much risk of false-positive restarts, while
+    still being well under the 400s+ hangs actually observed when stuck.
+    """
+    try:
+        import time as _time
+        import requests
+        from config import OLLAMA_HOST, ANALYST_MODEL
+        t0 = _time.monotonic()
+        try:
+            resp = requests.post(
+                f"{OLLAMA_HOST}/api/generate",
+                json={
+                    "model": ANALYST_MODEL,
+                    "prompt": "Reply with the single word OK.",
+                    "stream": False,
+                    "options": {"num_predict": 5},
+                },
+                timeout=_OLLAMA_GPU_CHECK_TIMEOUT_S,
+            )
+            resp.raise_for_status()
+            healthy = bool(resp.json().get("response"))
+        except Exception as e:
+            log.warning(f"check_ollama_gpu_health: probe failed: {e}")
+            healthy = False
+        elapsed = _time.monotonic() - t0
+
+        if healthy:
+            log.info(f"check_ollama_gpu_health: OK ({elapsed:.1f}s)")
+            return
+
+        log.error(f"check_ollama_gpu_health: {ANALYST_MODEL} unresponsive after "
+                  f"{elapsed:.1f}s — likely stuck CPU-only again")
+        restart_ollama_and_alert(f"{ANALYST_MODEL} unresponsive after {elapsed:.0f}s (periodic check)")
+    except Exception as e:
+        log.error(f"check_ollama_gpu_health failed: {e}")
+
+
+_VECTOR_STORE_CHECK_SCRIPT = """
+import sys
+import vector_store as vs
+for name in vs.COLLECTIONS:
+    print(f"CHECKING:{name}", flush=True)
+    col = vs._get_collection(name)
+    n = col.count()
+    print(f"OK:{name}:{n}", flush=True)
+print("ALL_OK", flush=True)
+"""
+
+
+@app.task(name="tasks.check_vector_store_health", bind=True, max_retries=0)
+def check_vector_store_health(self):
+    """
+    A corrupted ChromaDB collection segfaults the whole process on a bare
+    col.count() — happened to the "news" collection on 2026-07-17 (fixed
+    with a rebuild + a cross-process write lock in vector_store.store) and
+    again on 2026-07-21, three days later, despite that lock — a process
+    that crashes/gets killed mid-write can still corrupt the on-disk index
+    regardless of locking against concurrent writers. Checking this
+    in-process isn't safe (the crash would take down this worker too), so
+    each check runs in an isolated subprocess: if it dies, only that
+    subprocess dies, and the last "CHECKING:<name>" line with no matching
+    "OK:<name>" line tells us exactly which collection to rebuild.
+    """
+    try:
+        import subprocess
+        import sys as _sys
+        result = subprocess.run(
+            [_sys.executable, "-c", _VECTOR_STORE_CHECK_SCRIPT],
+            capture_output=True, text=True, timeout=120,
+            env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
+        )
+        lines = [l for l in result.stdout.splitlines() if l.strip()]
+        checking = {l.split(":", 1)[1] for l in lines if l.startswith("CHECKING:")}
+        ok = {l.split(":", 2)[1] for l in lines if l.startswith("OK:")}
+        corrupted = checking - ok
+
+        if not corrupted:
+            if result.returncode != 0:
+                log.warning(f"check_vector_store_health: subprocess exited {result.returncode} "
+                            f"but every collection reported OK first — {result.stderr[-500:]}")
+            else:
+                log.info(f"check_vector_store_health: OK ({len(ok)} collections)")
+            return
+
+        import vector_store as vs
+        client = vs._get_client()
+        rebuilt = []
+        for name in corrupted:
+            try:
+                log.error(f"check_vector_store_health: '{name}' is corrupted (segfaulted on "
+                          f"count) — rebuilding")
+                try:
+                    client.delete_collection(name)
+                except Exception:
+                    pass  # may already be gone/unreadable — get_or_create below still works
+                client.get_or_create_collection(name=name, metadata={"description": vs.COLLECTIONS.get(name, name)})
+                rebuilt.append(name)
+            except Exception as e:
+                log.error(f"check_vector_store_health: failed to rebuild '{name}': {e}")
+
+        if rebuilt:
+            import alerts
+            alerts._send(
+                f"🔧 <b>Vector store auto-recovery</b>\n"
+                f"Corrupted collection(s) rebuilt: {', '.join(rebuilt)}\n"
+                f"Their accumulated history is gone (this is semantic-memory context, not "
+                f"trading state) — they'll refill from ongoing ingestion. Nothing else was affected."
+            )
+    except Exception as e:
+        log.error(f"check_vector_store_health failed: {e}")
 
 
 @app.task(name="tasks.review_trade_outcomes", bind=True, max_retries=2)
@@ -1138,7 +1457,9 @@ def prune_seen_items(self):
         import db
         n_general = db.prune_seen_items(days=90)
         n_options = db.prune_seen_items(days=7, source="options_flow_dispatch")
-        log.info(f"Pruned seen_items: {n_general} general (>90d), {n_options} options dispatch (>7d)")
+        n_chat = db.prune_chat_history(days=30)
+        log.info(f"Pruned seen_items: {n_general} general (>90d), {n_options} options dispatch (>7d), "
+                 f"{n_chat} chat_history rows (>30d)")
     except Exception as e:
         log.error(f"prune_seen_items failed: {e}")
         raise self.retry(exc=e, countdown=300)

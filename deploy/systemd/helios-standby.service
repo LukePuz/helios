@@ -1,0 +1,24 @@
+[Unit]
+Description=Helios standby chat listener (Telegram-reachable while the full pipeline is stopped)
+After=network-online.target
+Wants=network-online.target
+# Mutual exclusion with the full pipeline — whichever one starts, systemd
+# stops the other automatically. This is what lets standby_bot.py just
+# trigger `systemctl start helios-local.service` on a wake and exit,
+# without any manual self-stop logic: the moment that unit activates,
+# this one gets torn down for free.
+Conflicts=helios-local.service
+
+[Service]
+Type=simple
+User=luke-puzenski
+WorkingDirectory=/home/luke-puzenski/Desktop/trading_bot
+ExecStart=/home/luke-puzenski/Desktop/trading_bot/venv/bin/python /home/luke-puzenski/Desktop/trading_bot/standby_bot.py
+Restart=on-failure
+RestartSec=10
+
+StandardOutput=append:/home/luke-puzenski/Desktop/trading_bot/logs/standby_bot.log
+StandardError=append:/home/luke-puzenski/Desktop/trading_bot/logs/standby_bot.log
+
+[Install]
+WantedBy=multi-user.target

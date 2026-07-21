@@ -1,11 +1,16 @@
 [Unit]
-Description=Stop Helios and suspend the PC a few hours after market close
+Description=Stop Helios and drop to the standby chat listener a few hours after market close
 
 [Timer]
 # 7:00 PM ET — 3 hours after the 4:00 PM close. Adjust as you like; this is
 # arbitrary "let the after-hours dust settle" padding, not tied to
 # anything in the trading logic itself.
-OnCalendar=Mon..Fri 19:00:00 America/New_York
+# Every day, not just weekdays: standby_bot.py can now wake the full
+# pipeline from a Telegram message at any time, including weekends — this
+# is what winds it back down to standby by evening regardless of which day
+# that happened on, instead of leaving the full pipeline (IBKR, Celery, the
+# 72B model) running all weekend after a single Saturday-morning message.
+OnCalendar=*-*-* 19:00:00 America/New_York
 Persistent=true
 Unit=helios-evening-stop.service
 

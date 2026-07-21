@@ -1,0 +1,52 @@
+# /etc/systemd/system/ibc.service
+[Unit]
+Description=IBC (headless IBKR TWS, paper trading, virtual display :99)
+After=network-online.target xvfb.service
+Wants=network-online.target
+Requires=xvfb.service
+# A crash-loop here should not silently retry into another lockup forever —
+# stop and surface the failure after a few attempts instead.
+StartLimitIntervalSec=600
+StartLimitBurst=3
+# Telegram alert if IBC exhausts the restart limit above and goes to
+# "failed" — mirrors helios-local.service's own OnFailure=. Added
+# 2026-07-18 alongside the Restart=always fix below; previously a
+# permanently-dead IBC had no alert path of its own at all.
+OnFailure=helios-notify-failure@%n.service
+
+[Service]
+Type=simple
+User=luke-puzenski
+Environment=DISPLAY=:99
+Environment=HOME=/home/luke-puzenski
+# Forces software-only rendering for TWS's embedded Chromium (jxBrowser)
+# component used on the login screen — belt-and-suspenders alongside
+# PrivateDevices= below.
+Environment=LIBGL_ALWAYS_SOFTWARE=1
+# Gives this service a private /dev with no GPU device nodes at all
+# (/dev/dri/*, /dev/nvidia*) — makes it structurally impossible for TWS's
+# embedded Chromium component (jxBrowser, used on the login screen) to
+# reach either GPU, no matter what it tries. This machine hard-locked
+# (full hardware reboot, no panic message reached disk) the first time IBC
+# ran against a working virtual display, immediately after startup — the
+# working theory is jxBrowser attempting hardware-accelerated rendering
+# via /dev/dri while the real GNOME session was also actively driving both
+# 3090s. Do not remove this without a real GPU-conflict diagnosis first.
+PrivateDevices=true
+ExecStart=/home/luke-puzenski/ibc/twsstart.sh
+# TWS restarts itself nightly as part of its own routine maintenance —
+# that's a clean, zero-exit-code shutdown from systemd's point of view, so
+# Restart=on-failure never caught it and IBC sat dead for 14+ hours
+# (2026-07-17 23:45 through 2026-07-18 14:00) while every task needing the
+# broker connection failed repeatedly and everything else (helios-local
+# .service, celery workers) kept running none the wiser. An explicit
+# `systemctl stop ibc.service` (used by helios-evening-stop.service) is
+# unaffected by Restart= — systemd never auto-restarts a unit that was
+# deliberately stopped, regardless of this policy.
+Restart=always
+RestartSec=30
+StandardOutput=append:/home/luke-puzenski/ibc/logs/ibc-systemd.log
+StandardError=append:/home/luke-puzenski/ibc/logs/ibc-systemd.log
+
+[Install]
+WantedBy=multi-user.target

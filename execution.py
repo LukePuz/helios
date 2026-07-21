@@ -340,7 +340,11 @@ def execute_approved(approval: dict, trigger: str = "telegram") -> bool:
                 except Exception:
                     pass
 
-        # Log outcome record for feedback loop
+        # Log outcome record for feedback loop — sub-scores live in
+        # analyst_json (the full analyst.analyze() result), not as their own
+        # pending_approvals columns, since only conviction/thesis_bucket are
+        # promoted to top-level columns there.
+        analyst_json = approval.get("analyst_json") or {}
         db.log_trade_outcome(
             approval_id=approval["id"],
             ticker=ticker,
@@ -348,6 +352,10 @@ def execute_approved(approval: dict, trigger: str = "telegram") -> bool:
             conviction=approval.get("conviction", 5),
             bucket=approval.get("thesis_bucket", ""),
             entry_price=current_price,
+            thesis_strength=analyst_json.get("thesis_strength"),
+            catalyst_quality=analyst_json.get("catalyst_quality"),
+            valuation_risk_reward=analyst_json.get("valuation_risk_reward"),
+            data_completeness=analyst_json.get("data_completeness"),
         )
 
         # Send trade alert

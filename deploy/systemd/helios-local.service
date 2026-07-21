@@ -14,6 +14,12 @@ OnFailure=helios-notify-failure@%n.service
 # and fires OnFailure= above.
 StartLimitIntervalSec=600
 StartLimitBurst=5
+# Mutual exclusion with the overnight standby listener — see
+# helios-standby.service. Ensures the two never both hold the Telegram
+# long-poll at once (Telegram 409s a second concurrent getUpdates caller),
+# regardless of whether this unit was started by helios-start.timer or by
+# standby_bot.py's own wake trigger.
+Conflicts=helios-standby.service
 
 [Service]
 Type=simple

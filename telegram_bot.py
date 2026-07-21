@@ -427,7 +427,7 @@ def _handle_mention(update: dict, is_urgent: bool) -> None:
     # Regular (or urgent non-trade) → Ollama
     try:
         import chat_assistant
-        response = chat_assistant.respond(clean, display)
+        response = chat_assistant.respond(clean, display, user_id=user_id)
         _reply(chat_id, response, msg_id)
     except Exception as e:
         log.error(f"chat_assistant.respond failed: {e}")

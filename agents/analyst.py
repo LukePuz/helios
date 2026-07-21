@@ -36,11 +36,25 @@ _NUM_CTX = 32768
 # Prompt builder
 # ---------------------------------------------------------------------------
 
+_SUBSCORE_LABELS = {
+    "thesis_strength":       "thesis_strength",
+    "catalyst_quality":      "catalyst_quality",
+    "valuation_risk_reward": "valuation_risk_reward",
+    "data_completeness":     "data_completeness",
+}
+
+
 def _build_track_record_text() -> str:
     """
-    Realized win-rate and alpha-vs-SPY by conviction level, so the model can
-    weigh its own stated confidence against how it has actually performed.
+    Realized win-rate and alpha-vs-SPY by conviction level AND by each 1-5
+    sub-score, so the model can weigh its own stated confidence — and each
+    individual component of it — against how it has actually performed.
     Returns "" when there isn't enough closed-trade history yet.
+
+    The per-dimension breakdown is the actual point of having sub-scores at
+    all: "conviction-8 calls win 55%" doesn't say why, but "catalyst_quality
+    -5 calls win 70%, valuation_risk_reward-5 calls only win 45%" tells the
+    model specifically which kind of judgment to trust more.
     """
     try:
         import db
@@ -60,9 +74,28 @@ def _build_track_record_text() -> str:
             f"  Conviction {c['conviction']}/10: {c['total']} closed trades, "
             f"{c['win_rate']:.0%} win rate, {alpha_str}"
         )
+
+    for field, label in _SUBSCORE_LABELS.items():
+        try:
+            sub_rows = [r for r in db.get_subscore_calibration(field) if r.get("total")]
+        except Exception:
+            sub_rows = []
+        if not sub_rows:
+            continue
+        lines.append(f"\nBy {label} (1-5):")
+        for r in sub_rows:
+            alpha = r.get("avg_alpha_pct")
+            alpha_str = f"{alpha:+.1%} alpha vs SPY" if alpha is not None else "alpha unknown"
+            lines.append(
+                f"  {label}={r['score']}: {r['total']} closed trades, "
+                f"{r['win_rate']:.0%} win rate, {alpha_str}"
+            )
+
     lines.append(
-        "Weigh this record when you state your own conviction — if past conviction-9 calls "
-        "realized a much lower win rate than 9/10 implies, that overconfidence should be corrected now."
+        "\nWeigh this record when you state your own conviction and sub-scores — if past "
+        "conviction-9 calls realized a much lower win rate than 9/10 implies, or one specific "
+        "sub-score consistently overstates its dimension, that overconfidence should be "
+        "corrected now, specifically on the dimension the data shows is miscalibrated."
     )
     return "\n".join(lines)
 
@@ -149,6 +182,13 @@ If the FUNDAMENTALS section says data isn't cached yet, say so explicitly
 in your reasoning and cap conviction at 6 for OPEN/ADD, since the valuation
 call would otherwise be an unsupported guess.
 
+Every dollar figure you write — bull_case_target, downside_scenario, any
+price mentioned in reasoning or thesis_summary — MUST be computed relative
+to the "Current Price" stated at the top of the situation brief, never an
+assumed or remembered price. If Current Price is marked UNKNOWN, do not
+write a dollar figure anywhere in your output; describe valuation only in
+relative terms (e.g. "trades below peer multiples") instead of a price.
+
 Conviction scale — use the FULL range; most ideas are ordinary and should score in the middle:
   1-2: thesis broken or contradicted by the evidence in the brief
   3-4: speculative — plausible story but no concrete supporting evidence yet
@@ -157,11 +197,26 @@ Conviction scale — use the FULL range; most ideas are ordinary and should scor
   9-10: exceptional, rare (a few per year) — overwhelming evidence, multiple independent confirmations, asymmetric payoff
 A 7 must be justified by evidence quoted from the situation brief or fundamentals, not by general optimism about the sector.
 
+In addition to the overall conviction, rate these four components separately,
+each 1-5 — conviction should be a defensible synthesis of these, not an
+independent gut feel. Keep each scale coarse (1-5, not finer): the point is
+that each dimension can be individually tracked against real outcomes later,
+which needs an honest, differentiated rating on each axis rather than
+four copies of the same overall confidence.
+  thesis_strength (1-5): 1 = generic story anyone could tell about this sector; 5 = a specific, differentiated insight that isn't obviously already priced in.
+  catalyst_quality (1-5): 1 = no concrete catalyst, or timing is vague/ongoing; 5 = a specific, dated event with a clear outcome that will confirm or break the thesis.
+  valuation_risk_reward (1-5): 1 = poor risk/reward even if the thesis plays out exactly; 5 = exceptional asymmetry. Should track your upside_downside_ratio, not contradict it.
+  data_completeness (1-5): 1 = little concrete evidence in the brief or fundamentals, mostly inference; 5 = comprehensive, fresh, well-sourced data backing the call.
+
 Then output ONLY valid JSON in exactly this format (no markdown, no explanation outside the JSON):
 
 {{
   "action": "OPEN or ADD or HOLD or TRIM or EXIT or WATCH or PASS",
   "conviction": <integer 1-10 per the scale above>,
+  "thesis_strength": <integer 1-5>,
+  "catalyst_quality": <integer 1-5>,
+  "valuation_risk_reward": <integer 1-5>,
+  "data_completeness": <integer 1-5>,
   "thesis_bucket": "Compounder or Accelerator or Moonshot",
   "thesis_summary": "One sentence why this position exists.",
   "expectation_gap": {{
@@ -188,7 +243,7 @@ Then output ONLY valid JSON in exactly this format (no markdown, no explanation 
   "options_opportunity": false,
   "options_notes": "Brief note or null",
   "pass_to_risk": true,
-  "reasoning": "2-3 sentence narrative explaining the recommendation."
+  "reasoning": "2-3 sentence narrative explaining the recommendation, citing specific numbers and their source per the rule below."
 }}
 
 Rules:
@@ -196,6 +251,7 @@ Rules:
 - For Moonshot tickers: conviction >= 7 required to recommend OPEN; never exceed 2% position
 - In {regime} regime: {'be selective, raise threshold to conviction 7+ for new positions' if regime in ('Neutral', 'Risk-Off', 'Strong Risk-Off') else 'normal conviction thresholds apply'}
 {'- Your stated conviction has a track record above — calibrate against it, not against how confident you feel' if track_record else ''}
+- reasoning and thesis_summary must be concrete, not persuasive prose: cite actual figures from the SITUATION BRIEF or FUNDAMENTALS section (a growth rate, a multiple, a dollar figure, a date) and name where each came from (e.g. "per Q2 fundamentals", "per the [source] article in the brief"). A sentence with no number and no named source is not acceptable reasoning — if the brief genuinely has no hard data to cite, say that explicitly instead of writing confident-sounding prose to fill the gap.
 - Output ONLY the JSON object, nothing else
 """
 
@@ -249,10 +305,18 @@ def _call_ollama(prompt: str, num_ctx: int = _NUM_CTX) -> str | None:
         },
     }
     try:
+        # Real 72B completions on this hardware routinely land at 182-195s
+        # (CPU-offloaded portion of the model, ~47GB not fitting in VRAM) —
+        # the old 180s timeout was cutting off almost every call right at
+        # the finish line, silently falling back to a stub recommendation
+        # (conviction=1, pass_to_risk=False) on ~100% of calls for days
+        # (found 2026-07-17 investigating an unrelated chat feature — grep
+        # helios logs for "Stub recommendation" going back to 07-15).
+        # 400s gives real headroom above the observed ~195s ceiling.
         resp = requests.post(
             f"{OLLAMA_HOST}/api/generate",
             json=payload,
-            timeout=180,
+            timeout=400,
         )
         resp.raise_for_status()
         return resp.json().get("response", "")
@@ -292,6 +356,10 @@ def _extract_json(raw: str) -> dict | None:
     for field, pattern in [
         ("action",        r'"action"\s*:\s*"(\w+)"'),
         ("conviction",    r'"conviction"\s*:\s*(\d+)'),
+        ("thesis_strength", r'"thesis_strength"\s*:\s*(\d+)'),
+        ("catalyst_quality", r'"catalyst_quality"\s*:\s*(\d+)'),
+        ("valuation_risk_reward", r'"valuation_risk_reward"\s*:\s*(\d+)'),
+        ("data_completeness", r'"data_completeness"\s*:\s*(\d+)'),
         ("thesis_bucket", r'"thesis_bucket"\s*:\s*"([^"]+)"'),
         ("reasoning",     r'"reasoning"\s*:\s*"([^"]+)"'),
         ("pass_to_risk",  r'"pass_to_risk"\s*:\s*(true|false)'),
@@ -300,7 +368,8 @@ def _extract_json(raw: str) -> dict | None:
         m = re.search(pattern, cleaned, re.IGNORECASE)
         if m:
             val = m.group(1)
-            if field == "conviction":
+            if field in ("conviction", "thesis_strength", "catalyst_quality",
+                         "valuation_risk_reward", "data_completeness"):
                 extracted[field] = int(val)
             elif field == "pass_to_risk":
                 extracted[field] = val.lower() == "true"
@@ -324,10 +393,78 @@ def _stub_recommendation(candidate: dict, reason: str) -> dict:
         emit("analyst", ticker, f"Model unavailable ({reason}) — skipping", "neutral")
     except Exception:
         pass
+    # This used to be a WARNING-level log line and nothing else — a real
+    # multi-day outage (every single analysis silently falling back to a
+    # stub from 2026-07-15 through 2026-07-17, ~137 calls, because the old
+    # 180s timeout was too tight) went completely unnoticed because nobody
+    # was grepping logs for it. Throttled to once/hour so a genuinely
+    # unhealthy model gets surfaced fast without spamming on every call.
+    try:
+        import db
+        from datetime import datetime as _dt, timezone as _tz
+        last = db.get_state("stub_recommendation_alert_at")
+        now = _dt.now(_tz.utc)
+        due = True
+        if last:
+            try:
+                due = (now - _dt.fromisoformat(last)).total_seconds() >= 3600
+            except ValueError:
+                pass
+        if due:
+            db.set_state("stub_recommendation_alert_at", now.isoformat())
+            import alerts
+            alerts._send(
+                f"⚠️ <b>Analyst falling back to stub</b> — {ticker}: {reason}\n"
+                f"The 72B model didn't return a usable response, so this and any "
+                f"other recent analyses defaulted to WATCH/no-action instead of a "
+                f"real recommendation. Check Ollama health if this keeps happening."
+            )
+    except Exception as e:
+        log.warning(f"stub_recommendation alert failed: {e}")
+
+    # Auto-recovery driven by REAL production failures, not a synthetic probe
+    # — found 2026-07-21: the periodic check_ollama_gpu_health task kept
+    # reporting healthy (its own probe always finished under 300s) while
+    # real analyst calls kept timing out at 400s all day, because that
+    # probe itself was adding load to the 72B server's single concurrency
+    # slot. This reacts to what's actually failing: 2+ stub fallbacks
+    # within a 20-minute window means something is genuinely wrong right
+    # now, independent of what any synthetic health check believes.
+    try:
+        import db
+        from datetime import datetime as _dt, timezone as _tz
+        now = _dt.now(_tz.utc)
+        streak_start_raw = db.get_state("stub_streak_start")
+        streak_start = None
+        if streak_start_raw:
+            try:
+                streak_start = _dt.fromisoformat(streak_start_raw)
+            except ValueError:
+                pass
+        if streak_start is None or (now - streak_start).total_seconds() > 1200:
+            streak_start = now
+            streak_count = 1
+        else:
+            streak_count = int(db.get_state("stub_streak_count") or "0") + 1
+        db.set_state("stub_streak_start", streak_start.isoformat())
+        db.set_state("stub_streak_count", str(streak_count))
+
+        if streak_count >= 2:
+            db.set_state("stub_streak_count", "0")  # avoid re-triggering every call while throttled
+            from tasks import restart_ollama_and_alert
+            restart_ollama_and_alert(
+                f"{streak_count} stub fallbacks in the last 20 minutes (latest: {ticker}, {reason})"
+            )
+    except Exception as e:
+        log.warning(f"stub streak auto-recovery check failed: {e}")
     return {
         "ticker":         ticker,
         "action":         "WATCH",
         "conviction":     1,
+        "thesis_strength": 1,
+        "catalyst_quality": 1,
+        "valuation_risk_reward": 1,
+        "data_completeness": 1,
         "thesis_bucket":  candidate.get("role", "Accelerator"),
         "thesis_summary": f"{ticker} on watchlist — model unavailable.",
         "expectation_gap": {
@@ -415,6 +552,25 @@ def analyze(
     conviction = max(1, min(10, int(parsed.get("conviction", 1) or 1)))
     udr        = float(parsed.get("upside_downside_ratio", 0) or 0)
 
+    # Sub-scores (1-5 each) — decompose overall conviction into components
+    # that can be individually calibrated against real outcomes later (see
+    # db.get_subscore_calibration / _build_track_record_text), instead of
+    # only ever knowing "conviction-8 calls win X% of the time" without
+    # knowing whether it's the catalyst calls or the valuation calls dragging
+    # that number down. `... or 3` here would silently turn a genuine 0 (bad
+    # output, should floor to 1) into the neutral default 3 instead — missing
+    # key and "explicitly 0" need different handling, not the same fallback.
+    def _sub_score(field: str) -> int:
+        value = parsed.get(field)
+        if value is None:
+            value = 3
+        return max(1, min(5, int(value)))
+
+    thesis_strength        = _sub_score("thesis_strength")
+    catalyst_quality       = _sub_score("catalyst_quality")
+    valuation_risk_reward  = _sub_score("valuation_risk_reward")
+    data_completeness      = _sub_score("data_completeness")
+
     # Bucket is watchlist-authoritative, not an LLM call — strategy ("strategy
     # is data, not code") lives in knowledge/watchlist.md, not in whatever a
     # given inference happens to output. A DDOG recommendation was sized as
@@ -487,6 +643,10 @@ def analyze(
         # calibration so a fundamentals-cache outage capping 7s to 6 doesn't
         # poison the conviction→outcome track record with manufactured 6s.
         "conviction_raw": conviction_raw,
+        "thesis_strength": thesis_strength,
+        "catalyst_quality": catalyst_quality,
+        "valuation_risk_reward": valuation_risk_reward,
+        "data_completeness": data_completeness,
         "thesis_bucket": bucket,
         "llm_suggested_bucket": llm_bucket if bucket_mismatch else None,
         "thesis_summary": parsed.get("thesis_summary", ""),
@@ -556,7 +716,9 @@ def analyze_batch(
         brief = ""
         try:
             from context_engine import build_scan_brief
-            brief = build_scan_brief(ticker, positions, trading_client)
+            from agents.crew import _get_price
+            price = _get_price(ticker, trading_client)
+            brief = build_scan_brief(ticker, positions, trading_client, current_price=price)
         except Exception as e:
             log.warning(f"[{ticker}] Scan brief build failed, analyzing without it: {e}")
 

@@ -39,6 +39,9 @@ _CRITICAL_SERVICES = ["celery_worker", "celery_llm_worker", "celery_beat"]
 _SNAPSHOT_STALE_MINUTES = 15
 
 
+_ALERT_THROTTLE_MINUTES = 30
+
+
 def _send_telegram(text: str) -> None:
     if not _TOKEN or not _CHAT_ID:
         print(f"[watchdog] No Telegram credentials configured — would have sent: {text}")
@@ -51,6 +54,33 @@ def _send_telegram(text: str) -> None:
         )
     except Exception as e:
         print(f"[watchdog] Telegram send failed: {e}")
+
+
+def _alert_due() -> bool:
+    """Re-fired on every 10-minute check with no throttling at all — an IBC
+    outage on 2026-07-18 (TWS's own nightly restart wasn't picked back up,
+    see ibc.service's Restart=always fix) produced repeated near-identical
+    "N min old" alerts before that root cause was fixed. Throttle re-alerts
+    of a still-unresolved problem to once per _ALERT_THROTTLE_MINUTES;
+    a problem clearing and recurring later still alerts immediately next
+    time since the throttle key naturally stops being touched once things
+    are healthy again."""
+    try:
+        import db
+        from datetime import datetime as _dt, timezone as _tz
+        last = db.get_state("watchdog_alert_at")
+        now = _dt.now(_tz.utc)
+        if last:
+            try:
+                if (now - _dt.fromisoformat(last)).total_seconds() < _ALERT_THROTTLE_MINUTES * 60:
+                    return False
+            except ValueError:
+                pass
+        db.set_state("watchdog_alert_at", now.isoformat())
+        return True
+    except Exception as e:
+        print(f"[watchdog] Throttle check failed, alerting anyway: {e}")
+        return True
 
 
 def _check_processes() -> list[str]:
@@ -92,8 +122,11 @@ def main() -> None:
     problems = _check_processes() + _check_snapshot_freshness()
     if problems:
         msg = "🚨 <b>Helios watchdog alert</b>\n" + "\n".join(f"• {p}" for p in problems)
-        print(f"[watchdog] {msg}")
-        _send_telegram(msg)
+        if _alert_due():
+            print(f"[watchdog] {msg}")
+            _send_telegram(msg)
+        else:
+            print(f"[watchdog] (throttled, not re-sent) {msg}")
     else:
         print("[watchdog] OK")
 

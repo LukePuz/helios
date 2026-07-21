@@ -212,6 +212,16 @@ CREATE TABLE IF NOT EXISTS orders (
 );
 
 CREATE INDEX IF NOT EXISTS orders_ticker_idx ON orders (ticker, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS chat_history (
+    id          SERIAL PRIMARY KEY,
+    user_id     VARCHAR(30) NOT NULL,
+    role        VARCHAR(10) NOT NULL,
+    content     TEXT NOT NULL,
+    timestamp   TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS chat_history_user_idx ON chat_history (user_id, timestamp DESC);
 """
 
 
@@ -305,6 +315,15 @@ _MIGRATIONS: list[tuple[int, str]] = [
     # never actually written) since each was introduced. Found 2026-07-16
     # while testing the screener split.
     (10, "ALTER TABLE signals ALTER COLUMN signal TYPE VARCHAR(30);"),
+    # Decomposes the single 1-10 conviction into four independently-
+    # calibratable components (see agents/analyst.py's sub-score rubric and
+    # get_subscore_calibration below) — added 2026-07-17 so "conviction-8
+    # calls underperform" can become "catalyst_quality-5 calls underperform,
+    # valuation calls are fine" instead of one blended, less actionable number.
+    (11, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS thesis_strength INTEGER;"),
+    (12, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS catalyst_quality INTEGER;"),
+    (13, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS valuation_risk_reward INTEGER;"),
+    (14, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS data_completeness INTEGER;"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -419,6 +438,51 @@ def get_recent_trades(limit: int = 50) -> list[dict]:
             ]
     except Exception as e:
         logging.error(f"get_recent_trades failed: {e}")
+        return []
+    finally:
+        _put_conn(conn)
+
+
+def append_chat_message(user_id: str, role: str, content: str) -> None:
+    """Persists one turn of a chat_assistant conversation. Keyed by Telegram
+    numeric user_id (not display name, which can collide/change) so DB-backed
+    history survives process restarts and is shared between the full
+    pipeline's telegram_bot.py and the overnight standby_bot.py — a user
+    chatting through an evening handoff shouldn't lose context."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO chat_history (user_id, role, content) VALUES (%s,%s,%s)",
+                (str(user_id), role, content),
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"append_chat_message failed: {e}")
+    finally:
+        _put_conn(conn)
+
+
+def get_chat_history(user_id: str, limit: int = 12, max_age_hours: float = 4) -> list[dict]:
+    """Returns the most recent turns for this user, oldest first, ready to
+    prepend to a fresh messages list. Bounded by both count and age — an
+    unrelated question hours/days later shouldn't drag in a stale, no-longer-
+    relevant conversation (max_age_hours matches REBUY_COOLDOWN_HOURS'
+    convention elsewhere in this codebase for "how long is context fresh")."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT role, content FROM chat_history "
+                "WHERE user_id = %s AND timestamp > NOW() - (%s || ' hours')::INTERVAL "
+                "ORDER BY timestamp DESC LIMIT %s",
+                (str(user_id), max_age_hours, limit),
+            )
+            rows = cur.fetchall()
+            return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+    except Exception as e:
+        logging.error(f"get_chat_history failed: {e}")
         return []
     finally:
         _put_conn(conn)
@@ -1082,6 +1146,28 @@ def prune_seen_items(days: int = 90, source: str | None = None) -> int:
         _put_conn(conn)
 
 
+def prune_chat_history(days: int = 30) -> int:
+    """chat_history is only ever read within a max_age_hours=4 window (see
+    get_chat_history) — nothing older than that is functionally used, so it
+    just accumulates otherwise. Returns the number of rows deleted."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM chat_history WHERE timestamp < NOW() - (%s || ' days')::interval",
+                (days,),
+            )
+            deleted = cur.rowcount
+        conn.commit()
+        return deleted
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"prune_chat_history failed: {e}")
+        return 0
+    finally:
+        _put_conn(conn)
+
+
 # ---------------------------------------------------------------------------
 # Ingestion health (heartbeat per source — detects "dead" vs "quiet")
 # ---------------------------------------------------------------------------
@@ -1494,6 +1580,10 @@ def log_trade_outcome(
     conviction: int,
     bucket: str,
     entry_price: float,
+    thesis_strength: int | None = None,
+    catalyst_quality: int | None = None,
+    valuation_risk_reward: int | None = None,
+    data_completeness: int | None = None,
 ) -> None:
     # Stamp the SPY price at entry so we can compute alpha (return vs. benchmark)
     # when the trade eventually closes.
@@ -1512,10 +1602,12 @@ def log_trade_outcome(
             cur.execute(
                 "INSERT INTO trade_outcomes "
                 "(approval_id, ticker, action, conviction, thesis_bucket, entry_price, "
-                " entry_benchmark_price) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                " entry_benchmark_price, thesis_strength, catalyst_quality, "
+                " valuation_risk_reward, data_completeness) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (approval_id, ticker, action, conviction, bucket, entry_price,
-                 entry_benchmark_price),
+                 entry_benchmark_price, thesis_strength, catalyst_quality,
+                 valuation_risk_reward, data_completeness),
             )
         conn.commit()
     except Exception as e:
@@ -1649,6 +1741,50 @@ def get_conviction_calibration() -> list[dict]:
         ]
     except Exception as e:
         logging.error(f"get_conviction_calibration failed: {e}")
+        return []
+    finally:
+        _put_conn(conn)
+
+
+_SUBSCORE_COLUMNS = (
+    "thesis_strength", "catalyst_quality", "valuation_risk_reward", "data_completeness",
+)
+
+
+def get_subscore_calibration(dimension: str) -> list[dict]:
+    """
+    Same shape as get_conviction_calibration, but grouped by one of the four
+    1-5 sub-scores (see agents/analyst.py) instead of the blended 1-10
+    conviction. This is what actually makes the sub-scores useful: instead of
+    only knowing "conviction-8 calls win 55% of the time", the model can see
+    "catalyst_quality-5 calls win 70%, but valuation_risk_reward-5 calls only
+    win 45%" — a specific, actionable signal a single blended number hides.
+    """
+    if dimension not in _SUBSCORE_COLUMNS:
+        raise ValueError(f"Unknown sub-score dimension: {dimension}")
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {dimension}, COUNT(*) AS total, "
+                f"  COUNT(*) FILTER (WHERE was_correct = TRUE) AS wins, "
+                f"  AVG(outcome_pct) AS avg_pct, AVG(alpha_pct) AS avg_alpha "
+                f"FROM trade_outcomes "
+                f"WHERE outcome_pct IS NOT NULL AND {dimension} IS NOT NULL "
+                f"GROUP BY {dimension} ORDER BY {dimension} DESC"
+            )
+            rows = cur.fetchall()
+        return [
+            {
+                "score": r[0], "total": r[1], "wins": r[2],
+                "win_rate": round(r[2] / r[1], 3) if r[1] else 0,
+                "avg_outcome_pct": round(float(r[3]), 4) if r[3] else None,
+                "avg_alpha_pct": round(float(r[4]), 4) if r[4] else None,
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        logging.error(f"get_subscore_calibration({dimension}) failed: {e}")
         return []
     finally:
         _put_conn(conn)

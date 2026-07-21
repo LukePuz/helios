@@ -117,7 +117,12 @@ def deep_analyze(event: dict, screening: dict | None = None) -> dict:
         from ibkr import IBKRClient
         client = IBKRClient()
         positions = _get_positions(client)
-        brief = assemble_brief(event, positions, client)
+        # Held tickers get a price via the CURRENT PORTFOLIO section; anything
+        # not held previously had NO price anywhere in the brief, so the model
+        # would invent one for any dollar-denominated valuation output (found
+        # 2026-07-17: a SNDK target of "$300" while it traded near $1,350).
+        price = _get_price(ticker, client)
+        brief = assemble_brief(event, positions, client, current_price=price)
     except Exception as e:
         log.warning(f"[{ticker}] Brief assembly failed: {e}")
         brief = f"Event: {event.get('title', '')}\n{event.get('text', '')[:1000]}"
@@ -150,6 +155,68 @@ def deep_analyze(event: dict, screening: dict | None = None) -> dict:
     # ── Route to approval queue if actionable ─────────────────────────────────
     if result.get("pass_to_risk"):
         _route_to_approval(result, regime, client)
+
+    return result
+
+
+def research_ticker(ticker: str) -> dict:
+    """
+    Read-only, on-demand run of the full analyst pipeline for a single
+    ticker — real situation brief, real 72B analysis, real conviction
+    scoring and evidence, triggered by an explicit chat request (see
+    chat_assistant.py's request_deep_analysis tool) rather than an
+    ingestion event.
+
+    Deliberately never calls _route_to_approval: no matter what the
+    analyst concludes — even a high-conviction OPEN — this can never size
+    or execute a trade. A curiosity question in chat must never become a
+    real order. Screening is skipped too: screen_event_only exists to
+    filter high-volume ambient news, but an explicit "analyze TICKER"
+    request is relevant by definition.
+    """
+    from agents.analyst import analyze
+    from agents.market_regime import get_cached_regime
+    from context_engine import assemble_brief
+
+    ticker = ticker.upper().strip()
+    event = {
+        "source": "chat_request",
+        "ticker": ticker,
+        "title":  f"User-requested research on {ticker}",
+        "text":   "",
+    }
+    log.info(f"[{ticker}] Chat-requested research (read-only, never executes)")
+
+    try:
+        from ibkr import IBKRClient
+        client = IBKRClient()
+        positions = _get_positions(client)
+        price = _get_price(ticker, client)
+        brief = assemble_brief(event, positions, client, current_price=price)
+    except Exception as e:
+        log.warning(f"[{ticker}] Brief assembly failed: {e}")
+        brief = f"User-requested research on {ticker}. No live event context available."
+
+    from knowledge_loader import get_watchlist_entry
+    wl_entry = get_watchlist_entry(ticker) or {}
+    candidate = {
+        "ticker":          ticker,
+        "role":            wl_entry.get("role", "Accelerator"),
+        "tier":            wl_entry.get("tier", "Watch"),
+        "sector":          wl_entry.get("sector", ""),
+        "composite_score": 60,  # chat-triggered, score is nominal
+    }
+
+    regime = get_cached_regime()
+    try:
+        result = analyze(candidate, situation_brief=brief, regime_packet=regime)
+    except Exception as exc:
+        log.error(f"[{ticker}] research_ticker analyze() raised: {exc}", exc_info=True)
+        result = {
+            "action": "SKIP", "ticker": ticker, "conviction": 0,
+            "pass_to_risk": False,
+            "reasoning": f"Analysis failed with exception: {exc}",
+        }
 
     return result
 

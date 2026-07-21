@@ -106,6 +106,7 @@ def assemble_brief(
     event: dict,
     positions: dict[str, dict],
     trading_client=None,
+    current_price: float | None = None,
 ) -> str:
     """
     Builds a complete situation brief for the 72B model.
@@ -114,6 +115,17 @@ def assemble_brief(
         event:          The triggering event (filing, news, options spike, etc.)
         positions:      Current open positions {symbol: {qty, entry_price, pl_pct}}
         trading_client: Alpaca TradingClient for live account data
+        current_price:  Live price for the ticker being evaluated. The CURRENT
+                         PORTFOLIO section below only shows a price for tickers
+                         already held — for anything not currently held (most
+                         chat-requested and event-triggered analyses), the model
+                         previously had NO current price anywhere in its prompt
+                         and would invent one when computing a dollar-denominated
+                         valuation target. Found 2026-07-17: a SNDK research
+                         request came back with a "$300 target" while SNDK
+                         actually traded around $1,350 — the model had no real
+                         price to anchor to and fabricated a plausible-sounding
+                         number instead.
 
     Returns:
         A formatted string ready to be injected into the model prompt.
@@ -122,12 +134,20 @@ def assemble_brief(
     ticker = event.get("ticker", "UNKNOWN")
     sections = []
 
+    price_line = (
+        f"Current Price: ${current_price:.2f}" if current_price
+        else "Current Price: UNKNOWN — do not state a dollar price, multiple-implied "
+             "price, or valuation target anywhere in your answer; describe valuation "
+             "only in relative/qualitative terms instead."
+    )
+
     # ── Header ──────────────────────────────────────────────────────────────
     sections.append(f"""=== SITUATION BRIEF ===
 Generated: {now}
 Triggering Event: {event.get('source', 'unknown').upper()} — {ticker}
 Event Type: {event.get('form', event.get('type', 'unknown'))}
-Event Title: {event.get('title', 'N/A')}""")
+Event Title: {event.get('title', 'N/A')}
+{price_line}""")
 
     # ── Event Content ────────────────────────────────────────────────────────
     event_text = event.get("text", "")
@@ -235,6 +255,7 @@ def build_scan_brief(
     ticker: str,
     positions: dict[str, dict] | None = None,
     trading_client=None,
+    current_price: float | None = None,
 ) -> str:
     """
     Situation brief for the SCANNER-driven path (daily candidate analysis).
@@ -246,12 +267,22 @@ def build_scan_brief(
     Only the rare event-triggered path (assemble_brief, above) got a brief.
     This gives scanner candidates the same context quality, built around the
     ticker itself rather than a triggering event.
+
+    current_price: see assemble_brief's docstring — same fix, same reason
+    (a ticker not already held had no price anchor anywhere in the prompt).
     """
     positions = positions or {}
     now = datetime.now(ET).strftime("%A %B %d, %Y %I:%M %p ET")
+    price_line = (
+        f"Current Price: ${current_price:.2f}" if current_price
+        else "Current Price: UNKNOWN — do not state a dollar price, multiple-implied "
+             "price, or valuation target anywhere in your answer; describe valuation "
+             "only in relative/qualitative terms instead."
+    )
     sections = [f"""=== SITUATION BRIEF (daily scan) ===
 Generated: {now}
-Ticker: {ticker}"""]
+Ticker: {ticker}
+{price_line}"""]
 
     # ── Current Portfolio ────────────────────────────────────────────────────
     if positions:

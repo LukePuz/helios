@@ -117,6 +117,13 @@ TRIM_FRACTION = 0.33   # analyst TRIM sells this fraction of the held position
 # alerting. Only ever reduces exposure; set False to fall back to alert-only.
 AUTO_EXECUTE_PROTECTIVE_SELLS = True
 
+# reconcile_stop_orders runs every 15 min (tasks.py beat schedule) and used
+# to re-alert every unresolved issue (e.g. a position missing a stop) on
+# every single cycle — ~96 identical Telegram messages/day for one standing
+# condition. Re-alert the same issue at most once per this many hours;
+# genuinely new issues or resolved-this-cycle actions always alert.
+RECONCILE_ALERT_THROTTLE_HOURS = 4
+
 # ---------------------------------------------------------------------------
 # Agent pipeline thresholds
 # ---------------------------------------------------------------------------

@@ -1,14 +1,17 @@
 [Unit]
-Description=Stop Helios + IBKR for the night, then suspend the PC
+Description=Stop Helios + IBKR for the night, hand off to the standby chat listener
 
 [Service]
 Type=oneshot
 # Order matters: stop the bot before yanking its broker connection out from
-# under it, then IBC/TWS, then the virtual display it ran in. Suspending
-# last (not poweroff) so the RTC-wake timers below can bring it back —
-# WakeSystem= on helios-start.timer only works from suspend, not from a
-# fully powered-off machine.
+# under it, then IBC/TWS, then the virtual display it ran in. Machine stays
+# powered on (no suspend) so helios-standby.service can keep polling
+# Telegram overnight — see standby_bot.py / helios-standby.service for why:
+# a fully suspended machine can't run any process, so "reachable 24/7"
+# requires staying up. helios-local.service's Conflicts=helios-standby
+# .service tears this back down automatically the moment the full pipeline
+# is started again (by a wake message or by helios-start.timer).
 ExecStart=/usr/bin/systemctl stop helios-local.service
 ExecStart=/usr/bin/systemctl stop ibc.service
 ExecStart=/usr/bin/systemctl stop xvfb.service
-ExecStart=/usr/bin/systemctl suspend
+ExecStart=/usr/bin/systemctl start helios-standby.service

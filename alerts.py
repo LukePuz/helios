@@ -187,17 +187,52 @@ def ack_callback(callback_query_id: str, decision: str) -> None:
 # Existing alert functions (unchanged)
 # ---------------------------------------------------------------------------
 
-def send_trade_alert(symbol: str, side: str, qty: int, price: float, reason: str) -> None:
+def send_trade_alert(
+    symbol: str,
+    side: str,
+    qty: int,
+    price: float,
+    reason: str,
+    conviction: int | None = None,
+    thesis_bucket: str | None = None,
+    reasoning: str | None = None,
+    thesis_strength: int | None = None,
+    catalyst_quality: int | None = None,
+    valuation_risk_reward: int | None = None,
+    data_completeness: int | None = None,
+) -> None:
+    """
+    conviction/thesis_bucket/reasoning/sub-scores are optional so this still
+    works for any caller without analyst context — but every analyst-driven
+    auto-execution has them, and the user explicitly wants to see the full
+    case (rationale + all conviction scores + bucket) on every trade, not
+    just the bare fill details this used to show.
+    """
     icon = "🟢" if side == "BUY" else "🔴"
     now  = datetime.now(_ET).strftime("%I:%M %p ET")
-    _send(
-        f"{icon} <b>TRADE EXECUTED</b>\n"
-        f"Symbol:  <b>{symbol}</b>\n"
-        f"Side:    {side}  ×{qty} shares\n"
-        f"Price:   ${price:.2f}\n"
-        f"Reason:  {reason}\n"
-        f"Time:    {now}"
-    )
+    lines = [
+        f"{icon} <b>TRADE EXECUTED</b>",
+        f"Symbol:  <b>{symbol}</b>",
+        f"Side:    {side}  ×{qty} shares",
+        f"Price:   ${price:.2f}",
+    ]
+    if thesis_bucket:
+        lines.append(f"Bucket:  {thesis_bucket}")
+    if conviction is not None:
+        sub_scores = [
+            ("Thesis", thesis_strength), ("Catalyst", catalyst_quality),
+            ("Valuation", valuation_risk_reward), ("Data", data_completeness),
+        ]
+        sub_str = " · ".join(f"{label} {v}/5" for label, v in sub_scores if v is not None)
+        conv_line = f"Conviction: {conviction}/10"
+        if sub_str:
+            conv_line += f" ({sub_str})"
+        lines.append(conv_line)
+    lines.append(f"Reason:  {reason}")
+    if reasoning:
+        lines.append(f"Rationale: {reasoning}")
+    lines.append(f"Time:    {now}")
+    _send("\n".join(lines))
 
 
 def send_daily_summary(portfolio_value: float, daily_pl: float, start_value: float = 100_000.0) -> None:

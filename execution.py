@@ -358,13 +358,21 @@ def execute_approved(approval: dict, trigger: str = "telegram") -> bool:
             data_completeness=analyst_json.get("data_completeness"),
         )
 
-        # Send trade alert
+        # Send trade alert — full rationale + all conviction scores + bucket,
+        # not just the bare fill details, per explicit user request.
         alert_module.send_trade_alert(
             symbol=ticker,
             side=side,
             qty=filled_qty,
             price=current_price,
             reason=f"{action} {trigger_label}",
+            conviction=approval.get("conviction"),
+            thesis_bucket=approval.get("thesis_bucket"),
+            reasoning=approval.get("reasoning") or analyst_json.get("reasoning"),
+            thesis_strength=analyst_json.get("thesis_strength"),
+            catalyst_quality=analyst_json.get("catalyst_quality"),
+            valuation_risk_reward=analyst_json.get("valuation_risk_reward"),
+            data_completeness=analyst_json.get("data_completeness"),
         )
 
         return True

@@ -566,10 +566,20 @@ class IBKRClient:
         for v in ib.accountValues():
             if v.currency == "USD":
                 vals[v.tag] = v.value
+        # CashBalance silently stopped being sent by IBKR for this account at
+        # some point (found 2026-07-23: it came back missing entirely, not
+        # just zero) — vals.get(..., 0) doesn't distinguish "tag absent" from
+        # "genuinely zero cash", so this defaulted to $0 with no error while
+        # the account actually held $847K, silently blocking every new BUY's
+        # risk sizing (20% of a $0 reserve is $0) for an unknown stretch of
+        # time. TotalCashValue is IBKR's more universally-sent equivalent —
+        # preferred now, with CashBalance kept as a fallback in case some
+        # account mode sends that one instead.
+        cash_str = vals.get("TotalCashValue", vals.get("CashBalance", 0))
         return _IBKRAccount(
             portfolio_value = float(vals.get("NetLiquidation", 0)),
             buying_power    = float(vals.get("BuyingPower",    0)),
-            cash            = float(vals.get("CashBalance",    0)),
+            cash            = float(cash_str),
         )
 
     def get_all_positions(self) -> list[_IBKRPosition]:

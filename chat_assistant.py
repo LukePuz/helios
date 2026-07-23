@@ -125,7 +125,10 @@ def _tool_get_portfolio(_args: dict) -> str:
         ib = _ibkr_mod._ib
         vals = {v.tag: v.value for v in ib.accountValues() if v.currency == "USD"}
         net_liq = float(vals.get("NetLiquidation", 0))
-        cash = float(vals.get("CashBalance", 0))
+        # CashBalance isn't reliably sent by IBKR for this account — see
+        # ibkr.py's get_account() for the full story. TotalCashValue is the
+        # field that's actually populated.
+        cash = float(vals.get("TotalCashValue", vals.get("CashBalance", 0)))
         portfolio = [item for item in ib.portfolio() if float(item.position) != 0]
         if not portfolio:
             return f"Portfolio value: ${net_liq:,.2f}. Cash: ${cash:,.2f}. No open positions."

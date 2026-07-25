@@ -92,6 +92,18 @@ app.conf.beat_schedule = {
         "schedule": crontab(hour=9, minute=35, day_of_week="mon-fri"),
         "options":  {"expires": 4 * 3600},
     },
+    # Position review — reassess already-held positions for TRIM/EXIT/HOLD,
+    # independent of whether a new event happens to fire on one. Added
+    # 2026-07-25: this was the actual gap behind the system never selling —
+    # _route_to_approval's TRIM/EXIT handling already worked correctly,
+    # nothing ever triggered it on a schedule (see agents/crew.py's
+    # review_all_held_positions docstring). 10:15 AM, after the daily scan,
+    # so new-candidate analysis isn't waiting behind it.
+    "position-review": {
+        "task":     "tasks.review_positions",
+        "schedule": crontab(hour=10, minute=15, day_of_week="mon-fri"),
+        "options":  {"queue": LLM_QUEUE_HELD, "expires": 6 * 3600},
+    },
     # Check trailing stops — every 30 min during market hours
     "check-stops": {
         "task":     "tasks.check_trailing_stops",
@@ -476,6 +488,19 @@ def run_daily_scan(self):
             )
     except Exception as e:
         log.error(f"run_daily_scan failed: {e}")
+        raise self.retry(exc=e, countdown=300)
+
+
+@app.task(name="tasks.review_positions", bind=True, max_retries=2)
+def review_positions(self):
+    """Scheduled reassessment of already-held positions for TRIM/EXIT/HOLD
+    — see agents/crew.py's review_all_held_positions docstring for why this
+    exists (nothing else ever asked this question on a schedule)."""
+    try:
+        from agents.crew import review_all_held_positions
+        review_all_held_positions(max_per_run=10)
+    except Exception as e:
+        log.error(f"review_positions failed: {e}")
         raise self.retry(exc=e, countdown=300)
 
 

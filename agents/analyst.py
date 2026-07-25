@@ -189,13 +189,24 @@ assumed or remembered price. If Current Price is marked UNKNOWN, do not
 write a dollar figure anywhere in your output; describe valuation only in
 relative terms (e.g. "trades below peer multiples") instead of a price.
 
-Conviction scale — use the FULL range; most ideas are ordinary and should score in the middle:
-  1-2: thesis broken or contradicted by the evidence in the brief
-  3-4: speculative — plausible story but no concrete supporting evidence yet
-  5-6: solid company, thesis intact, but NO identifiable edge over the market's current pricing (this is the default for "good but fairly priced")
-  7-8: specific, citable mispricing — you can point to evidence in the brief the market is missing, with a dated catalyst to close the gap
-  9-10: exceptional, rare (a few per year) — overwhelming evidence, multiple independent confirmations, asymmetric payoff
-A 7 must be justified by evidence quoted from the situation brief or fundamentals, not by general optimism about the sector.
+Conviction scale — each number below is a distinct bar, not a paired range.
+Count the citable, independent pieces of evidence in the brief that support
+an edge (a specific mispricing, an under-appreciated catalyst) — do not
+assign a score by how confident the narrative sounds:
+  1: Thesis is directly contradicted by evidence in the brief. Do not hold.
+  2: Thesis mostly broken — only a remote chance the story still plays out.
+  3: Speculative — a plausible story but zero concrete supporting evidence in the brief yet.
+  4: Speculative, but with exactly one concrete supporting data point; still mostly narrative.
+  5: Solid, thesis intact, fairly priced — no identifiable edge over consensus. The default for "good company, no edge."
+  6: Same as 5, plus one minor edge that doesn't yet rise to a full mispricing case (e.g. a catalyst that isn't confirmed yet, or a small valuation discount with no clear reason it closes).
+  7: Exactly ONE clear, citable mispricing or edge, backed by a single hard piece of evidence from the brief, with a dated catalyst.
+  8: TWO OR MORE independent, citable pieces of evidence supporting the same mispricing, a dated catalyst, and a quantified upside/downside.
+  9: Overwhelming evidence — three or more independent confirmations, asymmetric payoff, near-term dated catalyst, no meaningful counter-evidence in the brief.
+  10: Everything in 9, plus a specific, explainable reason the market hasn't already corrected this (a structural or temporary reason, not "it just hasn't happened yet").
+Do not default to 7 as a safe middle score, and do not aim for any particular
+number to "qualify" for a decision — score honestly per the table above and
+let downstream position-sizing logic decide what's actionable. If you find
+yourself about to write 7 out of habit, recount the actual evidence first.
 
 In addition to the overall conviction, rate these four components separately,
 each 1-5 — conviction should be a defensible synthesis of these, not an
@@ -249,7 +260,7 @@ Then output ONLY valid JSON in exactly this format (no markdown, no explanation 
 Rules:
 - Set pass_to_risk to true ONLY if action is OPEN, ADD, TRIM, or EXIT AND conviction >= 5 AND upside_downside_ratio >= 2.0
 - For Moonshot tickers: conviction >= 7 required to recommend OPEN; never exceed 2% position
-- In {regime} regime: {'be selective, raise threshold to conviction 7+ for new positions' if regime in ('Neutral', 'Risk-Off', 'Strong Risk-Off') else 'normal conviction thresholds apply'}
+- Score conviction on the evidence alone, regardless of regime — regime-based selectivity is applied downstream by position sizing, not by inflating or suppressing your stated score
 {'- Your stated conviction has a track record above — calibrate against it, not against how confident you feel' if track_record else ''}
 - reasoning and thesis_summary must be concrete, not persuasive prose: cite actual figures from the SITUATION BRIEF or FUNDAMENTALS section (a growth rate, a multiple, a dollar figure, a date) and name where each came from (e.g. "per Q2 fundamentals", "per the [source] article in the brief"). A sentence with no number and no named source is not acceptable reasoning — if the brief genuinely has no hard data to cite, say that explicitly instead of writing confident-sounding prose to fill the gap.
 - Output ONLY the JSON object, nothing else
@@ -632,6 +643,20 @@ def analyze(
     # Moonshots need conviction >= 7 for OPEN
     if bucket == "Moonshot" and action == "OPEN" and conviction < 7:
         log.info(f"[{ticker}] Moonshot conviction {conviction} < 7 — downgrading to WATCH")
+        action = "WATCH"
+        parsed["pass_to_risk"] = False
+
+    # Regime-based selectivity for new positions — enforced here instead of
+    # asked of the model. The prompt used to say "raise threshold to
+    # conviction 7+" for cautious regimes, which measurably caused the model
+    # to anchor on exactly 7 as the passing score rather than reasoning
+    # independently (2026-07-25 finding: 69% of every actionable decision
+    # ever made was conviction=7, with none ever below 5 or above 8). The
+    # model now scores conviction on evidence alone; this applies the actual
+    # selectivity policy deterministically instead of via prompt anchoring.
+    regime_str = regime_packet.get("regime", "Neutral")
+    if action == "OPEN" and regime_str in ("Neutral", "Risk-Off", "Strong Risk-Off") and conviction < 7:
+        log.info(f"[{ticker}] {regime_str} regime — conviction {conviction} < 7 for new position — downgrading to WATCH")
         action = "WATCH"
         parsed["pass_to_risk"] = False
 

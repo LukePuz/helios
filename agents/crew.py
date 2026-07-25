@@ -159,6 +159,101 @@ def deep_analyze(event: dict, screening: dict | None = None) -> dict:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Scheduled position review — the only other paths into analyze() are new
+# scanner candidates (OPEN-only) and ingestion events that happen to fire on
+# an already-held ticker, so without this, TRIM/EXIT could only ever occur
+# by coincidence. Confirmed 2026-07-25: 37 executed trades ever, zero EXITs,
+# one TRIM -- nothing was ever periodically asked "should we still hold
+# this?" independent of a new external event. _route_to_approval's TRIM/EXIT
+# handling (sized from the held position, bypassing buy gates) already
+# worked correctly; this closes the actual gap upstream of it.
+# ---------------------------------------------------------------------------
+
+def review_held_position(ticker: str, client, positions: dict, regime: dict) -> dict:
+    """Reassess one already-held position via the same brief/analyze/route
+    pipeline as the event-driven path, using a synthetic 'scheduled review'
+    event instead of a real filing/news item."""
+    from agents.analyst import analyze
+    from context_engine import assemble_brief
+    from knowledge_loader import get_watchlist_entry
+
+    log.info(f"[{ticker}] Scheduled position review")
+
+    event = {
+        "ticker": ticker, "source": "portfolio_review", "type": "scheduled review",
+        "title": f"Periodic position review — {ticker}", "text": "",
+    }
+    price = positions.get(ticker, {}).get("current_price") or _get_price(ticker, client)
+    brief = assemble_brief(event, positions, client, current_price=price)
+
+    wl_entry = get_watchlist_entry(ticker) or {}
+    candidate = {
+        "ticker":          ticker,
+        "role":            wl_entry.get("role", "Accelerator"),
+        "tier":            wl_entry.get("tier", "Watch"),
+        "sector":          wl_entry.get("sector", ""),
+        "composite_score": 60,
+    }
+
+    try:
+        result = analyze(candidate, situation_brief=brief, regime_packet=regime)
+    except Exception as exc:
+        log.error(f"[{ticker}] Position review analyze() raised: {exc}", exc_info=True)
+        return {
+            "action": "SKIP", "ticker": ticker, "conviction": 0, "pass_to_risk": False,
+            "reasoning": f"Review failed with exception: {exc}",
+        }
+
+    if result.get("pass_to_risk"):
+        _route_to_approval(result, regime, client)
+
+    return result
+
+
+def review_all_held_positions(max_per_run: int = 10) -> list[dict]:
+    """
+    Batch driver (tasks.review_positions) — capped per run since each review
+    is a full 72B call that competes with new-candidate analysis on the same
+    GPU queue. Rotates through every held position over successive runs
+    (oldest-reviewed-first, tracked in system_state) rather than always
+    reviewing the same few if there are more positions than max_per_run.
+    """
+    import json
+    from datetime import datetime, timezone
+    import db
+    from ibkr import IBKRClient
+    from agents.market_regime import get_cached_regime
+
+    client = IBKRClient()
+    positions = _get_positions(client)
+    regime = get_cached_regime()
+
+    try:
+        last_reviewed = json.loads(db.get_state("position_review_last_reviewed") or "{}")
+    except Exception:
+        last_reviewed = {}
+
+    tickers = sorted(positions.keys(), key=lambda t: last_reviewed.get(t, ""))[:max_per_run]
+    log.info(f"Position review: {len(tickers)} of {len(positions)} held tickers this run")
+
+    results = []
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for ticker in tickers:
+        try:
+            results.append(review_held_position(ticker, client, positions, regime))
+        except Exception as e:
+            log.error(f"[{ticker}] Position review failed: {e}")
+        last_reviewed[ticker] = now_iso
+
+    try:
+        db.set_state("position_review_last_reviewed", json.dumps(last_reviewed))
+    except Exception as e:
+        log.warning(f"Position review cursor save failed: {e}")
+
+    return results
+
+
 def research_ticker(ticker: str) -> dict:
     """
     Read-only, on-demand run of the full analyst pipeline for a single

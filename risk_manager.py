@@ -677,16 +677,39 @@ class RiskManager:
                     # — no more cancel/replace round-trips, and no window
                     # where the position is briefly unprotected between
                     # cancelling the old stop and placing the new one.
-                    new_stop = round(current * (1 - trail_dist), 2)
+                    #
+                    # Trail distance is ATR-based (N x ATR, same multiplier
+                    # table as the initial stop) rather than a flat percent —
+                    # a flat % gives every stock in a bucket the same trail
+                    # regardless of how it individually trades, the same
+                    # one-size-fits-all problem the initial stop already
+                    # solved by using ATR instead of a flat percent. Falls
+                    # back to the flat-% distance only if ATR is unavailable.
+                    atr = self.get_atr(ticker)
+                    trail_amount = None
+                    trail_pct = None
+                    if atr:
+                        mult_lo, mult_hi = ATR_STOP_MULTIPLIER.get(bucket, (1.5, 2.0))
+                        mult = (mult_lo + mult_hi) / 2
+                        trail_amount = round(mult * atr, 2)
+                        new_stop = round(current - trail_amount, 2)
+                        method_label = f"{mult:.1f}x ATR (${atr:.2f}) = ${trail_amount:.2f}"
+                    else:
+                        trail_pct = round(trail_dist * 100, 2)
+                        new_stop = round(current * (1 - trail_dist), 2)
+                        method_label = f"{trail_pct}% (ATR unavailable, flat-% fallback)"
+
                     try:
                         import ibkr
                         qty = round(abs(float(pos.qty)), 4)
-                        trail_pct = round(trail_dist * 100, 2)
                         ibkr.cancel_stop_orders_for(ticker)
-                        result = ibkr.place_trailing_stop_order(ticker, qty, trail_pct)
+                        if trail_amount is not None:
+                            result = ibkr.place_trailing_stop_order(ticker, qty, trail_amount=trail_amount)
+                        else:
+                            result = ibkr.place_trailing_stop_order(ticker, qty, trail_percent=trail_pct)
                         db.set_stop_broker_order_id(ticker, result["order_id"])
                         db.update_trailing_stop(ticker, new_stop, current)
-                        log.info(f"[{ticker}] Converted to native TRAIL stop ({trail_pct}%), "
+                        log.info(f"[{ticker}] Converted to native TRAIL stop ({method_label}), "
                                 f"orderId={result['order_id']}")
                     except Exception as e:
                         log.error(f"[{ticker}] Native TRAIL conversion failed — falling back to "

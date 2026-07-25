@@ -422,24 +422,37 @@ def place_bracket_order(
     }
 
 
-def place_trailing_stop_order(ticker: str, qty: float, trail_percent: float) -> dict:
+def place_trailing_stop_order(
+    ticker: str, qty: float,
+    trail_percent: float | None = None, trail_amount: float | None = None,
+) -> dict:
     """
     Native IBKR TRAIL order — the broker ratchets the stop price itself as
     the position gains, so no cancel/replace round-trip (and the gap that
     creates between "old stop cancelled" and "new stop live") is needed once
     a position's trailing stop has activated.
+
+    Exactly one of trail_percent / trail_amount must be given. trail_amount
+    (a dollar distance, e.g. N x ATR) is preferred when available — it
+    adapts to each stock's own volatility the same way the initial ATR
+    stop already does, instead of every stock in a bucket trailing the same
+    flat percent regardless of how it individually trades.
     """
+    if (trail_percent is None) == (trail_amount is None):
+        raise ValueError("place_trailing_stop_order: give exactly one of trail_percent/trail_amount")
+
     ib = get_ib()
     contract = _stock(ib, ticker)
+    order_kwargs = {"trailingPercent": trail_percent} if trail_percent is not None else {"auxPrice": trail_amount}
     order = ibi.Order(
-        action="SELL", totalQuantity=qty, orderType="TRAIL",
-        trailingPercent=trail_percent, tif="GTC",
+        action="SELL", totalQuantity=qty, orderType="TRAIL", tif="GTC", **order_kwargs,
     )
     trade = ib.placeOrder(contract, order)
     ib.sleep(1)
-    log.info(f"Native trailing stop placed: SELL {qty} {ticker} trailing {trail_percent}% "
+    label = f"{trail_percent}%" if trail_percent is not None else f"${trail_amount:.2f}"
+    log.info(f"Native trailing stop placed: SELL {qty} {ticker} trailing {label} "
              f"(orderId={trade.order.orderId})")
-    return {"order_id": trade.order.orderId, "trail_percent": trail_percent}
+    return {"order_id": trade.order.orderId, "trail_percent": trail_percent, "trail_amount": trail_amount}
 
 
 def place_stop_order(ticker: str, qty: float, stop_price: float) -> dict:

@@ -200,6 +200,7 @@ def send_trade_alert(
     catalyst_quality: int | None = None,
     valuation_risk_reward: int | None = None,
     data_completeness: int | None = None,
+    chase_risk: int | None = None,
 ) -> None:
     """
     conviction/thesis_bucket/reasoning/sub-scores are optional so this still
@@ -222,6 +223,7 @@ def send_trade_alert(
         sub_scores = [
             ("Thesis", thesis_strength), ("Catalyst", catalyst_quality),
             ("Valuation", valuation_risk_reward), ("Data", data_completeness),
+            ("Chase Risk", chase_risk),
         ]
         sub_str = " · ".join(f"{label} {v}/5" for label, v in sub_scores if v is not None)
         conv_line = f"Conviction: {conviction}/10"

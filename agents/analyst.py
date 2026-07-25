@@ -457,6 +457,16 @@ def _stub_recommendation(candidate: dict, reason: str) -> dict:
             )
     except Exception as e:
         log.warning(f"stub streak auto-recovery check failed: {e}")
+
+    # Still real (deterministic, not model-derived), unlike everything else
+    # in this stub -- no reason to throw away a genuine price-based signal
+    # just because Ollama is down.
+    try:
+        from agents.chase_risk import compute_chase_risk
+        chase = compute_chase_risk(ticker)
+    except Exception:
+        chase = None
+
     return {
         "ticker":         ticker,
         "action":         "WATCH",
@@ -465,6 +475,8 @@ def _stub_recommendation(candidate: dict, reason: str) -> dict:
         "catalyst_quality": 1,
         "valuation_risk_reward": 1,
         "data_completeness": 1,
+        "chase_risk": chase["score"] if chase else None,
+        "chase_risk_pct_from_kijun": chase["pct_from_kijun"] if chase else None,
         "thesis_bucket":  candidate.get("role", "Accelerator"),
         "thesis_summary": f"{ticker} on watchlist — model unavailable.",
         "expectation_gap": {
@@ -571,6 +583,25 @@ def analyze(
     valuation_risk_reward  = _sub_score("valuation_risk_reward")
     data_completeness      = _sub_score("data_completeness")
 
+    # Chase risk — deterministic, not LLM-estimated (see agents/chase_risk.py
+    # docstring for why). Informational only for now: doesn't affect action,
+    # conviction, or sizing, just surfaces "good thesis, bad entry price" as
+    # its own visible number in trade_outcomes and Telegram alerts.
+    try:
+        from agents.chase_risk import compute_chase_risk, KIJUN_PERIOD
+        chase = compute_chase_risk(ticker)
+    except Exception as e:
+        log.debug(f"[{ticker}] chase_risk computation failed: {e}")
+        chase = None
+        KIJUN_PERIOD = 26
+    chase_risk_score = chase["score"] if chase else None
+    if chase:
+        parsed["reasoning"] = (
+            parsed.get("reasoning", "") +
+            f" [Chase risk {chase['score']}/5 — price is {chase['pct_from_kijun']:+.1f}% "
+            f"from its {KIJUN_PERIOD}-day equilibrium (Kijun-sen).]"
+        )
+
     # Bucket is watchlist-authoritative, not an LLM call — strategy ("strategy
     # is data, not code") lives in knowledge/watchlist.md, not in whatever a
     # given inference happens to output. A DDOG recommendation was sized as
@@ -647,6 +678,8 @@ def analyze(
         "catalyst_quality": catalyst_quality,
         "valuation_risk_reward": valuation_risk_reward,
         "data_completeness": data_completeness,
+        "chase_risk": chase_risk_score,
+        "chase_risk_pct_from_kijun": chase["pct_from_kijun"] if chase else None,
         "thesis_bucket": bucket,
         "llm_suggested_bucket": llm_bucket if bucket_mismatch else None,
         "thesis_summary": parsed.get("thesis_summary", ""),

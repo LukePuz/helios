@@ -102,6 +102,20 @@ def _get_cpi_yoy() -> dict[str, str | float | None]:
     return {"label": "CPI Index (level)", "value": latest_val, "date": latest["date"]}
 
 
+# Series that FRED only updates monthly -- a 10-day lookback (fine for the
+# daily series below) will reliably find NOTHING for these, since the most
+# recently published reading is routinely 30-55 days old by the time the
+# next one posts. Found 2026-07-26: get_macro_snapshot() used the same
+# 10-day window for every series, so FEDFUNDS/UNRATE silently returned
+# "unavailable" essentially always (confirmed live: FEDFUNDS's actual latest
+# reading was dated 2026-06-01, 55 days before this was caught) -- which
+# defaulted market_regime's liquidity signal to Neutral on every assessment,
+# not just occasionally. _get_cpi_yoy already used a 400-day window for the
+# same reason; these two just got missed.
+_MONTHLY_SERIES = {"FEDFUNDS", "UNRATE"}
+_MONTHLY_LOOKBACK_DAYS = 60
+
+
 def get_macro_snapshot() -> dict[str, str | float | None]:
     """
     Returns the latest reading for every macro series.
@@ -112,7 +126,8 @@ def get_macro_snapshot() -> dict[str, str | float | None]:
         if series_id == "CPIAUCSL":
             snapshot[series_id] = _get_cpi_yoy()
             continue
-        obs = _fetch_series(series_id, lookback_days=10)
+        lookback = _MONTHLY_LOOKBACK_DAYS if series_id in _MONTHLY_SERIES else 10
+        obs = _fetch_series(series_id, lookback_days=lookback)
         # Find most recent non-null observation
         latest = next((o for o in obs if o.get("value") not in (".", None, "")), None)
         if latest:

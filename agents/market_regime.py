@@ -292,11 +292,105 @@ def _score_volume(spy_bars: list[dict]) -> tuple[int, str]:
         return _SCORE["Neutral"], f"Mixed volume: {ratio:.0%} on up days"
 
 
-def _score_markov(packet: dict) -> tuple[int, str]:
+def _score_relative_strength(
+    sector_bars: list[dict], benchmark_bars: list[dict],
+    medium_lookback: int = 30, short_lookback: int = 5,
+) -> tuple[int, str]:
     """
-    Empirical Markov transition-persistence signal for SPY 20-day return
+    Sector-vs-benchmark relative strength: the sector_etf/benchmark price
+    ratio and its trend. Added 2026-07-26 -- the direct answer to "could we
+    have caught the June 2026 tech rotation early": SOXX ran +28.9% vs SPY
+    from 2026-05-15 to 2026-06-22, then reversed -9.9% relative in the next
+    4 sessions, while SPY itself stayed flat (98-102 range) the entire time
+    -- completely invisible to every SPY-only signal above. A rotation
+    shows up in relative performance before it's obvious in absolute price,
+    which is exactly what this catches: not just "is the sector falling"
+    but "is money leaving this sector for others."
+
+    Also flags plain overextension (medium_chg > 20%) as Neutral rather
+    than Very Bullish even with no reversal yet -- an extended run being
+    scored as straightforwardly bullish is how you miss the setup, not
+    just the reversal.
+
+    short_lookback=5 (not 10): backtested against the actual June 2026
+    reversal, a 10-day window still spanned back into the tail end of the
+    rally itself (e.g. as-of 2026-06-26, day-10 was 2026-06-11 -- before
+    the 06-22 peak), netting positive and completely missing the rollover
+    on every date checked 06-23 through 06-30. A 5-day window isolates the
+    acute reversal and correctly flags it on 06-26. Tradeoff: 5-day is
+    noisier -- it also fired one ~3-day false alarm in mid-May during an
+    otherwise-intact uptrend -- but since this is one of several weighted
+    signals feeding an aggregate score (not a standalone trigger), missing
+    a real multi-week rotation is the more expensive failure mode.
+    """
+    sector_by_date = {b["date"]: b["close"] for b in sector_bars if b.get("close")}
+    bench_by_date  = {b["date"]: b["close"] for b in benchmark_bars if b.get("close")}
+    common_dates   = sorted(set(sector_by_date) & set(bench_by_date))
+
+    if len(common_dates) < medium_lookback + 1:
+        return _SCORE["Neutral"], "Insufficient overlapping history for relative strength"
+
+    ratio = [sector_by_date[d] / bench_by_date[d] for d in common_dates if bench_by_date[d]]
+    if len(ratio) < medium_lookback + 1:
+        return _SCORE["Neutral"], "Insufficient ratio history for relative strength"
+
+    medium_chg = (ratio[-1] - ratio[-medium_lookback]) / ratio[-medium_lookback] if ratio[-medium_lookback] else 0.0
+    short_chg  = (ratio[-1] - ratio[-short_lookback]) / ratio[-short_lookback] if ratio[-short_lookback] else 0.0
+
+    if medium_chg > 0.20:
+        if short_chg < -0.03:
+            return _SCORE["Very Bearish"], (
+                f"Sector extended +{medium_chg:.1%} vs benchmark over {medium_lookback}d, now "
+                f"rolling over {short_chg:+.1%} in the last {short_lookback}d — rotation risk"
+            )
+        return _SCORE["Neutral"], (
+            f"Sector extended +{medium_chg:.1%} vs benchmark over {medium_lookback}d — "
+            f"historically stretched, elevated reversal risk despite still leading"
+        )
+    if medium_chg > 0.10:
+        if short_chg < -0.02:
+            return _SCORE["Bearish"], (
+                f"Sector +{medium_chg:.1%} vs benchmark over {medium_lookback}d but rolling over "
+                f"{short_chg:+.1%} recently — possible rotation starting"
+            )
+        return _SCORE["Bullish"], f"Sector leading benchmark +{medium_chg:.1%} over {medium_lookback}d, trend intact"
+    if medium_chg > 0:
+        label = "Bullish" if short_chg > 0 else "Neutral"
+        return _SCORE[label], f"Sector modestly leading benchmark +{medium_chg:.1%} over {medium_lookback}d"
+    if short_chg < -0.02:
+        return _SCORE["Very Bearish"], (
+            f"Sector underperforming benchmark {medium_chg:+.1%} over {medium_lookback}d, "
+            f"accelerating {short_chg:+.1%} recently"
+        )
+    return _SCORE["Bearish"], f"Sector underperforming benchmark {medium_chg:+.1%} over {medium_lookback}d"
+
+
+def _score_price_action_volume(bars: list[dict], ticker: str = "") -> tuple[int, str]:
+    """Reuses agents/price_action.py's OBV/swing-structure analysis (already
+    built and wired into the scanner's stock-level scoring) at the sector-
+    ETF level -- distinguishes a real, volume-confirmed reversal from an
+    ordinary pullback, instead of adding a second parallel implementation."""
+    try:
+        from agents.price_action import compute_price_action
+        pa = compute_price_action(ticker=ticker, bars=bars)
+    except Exception as e:
+        return _SCORE["Neutral"], f"Price-action analysis unavailable: {e}"
+    if not pa:
+        return _SCORE["Neutral"], "Insufficient history for price-action analysis"
+
+    # Map price_action's 1-5 scale onto this module's -5..+5 scale.
+    score_map = {1: "Very Bearish", 2: "Bearish", 3: "Neutral", 4: "Bullish", 5: "Very Bullish"}
+    label = score_map.get(pa["score"], "Neutral")
+    return _SCORE[label], pa["summary"]
+
+
+def _score_markov(packet: dict, label: str = "SPY") -> tuple[int, str]:
+    """
+    Empirical Markov transition-persistence signal for 20-day return
     states. See agents/markov_regime.py for the transition-matrix estimation
     and knowledge/market_regime_rules.md for the threshold rationale.
+    `label` identifies the underlying series in the notes text (SPY, a
+    sector ETF ticker, or "RS ratio" for the relative-strength series).
     """
     if not packet.get("available"):
         return _SCORE["Neutral"], packet.get("notes") or "Markov data unavailable"
@@ -312,7 +406,7 @@ def _score_markov(packet: dict) -> tuple[int, str]:
     signal     = packet.get("signal", 0.0)
     stickiness = packet.get("stickiness", 0.0)
     notes = (
-        f"SPY Markov state={state}, stickiness={stickiness:.0%}, "
+        f"{label} Markov state={state}, stickiness={stickiness:.0%}, "
         f"signal={signal:+.2f} (n={row_samples})"
     )
 
@@ -360,8 +454,12 @@ def _fetch_watchlist_bars_for_breadth(sample_size: int = 30) -> list[list[dict]]
 # SPY bar fetcher (uses Alpaca via env — already available)
 # ---------------------------------------------------------------------------
 
-def _fetch_spy_bars(days: int = 220) -> list[dict]:
-    """Fetch daily SPY bars via Alpaca REST. Returns list of {date, open, high, low, close, volume}."""
+def _fetch_bars(ticker: str = "SPY", days: int = 220) -> list[dict]:
+    """Fetch daily bars for any ticker via Alpaca REST. Returns list of
+    {date, open, high, low, close, volume}. Generalized 2026-07-26 from a
+    SPY-only fetcher so sector ETFs (XLK, SOXX) can reuse the exact same
+    trend/volume/relative-strength scoring the overall regime already uses,
+    instead of a broad-market-only view of a book that's 100% AI/tech."""
     api_key    = os.getenv("ALPACA_API_KEY", "")
     api_secret = os.getenv("ALPACA_API_SECRET", "")
     if not api_key or not api_secret:
@@ -370,7 +468,7 @@ def _fetch_spy_bars(days: int = 220) -> list[dict]:
     end   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     start = (datetime.now(timezone.utc) - timedelta(days=days + 30)).strftime("%Y-%m-%d")
 
-    url = "https://data.alpaca.markets/v2/stocks/SPY/bars"
+    url = f"https://data.alpaca.markets/v2/stocks/{ticker}/bars"
     headers = {"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": api_secret}
     params  = {"timeframe": "1Day", "start": start, "end": end, "limit": days + 30, "feed": "iex"}
     try:
@@ -389,8 +487,14 @@ def _fetch_spy_bars(days: int = 220) -> list[dict]:
             for b in bars_raw
         ]
     except Exception as e:
-        log.warning(f"SPY bar fetch failed: {e}")
+        log.warning(f"{ticker} bar fetch failed: {e}")
         return []
+
+
+def _fetch_spy_bars(days: int = 220) -> list[dict]:
+    """Thin backward-compatible wrapper -- kept so the one existing call
+    site in assess_regime() doesn't need to change."""
+    return _fetch_bars("SPY", days)
 
 
 # ---------------------------------------------------------------------------
@@ -571,6 +675,186 @@ def assess_regime() -> dict:
 
     log.info(f"Regime assessment complete: {regime} (score={score})")
     return packet
+
+
+# ---------------------------------------------------------------------------
+# Sector regime — added 2026-07-26. The overall regime above is entirely
+# SPY/macro-based; every ticker in this system's watchlist (all 101, across
+# all 15 thesis sections) is AI/tech-infrastructure themed, so a broad-
+# market-neutral reading tells you very little about this book's actual
+# risk. Confirmed against real data: SOXX ran +28.9% vs SPY from 2026-05-15
+# to 2026-06-22, then reversed -9.9% relative in the next 4 sessions, while
+# SPY stayed flat (98-102 range) the whole time and the overall regime
+# stayed pinned at "Neutral" throughout. This is a second, independent
+# assessment (own weights, own cache, own DB rows via regime_type='sector')
+# -- it does not replace or change assess_regime() above.
+# ---------------------------------------------------------------------------
+
+_SECTOR_WEIGHTS = {
+    "trend": 1, "volatility": 1, "breadth": 1, "volume": 1,
+    "relative_strength": 3, "price_action_volume": 2, "markov": 1,
+}
+_SECTOR_MAX_RAW = sum(5 * w for w in _SECTOR_WEIGHTS.values())
+_SECTOR_MIN_RAW = sum(-5 * w for w in _SECTOR_WEIGHTS.values())
+
+_sector_regime_cache: dict[str, dict] = {}
+_sector_cache_ts: dict[str, float] = {}
+
+
+def _normalize_sector(raw: float) -> float:
+    return round((raw - _SECTOR_MIN_RAW) / (_SECTOR_MAX_RAW - _SECTOR_MIN_RAW) * 100, 1)
+
+
+def assess_sector_regime(sector_etf: str = "XLK", spy_bars: list[dict] | None = None) -> dict:
+    """
+    Same regime classification as assess_regime(), scoped to one sector ETF
+    instead of SPY, plus two signals the overall regime doesn't have:
+    relative-strength-vs-SPY (rotation detection) and OBV-confirmed
+    price-action structure (agents/price_action.py, reused as-is).
+
+    Liquidity/credit aren't sector-specific (macro conditions apply to the
+    whole market) so they're deliberately left out here rather than
+    duplicating the same macro read under a different label; breadth
+    reuses the existing watchlist sample since that watchlist already IS
+    the tech/AI universe.
+    """
+    from agents.markov_regime import get_markov_packet, get_markov_packet_from_closes
+
+    log.info(f"Assessing {sector_etf} sector regime...")
+    now = datetime.now(timezone.utc)
+
+    sector_bars = _fetch_bars(sector_etf, days=220)
+    if spy_bars is None:
+        spy_bars = _fetch_bars("SPY", days=220)
+
+    trend_raw, trend_notes = _score_trend(sector_bars)
+
+    try:
+        from ingestion.macro import get_macro_snapshot
+        macro = get_macro_snapshot()
+    except Exception as e:
+        log.warning(f"Macro fetch failed for sector regime: {e}")
+        macro = {}
+    vix = macro.get("VIXCLS", {}).get("value")
+    volatility_raw, volatility_notes = _score_volatility(vix, trend_raw, None)
+
+    watchlist_bars = _fetch_watchlist_bars_for_breadth()
+    breadth_raw, breadth_notes = _score_breadth(sector_bars, watchlist_bars)
+
+    volume_raw, volume_notes = _score_volume(sector_bars)
+
+    relative_strength_raw, relative_strength_notes = _score_relative_strength(sector_bars, spy_bars)
+
+    price_action_raw, price_action_notes = _score_price_action_volume(sector_bars, sector_etf)
+
+    # Markov on the RS ratio series itself (persistence of the ROTATION,
+    # not just of the sector's own absolute price) -- the more direct
+    # signal for "is this rotation likely to continue or mean-revert."
+    # Needs ~10y of history for a reliable chain, same as get_markov_packet's
+    # own SPY fetch -- the 220-day Alpaca bars used for trend/volume/RS above
+    # are nowhere near enough, so this fetches its own long history via
+    # yfinance rather than reusing sector_bars/spy_bars.
+    markov_packet = None
+    try:
+        import yfinance as yf
+        sector_hist = yf.Ticker(sector_etf).history(period="10y")["Close"].dropna()
+        spy_hist    = yf.Ticker("SPY").history(period="10y")["Close"].dropna()
+        sector_by_date = {d.strftime("%Y-%m-%d"): float(c) for d, c in sector_hist.items()}
+        bench_by_date  = {d.strftime("%Y-%m-%d"): float(c) for d, c in spy_hist.items()}
+        common_dates   = sorted(set(sector_by_date) & set(bench_by_date))
+        ratio_series   = [sector_by_date[d] / bench_by_date[d] for d in common_dates if bench_by_date[d]]
+        if len(ratio_series) >= 500:
+            markov_packet = get_markov_packet_from_closes(
+                ratio_series, label=f"{sector_etf}/SPY ratio", as_of=common_dates[-1],
+            )
+    except Exception as e:
+        log.debug(f"RS-ratio Markov fetch failed for {sector_etf}: {e}")
+
+    if not markov_packet or not markov_packet.get("available"):
+        # Not enough aligned history for a reliable ratio-based chain --
+        # fall back to the sector ETF's own absolute-price persistence
+        # rather than forcing a thin, unreliable sample.
+        markov_packet = get_markov_packet(sector_etf)
+    markov_raw, markov_notes = _score_markov(markov_packet, label=sector_etf)
+
+    weighted_raw = (
+        trend_raw              * _SECTOR_WEIGHTS["trend"] +
+        volatility_raw         * _SECTOR_WEIGHTS["volatility"] +
+        breadth_raw             * _SECTOR_WEIGHTS["breadth"] +
+        volume_raw              * _SECTOR_WEIGHTS["volume"] +
+        relative_strength_raw   * _SECTOR_WEIGHTS["relative_strength"] +
+        price_action_raw        * _SECTOR_WEIGHTS["price_action_volume"] +
+        markov_raw              * _SECTOR_WEIGHTS["markov"]
+    )
+    score      = _normalize_sector(weighted_raw)
+    regime     = _regime_from_score(score)
+    confidence = min(100.0, round(abs(score - 50) * 2, 1))
+
+    scores_map = {
+        "trend":               (trend_raw, trend_notes),
+        "volatility":          (volatility_raw, volatility_notes),
+        "breadth":             (breadth_raw, breadth_notes),
+        "volume":              (volume_raw, volume_notes),
+        "relative_strength":   (relative_strength_raw, relative_strength_notes),
+        "price_action_volume": (price_action_raw, price_action_notes),
+        "markov":              (markov_raw, markov_notes),
+    }
+    key_drivers = [notes for _, (raw, notes) in scores_map.items() if raw >= 2]
+    key_risks   = [notes for _, (raw, notes) in scores_map.items() if raw <= -2]
+
+    signal_lines = "\n".join(
+        f"  {name} ({_SECTOR_WEIGHTS[name]}x): score={raw} — {notes}"
+        for name, (raw, notes) in scores_map.items()
+    )
+    reasoning = (
+        f"{sector_etf} Sector Regime: {regime} | Score: {score}/100 | Confidence: {confidence:.0f}%\n\n"
+        f"Signal breakdown:\n{signal_lines}\n\n"
+        f"Key drivers: {'; '.join(key_drivers) if key_drivers else 'None'}\n"
+        f"Key risks: {'; '.join(key_risks) if key_risks else 'None'}"
+    )
+
+    packet = {
+        "agent": "market_regime_sector",
+        "sector_etf": sector_etf,
+        "date": now.strftime("%Y-%m-%d"),
+        "timestamp": now.isoformat(),
+        "regime": regime,
+        "score": score,
+        "confidence": confidence,
+        "signals": {name: {"score": raw, "notes": notes} for name, (raw, notes) in scores_map.items()},
+        "key_drivers": key_drivers,
+        "key_risks": key_risks,
+        "reasoning": reasoning,
+    }
+
+    try:
+        import db
+        db.log_regime(
+            regime, score, confidence, packet["signals"], {}, reasoning,
+            regime_type="sector", sector_etf=sector_etf,
+        )
+    except Exception as e:
+        log.warning(f"Failed to persist sector regime to DB: {e}")
+
+    _sector_regime_cache[sector_etf] = packet
+    _sector_cache_ts[sector_etf] = time.monotonic()
+
+    log.info(f"{sector_etf} sector regime assessment complete: {regime} (score={score})")
+    return packet
+
+
+def get_cached_sector_regime(sector_etf: str = "XLK") -> dict:
+    """Same TTL-cache/DB-fallback pattern as get_cached_regime(), scoped
+    per sector ETF."""
+    if sector_etf in _sector_regime_cache and \
+       (time.monotonic() - _sector_cache_ts.get(sector_etf, 0)) < REGIME_CACHE_TTL_SECONDS:
+        return _sector_regime_cache[sector_etf]
+    try:
+        return assess_sector_regime(sector_etf)
+    except Exception as e:
+        log.error(f"assess_sector_regime({sector_etf}) failed: {e}")
+        return {"available": False, "regime": "Neutral", "score": 50.0, "confidence": 0.0,
+                "reasoning": f"Sector regime unavailable: {e}"}
 
 
 def get_cached_regime() -> dict:

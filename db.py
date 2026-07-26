@@ -336,6 +336,15 @@ _MIGRATIONS: list[tuple[int, str]] = [
     # calibratable against real outcomes the same way the other sub-scores are.
     (17, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS price_action INTEGER;"),
     (18, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS price_action_structure VARCHAR(20);"),
+    # Sector-specific regime (agents/market_regime.py's assess_sector_regime,
+    # added 2026-07-26 after finding the overall SPY-based regime stayed
+    # "Neutral" throughout the real June 2026 tech/semis rotation -- SOXX
+    # ran +29% vs SPY over 5 weeks then reversed -10% relative in 4 sessions
+    # while SPY itself barely moved. regime_type distinguishes rows in the
+    # same table rather than standing up a parallel one; NULL/'overall' on
+    # every existing row is the pre-existing behavior.
+    (19, "ALTER TABLE market_regime_log ADD COLUMN IF NOT EXISTS regime_type VARCHAR(20) DEFAULT 'overall';"),
+    (20, "ALTER TABLE market_regime_log ADD COLUMN IF NOT EXISTS sector_etf VARCHAR(10);"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -555,19 +564,22 @@ def log_regime(
     signals: dict,
     portfolio_impact: dict,
     reasoning: str,
+    regime_type: str = "overall",
+    sector_etf: str | None = None,
 ) -> None:
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO market_regime_log "
-                "(regime, score, confidence, signals_json, portfolio_impact_json, reasoning) "
-                "VALUES (%s,%s,%s,%s,%s,%s)",
+                "(regime, score, confidence, signals_json, portfolio_impact_json, reasoning, "
+                " regime_type, sector_etf) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
                 (
                     regime, score, confidence,
                     psycopg2.extras.Json(signals),
                     psycopg2.extras.Json(portfolio_impact),
-                    reasoning,
+                    reasoning, regime_type, sector_etf,
                 ),
             )
         conn.commit()

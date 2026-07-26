@@ -55,10 +55,18 @@ def _fetch_bars(ticker: str, days: int = 90) -> list[dict]:
 # Individual scoring functions (each returns 0-25)
 # ---------------------------------------------------------------------------
 
-def _score_technical(bars: list[dict]) -> tuple[int, str]:
+def _score_technical(bars: list[dict], ticker: str = "") -> tuple[int, str]:
     """
-    Price position relative to 50DMA and 200DMA, plus breakout detection.
-    Max 25 points.
+    Price position relative to 50DMA and 200DMA, plus real trend structure
+    (swing highs/lows -- Dow Theory) and 200DMA slope. Max 25 points.
+
+    2026-07-26: replaced the old "new 20-day high/low in the last 3
+    sessions" breakout/breakdown check with agents.price_action's swing
+    structure -- a single-bar extreme is not trend structure, and the old
+    check couldn't tell "genuine uptrend" from "bounced once inside a
+    downtrend". Also added a 200DMA-slope check: price sitting above a
+    FALLING 200DMA is a much weaker signal than above a rising one, which
+    the old code couldn't distinguish at all.
     """
     if len(bars) < 50:
         return 0, "Insufficient data"
@@ -81,25 +89,48 @@ def _score_technical(bars: list[dict]) -> tuple[int, str]:
     else:
         notes_parts.append(f"below 50DMA ({ma50:.2f})")
 
-    # Recent breakout: new 20-day high in last 3 sessions
-    if len(bars) >= 23:
-        recent_high = max(b["high"] for b in bars[-23:-3])
-        if any(b["high"] > recent_high for b in bars[-3:]):
+    try:
+        from agents.price_action import compute_price_action
+        pa = compute_price_action(ticker=ticker, bars=bars)
+    except Exception as e:
+        pa = None
+        log.debug(f"price_action unavailable for technical scoring: {e}")
+
+    if pa:
+        if pa["structure"] == "uptrend":
             score += 10
-            notes_parts.append("recent 20-day breakout")
+            notes_parts.append("swing structure: uptrend (higher highs + higher lows)")
+        elif pa["structure"] == "downtrend":
+            score = max(0, score - 10)
+            notes_parts.append("swing structure: downtrend (lower highs + lower lows) — penalized")
+        else:
+            notes_parts.append(f"swing structure: {pa['structure']}")
 
-    # Recent breakdown: new 20-day low in last 3 sessions (disqualify)
-    if len(bars) >= 23:
-        recent_low = min(b["low"] for b in bars[-23:-3])
-        if any(b["low"] < recent_low for b in bars[-3:]):
+        if pa["ma200_direction"] == "rising":
+            score += 5
+            notes_parts.append("200DMA rising")
+        elif pa["ma200_direction"] == "falling":
             score = max(0, score - 5)
-            notes_parts.append("recent breakdown — penalized")
+            notes_parts.append("200DMA falling — penalized")
+    else:
+        # Fall back to the old single-bar check only when price_action
+        # genuinely can't compute (e.g. too little history) rather than
+        # silently dropping this half of the score.
+        if len(bars) >= 23:
+            recent_high = max(b["high"] for b in bars[-23:-3])
+            if any(b["high"] > recent_high for b in bars[-3:]):
+                score += 10
+                notes_parts.append("recent 20-day breakout (fallback check)")
+            recent_low = min(b["low"] for b in bars[-23:-3])
+            if any(b["low"] < recent_low for b in bars[-3:]):
+                score = max(0, score - 5)
+                notes_parts.append("recent breakdown — penalized (fallback check)")
 
-    score = min(25, score)
+    score = max(0, min(25, score))
     return score, f"Technical: {score}/25 — " + "; ".join(notes_parts)
 
 
-def _score_momentum(bars: list[dict]) -> tuple[int, str]:
+def _score_momentum(bars: list[dict], ticker: str = "") -> tuple[int, str]:
     """
     Price momentum: 20-day and 60-day % changes.
     Proxy for revenue/earnings momentum (proper fundamental data needs earnings API).
@@ -137,24 +168,41 @@ def _score_momentum(bars: list[dict]) -> tuple[int, str]:
     else:
         score += 0
 
-    # Volume confirmation (last 5 days vs prior 20-day avg)
-    if len(bars) >= 25:
+    # Volume confirmation via OBV direction, not a raw surge flag.
+    # 2026-07-26: the old check added +3 for ANY 5-day volume surge vs the
+    # prior 20-day average, with NO regard for direction -- a volume spike
+    # on a down move scored identically to one on an up move, silently
+    # rewarding distribution as if it were accumulation. OBV only confirms
+    # when volume is actually flowing the same way price is moving.
+    try:
+        from agents.price_action import compute_price_action
+        pa = compute_price_action(ticker=ticker, bars=bars)
+    except Exception as e:
+        pa = None
+        log.debug(f"price_action unavailable for momentum scoring: {e}")
+
+    if pa:
+        if pa["volume_confirmation"] == "confirmed":
+            score += 3
+            notes_parts.append("volume (OBV) confirms uptrend")
+        elif pa["volume_confirmation"] == "bearish_divergence":
+            score = max(0, score - 3)
+            notes_parts.append("volume (OBV) bearish divergence — penalized")
+    elif len(bars) >= 25:
+        # Fallback only if price_action genuinely can't compute.
         recent_vol  = sum(b["volume"] for b in bars[-5:]) / 5
         prior_avg   = sum(b["volume"] for b in bars[-25:-5]) / 20
         if prior_avg > 0 and recent_vol > prior_avg * 1.3:
             score += 3
-            notes_parts.append("volume surge")
+            notes_parts.append("volume surge (fallback check, no direction)")
 
-    # Options flow signal (Unusual Whales) — appended to price momentum
-    ticker = None  # will be passed via wrapper below; skip if not available
-
-    score = min(25, score)
+    score = max(0, min(25, score))
     return score, f"Momentum: {score}/25 — " + "; ".join(notes_parts)
 
 
 def _score_momentum_with_flow(bars: list[dict], ticker: str) -> tuple[int, str]:
     """Wraps _score_momentum and appends Unusual Whales options flow signal."""
-    score, notes = _score_momentum(bars)
+    score, notes = _score_momentum(bars, ticker)
 
     try:
         from ingestion.options_flow import get_flow_summary
@@ -392,7 +440,7 @@ def run_scan(regime_packet: dict | None = None) -> dict:
             pass
 
         # Score each dimension
-        tech_score,     tech_notes    = _score_technical(bars)
+        tech_score,     tech_notes    = _score_technical(bars, ticker)
         mom_score,      mom_notes     = _score_momentum_with_flow(bars, ticker)
         cat_score,      cat_notes, scan_type = _score_catalyst(entry_with_ticker, recent_filings)
 

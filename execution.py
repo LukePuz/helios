@@ -358,6 +358,8 @@ def execute_approved(approval: dict, trigger: str = "telegram") -> bool:
             data_completeness=analyst_json.get("data_completeness"),
             chase_risk=analyst_json.get("chase_risk"),
             chase_risk_pct_from_kijun=analyst_json.get("chase_risk_pct_from_kijun"),
+            price_action=analyst_json.get("price_action"),
+            price_action_structure=analyst_json.get("price_action_structure"),
         )
 
         # Send trade alert — full rationale + all conviction scores + bucket,
@@ -376,6 +378,7 @@ def execute_approved(approval: dict, trigger: str = "telegram") -> bool:
             valuation_risk_reward=analyst_json.get("valuation_risk_reward"),
             data_completeness=analyst_json.get("data_completeness"),
             chase_risk=analyst_json.get("chase_risk"),
+            price_action=analyst_json.get("price_action"),
         )
 
         return True

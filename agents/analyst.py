@@ -477,6 +477,11 @@ def _stub_recommendation(candidate: dict, reason: str) -> dict:
         chase = compute_chase_risk(ticker)
     except Exception:
         chase = None
+    try:
+        from agents.price_action import compute_price_action
+        price_action = compute_price_action(ticker)
+    except Exception:
+        price_action = None
 
     return {
         "ticker":         ticker,
@@ -488,6 +493,8 @@ def _stub_recommendation(candidate: dict, reason: str) -> dict:
         "data_completeness": 1,
         "chase_risk": chase["score"] if chase else None,
         "chase_risk_pct_from_kijun": chase["pct_from_kijun"] if chase else None,
+        "price_action": price_action["score"] if price_action else None,
+        "price_action_structure": price_action["structure"] if price_action else None,
         "thesis_bucket":  candidate.get("role", "Accelerator"),
         "thesis_summary": f"{ticker} on watchlist — model unavailable.",
         "expectation_gap": {
@@ -613,6 +620,24 @@ def analyze(
             f"from its {KIJUN_PERIOD}-day equilibrium (Kijun-sen).]"
         )
 
+    # Price action / volume — deterministic (agents/price_action.py),
+    # already wired into the scanner's composite_score (swing structure +
+    # 200DMA slope + OBV volume confirmation). Surfaced here too so the
+    # analyst's own reasoning can reference the same real signal instead of
+    # restating "50DMA above 200DMA" as if that were the whole picture.
+    try:
+        from agents.price_action import compute_price_action
+        price_action = compute_price_action(ticker)
+    except Exception as e:
+        log.debug(f"[{ticker}] price_action computation failed: {e}")
+        price_action = None
+    price_action_score = price_action["score"] if price_action else None
+    if price_action:
+        parsed["reasoning"] = (
+            parsed.get("reasoning", "") +
+            f" [Price action {price_action['score']}/5 — {price_action['summary']}]"
+        )
+
     # Bucket is watchlist-authoritative, not an LLM call — strategy ("strategy
     # is data, not code") lives in knowledge/watchlist.md, not in whatever a
     # given inference happens to output. A DDOG recommendation was sized as
@@ -705,6 +730,8 @@ def analyze(
         "data_completeness": data_completeness,
         "chase_risk": chase_risk_score,
         "chase_risk_pct_from_kijun": chase["pct_from_kijun"] if chase else None,
+        "price_action": price_action_score,
+        "price_action_structure": price_action["structure"] if price_action else None,
         "thesis_bucket": bucket,
         "llm_suggested_bucket": llm_bucket if bucket_mismatch else None,
         "thesis_summary": parsed.get("thesis_summary", ""),

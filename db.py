@@ -329,6 +329,13 @@ _MIGRATIONS: list[tuple[int, str]] = [
     # 2026-07-25, informational only (doesn't affect sizing/gating yet).
     (15, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS chase_risk INTEGER;"),
     (16, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS chase_risk_pct_from_kijun DECIMAL;"),
+    # Price action / volume (agents/price_action.py) — deterministic swing-
+    # structure + 200DMA-slope + OBV-volume-confirmation sub-score, added
+    # 2026-07-26. Already wired into the scanner's composite_score (a real
+    # behavior change to screening); this column just makes it trackable/
+    # calibratable against real outcomes the same way the other sub-scores are.
+    (17, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS price_action INTEGER;"),
+    (18, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS price_action_structure VARCHAR(20);"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -1591,6 +1598,8 @@ def log_trade_outcome(
     data_completeness: int | None = None,
     chase_risk: int | None = None,
     chase_risk_pct_from_kijun: float | None = None,
+    price_action: int | None = None,
+    price_action_structure: str | None = None,
 ) -> None:
     # Stamp the SPY price at entry so we can compute alpha (return vs. benchmark)
     # when the trade eventually closes.
@@ -1611,12 +1620,12 @@ def log_trade_outcome(
                 "(approval_id, ticker, action, conviction, thesis_bucket, entry_price, "
                 " entry_benchmark_price, thesis_strength, catalyst_quality, "
                 " valuation_risk_reward, data_completeness, chase_risk, "
-                " chase_risk_pct_from_kijun) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                " chase_risk_pct_from_kijun, price_action, price_action_structure) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (approval_id, ticker, action, conviction, bucket, entry_price,
                  entry_benchmark_price, thesis_strength, catalyst_quality,
                  valuation_risk_reward, data_completeness, chase_risk,
-                 chase_risk_pct_from_kijun),
+                 chase_risk_pct_from_kijun, price_action, price_action_structure),
             )
         conn.commit()
     except Exception as e:
@@ -1757,7 +1766,7 @@ def get_conviction_calibration() -> list[dict]:
 
 _SUBSCORE_COLUMNS = (
     "thesis_strength", "catalyst_quality", "valuation_risk_reward", "data_completeness",
-    "chase_risk",
+    "chase_risk", "price_action",
 )
 
 

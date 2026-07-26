@@ -66,6 +66,46 @@ def refresh_all_price_history() -> int:
     return updated
 
 
+def refresh_sp500_price_history(skip_watchlist: bool = True) -> int:
+    """
+    Refreshes 1y daily bars for the full S&P 500 universe (added 2026-07-26
+    for two new consumers, both of which need real per-ticker history
+    outside the AI/tech watchlist):
+      - market_regime's GICS-sector breadth (a real "% of Financials above
+        its 200DMA" needs actual Financials constituents, not the AI/tech
+        watchlist -- using the watchlist there would just repeat the same
+        tech-breadth number under every unrelated sector's name)
+      - candidate_scanner's new-ticker/watchlist-candidate movement screen
+
+    Weekly cadence (not nightly like refresh_all_price_history): breadth is
+    inherently a slow-moving background signal, and candidate discovery is
+    exploratory, not time-sensitive -- a week-old bar set is never
+    meaningfully wrong for either. skip_watchlist avoids re-fetching ~101
+    tickers the nightly job already refreshes.
+    """
+    import db
+    from ingestion.sp500_universe import get_sp500_tickers
+
+    tickers = get_sp500_tickers()
+    if skip_watchlist:
+        try:
+            from knowledge_loader import get_all_tickers
+            watchlist = set(get_all_tickers())
+            tickers = [t for t in tickers if t not in watchlist]
+        except Exception as e:
+            log.debug(f"Could not load watchlist to dedupe S&P 500 refresh: {e}")
+
+    updated = 0
+    for ticker in tickers:
+        bars = _fetch_bars(ticker)
+        if bars:
+            n = db.upsert_price_bars(ticker, bars)
+            if n:
+                updated += 1
+        time.sleep(0.2)  # be polite to Yahoo's unofficial endpoint
+    return updated
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     print(f"Refreshed price history: {refresh_all_price_history()} tickers")

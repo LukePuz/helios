@@ -345,6 +345,25 @@ _MIGRATIONS: list[tuple[int, str]] = [
     # every existing row is the pre-existing behavior.
     (19, "ALTER TABLE market_regime_log ADD COLUMN IF NOT EXISTS regime_type VARCHAR(20) DEFAULT 'overall';"),
     (20, "ALTER TABLE market_regime_log ADD COLUMN IF NOT EXISTS sector_etf VARCHAR(10);"),
+    # New table, not a repurposed one -- scanner_candidates' schema
+    # (catalyst_score, thesis_alignment_score computed from an existing
+    # watchlist tier/role entry) doesn't apply to tickers that aren't on
+    # the watchlist yet, which is exactly what agents/candidate_scanner.py
+    # screens. Added 2026-07-26.
+    (21, """
+        CREATE TABLE IF NOT EXISTS watchlist_candidates (
+            id                SERIAL PRIMARY KEY,
+            ticker            VARCHAR(10) NOT NULL,
+            gics_sector       VARCHAR(50),
+            movement_score    INTEGER,
+            thesis_match_score INTEGER,
+            composite_score   INTEGER,
+            matched_thesis    VARCHAR(50),
+            notes             TEXT,
+            scanned_at        TIMESTAMPTZ DEFAULT NOW()
+        );
+    """),
+    (22, "CREATE INDEX IF NOT EXISTS idx_watchlist_candidates_scanned_at ON watchlist_candidates (scanned_at DESC);"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -1402,6 +1421,15 @@ def get_price_history_bulk(tickers: list[str], days: int = 260) -> dict[str, lis
     once weekends/holidays are factored in (e.g. 251 cached trading days
     span ~350 calendar days, so a 210-calendar-day cutoff returned only
     ~150 bars — silently starving the 200-bar breadth/correlation checks).
+
+    Returns full OHLCV per bar (not just close) — added 2026-07-26 for
+    agents/candidate_scanner.py, which feeds these bars into agents.scanner's
+    technical/momentum scoring, and that in turn calls agents.price_action's
+    swing-structure/OBV analysis needing high/low/volume. Those calls were
+    already wrapped in try/except (silently degrading to a weaker fallback
+    on a KeyError) so this would never have crashed -- it would just have
+    quietly scored every single candidate on degraded signals forever.
+    Harmless for the existing breadth caller, which only ever reads close.
     """
     if not tickers:
         return {}
@@ -1410,8 +1438,8 @@ def get_price_history_bulk(tickers: list[str], days: int = 260) -> dict[str, lis
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT ticker, date, close FROM (
-                    SELECT ticker, date, close,
+                SELECT ticker, date, open, high, low, close, volume FROM (
+                    SELECT ticker, date, open, high, low, close, volume,
                            ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date DESC) AS rn
                     FROM price_history
                     WHERE ticker = ANY(%s)
@@ -1423,8 +1451,11 @@ def get_price_history_bulk(tickers: list[str], days: int = 260) -> dict[str, lis
             )
             rows = cur.fetchall()
         result: dict[str, list[dict]] = {}
-        for ticker, d, close in rows:
-            result.setdefault(ticker, []).append({"date": str(d), "close": float(close)})
+        for ticker, d, o, h, l, c, v in rows:
+            result.setdefault(ticker, []).append({
+                "date": str(d), "open": float(o), "high": float(h),
+                "low": float(l), "close": float(c), "volume": int(v),
+            })
         return result
     except Exception as e:
         logging.error(f"get_price_history_bulk failed: {e}")
@@ -2079,5 +2110,61 @@ def log_scanner_candidate(
     except Exception as e:
         conn.rollback()
         logging.error(f"log_scanner_candidate failed: {e}")
+    finally:
+        _put_conn(conn)
+
+
+# ---------------------------------------------------------------------------
+# Watchlist candidates (new-ticker discovery — agents/candidate_scanner.py)
+# ---------------------------------------------------------------------------
+
+def log_watchlist_candidate(
+    ticker: str,
+    gics_sector: str | None,
+    movement_score: int,
+    thesis_match_score: int,
+    composite_score: int,
+    matched_thesis: str | None,
+    notes: str,
+) -> None:
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO watchlist_candidates "
+                "(ticker, gics_sector, movement_score, thesis_match_score, "
+                "composite_score, matched_thesis, notes) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                (ticker, gics_sector, movement_score, thesis_match_score,
+                 composite_score, matched_thesis, notes),
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"log_watchlist_candidate failed: {e}")
+    finally:
+        _put_conn(conn)
+
+
+def get_recent_watchlist_candidates(days: int = 7, limit: int = 25) -> list[dict]:
+    """Latest scan's top candidates, deduped to each ticker's most recent
+    row (a ticker can appear across multiple weekly scans)."""
+    conn = _get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT DISTINCT ON (ticker) ticker, gics_sector, movement_score, "
+                "thesis_match_score, composite_score, matched_thesis, notes, scanned_at "
+                "FROM watchlist_candidates "
+                "WHERE scanned_at > NOW() - (%s || ' days')::interval "
+                "ORDER BY ticker, scanned_at DESC",
+                (days,),
+            )
+            rows = cur.fetchall()
+        rows.sort(key=lambda r: r["composite_score"], reverse=True)
+        return rows[:limit]
+    except Exception as e:
+        logging.error(f"get_recent_watchlist_candidates failed: {e}")
+        return []
     finally:
         _put_conn(conn)

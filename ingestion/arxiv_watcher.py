@@ -106,6 +106,29 @@ def _search(query: str, max_results: int = 10) -> list[dict]:
     return papers
 
 
+def link_paper_to_tickers(paper: dict) -> list[tuple[str, str]]:
+    """
+    Finds S&P 500 companies named in a paper's title/abstract that aren't
+    already on the watchlist -- a paper naming a breakthrough at a company
+    we don't yet track is a candidate-discovery signal in its own right
+    (agents/candidate_scanner.py's price/thesis screen wouldn't otherwise
+    have any reason to look at that specific ticker this week). Added
+    2026-07-26. Returns [(ticker, company), ...], watchlist tickers
+    excluded since they're already fully covered elsewhere.
+    """
+    from ingestion.sp500_universe import match_companies_in_text
+
+    try:
+        from knowledge_loader import get_all_tickers
+        watchlist = set(get_all_tickers())
+    except Exception:
+        watchlist = set()
+
+    text = f"{paper.get('title', '')} {paper.get('summary', '')}"
+    matches = match_companies_in_text(text)
+    return [(t, c) for t, c in matches if t not in watchlist]
+
+
 def poll_once() -> list[dict]:
     """Checks all search queries and returns new papers."""
     all_papers = []

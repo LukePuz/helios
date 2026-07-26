@@ -42,6 +42,7 @@ WATCHLIST: {symbols}
 EVENT TO SCREEN:
 Source: {source}
 Ticker: {ticker}
+Watchlist tier: {tier}
 Title: {title}
 Content (first 500 chars): {content}
 
@@ -62,10 +63,20 @@ real content, just not something worth a deep trading analysis every time \
 one is published — being mentioned in a roundup is not the same as being \
 the subject of new information.
 
-If relevant, set urgency. If you would mark urgency "low" (background \
-context, no action needed), mark the event NOT relevant instead — there's \
-no reason to pay for a deep analysis of something you've just said doesn't \
-need action.
+If relevant, set urgency, weighted by watchlist tier:
+- Core: this is a large, high-conviction position — bias toward "immediate" \
+  for anything materially relevant; the position size means fast reaction \
+  matters most here.
+- Watch: default to "eod" unless the news is a genuine, position-changing \
+  catalyst (earnings surprise, guidance change, major contract/partnership).
+- Speculative: these are small, thesis-validation-stage positions — reserve \
+  "immediate" for binary/thesis-defining catalysts only (a contract award, \
+  a regulatory decision, an FDA/DoD/major-partner announcement); routine \
+  news should be "eod" even if it clears the relevance bar.
+
+If relevant and you'd mark urgency "low" (background context, no action \
+needed), mark the event NOT relevant instead — there's no reason to pay for \
+a deep analysis of something you've just said doesn't need action.
 
 Respond ONLY with valid JSON, no other text:
 {{
@@ -75,10 +86,6 @@ Respond ONLY with valid JSON, no other text:
   "reason": "one sentence explanation — if relevant, name the specific new fact",
   "indirect_effects": "brief description of any second-order effects, or null"
 }}
-
-Urgency definitions (only apply when relevant=true):
-- immediate: market-moving news, act within the hour
-- eod:       relevant for end-of-day review
 """
 
 
@@ -116,7 +123,30 @@ def _call_ollama(prompt: str) -> str | None:
         return None
 
 
-def _keyword_fallback(event: dict) -> dict:
+def _get_tier(ticker: str) -> str:
+    """Watchlist tier for a ticker (Core | Watch | Speculative), used to
+    weight urgency — see _SCREENER_PROMPT's tier guidance. Defaults to
+    "Watch" for tickers not on the watchlist (indirect-effect events) so
+    they get the middle-ground urgency treatment rather than either
+    extreme."""
+    try:
+        from knowledge_loader import load_watchlist
+        return load_watchlist().get(ticker.upper(), {}).get("tier", "Watch")
+    except Exception:
+        return "Watch"
+
+
+# Keywords strong enough to count as a binary/thesis-defining catalyst even
+# for a Speculative-tier position — everything else on a Speculative ticker
+# gets downgraded to "eod" in the keyword fallback (mirrors the tier
+# guidance given to the 7B model in _SCREENER_PROMPT).
+_MAJOR_CATALYST_KEYWORDS = [
+    "contract", "fda", "doj", "antitrust", "acquisition", "merger",
+    "quantum advantage", "breakthrough", "sec investigation", "bankruptcy",
+]
+
+
+def _keyword_fallback(event: dict, tier: str = "Watch") -> dict:
     """
     Heuristic fallback when Ollama is not available.
     Less accurate than the model but keeps the pipeline running.
@@ -159,9 +189,18 @@ def _keyword_fallback(event: dict) -> dict:
     # that merely mentions a watchlist ticker.
     relevant = is_urgent and len(affected) > 0
 
+    # Tier-weighted urgency: Speculative positions are small and thesis-
+    # validation-stage, so only a binary/thesis-defining catalyst warrants
+    # "immediate" — routine urgent-keyword hits (e.g. "layoffs",
+    # "partnership") still pass as relevant but downgrade to "eod".
+    if relevant and tier == "Speculative" and not any(kw in text for kw in _MAJOR_CATALYST_KEYWORDS):
+        urgency = "eod"
+    else:
+        urgency = "immediate" if relevant else "eod"
+
     return {
         "relevant":         relevant,
-        "urgency":          "immediate" if relevant else "eod",
+        "urgency":          urgency,
         "affected_tickers": affected if relevant else [],
         "reason":           "Keyword heuristic (Ollama not available)",
         "indirect_effects": None,
@@ -178,6 +217,7 @@ def screen(event: dict) -> dict:
     ticker = event.get("ticker", "?")
     source = event.get("source", "unknown")
     title  = event.get("title", "")
+    tier   = _get_tier(ticker)
 
     try:
         from feed import emit
@@ -191,6 +231,7 @@ def screen(event: dict) -> dict:
         symbols=", ".join(SYMBOLS),
         source=source,
         ticker=ticker,
+        tier=tier,
         title=title,
         content=event.get("text", "")[:500],
     )
@@ -199,16 +240,16 @@ def screen(event: dict) -> dict:
 
     if raw is None:
         log.debug("Ollama unavailable — using keyword fallback for screening.")
-        result = _keyword_fallback(event)
+        result = _keyword_fallback(event, tier=tier)
     else:
         try:
             # Extract JSON from model response (model sometimes adds commentary)
             json_match = re.search(r"\{.*\}", raw, re.DOTALL)
-            result = json.loads(json_match.group()) if json_match else _keyword_fallback(event)
+            result = json.loads(json_match.group()) if json_match else _keyword_fallback(event, tier=tier)
             result["model_used"] = SCREENER_MODEL
         except (json.JSONDecodeError, AttributeError):
             log.warning("7B model returned invalid JSON — using fallback.")
-            result = _keyword_fallback(event)
+            result = _keyword_fallback(event, tier=tier)
 
     log.info(
         f"Screened [{source}] {ticker}: "

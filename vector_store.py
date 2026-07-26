@@ -61,6 +61,12 @@ COLLECTIONS = {
     "macro":        "Macro economic events and data",
     "congressional":"Congressional trading disclosures",
     "options":      "Options flow alerts",
+    # Added 2026-07-26 for agents/candidate_scanner.py: one document per
+    # knowledge/*.md investment thesis file, seeded once (seed_thesis_
+    # collection there), so a non-watchlist S&P 500 ticker's business
+    # description can be semantically matched against our actual thesis
+    # prose rather than a hardcoded keyword list.
+    "thesis":       "Investment thesis descriptions per theme",
 }
 
 

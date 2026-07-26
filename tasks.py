@@ -92,6 +92,25 @@ app.conf.beat_schedule = {
         "schedule": crontab(hour=9, minute=35, day_of_week="mon-fri"),
         "options":  {"expires": 4 * 3600},
     },
+    # Full GICS sector map — 9:45 AM ET, after the overall regime/scan.
+    # Pure price/volume signals across all 11 sector ETFs, no LLM involved
+    # -- cheap enough for ops queue. Gives the "how's the whole market
+    # rotating" view the AI/tech-only regime above can't (see
+    # assess_market_sector_map's docstring).
+    "assess-gics-sector-map": {
+        "task":     "tasks.assess_gics_sector_map",
+        "schedule": crontab(hour=9, minute=45, day_of_week="mon-fri"),
+        "options":  {"expires": 4 * 3600},
+    },
+    # Watchlist-candidate discovery — weekly, Monday 9:00 AM ET. Scheduled
+    # after refresh-sp500-history's Monday 08:45 catch-up (see that entry's
+    # comment) so this reads freshly-populated bars, not week-old ones from
+    # before the catch-up ran.
+    "candidate-scan": {
+        "task":     "tasks.run_candidate_scan",
+        "schedule": crontab(hour=9, minute=0, day_of_week="mon"),
+        "options":  {"expires": 6 * 3600},
+    },
     # Position review — reassess already-held positions for TRIM/EXIT/HOLD,
     # independent of whether a new event happens to fire on one. Added
     # 2026-07-25: this was the actual gap behind the system never selling —
@@ -143,6 +162,14 @@ app.conf.beat_schedule = {
     # Insider trades — every 30 minutes
     "poll-insider": {
         "task":     "tasks.poll_insider",
+        "schedule": 1800,
+        "options":  {"expires": 1800},
+    },
+    # Analyst rating changes (yfinance, free) — every 30 minutes, same
+    # cadence as insider (both are "check for something new," not
+    # continuous streams).
+    "poll-analyst-ratings": {
+        "task":     "tasks.poll_analyst_ratings",
         "schedule": 1800,
         "options":  {"expires": 1800},
     },
@@ -251,6 +278,16 @@ app.conf.beat_schedule = {
         "task":     "tasks.refresh_price_history",
         "schedule": crontab(hour=16, minute=45, day_of_week="mon-fri"),
         "options":  {"expires": 2 * 3600},
+    },
+    # S&P 500 universe price history — weekly, Saturday 9:00 AM. Same
+    # suspended-weekend caveat as prune-vector-store/prune-seen-items above:
+    # actually runs via Monday 08:45 catch-up (~48h later), which is fine —
+    # feeds GICS-sector breadth + candidate_scanner, neither of which needs
+    # day-fresh data (see refresh_sp500_history's docstring).
+    "refresh-sp500-history": {
+        "task":     "tasks.refresh_sp500_history",
+        "schedule": crontab(hour=9, minute=0, day_of_week="sat"),
+        "options":  {"expires": 48 * 3600},
     },
     # Ingestion health check — hourly
     "check-ingestion-health": {
@@ -466,6 +503,48 @@ def assess_regime_daily(self):
     except Exception as e:
         log.error(f"assess_regime_daily failed: {e}")
         raise self.retry(exc=e, countdown=120)
+
+
+@app.task(name="tasks.assess_gics_sector_map", bind=True, max_retries=2)
+def assess_gics_sector_map(self):
+    """Daily full-market GICS sector regime sweep at 9:45 AM ET — see
+    agents.market_regime.assess_market_sector_map's docstring."""
+    try:
+        from agents.market_regime import assess_market_sector_map
+        results = assess_market_sector_map()
+        summary = ", ".join(f"{etf}={p['score']}" for etf, p in results.items())
+        log.info(f"GICS sector map assessed: {summary}")
+    except Exception as e:
+        log.error(f"assess_gics_sector_map failed: {e}")
+        raise self.retry(exc=e, countdown=300)
+
+
+@app.task(name="tasks.run_candidate_scan", bind=True, max_retries=1)
+def run_candidate_scan(self):
+    """Weekly new-ticker/watchlist-candidate discovery sweep — see
+    agents.candidate_scanner's docstring. Output is a shortlist for human
+    review only; nothing here touches the actual watchlist or places any
+    order."""
+    try:
+        from agents.candidate_scanner import run_candidate_scan as scan
+        result = scan()
+        log.info(result["scan_notes"])
+        _heartbeat_ok("candidate_scan", len(result["candidates"]))
+
+        top = result["candidates"][:5]
+        if top:
+            import alerts
+            lines = [f"Watchlist candidate scan: {result['scan_notes']}", ""]
+            for c in top:
+                lines.append(
+                    f"• {c['ticker']} ({c['company']}) — composite {c['composite_score']}, "
+                    f"{c['gics_sector']}"
+                )
+            alerts._send("\n".join(lines))
+    except Exception as e:
+        log.error(f"run_candidate_scan failed: {e}")
+        _heartbeat_fail("candidate_scan", str(e))
+        raise self.retry(exc=e, countdown=600)
 
 
 @app.task(name="tasks.run_daily_scan", bind=True, max_retries=2)
@@ -731,15 +810,29 @@ def poll_macro(self):
 
 @app.task(name="tasks.poll_arxiv", bind=True, max_retries=3)
 def poll_arxiv(self):
-    """Fetches new quantum/AI papers from arXiv and stores in vector memory."""
+    """Fetches new quantum/AI papers from arXiv and stores in vector memory.
+    Also checks each paper for non-watchlist S&P 500 company mentions --
+    see arxiv_watcher.link_paper_to_tickers's docstring for why."""
     try:
-        from ingestion.arxiv_watcher import poll_once
+        from ingestion.arxiv_watcher import poll_once, link_paper_to_tickers
+        from ingestion.sp500_universe import get_sp500_constituents
         import vector_store
+        import db
 
         papers = poll_once()
         log.info(f"arXiv: {len(papers)} new paper(s)")
+        constituents = get_sp500_constituents()
         for paper in papers:
             vector_store.store_arxiv(paper)
+            for ticker, company in link_paper_to_tickers(paper):
+                gics_sector = constituents.get(ticker, {}).get("gics_sector")
+                db.log_watchlist_candidate(
+                    ticker=ticker, gics_sector=gics_sector,
+                    movement_score=0, thesis_match_score=15, composite_score=15,
+                    matched_thesis=None,
+                    notes=f"arXiv mention: \"{paper['title'][:100]}\" ({paper['url']})",
+                )
+                log.info(f"arXiv candidate signal: {company} ({ticker}) mentioned in {paper['title'][:60]}")
         _heartbeat_ok("arxiv", len(papers))
     except Exception as e:
         log.error(f"poll_arxiv failed: {e}")
@@ -807,6 +900,24 @@ def poll_insider(self):
         raise self.retry(exc=e, countdown=120)
 
 
+@app.task(name="tasks.poll_analyst_ratings", bind=True, max_retries=3)
+def poll_analyst_ratings(self):
+    """Polls free analyst upgrade/downgrade + price-target data (yfinance)
+    for the watchlist -- see ingestion/analyst_ratings.py's docstring."""
+    try:
+        from ingestion.analyst_ratings import poll_once
+
+        items = poll_once()
+        log.info(f"Analyst ratings: {len(items)} new item(s)")
+        for item in items:
+            _dispatch_event(item)
+        _heartbeat_ok("analyst_ratings", len(items))
+    except Exception as e:
+        log.error(f"poll_analyst_ratings failed: {e}")
+        _heartbeat_fail("analyst_ratings", str(e))
+        raise self.retry(exc=e, countdown=300)
+
+
 @app.task(name="tasks.poll_news", bind=True, max_retries=3)
 def poll_news(self):
     """Polls free news sources (yfinance + Google News RSS) for the watchlist."""
@@ -838,6 +949,25 @@ def refresh_price_history(self):
         raise self.retry(exc=e, countdown=300)
 
 
+@app.task(name="tasks.refresh_sp500_history", bind=True, max_retries=2)
+def refresh_sp500_history(self):
+    """Weekly refresh of the price_history cache for the full S&P 500
+    universe (minus the watchlist, already refreshed nightly) -- feeds
+    market_regime's GICS-sector breadth and candidate_scanner's movement
+    screen. Weekly, not nightly: ~400 extra yfinance calls is fine at this
+    cadence but wasteful daily for signals that don't need day-fresh data
+    (see ingestion/price_history.py's refresh_sp500_price_history docstring)."""
+    try:
+        from ingestion.price_history import refresh_sp500_price_history
+        count = refresh_sp500_price_history()
+        log.info(f"S&P 500 price history refreshed: {count} tickers updated")
+        _heartbeat_ok("sp500_history", count)
+    except Exception as e:
+        log.error(f"refresh_sp500_history failed: {e}")
+        _heartbeat_fail("sp500_history", str(e))
+        raise self.retry(exc=e, countdown=600)
+
+
 @app.task(name="tasks.refresh_fundamentals", bind=True, max_retries=2)
 def refresh_fundamentals(self):
     """Nightly refresh of fundamental metrics for the watchlist (free, via yfinance)."""
@@ -861,7 +991,8 @@ def _get_stale_ingestion_sources() -> list[str]:
     expected_minutes = {
         "edgar": 20, "options_flow": 15, "macro": 90, "arxiv": 1560,
         "congressional": 400, "insider": 60, "news": 30, "fundamentals": 1560,
-        "price_history": 1560,
+        "price_history": 1560, "sp500_history": 10080, "analyst_ratings": 60,
+        "candidate_scan": 10080,
     }
 
     stale = []

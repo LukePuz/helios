@@ -705,7 +705,12 @@ def _normalize_sector(raw: float) -> float:
     return round((raw - _SECTOR_MIN_RAW) / (_SECTOR_MAX_RAW - _SECTOR_MIN_RAW) * 100, 1)
 
 
-def assess_sector_regime(sector_etf: str = "XLK", spy_bars: list[dict] | None = None) -> dict:
+def assess_sector_regime(
+    sector_etf: str = "XLK",
+    spy_bars: list[dict] | None = None,
+    breadth_tickers: list[str] | None = None,
+    regime_type: str = "sector",
+) -> dict:
     """
     Same regime classification as assess_regime(), scoped to one sector ETF
     instead of SPY, plus two signals the overall regime doesn't have:
@@ -714,13 +719,25 @@ def assess_sector_regime(sector_etf: str = "XLK", spy_bars: list[dict] | None = 
 
     Liquidity/credit aren't sector-specific (macro conditions apply to the
     whole market) so they're deliberately left out here rather than
-    duplicating the same macro read under a different label; breadth
-    reuses the existing watchlist sample since that watchlist already IS
-    the tech/AI universe.
+    duplicating the same macro read under a different label.
+
+    breadth_tickers: explicit ticker list to sample for the breadth signal.
+    Defaults to the AI/tech watchlist (the original XLK/SOXX use case,
+    where that watchlist already IS the relevant universe). Added
+    2026-07-26 for assess_market_sector_map()'s full 11-sector GICS sweep,
+    where e.g. Financials' breadth needs real Financials constituents --
+    the watchlist sample would otherwise silently repeat the same
+    tech-breadth number under every unrelated sector's name.
+
+    regime_type: passed through to db.log_regime, so the thesis-specific
+    XLK/SOXX tracking (regime_type="sector", unchanged) and the broad GICS
+    sweep (regime_type="gics_sector") don't collide as the same ticker can
+    appear in both (XLK is both our thesis's sector ETF and the GICS
+    Information Technology ETF).
     """
     from agents.markov_regime import get_markov_packet, get_markov_packet_from_closes
 
-    log.info(f"Assessing {sector_etf} sector regime...")
+    log.info(f"Assessing {sector_etf} sector regime ({regime_type})...")
     now = datetime.now(timezone.utc)
 
     sector_bars = _fetch_bars(sector_etf, days=220)
@@ -738,8 +755,17 @@ def assess_sector_regime(sector_etf: str = "XLK", spy_bars: list[dict] | None = 
     vix = macro.get("VIXCLS", {}).get("value")
     volatility_raw, volatility_notes = _score_volatility(vix, trend_raw, None)
 
-    watchlist_bars = _fetch_watchlist_bars_for_breadth()
-    breadth_raw, breadth_notes = _score_breadth(sector_bars, watchlist_bars)
+    if breadth_tickers is not None:
+        try:
+            import db
+            bulk = db.get_price_history_bulk(breadth_tickers, days=210)
+            breadth_bars = [bars for bars in bulk.values() if len(bars) >= 200]
+        except Exception as e:
+            log.debug(f"Sector breadth sample fetch failed for {sector_etf}: {e}")
+            breadth_bars = []
+    else:
+        breadth_bars = _fetch_watchlist_bars_for_breadth()
+    breadth_raw, breadth_notes = _score_breadth(sector_bars, breadth_bars)
 
     volume_raw, volume_notes = _score_volume(sector_bars)
 
@@ -831,30 +857,69 @@ def assess_sector_regime(sector_etf: str = "XLK", spy_bars: list[dict] | None = 
         import db
         db.log_regime(
             regime, score, confidence, packet["signals"], {}, reasoning,
-            regime_type="sector", sector_etf=sector_etf,
+            regime_type=regime_type, sector_etf=sector_etf,
         )
     except Exception as e:
         log.warning(f"Failed to persist sector regime to DB: {e}")
 
-    _sector_regime_cache[sector_etf] = packet
-    _sector_cache_ts[sector_etf] = time.monotonic()
+    cache_key = f"{sector_etf}:{regime_type}"
+    _sector_regime_cache[cache_key] = packet
+    _sector_cache_ts[cache_key] = time.monotonic()
 
     log.info(f"{sector_etf} sector regime assessment complete: {regime} (score={score})")
     return packet
 
 
-def get_cached_sector_regime(sector_etf: str = "XLK") -> dict:
+def get_cached_sector_regime(sector_etf: str = "XLK", regime_type: str = "sector") -> dict:
     """Same TTL-cache/DB-fallback pattern as get_cached_regime(), scoped
-    per sector ETF."""
-    if sector_etf in _sector_regime_cache and \
-       (time.monotonic() - _sector_cache_ts.get(sector_etf, 0)) < REGIME_CACHE_TTL_SECONDS:
-        return _sector_regime_cache[sector_etf]
+    per sector ETF (and per regime_type, since XLK is tracked both as our
+    thesis's sector ETF and as the GICS Information Technology ETF)."""
+    cache_key = f"{sector_etf}:{regime_type}"
+    if cache_key in _sector_regime_cache and \
+       (time.monotonic() - _sector_cache_ts.get(cache_key, 0)) < REGIME_CACHE_TTL_SECONDS:
+        return _sector_regime_cache[cache_key]
     try:
-        return assess_sector_regime(sector_etf)
+        return assess_sector_regime(sector_etf, regime_type=regime_type)
     except Exception as e:
-        log.error(f"assess_sector_regime({sector_etf}) failed: {e}")
+        log.error(f"assess_sector_regime({sector_etf}, {regime_type}) failed: {e}")
         return {"available": False, "regime": "Neutral", "score": 50.0, "confidence": 0.0,
                 "reasoning": f"Sector regime unavailable: {e}"}
+
+
+def assess_market_sector_map() -> dict:
+    """
+    Broad-market cross-sector regime map: assess_sector_regime() run across
+    all 11 GICS/SPDR sector ETFs (XLK, XLF, XLV, XLE, XLI, XLY, XLP, XLU,
+    XLB, XLC, XLRE), each with a real breadth sample drawn from that
+    sector's actual S&P 500 constituents.
+
+    Distinct from the XLK/SOXX calls elsewhere in this module (regime_type
+    "sector"): those track our specific AI/tech thesis against the
+    watchlist as its own breadth universe. This is the "how's the whole
+    market rotating" view -- logged as regime_type="gics_sector" so the two
+    never collide even where the same ETF (XLK) appears in both. Pure
+    price/volume signals, no LLM involved -- safe to run as a frequent,
+    cheap ops-queue task.
+    """
+    from ingestion.sp500_universe import SECTOR_ETF_MAP, get_tickers_by_gics_sector
+
+    log.info("Assessing full GICS sector map (11 sectors)...")
+    spy_bars = _fetch_bars("SPY", days=220)
+
+    results: dict[str, dict] = {}
+    for gics_sector, etf in SECTOR_ETF_MAP.items():
+        try:
+            breadth_sample = get_tickers_by_gics_sector(gics_sector, limit=20)
+            packet = assess_sector_regime(
+                etf, spy_bars=spy_bars,
+                breadth_tickers=breadth_sample, regime_type="gics_sector",
+            )
+            results[etf] = {**packet, "gics_sector": gics_sector}
+        except Exception as e:
+            log.warning(f"assess_sector_regime({etf}) failed in sector map: {e}")
+
+    log.info(f"GICS sector map complete: {len(results)}/{len(SECTOR_ETF_MAP)} sectors assessed")
+    return results
 
 
 def get_cached_regime() -> dict:

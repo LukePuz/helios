@@ -923,17 +923,31 @@ def poll_news(self):
     """Polls free news sources (yfinance + Google News RSS) for the watchlist."""
     try:
         from ingestion.news import poll_once
+        from ingestion.company_photos import get_fallback_image
+        from knowledge_loader import load_watchlist
         import db
 
         items = poll_once()
         log.info(f"News: {len(items)} new item(s)")
+        watchlist = load_watchlist()
         for item in items:
             # Logged for the public research site's News section regardless
             # of the screener's trade-relevance verdict below -- a reader
             # wants every headline Yahoo/Google published, not just the
-            # subset judged worth a 72B trading analysis.
+            # subset judged worth a 72B trading analysis. Every headline
+            # gets a photo: the article's own thumbnail if yfinance
+            # provided one, otherwise a company-related fallback (Google
+            # News RSS items never carry one at all).
+            ticker = item.get("ticker", "")
+            image_url = item.get("image_url")
+            if not image_url:
+                company = watchlist.get(ticker, {}).get("company", ticker)
+                try:
+                    image_url = get_fallback_image(ticker, company)
+                except Exception as e:
+                    log.debug(f"[{ticker}] fallback image lookup failed: {e}")
             try:
-                db.log_news_item(item.get("ticker", ""), item.get("title", ""), item.get("url", ""))
+                db.log_news_item(ticker, item.get("title", ""), item.get("url", ""), image_url)
             except Exception as e:
                 log.debug(f"log_news_item failed: {e}")
             _dispatch_event(item)

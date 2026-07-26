@@ -383,6 +383,10 @@ _MIGRATIONS: list[tuple[int, str]] = [
     """),
     (24, "CREATE INDEX IF NOT EXISTS idx_news_log_ticker_published ON news_log (ticker, published_at DESC);"),
     (25, "CREATE INDEX IF NOT EXISTS idx_news_log_published_at ON news_log (published_at DESC);"),
+    # Every headline gets a photo -- the article's own thumbnail
+    # (yfinance carries one ~90-100% of the time) or, failing that, a
+    # company-related fallback image (ingestion/company_photos.py).
+    (26, "ALTER TABLE news_log ADD COLUMN IF NOT EXISTS image_url TEXT;"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -2193,13 +2197,13 @@ def get_recent_watchlist_candidates(days: int = 7, limit: int = 25) -> list[dict
 # News headlines (public research site's News section)
 # ---------------------------------------------------------------------------
 
-def log_news_item(ticker: str, title: str, url: str) -> None:
+def log_news_item(ticker: str, title: str, url: str, image_url: str | None = None) -> None:
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO news_log (ticker, title, url) VALUES (%s,%s,%s)",
-                (ticker, title, url),
+                "INSERT INTO news_log (ticker, title, url, image_url) VALUES (%s,%s,%s,%s)",
+                (ticker, title, url, image_url),
             )
         conn.commit()
     except Exception as e:
@@ -2215,7 +2219,7 @@ def get_recent_news(limit: int = 30) -> list[dict]:
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
-                "SELECT ticker, title, url, published_at FROM news_log "
+                "SELECT ticker, title, url, image_url, published_at FROM news_log "
                 "ORDER BY published_at DESC LIMIT %s",
                 (limit,),
             )
@@ -2232,7 +2236,7 @@ def get_recent_news_for_ticker(ticker: str, limit: int = 15) -> list[dict]:
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
-                "SELECT ticker, title, url, published_at FROM news_log "
+                "SELECT ticker, title, url, image_url, published_at FROM news_log "
                 "WHERE ticker = %s ORDER BY published_at DESC LIMIT %s",
                 (ticker.upper(), limit),
             )

@@ -53,6 +53,22 @@ def _is_seen_title(title: str) -> bool:
         return False
 
 
+def _pick_thumbnail(content: dict) -> str | None:
+    """yfinance news items carry a real thumbnail ~90-100% of the time
+    (verified live 2026-07-26) -- previously fetched but never captured.
+    Prefers a compact resolution (~140-220px wide, good for a list
+    thumbnail) over the "original" (often 1200px+, wasteful to embed in a
+    headline list); falls back to the original/base URL if no resolution
+    list is present."""
+    thumbnail = content.get("thumbnail") or {}
+    resolutions = thumbnail.get("resolutions") or []
+    for res in resolutions:
+        width = res.get("width") or 0
+        if 140 <= width <= 220 and res.get("url"):
+            return res["url"]
+    return thumbnail.get("originalUrl") or (resolutions[0].get("url") if resolutions else None)
+
+
 def _yfinance_news(ticker: str) -> list[dict]:
     """Fetches recent headlines for a ticker via yfinance's news feed."""
     try:
@@ -83,6 +99,7 @@ def _yfinance_news(ticker: str) -> list[dict]:
             "ticker": ticker,
             "title":  title,
             "url":    url,
+            "image_url": _pick_thumbnail(content),
             "text":   f"{title}\n\n{summary}".strip(),
             # Not marked seen yet — tasks.poll_news marks both keys after a
             # successful dispatch, so a Celery retry can't lose the item.
@@ -117,6 +134,11 @@ def _google_news_rss(ticker: str) -> list[dict]:
             "ticker": ticker,
             "title":  title,
             "url":    link,
+            # Google News RSS carries no image data at all (verified live
+            # 2026-07-26 -- no <media:thumbnail>/<enclosure> despite the
+            # feed declaring the media: namespace) -- filled by
+            # ingestion.company_photos's fallback at log time instead.
+            "image_url": None,
             "text":   f"{title} (published {pub})",
             "_seen_keys": [(_SOURCE, item_id), (_TITLE_SOURCE, _title_key(title))],
         })

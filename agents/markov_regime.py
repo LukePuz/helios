@@ -43,9 +43,11 @@ _BULL_THRESHOLD = 0.05
 _BEAR_THRESHOLD = -0.05
 
 # ---------------------------------------------------------------------------
-# Cache — one fetch per calendar day
+# Cache — one fetch per calendar day, per ticker (2026-07-26: generalized
+# from SPY-only to also cover sector ETFs, so the cache key must include
+# which series a cached packet belongs to).
 # ---------------------------------------------------------------------------
-_packet_cache: dict | None = None
+_packet_cache: dict[str, dict] = {}
 _packet_cache_date: str | None = None
 
 
@@ -148,11 +150,53 @@ def _unavailable(reason: str) -> dict:
     return {"available": False, "notes": reason}
 
 
-def get_markov_packet() -> dict:
+def _build_packet_from_closes(closes: list[float], as_of: str, label: str) -> dict:
+    """Shared assembly logic for both the ticker-fetch and direct-closes
+    entry points below -- the actual Markov math doesn't care where the
+    closes came from."""
+    if len(closes) < 500 or any(c <= 0 for c in closes):
+        return _unavailable(
+            f"Insufficient/invalid {label} history for Markov analysis ({len(closes)} closes)"
+        )
+
+    states = compute_states(closes)
+    if not states:
+        return _unavailable("Not enough closes to compute 20-day return states")
+
+    matrix, counts = build_transition_matrix(states)
+    state = states[-1]
+    stickiness = matrix[state][state]
+    signal = matrix[state]["bull"] - matrix[state]["bear"]
+    row_samples = counts[state]
+    projection_5d = k_step_projection(matrix, state, 5)
+
+    notes = (
+        f"{label} 20d return state={state}, stickiness={stickiness:.2f}, "
+        f"signal={signal:+.2f} (n={row_samples})"
+    )
+
+    return {
+        "available": True,
+        "as_of": as_of,
+        "state": state,
+        "stickiness": stickiness,
+        "signal": signal,
+        "row_samples": row_samples,
+        "matrix": matrix,
+        "projection_5d": projection_5d,
+        "notes": notes,
+    }
+
+
+def get_markov_packet(ticker: str = "SPY") -> dict:
     """
-    Fetches ~10 years of SPY daily closes, computes the empirical Markov
-    transition matrix over 20-day return states, and returns a packet
-    describing the current state's persistence/direction signal.
+    Fetches ~10 years of daily closes for `ticker`, computes the empirical
+    Markov transition matrix over 20-day return states, and returns a
+    packet describing the current state's persistence/direction signal.
+
+    Generalized 2026-07-26 from a SPY-only function (parameter added, cache
+    keyed per-ticker) so the same persistence analysis can run on a sector
+    ETF (XLK, SOXX) alongside the original SPY signal.
 
     Cached in-memory per calendar day so repeated calls within the same day
     don't re-fetch from yfinance.
@@ -160,61 +204,44 @@ def get_markov_packet() -> dict:
     global _packet_cache, _packet_cache_date
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if _packet_cache is not None and _packet_cache_date == today:
-        return _packet_cache
+    if _packet_cache_date == today and ticker in _packet_cache:
+        return _packet_cache[ticker]
 
     try:
         import yfinance as yf
 
-        hist = yf.Ticker("SPY").history(period="10y")
+        hist = yf.Ticker(ticker).history(period="10y")
         if hist is None or hist.empty or "Close" not in hist:
-            packet = _unavailable("SPY history fetch returned no data")
+            packet = _unavailable(f"{ticker} history fetch returned no data")
         else:
             closes_series = hist["Close"].dropna()
             closes = [float(c) for c in closes_series.tolist()]
-
-            if len(closes) < 500 or any(c <= 0 for c in closes):
-                packet = _unavailable(
-                    f"Insufficient/invalid SPY close history for Markov analysis "
-                    f"({len(closes)} closes)"
-                )
-            else:
-                states = compute_states(closes)
-                if not states:
-                    packet = _unavailable("Not enough closes to compute 20-day return states")
-                else:
-                    matrix, counts = build_transition_matrix(states)
-                    state = states[-1]
-                    stickiness = matrix[state][state]
-                    signal = matrix[state]["bull"] - matrix[state]["bear"]
-                    row_samples = counts[state]
-                    projection_5d = k_step_projection(matrix, state, 5)
-
-                    dates = closes_series.index
-                    as_of = dates[-1].strftime("%Y-%m-%d") if len(dates) else today
-
-                    notes = (
-                        f"SPY 20d return state={state}, stickiness={stickiness:.2f}, "
-                        f"signal={signal:+.2f} (n={row_samples})"
-                    )
-
-                    packet = {
-                        "available": True,
-                        "as_of": as_of,
-                        "state": state,
-                        "stickiness": stickiness,
-                        "signal": signal,
-                        "row_samples": row_samples,
-                        "matrix": matrix,
-                        "projection_5d": projection_5d,
-                        "notes": notes,
-                    }
+            dates = closes_series.index
+            as_of = dates[-1].strftime("%Y-%m-%d") if len(dates) else today
+            packet = _build_packet_from_closes(closes, as_of, ticker)
     except Exception as e:
-        packet = _unavailable(f"Markov regime fetch failed: {e}")
+        packet = _unavailable(f"Markov regime fetch failed for {ticker}: {e}")
 
     # Only cache successful packets — a transient fetch failure at the 9:30
     # assessment must not blank the signal for intraday reassessments too.
     if packet.get("available"):
-        _packet_cache = packet
-        _packet_cache_date = today
+        if _packet_cache_date != today:
+            _packet_cache = {}
+            _packet_cache_date = today
+        _packet_cache[ticker] = packet
     return packet
+
+
+def get_markov_packet_from_closes(closes: list[float], label: str, as_of: str | None = None) -> dict:
+    """
+    Same Markov analysis, for a precomputed close-price-like series that
+    isn't a directly-tradable ticker yfinance can fetch -- specifically the
+    sector/benchmark relative-strength ratio (see market_regime.py's
+    _score_relative_strength). Not cached: callers computing an RS ratio
+    already have to fetch/align both underlying series themselves, so
+    there's no redundant network call to save here the way there is for a
+    ticker fetch.
+    """
+    if as_of is None:
+        as_of = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return _build_packet_from_closes(closes, as_of, label)

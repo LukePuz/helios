@@ -923,10 +923,19 @@ def poll_news(self):
     """Polls free news sources (yfinance + Google News RSS) for the watchlist."""
     try:
         from ingestion.news import poll_once
+        import db
 
         items = poll_once()
         log.info(f"News: {len(items)} new item(s)")
         for item in items:
+            # Logged for the public research site's News section regardless
+            # of the screener's trade-relevance verdict below -- a reader
+            # wants every headline Yahoo/Google published, not just the
+            # subset judged worth a 72B trading analysis.
+            try:
+                db.log_news_item(item.get("ticker", ""), item.get("title", ""), item.get("url", ""))
+            except Exception as e:
+                log.debug(f"log_news_item failed: {e}")
             _dispatch_event(item)
         _heartbeat_ok("news", len(items))
     except Exception as e:

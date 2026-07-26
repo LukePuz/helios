@@ -15,6 +15,7 @@ catalyst_calendar.db
 celerybeat-schedule*
 ingestion/.cik_cache.json
 ingestion/.sp500_cache.json
+ingestion/.company_photo_cache.json
 trading_bot.code-workspace
 
 # Installers (large binaries — download fresh, don't commit)

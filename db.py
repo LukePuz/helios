@@ -364,6 +364,25 @@ _MIGRATIONS: list[tuple[int, str]] = [
         );
     """),
     (22, "CREATE INDEX IF NOT EXISTS idx_watchlist_candidates_scanned_at ON watchlist_candidates (scanned_at DESC);"),
+    # Durable news headlines -- added 2026-07-26 for the public research
+    # site's News section. Every other public-site table (market_regime_log,
+    # trade_outcomes, ...) is written by trading_bot and read directly by
+    # helios-research's backend (same Supabase DB); this follows the same
+    # pattern rather than the site hitting yfinance/Google RSS live.
+    # ChromaDB's news collection can't serve "most recent N headlines"
+    # cheaply (no real timestamp-ordered query), so this is a plain table,
+    # not a vector_store addition.
+    (23, """
+        CREATE TABLE IF NOT EXISTS news_log (
+            id            SERIAL PRIMARY KEY,
+            ticker        VARCHAR(10),
+            title         TEXT NOT NULL,
+            url           TEXT,
+            published_at  TIMESTAMPTZ DEFAULT NOW()
+        );
+    """),
+    (24, "CREATE INDEX IF NOT EXISTS idx_news_log_ticker_published ON news_log (ticker, published_at DESC);"),
+    (25, "CREATE INDEX IF NOT EXISTS idx_news_log_published_at ON news_log (published_at DESC);"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -2165,6 +2184,61 @@ def get_recent_watchlist_candidates(days: int = 7, limit: int = 25) -> list[dict
         return rows[:limit]
     except Exception as e:
         logging.error(f"get_recent_watchlist_candidates failed: {e}")
+        return []
+    finally:
+        _put_conn(conn)
+
+
+# ---------------------------------------------------------------------------
+# News headlines (public research site's News section)
+# ---------------------------------------------------------------------------
+
+def log_news_item(ticker: str, title: str, url: str) -> None:
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO news_log (ticker, title, url) VALUES (%s,%s,%s)",
+                (ticker, title, url),
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"log_news_item failed: {e}")
+    finally:
+        _put_conn(conn)
+
+
+def get_recent_news(limit: int = 30) -> list[dict]:
+    """Latest headlines across the whole watchlist, newest first."""
+    conn = _get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT ticker, title, url, published_at FROM news_log "
+                "ORDER BY published_at DESC LIMIT %s",
+                (limit,),
+            )
+            return cur.fetchall()
+    except Exception as e:
+        logging.error(f"get_recent_news failed: {e}")
+        return []
+    finally:
+        _put_conn(conn)
+
+
+def get_recent_news_for_ticker(ticker: str, limit: int = 15) -> list[dict]:
+    conn = _get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT ticker, title, url, published_at FROM news_log "
+                "WHERE ticker = %s ORDER BY published_at DESC LIMIT %s",
+                (ticker.upper(), limit),
+            )
+            return cur.fetchall()
+    except Exception as e:
+        logging.error(f"get_recent_news_for_ticker({ticker}) failed: {e}")
         return []
     finally:
         _put_conn(conn)

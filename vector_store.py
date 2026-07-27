@@ -86,8 +86,21 @@ def _get_embedder() -> SentenceTransformer:
     global _embedder
     if _embedder is None:
         log.info(f"Loading embedding model {_EMBED_MODEL}...")
-        _embedder = SentenceTransformer(_EMBED_MODEL)
-        log.info("Embedding model ready.")
+        # Forced onto CPU explicitly -- same fix, same reason as
+        # agents/screener.py's 7B model. Left to auto-select, this loads
+        # onto cuda:0 (confirmed live 2026-07-26), and both GPUs already
+        # sit at ~93% VRAM just holding the 72B analyst model. This module
+        # gets called far more often than screener.py ever was (every
+        # filing/news/arxiv/congressional store, plus 2026-07-26's new
+        # candidate_scanner --  ~466 embeddings per weekly scan) --
+        # contending with Ollama for the same near-full GPUs traces
+        # directly to that day's real production incident: 72B analyst
+        # calls that normally land at ~190s started repeatedly hitting the
+        # 400s timeout and falling back to stub recommendations for hours.
+        # MiniLM is tiny; CPU inference costs milliseconds, not the
+        # multi-minute difference GPU contention was causing Ollama.
+        _embedder = SentenceTransformer(_EMBED_MODEL, device="cpu")
+        log.info("Embedding model ready (CPU).")
     return _embedder
 
 

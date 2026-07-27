@@ -85,6 +85,36 @@ def execute_approved(approval: dict, trigger: str = "telegram") -> bool:
 
         if action in ("OPEN", "ADD"):
             side = "BUY"
+            # New-entry orders only, gated on market hours -- found
+            # 2026-07-26: an auto-executed ADD submitted a DAY market BUY
+            # while the market was closed (Sunday evening). IBKR doesn't
+            # reject that, it queues the order for the next session
+            # (warning 399), so it sat live at the broker while our own
+            # 30s fill-wait declared the trade FAILED with nothing
+            # recorded -- an orphaned, unprotected order that would have
+            # tried to fill at next open with no stop and no trade log
+            # entry. A stale, hours-old recommendation shouldn't silently
+            # execute at whatever price next open brings anyway; the
+            # analyst should re-run fresh when the market's actually open.
+            # Risk-reducing SELLs (TRIM/EXIT) are deliberately NOT gated
+            # here -- ibkr.place_market_order's own market-closed check is
+            # the backstop for those, since blocking a protective sell
+            # outright would go against the "never abort a risk-reducing
+            # order" principle elsewhere in this file.
+            try:
+                from market_data import is_market_hours
+                if not is_market_hours():
+                    log.error(f"[{ticker}] {action} blocked — market is closed, "
+                              f"not submitting a new entry order")
+                    alert_module._send(
+                        f"⏸️ ORDER DEFERRED — Market Closed\n"
+                        f"<b>{ticker}</b> {action} was approved but the market is closed.\n"
+                        f"Not submitting — a stale recommendation shouldn't fill blind at "
+                        f"next open. Re-run analysis when the market reopens."
+                    )
+                    return False
+            except Exception as e:
+                log.warning(f"[{ticker}] Market-hours check failed, proceeding: {e}")
         elif action in ("TRIM", "EXIT"):
             side = "SELL"
             # Clamp to what we actually hold — a TRIM sized larger than the

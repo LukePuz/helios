@@ -18,12 +18,25 @@ log = logging.getLogger(__name__)
 STALE_AFTER_MINUTES = 20
 
 
-def _is_market_hours(now_utc: datetime | None = None) -> bool:
-    """Rough US regular-trading-hours check (Mon-Fri 13:30-20:00 UTC)."""
+def is_market_hours(now_utc: datetime | None = None) -> bool:
+    """Rough US regular-trading-hours check (Mon-Fri 13:30-20:00 UTC).
+
+    Promoted from module-private 2026-07-27 so ibkr.place_market_order and
+    execution.execute_approved can gate new BUY entries on it directly --
+    see place_market_order's docstring for the incident this closes (a
+    Sunday-evening auto-executed ADD submitted a DAY market order while the
+    market was closed; IBKR queued it for the next session instead of
+    filling or rejecting it, and the 30s fill-wait then declared the trade
+    FAILED without ever cancelling the now-orphaned, still-live order)."""
     now = now_utc or datetime.now(timezone.utc)
     if now.weekday() >= 5:
         return False
     return dtime(13, 30) <= now.time() <= dtime(20, 0)
+
+
+# Old name kept as an alias -- this module's own get_priced_quote already
+# called the private name before the rename.
+_is_market_hours = is_market_hours
 
 
 def get_priced_quote(ticker: str) -> dict | None:

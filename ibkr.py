@@ -221,6 +221,19 @@ def place_market_order(ticker: str, side: str, qty: float, fill_timeout: float =
     Place a market order and wait for the fill. side = 'BUY' or 'SELL'.
     Returns dict with order_id, status, fill_price (None if unfilled at timeout),
     and filled_qty.
+
+    Incident 2026-07-26/27: a "DAY" market order submitted while the market
+    is closed doesn't get rejected -- IBKR accepts it and queues it for the
+    next session (API warning 399, "will not be placed at the exchange
+    until [next open]"), so it sits PreSubmitted indefinitely. The 30s
+    fill-wait below then reports it as unfilled, and callers (execution.
+    execute_approved) marked the trade FAILED without ever cancelling the
+    now-orphaned order -- it was still live at the broker, disconnected
+    from any DB record, and would have silently attempted to fill at the
+    next open with no stop-loss and no trade log entry. If the wait window
+    ends with the order still pending AND the market is closed, cancel it
+    here so no caller can ever leave one dangling, regardless of whether
+    that caller itself checks market hours first.
     """
     ib = get_ib()
     contract = _stock(ib, ticker)
@@ -253,6 +266,25 @@ def place_market_order(ticker: str, side: str, qty: float, fill_timeout: float =
         log.warning(f"Order not confirmed filled after {fill_timeout:.0f}s: "
                     f"{side.upper()} {qty} {ticker} status={status} "
                     f"(orderId={trade.order.orderId}) — fill will need reconciliation")
+
+        # Still pending and the market's closed -- this will never fill
+        # within any reasonable wait window (it's queued for next session,
+        # not slow). Cancel it rather than leaving it live and untracked;
+        # see this function's docstring for the incident this prevents.
+        if status in ("PreSubmitted", "PendingSubmit", "Submitted"):
+            try:
+                from market_data import is_market_hours
+                if not is_market_hours():
+                    ib.cancelOrder(trade.order)
+                    ib.sleep(1)
+                    log.warning(
+                        f"Cancelled {side.upper()} {qty} {ticker} (orderId={trade.order.orderId}) "
+                        f"— market is closed, order would have queued for next session untracked"
+                    )
+                    status = "Cancelled"
+            except Exception as e:
+                log.error(f"Failed to cancel stale {side.upper()} {ticker} order "
+                          f"(orderId={trade.order.orderId}) after market-closed check: {e}")
 
     return {
         "order_id":   trade.order.orderId,

@@ -181,6 +181,55 @@ def _reconcile_positions() -> None:
         logging.warning(f"Position reconciliation skipped: {e}")
 
 
+def _reconcile_open_orders() -> None:
+    """
+    Cancels stale open MARKET BUY orders left over from a previous session
+    -- a startup safety net for the incident found 2026-07-26: a DAY market
+    BUY submitted while the market was closed gets queued by IBKR for the
+    next session instead of rejected, and (before this and the
+    place_market_order/execute_approved fixes landed) our own code declared
+    the trade FAILED after a 30s wait without ever cancelling the
+    now-orphaned order. Any such order still open at startup is disconnected
+    from any active approval/trade record and would otherwise silently
+    attempt to fill at today's open with no stop-loss and no bookkeeping.
+
+    Scoped to plain "MKT" orders only -- bracket/limit entries (see
+    config.USE_BRACKET_ORDERS) can legitimately sit open longer and aren't
+    what this incident was about.
+    """
+    try:
+        from ibkr import get_client, get_open_orders, cancel_order
+        get_client()  # ensure connected before querying
+        stale = [
+            o for o in get_open_orders()
+            if o["action"] == "BUY" and o["order_type"] == "MKT"
+        ]
+        if not stale:
+            logging.info("Open-order reconciliation: no stale market BUY orders.")
+            return
+
+        cancelled = []
+        for o in stale:
+            if cancel_order(o["order_id"]):
+                cancelled.append(f"{o['ticker']} ({o['qty']} shares, orderId={o['order_id']})")
+            else:
+                cancelled.append(f"{o['ticker']} — COULD NOT CANCEL orderId={o['order_id']}, check TWS manually")
+
+        logging.warning(f"Open-order reconciliation: cancelled stale market BUY orders: {cancelled}")
+        try:
+            import alerts
+            alerts._send(
+                "🔧 <b>Startup Order Reconciliation</b>\n"
+                "Cancelled stale market BUY order(s) left over from a previous session "
+                "(orphaned by a market-closed submission, not tied to any active approval):\n"
+                + "\n".join(f"• {c}" for c in cancelled)
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        logging.warning(f"Open-order reconciliation skipped: {e}")
+
+
 def _check_ollama() -> None:
     try:
         import requests
@@ -287,6 +336,11 @@ def main() -> None:
     # 5b. Position reconciliation (non-fatal — warns if DB and IBKR disagree)
     print("  [5b] Reconciling positions with IBKR...")
     _reconcile_positions()
+
+    # 5c. Open-order reconciliation — cancels stale market BUY orders left
+    # over from a previous session (see _reconcile_open_orders docstring).
+    print("  [5c] Reconciling open orders with IBKR...")
+    _reconcile_open_orders()
 
     # 6. Dashboard
     print("  [6/6] Starting dashboard + services...")

@@ -1034,14 +1034,21 @@ def _get_stale_ingestion_sources() -> list[str]:
 
 @app.task(name="tasks.check_ingestion_health", bind=True, max_retries=1)
 def check_ingestion_health(self):
-    """Alerts when an ingestion source hasn't succeeded within its expected cadence."""
+    """Alerts when an ingestion source hasn't succeeded within its expected
+    cadence. Same standing-condition-spam bug as reconcile_stop_orders had
+    (found together 2026-07-27): this ran hourly with no dedup, so a source
+    that stayed stale for a full trading day re-sent the identical alert
+    every single hour. Throttled per the specific set of stale sources, so
+    a genuinely new/different issue still alerts promptly."""
     try:
         import alerts
 
         stale = _get_stale_ingestion_sources()
         if stale:
             log.warning("Ingestion health issues: " + " | ".join(stale))
-            alerts._send("⚠️ <b>Ingestion Health Check</b>\n" + "\n".join(f"• {s}" for s in stale))
+            issue_key = "ingestion_" + "_".join(sorted(s.split(":")[0] for s in stale))
+            if _reconcile_alert_due(issue_key):
+                alerts._send("⚠️ <b>Ingestion Health Check</b>\n" + "\n".join(f"• {s}" for s in stale))
     except Exception as e:
         log.error(f"check_ingestion_health failed: {e}")
         raise self.retry(exc=e, countdown=300)
@@ -1333,7 +1340,16 @@ def reconcile_stop_orders(self):
                     msg = (f"Cancelled ORPHANED stop: SELL {o['qty']} {o['ticker']} "
                            f"@ ${o['stop_price'] or 0:.2f} (no position held — would have shorted)")
                     all_actions.append(msg)
-                    new_actions.append(msg)  # real state change — always surface
+                    # Found 2026-07-27: this was deliberately left unthrottled
+                    # on the assumption a successful cancel can't recur for
+                    # the same order -- SNDK proved that wrong (a cross-
+                    # clientId order whose status transiently reads
+                    # "cancelled" in cancel_order's own check without the
+                    # cancel actually sticking at the broker), firing the
+                    # identical message ~33x in one trading day. Same
+                    # order_id-keyed throttle as the other two branches below.
+                    if _reconcile_alert_due(f"orphan_cancelled_{o['order_id']}"):
+                        new_actions.append(msg)
                 else:
                     msg = (f"Could NOT cancel orphaned stop: SELL {o['qty']} {o['ticker']} "
                            f"orderId={o['order_id']} — likely owned by a different clientId, "

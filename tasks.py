@@ -1389,15 +1389,20 @@ def reconcile_stop_orders(self):
     - Cancels orphaned stops (stop exists, position doesn't) → prevents
       accidental short positions.
     - Deletes stale DB stop records with no matching position.
-    - Alerts on positions that have NO protective stop at the broker.
-    Every corrective action is logged; only new/unresolved-and-due issues
-    are sent to Telegram (see _reconcile_alert_due) so a standing condition
-    doesn't re-alert every 15-minute cycle.
+    - Flags positions that have NO protective stop at the broker.
+    Every corrective action and new/unresolved-and-due issue is logged as a
+    WARNING (see _reconcile_alert_due for the per-issue throttle) but no
+    longer sent to Telegram — 2026-07-28, user request, after the
+    unthrottled-repeat bug that caused this was already fixed the day
+    before. NOTE: this includes the "no protective stop" case, which is
+    the same category of gap behind the AMKR incident that same day — it's
+    silent now too, not just the routine auto-corrections. Check
+    logs/celery_worker.log for "Stop reconciliation" WARNING lines, or the
+    dashboard, if you want to keep an eye on this some other way.
     """
     try:
         import db
         import ibkr
-        import alerts
 
         client    = ibkr.get_client()
         held      = {p.symbol: round(abs(float(p.qty)), 4)
@@ -1456,10 +1461,8 @@ def reconcile_stop_orders(self):
             log.info("Stop reconciliation: broker and DB in sync.")
 
         if new_actions:
+            # Logged only, not sent to Telegram — see this task's docstring.
             log.warning("Stop reconciliation — new/unthrottled: " + " | ".join(new_actions))
-            alerts._send(
-                "🔧 <b>Stop Order Reconciliation</b>\n" + "\n".join(f"• {a}" for a in new_actions)
-            )
     except Exception as e:
         log.error(f"reconcile_stop_orders failed: {e}")
         raise self.retry(exc=e, countdown=120)

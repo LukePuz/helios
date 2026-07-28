@@ -148,9 +148,15 @@ class TestReconciliationAlertThrottle:
     cancel doesn't actually stick at the broker proved that wrong,
     firing the identical alert ~33x in one trading day for the same
     orphaned SNDK stop. Same fix applied to check_ingestion_health below,
-    which had the identical unthrottled-standing-condition pattern."""
+    which had the identical unthrottled-standing-condition pattern.
 
-    def _run_reconcile(self, state, open_orders, cancel_returns=True):
+    2026-07-28: this task no longer sends to Telegram at all (user
+    request) — the per-issue throttle below still governs the WARNING-
+    level log line, which is what these tests now check via caplog
+    instead of an alerts._send mock."""
+
+    def _run_reconcile(self, state, open_orders, caplog, cancel_returns=True):
+        import logging
         client = MagicMock()
         client.get_all_positions.return_value = []  # nothing held -> every stop is orphaned
 
@@ -160,38 +166,39 @@ class TestReconciliationAlertThrottle:
         def fake_set_state(key, value):
             state[key] = value
 
-        with patch("ibkr.get_client", return_value=client), \
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="tasks"), \
+             patch("ibkr.get_client", return_value=client), \
              patch("ibkr.get_open_orders", return_value=open_orders), \
              patch("ibkr.cancel_order", return_value=cancel_returns), \
              patch("db.get_all_position_stops", return_value=[]), \
              patch("db.get_state", side_effect=fake_get_state), \
-             patch("db.set_state", side_effect=fake_set_state), \
-             patch("alerts._send") as mock_alert:
+             patch("db.set_state", side_effect=fake_set_state):
             tasks.reconcile_stop_orders.run()
-        return mock_alert
+        return sum(1 for r in caplog.records if "new/unthrottled" in r.message)
 
-    def test_repeat_orphan_cancel_for_same_order_does_not_realert(self):
+    def test_repeat_orphan_cancel_for_same_order_does_not_realert(self, caplog):
         order = {"order_id": 999, "ticker": "SNDK", "action": "SELL", "order_type": "STP",
                  "qty": 12.0, "stop_price": 1332.93, "status": "PreSubmitted"}
         state = {}
-        first  = self._run_reconcile(state, [order])
-        second = self._run_reconcile(state, [order])  # same order still "orphaned" next cycle
+        first_count  = self._run_reconcile(state, [order], caplog)
+        second_count = self._run_reconcile(state, [order], caplog)  # same order still "orphaned" next cycle
 
-        assert first.call_count == 1
-        assert second.call_count == 0
+        assert first_count == 1
+        assert second_count == 0
 
-    def test_different_orphaned_order_still_alerts(self):
+    def test_different_orphaned_order_still_alerts(self, caplog):
         state = {}
         order_a = {"order_id": 1, "ticker": "AAA", "action": "SELL", "order_type": "STP",
                    "qty": 1.0, "stop_price": 10.0, "status": "PreSubmitted"}
         order_b = {"order_id": 2, "ticker": "BBB", "action": "SELL", "order_type": "STP",
                    "qty": 1.0, "stop_price": 20.0, "status": "PreSubmitted"}
 
-        first  = self._run_reconcile(state, [order_a])
-        second = self._run_reconcile(state, [order_b])
+        first_count  = self._run_reconcile(state, [order_a], caplog)
+        second_count = self._run_reconcile(state, [order_b], caplog)
 
-        assert first.call_count == 1
-        assert second.call_count == 1  # a genuinely new/different order still alerts promptly
+        assert first_count == 1
+        assert second_count == 1  # a genuinely new/different order still logs promptly
 
     def test_ingestion_health_same_stale_sources_do_not_realert(self):
         state = {}

@@ -2,15 +2,15 @@
 Description=Run the Helios liveness watchdog every 10 minutes during market hours
 
 [Timer]
-# 08:50-18:50 ET weekdays, every 10 min — starts 5 min after
-# helios-start.timer's 08:45 wake so the stack has time to come up before
+# 05:05-18:55 ET weekdays, every 10 min — starts 5 min after
+# helios-start.timer's 05:00 wake so the stack has time to come up before
 # the first check, and stops before helios-evening-stop suspends the
 # machine at 19:00 (a check firing right as things shut down would
-# false-alarm). systemd's OnCalendar can't express a single HH:MM-HH:MM
-# range with a minute step, hence two lines: one for :50 past 8, then the
-# regular every-10-minutes sweep for 9 through 18.
-OnCalendar=Mon..Fri 08:50:00 America/New_York
-OnCalendar=Mon..Fri 9..18:0/10:00 America/New_York
+# false-alarm). Wake now lands exactly on the hour (05:00), so unlike the
+# old 08:45 wake this doesn't need a separate first-check line -- the
+# whole window is one grid, offset 5 minutes so the first check isn't a
+# race against the start timer.
+OnCalendar=Mon..Fri 5..18:5/10:00 America/New_York
 Persistent=false
 
 [Install]

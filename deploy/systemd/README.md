@@ -70,16 +70,17 @@ directory. It wires together:
   actually accept connections before starting `main.py`, since IBC's login
   can take well over a minute.
 - `helios-start.timer` / `helios-evening-stop.timer` — the daily schedule.
-  The start timer uses `WakeSystem=true`, which arms the machine's RTC to
-  wake it from suspend at the scheduled time regardless of what put it to
-  sleep the night before. The evening timer stops everything and calls
-  `systemctl suspend` (not a full shutdown — full poweroff would need a
-  BIOS-level "Power On by RTC Alarm" setting this can't configure
-  remotely; suspend + RTC-wake is software-only and works on most desktops
-  out of the box).
+  The start timer's `WakeSystem=true` would arm the machine's RTC to wake
+  it from suspend at the scheduled time if the machine ever actually
+  suspended — in practice (verified 2026-07-26 via `journalctl`) it
+  doesn't: the evening timer only stops `helios-local`/`ibc`/`xvfb` and
+  hands off to `helios-standby.service`, a lightweight listener that keeps
+  the machine reachable over Telegram overnight. `WakeSystem=true` is
+  harmless defensive config, not something this setup currently relies on.
 
 Edit the two `OnCalendar=` times in `helios-start.timer` /
-`helios-evening-stop.timer` before installing if the defaults (8:45 AM /
-7:00 PM America/New_York) don't fit. Note the evening timer suspends the
-*entire machine*, not just the bot — anyone using it for something else
+`helios-evening-stop.timer` before installing if the defaults (5:00 AM /
+7:00 PM America/New_York) don't fit. The evening timer only stops the
+trading stack, not the whole machine — see `helios-evening-stop.service`'s
+own comments — but anyone using it for something else
 at that hour will get interrupted.

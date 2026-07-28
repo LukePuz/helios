@@ -7,7 +7,7 @@ metadata so consumers (drift guards, stop monitors) can refuse to act on
 last-RTH prices hours after the close.
 """
 import logging
-from datetime import datetime, time as dtime, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
 
 from ibkr import get_latest_price, get_historical_bars
 from config import SYMBOLS
@@ -37,6 +37,24 @@ def is_market_hours(now_utc: datetime | None = None) -> bool:
 # Old name kept as an alias -- this module's own get_priced_quote already
 # called the private name before the rename.
 _is_market_hours = is_market_hours
+
+
+def next_market_open(now_utc: datetime | None = None) -> datetime:
+    """Next regular-session open (13:30 UTC / 9:30 ET on a weekday) at or
+    after `now`. Added 2026-07-28 alongside the move to a 5:00 AM ET wake --
+    early ingestion/analysis now often finishes a new-entry recommendation
+    well before the market opens, and execution.execute_approved's
+    market-hours gate defers it rather than firing blind at a stale price.
+    tasks.retry_deferred_entry uses this to schedule a single retry right
+    at the open, instead of the recommendation just sitting FAILED until
+    something else happens to re-trigger analysis."""
+    now = now_utc or datetime.now(timezone.utc)
+    candidate = now.replace(hour=13, minute=30, second=0, microsecond=0)
+    if candidate <= now:
+        candidate += timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate += timedelta(days=1)
+    return candidate
 
 
 def get_priced_quote(ticker: str) -> dict | None:

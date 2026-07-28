@@ -102,15 +102,28 @@ def execute_approved(approval: dict, trigger: str = "telegram") -> bool:
             # outright would go against the "never abort a risk-reducing
             # order" principle elsewhere in this file.
             try:
-                from market_data import is_market_hours
+                from market_data import is_market_hours, next_market_open
                 if not is_market_hours():
+                    eta = next_market_open()
                     log.error(f"[{ticker}] {action} blocked — market is closed, "
-                              f"not submitting a new entry order")
+                              f"not submitting a new entry order; retry scheduled for "
+                              f"{eta.isoformat()}")
+                    try:
+                        from tasks import retry_deferred_entry
+                        retry_deferred_entry.apply_async(
+                            args=[approval["id"]], eta=eta, queue="ops",
+                        )
+                    except Exception as e:
+                        log.error(f"[{ticker}] Could not schedule market-open retry "
+                                  f"for approval #{approval.get('id')}: {e}")
+                    from zoneinfo import ZoneInfo
+                    eta_et = eta.astimezone(ZoneInfo("America/New_York"))
                     alert_module._send(
                         f"⏸️ ORDER DEFERRED — Market Closed\n"
                         f"<b>{ticker}</b> {action} was approved but the market is closed.\n"
-                        f"Not submitting — a stale recommendation shouldn't fill blind at "
-                        f"next open. Re-run analysis when the market reopens."
+                        f"Not submitting now — a stale recommendation shouldn't fill blind. "
+                        f"Will retry automatically at the next open "
+                        f"({eta_et.strftime('%a %I:%M %p ET')}) with a fresh price/drift check."
                     )
                     return False
             except Exception as e:

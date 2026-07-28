@@ -172,19 +172,29 @@ class TestMarketHoursGate:
     exempt."""
 
     def test_new_entry_blocked_when_market_closed(self):
+        """Blocked, and a single retry gets scheduled for the next open —
+        added 2026-07-28 alongside the 5:00 AM wake, so pre-market
+        analysis that finishes before 9:30 isn't just discarded."""
+        import datetime
         approval = _approval(action="ADD")
+        fake_eta = datetime.datetime(2026, 7, 28, 13, 30, tzinfo=datetime.timezone.utc)
 
         with patch("ibkr.get_ib"), \
              patch("ibkr.get_client"), \
              patch("risk_manager.RiskManager") as mock_rm_cls, \
              patch("ibkr.place_market_order") as mock_order, \
              patch("market_data.is_market_hours", return_value=False), \
+             patch("market_data.next_market_open", return_value=fake_eta), \
+             patch("tasks.retry_deferred_entry") as mock_retry_task, \
              patch("alerts._send"):
             mock_rm_cls.return_value.is_halted.return_value = False
             result = execution.execute_approved(approval)
 
         assert result is False
         mock_order.assert_not_called()
+        mock_retry_task.apply_async.assert_called_once_with(
+            args=[approval["id"]], eta=fake_eta, queue="ops",
+        )
 
     def test_sell_not_blocked_when_market_closed(self):
         """TRIM/EXIT must still be allowed to proceed even when closed —

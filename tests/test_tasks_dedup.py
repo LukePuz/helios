@@ -210,3 +210,39 @@ class TestReconciliationAlertThrottle:
             tasks.check_ingestion_health.run()
 
         assert mock_alert.call_count == 1
+
+
+class TestRetryDeferredEntry:
+    """2026-07-28: added alongside the move to a 5:00 AM ET wake. A new
+    entry deferred by execution.execute_approved's market-hours gate gets
+    exactly one retry scheduled for the next open, reusing
+    execute_approved's own safety checks (price drift, drawdown halt)
+    rather than re-running the 72B analysis."""
+
+    def test_retries_failed_approval(self):
+        approval = {"id": 1, "ticker": "NVDA", "status": "FAILED"}
+        with patch("db.get_approval_by_id", return_value=approval), \
+             patch("execution.execute_approved", return_value=True) as mock_execute, \
+             patch("db.update_approval_status") as mock_update:
+            tasks.retry_deferred_entry.run(1)
+
+        mock_execute.assert_called_once_with(approval, trigger="auto_retry")
+        mock_update.assert_called_once_with(1, "APPROVED")
+
+    def test_skips_approval_not_in_failed_status(self):
+        """Already handled some other way -- e.g. a fresher event
+        re-triggered analysis and it's now APPROVED/PROCESSING -- must not
+        double-execute."""
+        approval = {"id": 2, "ticker": "AMD", "status": "APPROVED"}
+        with patch("db.get_approval_by_id", return_value=approval), \
+             patch("execution.execute_approved") as mock_execute:
+            tasks.retry_deferred_entry.run(2)
+
+        mock_execute.assert_not_called()
+
+    def test_missing_approval_does_not_error(self):
+        with patch("db.get_approval_by_id", return_value=None), \
+             patch("execution.execute_approved") as mock_execute:
+            tasks.retry_deferred_entry.run(999)  # should not raise
+
+        mock_execute.assert_not_called()

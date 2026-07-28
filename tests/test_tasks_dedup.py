@@ -246,3 +246,58 @@ class TestRetryDeferredEntry:
             tasks.retry_deferred_entry.run(999)  # should not raise
 
         mock_execute.assert_not_called()
+
+
+class TestBackstopStaleStopCache:
+    """2026-07-28 (AMKR): a cached broker stop-order can go stale in
+    exactly one dangerous direction -- IBKR only pushes fill/status
+    updates for an order to the clientId that placed it, so a different
+    long-lived connection (the ops worker, here) can keep reporting an
+    already-filled stop as still open indefinitely. A plain ticker-
+    membership check ("is AMKR in the set of tickers with an open stop")
+    kept concluding the position was covered for hours after the real
+    stop had filled and reduced it from 186 to 110 shares, so the
+    backstop-sell never fired while the remainder sat unprotected.
+    check_trailing_stops now cross-checks the stop's cached quantity
+    against the actual held quantity instead of trusting presence alone."""
+
+    def _run(self, held_qty, stop_orders, triggered_action="EXIT"):
+        client = MagicMock()
+        client.get_open_position.return_value = MagicMock(qty=held_qty)
+
+        with patch("tasks._get_client", return_value=client), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("ibkr.get_open_orders", return_value=stop_orders), \
+             patch("tasks._execute_backstop_sell", return_value=True) as mock_backstop, \
+             patch("alerts.send_stop_triggered"), \
+             patch("config.AUTO_EXECUTE_PROTECTIVE_SELLS", True):
+            mock_rm_cls.return_value.check_trailing_stops.return_value = [{
+                "ticker": "AMKR", "action": triggered_action,
+                "current_price": 46.0, "stop_price": 55.71,
+                "reason": "Stop triggered at $55.71 (current $46.00)",
+            }]
+            tasks.check_trailing_stops.run()
+        return mock_backstop
+
+    def test_stale_cached_stop_for_more_shares_than_held_still_backstops(self):
+        """The exact AMKR shape: a cached stop still shows 186 shares open,
+        but only 110 are actually held -- the cache is stale, not real
+        coverage, so the backstop must still fire."""
+        stop_orders = [{"ticker": "AMKR", "action": "SELL", "order_type": "STP",
+                         "qty": 186.0, "stop_price": 55.71, "order_id": 70,
+                         "status": "PreSubmitted"}]
+        mock_backstop = self._run(held_qty=110.0, stop_orders=stop_orders)
+        mock_backstop.assert_called_once()
+
+    def test_stop_matching_current_position_is_trusted(self):
+        """A stop genuinely covering the current position (quantities
+        match) is real protection -- must not double-sell on top of it."""
+        stop_orders = [{"ticker": "AMKR", "action": "SELL", "order_type": "STP",
+                         "qty": 110.0, "stop_price": 34.66, "order_id": 6,
+                         "status": "PreSubmitted"}]
+        mock_backstop = self._run(held_qty=110.0, stop_orders=stop_orders)
+        mock_backstop.assert_not_called()
+
+    def test_no_stop_at_all_backstops(self):
+        mock_backstop = self._run(held_qty=110.0, stop_orders=[])
+        mock_backstop.assert_called_once()

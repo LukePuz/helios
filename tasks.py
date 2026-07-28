@@ -690,15 +690,37 @@ def check_trailing_stops(self):
 
         # A live broker stop will fire on its own — never race it with a
         # market sell. Only backstop tickers with no SELL stop at the broker.
+        #
+        # Found 2026-07-28 (AMKR): this ops-worker connection's local order
+        # cache can go stale in exactly one dangerous direction -- IBKR
+        # generally only pushes fill/status updates for an order to the
+        # clientId that placed it, not to other clients that merely queried
+        # it via reqAllOpenOrders(). A stop placed by the execution worker
+        # (a different clientId) that later fills is invisible to this
+        # connection's cache, which keeps reporting it "PreSubmitted" with
+        # filled=0 indefinitely -- so a plain ticker-membership check kept
+        # concluding "AMKR still has a live stop" for hours after the real
+        # stop had already filled and reduced the position, and the backstop
+        # never fired while the remainder sat completely unprotected.
+        #
+        # Fix: track the covered QUANTITY per ticker, not just presence, and
+        # cross-check it against the actual current position size (which
+        # updates correctly and promptly via the account's live position
+        # feed). A stop genuinely still open for the current position covers
+        # it almost exactly; a stop claiming to cover materially more or
+        # fewer shares than are actually held cannot be a live, valid stop
+        # for what's held right now, and gets treated as unreliable --
+        # firing the backstop rather than trusting a number that doesn't
+        # match reality.
         import ibkr
         try:
-            open_stop_tickers = {
-                o["ticker"] for o in ibkr.get_open_orders()
-                if o["action"] == "SELL" and o["order_type"] in ("STP", "STP LMT", "TRAIL")
-            }
+            open_stop_qty: dict[str, float] = {}
+            for o in ibkr.get_open_orders():
+                if o["action"] == "SELL" and o["order_type"] in ("STP", "STP LMT", "TRAIL"):
+                    open_stop_qty[o["ticker"]] = open_stop_qty.get(o["ticker"], 0.0) + o["qty"]
         except Exception as e:
             log.warning(f"Could not fetch open orders for backstop check: {e}")
-            open_stop_tickers = None  # unknown — don't sell blind
+            open_stop_qty = None  # unknown — don't sell blind
 
         for alert in triggered:
             ticker = alert["ticker"]
@@ -706,9 +728,18 @@ def check_trailing_stops(self):
             backstopped = False
             if (alert.get("action") == "EXIT"
                     and AUTO_EXECUTE_PROTECTIVE_SELLS
-                    and open_stop_tickers is not None
-                    and ticker not in open_stop_tickers):
-                backstopped = _execute_backstop_sell(ticker, alert)
+                    and open_stop_qty is not None):
+                try:
+                    held_qty = abs(float(client.get_open_position(ticker).qty))
+                except Exception:
+                    held_qty = 0.0
+                stop_qty = open_stop_qty.get(ticker, 0.0)
+                covered = held_qty > 0 and abs(stop_qty - held_qty) < max(0.01, held_qty * 0.02)
+                if held_qty > 0 and not covered:
+                    if stop_qty:
+                        log.warning(f"[{ticker}] Cached stop covers {stop_qty} shares but "
+                                    f"{held_qty} are actually held — treating as stale/unreliable")
+                    backstopped = _execute_backstop_sell(ticker, alert)
             alerts.send_stop_triggered(
                 ticker=ticker,
                 current_price=alert["current_price"],

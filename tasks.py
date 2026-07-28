@@ -75,7 +75,7 @@ LLM_EVENT_EXPIRES_SECONDS = 4 * 3600
 # after one interval (running a 4-hour-old portfolio snapshot after fresher
 # ones is pure waste — this is what let the queue back up 296 deep on
 # 2026-07-15). Daily/weekly tasks get generous expiries sized to the
-# machine's sleep window (suspended 19:00→08:45 weekdays, all weekend), so
+# machine's sleep window (stack down 19:00→05:00 weekdays, all weekend), so
 # beat's catch-up send on wake still executes rather than being discarded.
 app.conf.beat_schedule = {
     # Market regime — daily at 9:30 AM ET (market open). LLM-heavy → llm
@@ -103,9 +103,10 @@ app.conf.beat_schedule = {
         "options":  {"expires": 4 * 3600},
     },
     # Watchlist-candidate discovery — weekly, Monday 9:00 AM ET. Scheduled
-    # after refresh-sp500-history's Monday 08:45 catch-up (see that entry's
+    # after refresh-sp500-history's Monday 05:00 catch-up (see that entry's
     # comment) so this reads freshly-populated bars, not week-old ones from
-    # before the catch-up ran.
+    # before the catch-up ran -- now a 4h buffer instead of 15min since the
+    # wake moved from 08:45 to 05:00.
     "candidate-scan": {
         "task":     "tasks.run_candidate_scan",
         "schedule": crontab(hour=9, minute=0, day_of_week="mon"),
@@ -185,8 +186,9 @@ app.conf.beat_schedule = {
         "schedule": 1800,
         "options":  {"expires": 1800},
     },
-    # Earnings calendar refresh — Monday 8:00 AM ET. Fires while the machine
-    # is still suspended (wake is 8:45); runs via beat catch-up on wake.
+    # Earnings calendar refresh — Monday 8:00 AM ET. Used to fire before
+    # the old 08:45 wake and need beat's catch-up; now runs live, 3h after
+    # the 05:00 wake.
     "refresh-earnings": {
         "task":     "tasks.refresh_earnings_calendar",
         "schedule": crontab(hour=8, minute=0, day_of_week="mon"),
@@ -242,15 +244,15 @@ app.conf.beat_schedule = {
         "schedule": crontab(hour=16, minute=30, day_of_week="mon-fri"),
         "options":  {"expires": 24 * 3600},
     },
-    # Vector store pruning — Sunday 3:00 AM. Machine is suspended all
-    # weekend; actually runs via catch-up Monday 8:45 (~30h later).
+    # Vector store pruning — Sunday 3:00 AM. Stack is down all weekend;
+    # actually runs via catch-up Monday 05:00 (~26h later).
     "prune-vector-store": {
         "task":     "tasks.prune_vector_store",
         "schedule": crontab(hour=3, minute=0, day_of_week="sun"),
         "options":  {"expires": 36 * 3600},
     },
     # seen_items dedup table — same slot as vector store pruning, same
-    # suspended-weekend caveat (runs via Monday 08:45 catch-up).
+    # down-all-weekend caveat (runs via Monday 05:00 catch-up).
     "prune-seen-items": {
         "task":     "tasks.prune_seen_items",
         "schedule": crontab(hour=3, minute=15, day_of_week="sun"),
@@ -262,15 +264,15 @@ app.conf.beat_schedule = {
         "schedule": 900,
         "options":  {"expires": 900},
     },
-    # Fundamentals refresh — 5:00 PM ET. Must run inside the awake window:
-    # helios-evening-stop suspends the machine at 19:00 and it doesn't wake
-    # until 08:45, so the old 2:00 AM slot never fired — the fundamentals
+    # Fundamentals refresh — 5:00 PM ET. Must run inside the awake window
+    # (currently 05:00-19:00): the old 2:00 AM slot predated even the
+    # original 08:45 wake, so it never fired at all — the fundamentals
     # table stayed empty forever, which silently capped every analyst
     # conviction at 6 via the ungrounded-valuation guardrail.
     "refresh-fundamentals": {
         "task":     "tasks.refresh_fundamentals",
         "schedule": crontab(hour=17, minute=0, day_of_week="mon-fri"),
-        "options":  {"expires": 2 * 3600},  # must finish before 19:00 suspend
+        "options":  {"expires": 2 * 3600},  # must finish before the 19:00 stack-down
     },
     # Price history cache refresh — 4:45 PM ET (before fundamentals, after
     # close; same awake-window constraint as above).
@@ -280,8 +282,8 @@ app.conf.beat_schedule = {
         "options":  {"expires": 2 * 3600},
     },
     # S&P 500 universe price history — weekly, Saturday 9:00 AM. Same
-    # suspended-weekend caveat as prune-vector-store/prune-seen-items above:
-    # actually runs via Monday 08:45 catch-up (~48h later), which is fine —
+    # down-all-weekend caveat as prune-vector-store/prune-seen-items above:
+    # actually runs via Monday 05:00 catch-up (~44h later), which is fine —
     # feeds GICS-sector breadth + candidate_scanner, neither of which needs
     # day-fresh data (see refresh_sp500_history's docstring).
     "refresh-sp500-history": {
@@ -302,8 +304,8 @@ app.conf.beat_schedule = {
         "schedule": crontab(hour=16, minute=15, day_of_week="mon-fri"),
         "options":  {"expires": 3 * 3600},
     },
-    # Weekly self-review — Sunday 6:00 PM ET (suspended then; catch-up runs
-    # it Monday 8:45). LLM-heavy → llm bulk lane.
+    # Weekly self-review — Sunday 6:00 PM ET (stack is down then; catch-up
+    # runs it Monday 05:00). LLM-heavy → llm bulk lane.
     "weekly-self-review": {
         "task":     "tasks.weekly_self_review",
         "schedule": crontab(hour=18, minute=0, day_of_week="sun"),
@@ -489,6 +491,48 @@ def analyze_candidates(self, candidates: list, max_per_run: int = 5):
     except Exception as e:
         log.error(f"analyze_candidates failed: {e}")
         raise self.retry(exc=e, countdown=300)
+
+
+@app.task(name="tasks.retry_deferred_entry", bind=True, max_retries=0)
+def retry_deferred_entry(self, approval_id: int):
+    """
+    Single retry for a new-entry (OPEN/ADD) approval that execution.
+    execute_approved deferred because the market was closed at analysis
+    time — scheduled via market_data.next_market_open() at the moment of
+    deferral (see execute_approved's market-hours gate). Added 2026-07-28
+    alongside the move to a 5:00 AM ET wake: pre-market analysis now
+    routinely finishes well before 9:30, and without this the
+    recommendation would just sit FAILED until something else happened to
+    re-trigger fresh analysis.
+
+    Deliberately does NOT re-run the 72B analysis — reuses
+    execute_approved's own price-drift guard (aborts if price moved >8%
+    since the original sizing) as the safety check against firing a
+    now-stale decision. If the market is somehow still closed when this
+    fires (holiday, clock skew), execute_approved's gate defers it again
+    with a fresh retry scheduled for the next computed open — self-
+    correcting, not a tight loop, since each retry target is strictly
+    later than the last and real time keeps moving forward.
+    """
+    import db
+    from execution import execute_approved
+
+    approval = db.get_approval_by_id(approval_id)
+    if not approval:
+        log.warning(f"retry_deferred_entry: approval #{approval_id} not found")
+        return
+    if approval.get("status") != "FAILED":
+        # Already handled some other way (a fresher event re-triggered
+        # analysis, a human acted on it, etc.) -- don't double-execute.
+        log.info(f"retry_deferred_entry: approval #{approval_id} status is "
+                 f"'{approval.get('status')}', not FAILED — skipping retry")
+        return
+
+    ticker = approval.get("ticker", "?")
+    success = execute_approved(approval, trigger="auto_retry")
+    db.update_approval_status(approval_id, "APPROVED" if success else "FAILED")
+    log.info(f"retry_deferred_entry: [{ticker}] approval #{approval_id} "
+             f"{'executed' if success else 'still failed'} on market-open retry")
 
 
 # ── New tasks: regime + scanner + stop monitor ────────────────────────────────
@@ -720,7 +764,7 @@ def poll_options_flow(self):
         if not _is_market_hours():
             # Option chains are stale outside RTH (last-quoted OI/volume,
             # not live) — this poller ran every 5 min around the clock
-            # during the awake-but-closed windows (08:45-09:30, 16:00-19:00)
+            # during the awake-but-closed windows (05:00-09:30, 16:00-19:00)
             # for no signal value.
             log.debug("poll_options_flow: market closed, skipping")
             return

@@ -2,11 +2,19 @@
 Description=Wake the PC and start Helios each weekday premarket
 
 [Timer]
-# 8:45 AM ET — 45 min before the 9:30 open, enough time for IBC/TWS login,
-# Ollama model warm-up, and the initial regime assessment to finish before
-# the 9:30 assess-regime / 9:35 scan Celery tasks fire. Adjust the time if
-# your machine needs longer (slower TWS login, cold model load, etc).
-OnCalendar=Mon..Fri 08:45:00 America/New_York
+# 5:00 AM ET — moved from 08:45 (2026-07-28) specifically to get the
+# ingestion/screen/analysis pipeline running well before the market opens,
+# not just before assess-regime/daily-scan fire. Pre-market and BMO
+# (before-market-open) earnings/news is common in this window; waking
+# early means the slow part (72B analysis, ~3 min/call plus whatever queue
+# depth exists) is already done by 9:30 instead of only starting then.
+# New BUY entries still can't execute before the open (market_data.
+# is_market_hours gates execution.execute_approved) -- see
+# tasks.retry_deferred_entry for what happens to an approval that's ready
+# before the bell. 4.5h of buffer before 9:30 is generous; the old 45-min
+# window was sized only for IBC/TWS login + model warm-up, not for a full
+# morning of ingestion to run through.
+OnCalendar=Mon..Fri 05:00:00 America/New_York
 # WakeSystem is what actually wakes the machine from suspend for this —
 # systemd arms the RTC to this timer's next elapse whenever the system
 # suspends, regardless of what triggered the suspend.

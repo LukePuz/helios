@@ -75,20 +75,33 @@ def get_priced_quote(ticker: str) -> dict | None:
         bar_time = None
         age_min: float | None = None
         try:
-            # IBKR bar dates: '20260706 15:59:00 US/Eastern' or date-only for daily
-            raw = str(last["time"]).split(" US/")[0]
-            for fmt in ("%Y%m%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y%m%d", "%Y-%m-%d"):
-                try:
-                    bar_time = datetime.strptime(raw, fmt)
-                    break
-                except ValueError:
-                    continue
-            if bar_time:
-                # Bar times arrive in exchange-local time; treat as UTC-approx
-                # for age purposes (error is bounded by tz offset and only
-                # makes the check MORE conservative during RTH).
-                age_min = (datetime.now(timezone.utc)
-                           - bar_time.replace(tzinfo=timezone.utc)).total_seconds() / 60
+            raw = str(last["time"])
+            # Current ib_insync intraday bars stringify as
+            # '2026-07-29 13:04:00-04:00' (real UTC offset, tz-aware) --
+            # fromisoformat handles that natively and gives a correct age
+            # directly, no UTC-approximation needed.
+            try:
+                bar_time = datetime.fromisoformat(raw)
+                if bar_time.tzinfo is not None:
+                    age_min = (datetime.now(timezone.utc) - bar_time.astimezone(timezone.utc)).total_seconds() / 60
+                    bar_time = bar_time.replace(tzinfo=None)
+            except ValueError:
+                bar_time = None
+            if age_min is None:
+                # Older/alternate formats: '20260706 15:59:00 US/Eastern' or
+                # date-only for daily bars -- naive, treat as UTC-approx
+                # (error is bounded by tz offset and only makes the check
+                # MORE conservative during RTH).
+                stripped = raw.split(" US/")[0]
+                for fmt in ("%Y%m%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y%m%d", "%Y-%m-%d"):
+                    try:
+                        bar_time = datetime.strptime(stripped, fmt)
+                        break
+                    except ValueError:
+                        continue
+                if bar_time:
+                    age_min = (datetime.now(timezone.utc)
+                               - bar_time.replace(tzinfo=timezone.utc)).total_seconds() / 60
         except Exception:
             pass
 

@@ -1565,6 +1565,39 @@ def update_order_fill(order_id: int, fill_price: float, filled_qty: float, statu
         _put_conn(conn)
 
 
+def get_unconfirmed_orders(max_age_hours: int = 24) -> list[dict]:
+    """Orders logged with status='unconfirmed' (no fill seen within
+    place_market_order's wait window) in the last max_age_hours. Feeds
+    tasks.reconcile_unconfirmed_orders -- see get_fill_for_order's docstring
+    in ibkr.py for the incident (CRWD 2026-07-28) that motivated checking
+    these against the broker's own execution record instead of assuming
+    "unconfirmed" means "never filled"."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, ticker, side, qty, broker_order_id, decision_price, approval_id "
+                "FROM orders WHERE status='unconfirmed' AND broker_order_id IS NOT NULL "
+                "AND created_at > NOW() - INTERVAL '%s hours' ORDER BY created_at",
+                (max_age_hours,),
+            )
+            rows = cur.fetchall()
+        return [
+            {
+                "id": r[0], "ticker": r[1], "side": r[2],
+                "qty": float(r[3]) if r[3] is not None else None,
+                "broker_order_id": r[4], "decision_price": float(r[5]) if r[5] is not None else None,
+                "approval_id": r[6],
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        logging.error(f"get_unconfirmed_orders failed: {e}")
+        return []
+    finally:
+        _put_conn(conn)
+
+
 def get_recent_orders(limit: int = 50) -> list[dict]:
     conn = _get_conn()
     try:

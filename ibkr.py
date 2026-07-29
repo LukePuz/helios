@@ -247,11 +247,21 @@ def place_market_order(ticker: str, side: str, qty: float, fill_timeout: float =
     order.tif = "DAY"  # market orders must not persist across sessions
     trade = ib.placeOrder(contract, order)
 
-    # Wait for the real fill instead of guessing the price afterwards
-    waited = 0.0
-    while not trade.isDone() and waited < fill_timeout:
+    # Wait for the real fill instead of guessing the price afterwards.
+    # Incident 2026-07-28: this used to count loop iterations ("waited += 1"
+    # per call) as a proxy for elapsed seconds, on the assumption each
+    # ib.waitOnUpdate(timeout=1) call blocks for ~1s. At 9:30:02 ET market
+    # open, a burst of already-queued order/market-data events (many other
+    # tickers' stop orders re-broadcasting status) made waitOnUpdate return
+    # near-instantly on every call, so the loop burned through all 30
+    # "seconds" in about 1 real second and gave up — logging "no fill" for
+    # a CRWD BUY that filled for real 12 seconds later, live and untracked
+    # at the broker with no stop, no trade row. Use actual wall-clock time
+    # so a fast-draining event queue can't fake out the wait window.
+    import time as _time
+    start = _time.monotonic()
+    while not trade.isDone() and (_time.monotonic() - start) < fill_timeout:
         ib.waitOnUpdate(timeout=1)
-        waited += 1
 
     ib.cancelMktData(contract)
 
@@ -565,6 +575,31 @@ def cancel_stop_orders_for(ticker: str) -> int:
     if cancelled:
         ib.sleep(1)
     return cancelled
+
+
+def get_fill_for_order(broker_order_id: int) -> dict | None:
+    """Looks up actual executions for a specific order by id, aggregating
+    partials into one (filled_qty, avg_price). Returns None if nothing has
+    executed for that order (yet, or ever).
+
+    Added 2026-07-29 alongside tasks.reconcile_unconfirmed_orders: a market
+    order can legitimately fill *after* place_market_order's fill-wait gives
+    up (the CRWD incident -- filled 12s past the window, order recorded
+    "unconfirmed", position ended up live and untracked with no stop). This
+    lets a periodic reconciliation pass find such late fills using IBKR's
+    own execution record, rather than trusting whatever place_market_order
+    observed in its own limited wait window.
+    """
+    ib = get_ib()
+    execs = ib.reqExecutions()
+    matches = [e for e in execs if e.execution.orderId == broker_order_id]
+    if not matches:
+        return None
+    total_qty = sum(float(e.execution.shares) for e in matches)
+    if total_qty <= 0:
+        return None
+    avg_price = sum(float(e.execution.shares) * float(e.execution.avgPrice) for e in matches) / total_qty
+    return {"filled_qty": total_qty, "fill_price": avg_price}
 
 
 # ---------------------------------------------------------------------------

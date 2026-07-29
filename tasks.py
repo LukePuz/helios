@@ -212,6 +212,17 @@ app.conf.beat_schedule = {
         "schedule": 900,
         "options":  {"expires": 900},
     },
+    # Late-fill reconciliation — every 5 minutes. Catches orders that filled
+    # after place_market_order's wait window gave up (see
+    # tasks.reconcile_unconfirmed_orders docstring for the 2026-07-28 CRWD
+    # incident this closes); short interval since an unprotected live
+    # position is the failure mode, and short expiry so a delayed run never
+    # stacks behind another.
+    "reconcile-unconfirmed-orders": {
+        "task":     "tasks.reconcile_unconfirmed_orders",
+        "schedule": 300,
+        "options":  {"expires": 280},
+    },
     # Low-frequency overnight-dead-with-no-traffic safety net — every 30
     # minutes, not 10. The 72B server only handles one request at a time
     # (-np 1), and this probe occupies that slot for up to 300s each run;
@@ -533,6 +544,97 @@ def retry_deferred_entry(self, approval_id: int):
     db.update_approval_status(approval_id, "APPROVED" if success else "FAILED")
     log.info(f"retry_deferred_entry: [{ticker}] approval #{approval_id} "
              f"{'executed' if success else 'still failed'} on market-open retry")
+
+
+@app.task(name="tasks.reconcile_unconfirmed_orders", bind=True, max_retries=2)
+def reconcile_unconfirmed_orders(self):
+    """
+    Catches late fills that land after ibkr.place_market_order's fill-wait
+    window already gave up. Incident 2026-07-28: a CRWD BUY (144 shares,
+    order 764) filled 12s after the 30s wait closed -- see
+    place_market_order's wall-clock-timing fix docstring for the bug that
+    caused the false "no fill" in the first place. The order was correctly
+    logged status='unconfirmed' (never fabricate a fill we didn't see), but
+    nothing ever went back to check whether it filled anyway, so a real
+    ~$26K position sat live at the broker all day with no stop and no trade
+    record -- invisible to every other safety system, since they all read
+    the DB, not the broker directly.
+
+    Runs against every 'unconfirmed' order from the last 24h, checking
+    IBKR's own execution record (ibkr.get_fill_for_order) rather than
+    trusting the original wait-window snapshot. A match here is a
+    confirmed broker execution, not a guess -- recording it doesn't fall
+    under the "never fabricate a fill" rule that governs the unconfirmed
+    path itself.
+    """
+    import db
+    import ibkr
+    import alerts
+
+    try:
+        pending = db.get_unconfirmed_orders(max_age_hours=24)
+    except Exception as e:
+        log.error(f"reconcile_unconfirmed_orders: could not load unconfirmed orders: {e}")
+        raise self.retry(exc=e, countdown=120)
+
+    for order in pending:
+        ticker = order["ticker"]
+        try:
+            fill = ibkr.get_fill_for_order(order["broker_order_id"])
+        except Exception as e:
+            log.warning(f"[{ticker}] reconcile_unconfirmed_orders: fill lookup failed for "
+                        f"order {order['broker_order_id']}: {e}")
+            continue
+        if not fill:
+            continue  # still genuinely unfilled (or cancelled/rejected) -- leave alone
+
+        fill_qty, fill_price = fill["filled_qty"], fill["fill_price"]
+        log.warning(f"[{ticker}] Late fill found for order {order['broker_order_id']}: "
+                    f"{order['side']} {fill_qty} @ ${fill_price:.2f} — was recorded "
+                    f"unconfirmed, reconciling now")
+
+        db.log_trade(
+            symbol=ticker, side=order["side"], quantity=fill_qty, price=fill_price,
+            reason="Late-fill reconciled (order placed unconfirmed, filled after the wait window)",
+        )
+        db.update_order_fill(order["id"], fill_price=fill_price, filled_qty=fill_qty, status="filled")
+
+        stop_placed = False
+        approval = db.get_approval_by_id(order["approval_id"]) if order["approval_id"] else None
+        if order["side"] == "BUY" and approval:
+            risk_json = approval.get("risk_json") or {}
+            stop_price = approval.get("stop_loss_price") or risk_json.get("stop_loss_price")
+            if stop_price:
+                try:
+                    stop_result = ibkr.place_stop_order(ticker, fill_qty, float(stop_price))
+                    db.upsert_position_stop(
+                        ticker=ticker, entry_price=fill_price, stop_price=float(stop_price),
+                        stop_method=risk_json.get("stop_method", ""),
+                        bucket=approval.get("thesis_bucket", "Accelerator"),
+                        conviction=approval.get("conviction", 5),
+                        trail_distance_pct=risk_json.get("trailing_stop_distance_pct"),
+                    )
+                    db.set_stop_broker_order_id(ticker, stop_result["order_id"])
+                    stop_placed = True
+                except Exception as e:
+                    log.error(f"[{ticker}] reconcile_unconfirmed_orders: stop placement failed: {e}")
+            if approval.get("status") == "FAILED":
+                db.update_approval_status(order["approval_id"], "APPROVED")
+
+        alert_lines = [
+            f"🔁 LATE FILL RECONCILED — <b>{ticker}</b>",
+            f"{order['side']} {fill_qty:g} shares @ ${fill_price:.2f} — this order was marked "
+            f"unconfirmed but had actually filled at the broker.",
+        ]
+        if order["side"] == "BUY":
+            alert_lines.append(
+                "Protective stop placed." if stop_placed else
+                "⚠️ Could not place a protective stop automatically — check TWS."
+            )
+        try:
+            alerts._send("\n".join(alert_lines))
+        except Exception:
+            pass
 
 
 # ── New tasks: regime + scanner + stop monitor ────────────────────────────────

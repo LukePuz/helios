@@ -308,3 +308,113 @@ class TestBackstopStaleStopCache:
     def test_no_stop_at_all_backstops(self):
         mock_backstop = self._run(held_qty=110.0, stop_orders=[])
         mock_backstop.assert_called_once()
+
+
+class TestReconcileUnconfirmedOrders:
+    """2026-07-28 (CRWD): a market order can fill *after*
+    ibkr.place_market_order's fill-wait window gives up and the order gets
+    logged status='unconfirmed'. Nothing ever went back to check whether it
+    filled anyway -- a real 144-share CRWD position sat live at the broker
+    all day with no stop and no trade record, invisible to every other
+    safety system since they all read the DB, not the broker directly.
+    reconcile_unconfirmed_orders closes that gap by checking IBKR's own
+    execution record for each 'unconfirmed' order."""
+
+    def _order(self, order_id=44, ticker="CRWD", side="BUY", qty=144.0,
+               broker_order_id=764, approval_id=59):
+        return {"id": order_id, "ticker": ticker, "side": side, "qty": qty,
+                "broker_order_id": broker_order_id, "decision_price": 180.1,
+                "approval_id": approval_id}
+
+    def _approval(self, status="FAILED"):
+        return {
+            "id": 59, "ticker": "CRWD", "status": status,
+            "thesis_bucket": "Compounder", "conviction": 7,
+            "stop_loss_price": 153.61,
+            "risk_json": {"stop_method": "2.5x ATR", "trailing_stop_distance_pct": 0.175},
+        }
+
+    def test_late_fill_is_recorded_and_stopped(self):
+        """The exact CRWD shape: order was unconfirmed, but IBKR's
+        execution record shows it actually filled -- must be logged as a
+        real trade, protected with the stop already computed at sizing
+        time, and the approval flipped off FAILED."""
+        with patch("db.get_unconfirmed_orders", return_value=[self._order()]), \
+             patch("ibkr.get_fill_for_order",
+                   return_value={"filled_qty": 144.0, "fill_price": 181.3}), \
+             patch("db.log_trade") as mock_log_trade, \
+             patch("db.update_order_fill") as mock_update_fill, \
+             patch("db.get_approval_by_id", return_value=self._approval()), \
+             patch("ibkr.place_stop_order",
+                   return_value={"order_id": 900, "stop_price": 153.61}) as mock_stop, \
+             patch("db.upsert_position_stop") as mock_upsert_stop, \
+             patch("db.set_stop_broker_order_id") as mock_set_stop_id, \
+             patch("db.update_approval_status") as mock_update_approval, \
+             patch("alerts._send") as mock_alert:
+            tasks.reconcile_unconfirmed_orders.run()
+
+        mock_log_trade.assert_called_once()
+        assert mock_log_trade.call_args.kwargs["quantity"] == 144.0
+        assert mock_log_trade.call_args.kwargs["price"] == 181.3
+        mock_update_fill.assert_called_once_with(44, fill_price=181.3, filled_qty=144.0, status="filled")
+        mock_stop.assert_called_once_with("CRWD", 144.0, 153.61)
+        mock_upsert_stop.assert_called_once()
+        mock_set_stop_id.assert_called_once_with("CRWD", 900)
+        mock_update_approval.assert_called_once_with(59, "APPROVED")
+        mock_alert.assert_called_once()
+
+    def test_still_unfilled_order_is_left_alone(self):
+        """No execution found at the broker -- genuinely never filled (or
+        was cancelled/rejected). Must not fabricate anything."""
+        with patch("db.get_unconfirmed_orders", return_value=[self._order()]), \
+             patch("ibkr.get_fill_for_order", return_value=None), \
+             patch("db.log_trade") as mock_log_trade, \
+             patch("db.update_approval_status") as mock_update_approval, \
+             patch("alerts._send") as mock_alert:
+            tasks.reconcile_unconfirmed_orders.run()
+
+        mock_log_trade.assert_not_called()
+        mock_update_approval.assert_not_called()
+        mock_alert.assert_not_called()
+
+    def test_no_pending_orders_is_a_noop(self):
+        with patch("db.get_unconfirmed_orders", return_value=[]), \
+             patch("ibkr.get_fill_for_order") as mock_lookup:
+            tasks.reconcile_unconfirmed_orders.run()
+
+        mock_lookup.assert_not_called()
+
+    def test_late_fill_without_approval_still_records_trade_but_skips_stop(self):
+        """Manual/non-approval orders (no approval_id) have no computed
+        stop price to use -- must still record the real fill, just can't
+        auto-place a stop blind, and the alert must say so."""
+        order = self._order(approval_id=None)
+        with patch("db.get_unconfirmed_orders", return_value=[order]), \
+             patch("ibkr.get_fill_for_order",
+                   return_value={"filled_qty": 144.0, "fill_price": 181.3}), \
+             patch("db.log_trade") as mock_log_trade, \
+             patch("db.update_order_fill"), \
+             patch("ibkr.place_stop_order") as mock_stop, \
+             patch("alerts._send") as mock_alert:
+            tasks.reconcile_unconfirmed_orders.run()
+
+        mock_log_trade.assert_called_once()
+        mock_stop.assert_not_called()
+        assert "check TWS" in mock_alert.call_args[0][0]
+
+    def test_sell_side_late_fill_does_not_attempt_a_stop(self):
+        """A late-filled SELL (e.g. a TRIM/EXIT) must never trigger stop
+        placement -- stops are a BUY-side concern."""
+        order = self._order(side="SELL", qty=50.0)
+        with patch("db.get_unconfirmed_orders", return_value=[order]), \
+             patch("ibkr.get_fill_for_order",
+                   return_value={"filled_qty": 50.0, "fill_price": 175.0}), \
+             patch("db.log_trade"), \
+             patch("db.update_order_fill"), \
+             patch("db.get_approval_by_id", return_value=self._approval()), \
+             patch("ibkr.place_stop_order") as mock_stop, \
+             patch("db.update_approval_status"), \
+             patch("alerts._send"):
+            tasks.reconcile_unconfirmed_orders.run()
+
+        mock_stop.assert_not_called()

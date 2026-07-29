@@ -13,6 +13,8 @@ drift check.
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
+import pytest
+
 import market_data
 
 
@@ -85,3 +87,74 @@ class TestBarTimeParsing:
         assert q is not None
         assert q["age_minutes"] > 100
         assert q["is_stale"] is True
+
+
+def _daily_intraday(prior_close, opens_and_closes):
+    """opens_and_closes: list of (open, close) tuples, one per 1-min bar,
+    in order since the open -- lets a test describe a price path cheaply."""
+    daily = [{"time": "2026-07-28", "open": prior_close, "high": prior_close,
+              "low": prior_close, "close": prior_close, "volume": 1_000_000}]
+    intraday = [
+        {"time": f"2026-07-29 09:{30+i}:00-04:00", "open": o, "high": max(o, c),
+         "low": min(o, c), "close": c, "volume": 10_000}
+        for i, (o, c) in enumerate(opens_and_closes)
+    ]
+
+    def fake(ticker, duration="20 D", bar_size="1 day", **kwargs):
+        return daily if bar_size == "1 day" else intraday
+    return fake
+
+
+class TestGapConfirmation:
+    """Regression coverage for the 2026-07-29 TER incident: an opening gap
+    was treated as a valid, tradeable price the instant the market-hours
+    gate cleared, with no check for whether the gap was actually holding.
+    TER gapped from a $320.65 close to a $368 open and fully round-tripped
+    (low $319.41) within the session -- market_data.check_gap_confirmation
+    is the deterministic judge of "holding vs. fading" that execution.py's
+    BUY path now consults before firing."""
+
+    def test_small_move_is_no_gap(self):
+        """A move below the threshold isn't a "gap" at all -- the ordinary
+        drift guard governs, this check doesn't apply."""
+        fake = _daily_intraday(prior_close=100.0, opens_and_closes=[(101.0, 101.2)])
+        with patch("market_data.get_historical_bars", side_effect=fake):
+            result = market_data.check_gap_confirmation("AAPL")
+        assert result["status"] == "no_gap"
+
+    def test_gap_holding_after_enough_bars_is_confirmed(self):
+        """A real gap (>5%) where price has stayed near the open across
+        enough bars to judge -- must not be flagged as fading."""
+        path = [(110.0, 110.0)] * 12  # 12 bars, essentially flat at the open
+        fake = _daily_intraday(prior_close=100.0, opens_and_closes=path)
+        with patch("market_data.get_historical_bars", side_effect=fake):
+            result = market_data.check_gap_confirmation("AAPL")
+        assert result["status"] == "confirmed"
+        assert result["gap_pct"] == pytest.approx(0.10)
+
+    def test_not_enough_bars_yet_is_pending(self):
+        """Right after the open there's no way to tell holding from fading
+        -- must not guess either way."""
+        path = [(110.0, 110.0)] * 3
+        fake = _daily_intraday(prior_close=100.0, opens_and_closes=path)
+        with patch("market_data.get_historical_bars", side_effect=fake):
+            result = market_data.check_gap_confirmation("AAPL")
+        assert result["status"] == "pending"
+
+    def test_gap_fully_reversing_is_failed(self):
+        """The exact TER shape: gapped up, then gave essentially the whole
+        move back -- must be flagged as failed, not confirmed."""
+        path = [(110.0, 108.0), (108.0, 104.0), (104.0, 101.0),
+                (101.0, 100.5), (100.5, 100.2), (100.2, 100.1),
+                (100.1, 100.0), (100.0, 100.0), (100.0, 100.0),
+                (100.0, 100.0), (100.0, 100.0)]
+        fake = _daily_intraday(prior_close=100.0, opens_and_closes=path)
+        with patch("market_data.get_historical_bars", side_effect=fake):
+            result = market_data.check_gap_confirmation("AAPL")
+        assert result["status"] == "failed"
+        assert result["retracement_pct"] >= 0.5
+
+    def test_no_data_available_is_no_gap_not_an_error(self):
+        with patch("market_data.get_historical_bars", return_value=[]):
+            result = market_data.check_gap_confirmation("AAPL")
+        assert result["status"] == "no_gap"

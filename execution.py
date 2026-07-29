@@ -23,7 +23,7 @@ log = logging.getLogger(__name__)
 # Approval-driven execution (auto-execute pipeline + Telegram Approve button)
 # ---------------------------------------------------------------------------
 
-def execute_approved(approval: dict, trigger: str = "telegram") -> bool:
+def execute_approved(approval: dict, trigger: str = "telegram", gap_retry_attempt: int = 1) -> bool:
     """
     Submit the approved order to IBKR via TWS, log the trade and stop.
 
@@ -31,6 +31,11 @@ def execute_approved(approval: dict, trigger: str = "telegram") -> bool:
     audit trail: "auto" for the crew.py pipeline (no human ever saw this),
     "telegram" for an actual Approve-button tap. Everything else about
     execution is identical regardless of trigger.
+
+    gap_retry_attempt counts opening-gap-confirmation re-checks (see the
+    gap-confirmation block below and tasks.retry_deferred_entry) -- distinct
+    from the market-hours-closed retry, which always starts a fresh attempt
+    count of 1.
 
     Returns True on success.
     """
@@ -241,6 +246,73 @@ def execute_approved(approval: dict, trigger: str = "telegram") -> bool:
                     f"[{ticker}] Price drift {drift:.1%} since sizing on SELL "
                     f"(was ${price_at_sizing:.2f}, now ${current_price_pre:.2f}) — proceeding anyway"
                 )
+
+        # Opening-gap confirmation — added 2026-07-29 after TER: a stock
+        # that gaps hard on an overnight catalyst can give the entire move
+        # back within the first half hour once real regular-session volume
+        # shows up (premarket/opening price discovery runs on a fraction of
+        # normal volume). This is a separate check from the drift guard
+        # above -- drift compares against price_at_sizing and can pass
+        # cleanly even for a real gap if the analysis itself was done after
+        # the gap already happened. Only gates BUYs; a risk-reducing SELL
+        # is never held up waiting for confirmation.
+        if side == "BUY":
+            try:
+                from market_data import check_gap_confirmation
+                from config import GAP_CONFIRMATION_MAX_RETRIES, GAP_CONFIRMATION_RETRY_MINUTES
+                gap = check_gap_confirmation(ticker)
+                if gap["status"] == "failed":
+                    log.error(
+                        f"[{ticker}] Opening gap already reversing "
+                        f"({gap['retracement_pct']:.0%} given back of a {gap['gap_pct']:.1%} gap) "
+                        f"— aborting {action} rather than chase a fading move"
+                    )
+                    alert_module._send(
+                        f"⚠️ ORDER ABORTED — Gap Reversing\n"
+                        f"<b>{ticker}</b> gapped {gap['gap_pct']:+.1%} from prior close "
+                        f"(${gap['prior_close']:.2f} → ${gap['open_price']:.2f}) but has already "
+                        f"given back {gap['retracement_pct']:.0%} of that move "
+                        f"(now ${gap['current_price']:.2f}). Skipping — this looks like a fade, "
+                        f"not a move that's holding."
+                    )
+                    return False
+                if gap["status"] == "pending":
+                    if gap_retry_attempt >= GAP_CONFIRMATION_MAX_RETRIES:
+                        log.warning(
+                            f"[{ticker}] Opening gap ({gap['gap_pct']:+.1%}) never confirmed "
+                            f"within {GAP_CONFIRMATION_MAX_RETRIES} checks — giving up"
+                        )
+                        alert_module._send(
+                            f"⚠️ ORDER SKIPPED — Gap Unconfirmed\n"
+                            f"<b>{ticker}</b> gapped {gap['gap_pct']:+.1%} but price action never "
+                            f"clearly confirmed or failed within the check window. Skipping this "
+                            f"entry rather than guess — re-run analysis if the thesis still holds."
+                        )
+                        return False
+                    from datetime import datetime, timedelta, timezone
+                    eta = datetime.now(timezone.utc) + timedelta(minutes=GAP_CONFIRMATION_RETRY_MINUTES)
+                    log.info(
+                        f"[{ticker}] Opening gap ({gap['gap_pct']:+.1%}) not yet confirmed "
+                        f"(attempt {gap_retry_attempt}/{GAP_CONFIRMATION_MAX_RETRIES}) — "
+                        f"re-checking at {eta.isoformat()}"
+                    )
+                    try:
+                        from tasks import retry_deferred_entry
+                        retry_deferred_entry.apply_async(
+                            args=[approval["id"], gap_retry_attempt + 1], eta=eta, queue="ops",
+                        )
+                    except Exception as e:
+                        log.error(f"[{ticker}] Could not schedule gap re-check: {e}")
+                    alert_module._send(
+                        f"⏸️ WAITING FOR CONFIRMATION — {ticker}\n"
+                        f"Gapped {gap['gap_pct']:+.1%} from prior close — waiting to see if the "
+                        f"move holds before entering (check {gap_retry_attempt}/{GAP_CONFIRMATION_MAX_RETRIES}). "
+                        f"Will re-check in {GAP_CONFIRMATION_RETRY_MINUTES} min."
+                    )
+                    return False
+                # "confirmed" or "no_gap" -- proceed normally.
+            except Exception as e:
+                log.warning(f"[{ticker}] Gap-confirmation check failed, proceeding: {e}")
 
         if side == "SELL":
             # Cancel the existing broker stop only now that the sell is

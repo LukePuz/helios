@@ -109,6 +109,27 @@ TRAILING_STOP_DISTANCE: dict[str, tuple[float, float]] = {
 REBUY_COOLDOWN_HOURS = 4
 
 # ---------------------------------------------------------------------------
+# Opening-gap confirmation
+# ---------------------------------------------------------------------------
+# Incident 2026-07-29 (TER): an earnings gap-up doesn't tell you whether the
+# move holds or fades -- premarket/opening price discovery runs on a small
+# fraction of regular-session volume, and big gaps are routinely given back
+# within the first half hour. A BUY (OPEN/ADD) into a gap of at least this
+# size from the prior close waits for agents.price_action-style confirmation
+# (is the open holding, not already reversing) instead of firing the moment
+# the market-hours gate clears -- see execution.execute_approved and
+# market_data.check_gap_confirmation.
+GAP_CONFIRMATION_THRESHOLD_PCT = 0.05
+# If price has already given back this fraction of the gap (open vs prior
+# close) the move is judged to be failing -- don't buy into a reversing gap.
+GAP_FAIL_RETRACEMENT_PCT = 0.5
+# How many times to re-check an unresolved (neither confirmed nor failed)
+# gap before giving up -- bounds the retry chain to a fixed window after
+# the open rather than deferring indefinitely.
+GAP_CONFIRMATION_MAX_RETRIES = 3
+GAP_CONFIRMATION_RETRY_MINUTES = 5
+
+# ---------------------------------------------------------------------------
 # Sell behaviour
 # ---------------------------------------------------------------------------
 TRIM_FRACTION = 0.33   # analyst TRIM sells this fraction of the held position

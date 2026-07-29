@@ -301,3 +301,125 @@ class TestStalePriceBuyGuard:
         mock_order.assert_called_once()
         mock_sleep.assert_not_called()
         assert mock_quote.call_count == 1  # no retry loop for a SELL
+
+
+class TestGapConfirmationGuard:
+    """Regression coverage for the 2026-07-29 TER incident's second half:
+    even with a genuinely fresh price, execution.execute_approved had no
+    concept of "this gap hasn't been confirmed yet" -- it would fire the
+    instant the market-hours gate cleared. market_data.check_gap_confirmation
+    now gates every BUY; these tests cover execution.py's handling of its
+    three real outcomes plus the "give up" case."""
+
+    def _fresh_quote(self, price=110.0):
+        return {"price": price, "is_stale": False, "age_minutes": 1.0, "market_open": True}
+
+    def test_buy_proceeds_when_gap_confirmed(self):
+        approval = _approval(action="ADD", price_at_sizing=108.0)
+
+        with patch("ibkr.get_ib"), \
+             patch("ibkr.get_client"), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("ibkr.place_market_order") as mock_order, \
+             patch("market_data.get_priced_quote", return_value=self._fresh_quote()), \
+             patch("market_data.check_gap_confirmation",
+                   return_value={"status": "confirmed", "gap_pct": 0.10, "retracement_pct": 0.1,
+                                 "open_price": 110.0, "prior_close": 100.0, "current_price": 109.0}), \
+             patch("market_data.is_market_hours", return_value=True), \
+             patch("config.USE_BRACKET_ORDERS", False), \
+             patch("db.log_trade"), patch("db.log_order", return_value=1), \
+             patch("db.upsert_position_stop"), patch("db.set_stop_broker_order_id"), \
+             patch("db.log_trade_outcome"), patch("alerts._send"), \
+             patch("alerts.send_trade_alert"):
+            mock_rm_cls.return_value.is_halted.return_value = False
+            mock_order.return_value = {"order_id": 1, "fill_price": 110.0, "filled_qty": 100.0}
+            result = execution.execute_approved(approval)
+
+        assert result is True
+        mock_order.assert_called_once()
+
+    def test_buy_aborts_when_gap_already_failed(self):
+        approval = _approval(action="ADD", price_at_sizing=108.0)
+
+        with patch("ibkr.get_ib"), \
+             patch("ibkr.get_client"), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("ibkr.place_market_order") as mock_order, \
+             patch("market_data.get_priced_quote", return_value=self._fresh_quote()), \
+             patch("market_data.check_gap_confirmation",
+                   return_value={"status": "failed", "gap_pct": 0.10, "retracement_pct": 0.6,
+                                 "open_price": 110.0, "prior_close": 100.0, "current_price": 104.0}), \
+             patch("market_data.is_market_hours", return_value=True), \
+             patch("alerts._send") as mock_alert:
+            mock_rm_cls.return_value.is_halted.return_value = False
+            result = execution.execute_approved(approval)
+
+        assert result is False
+        mock_order.assert_not_called()
+        assert "Gap Reversing" in mock_alert.call_args[0][0]
+
+    def test_buy_defers_and_reschedules_when_gap_pending(self):
+        approval = _approval(action="ADD", price_at_sizing=108.0)
+
+        with patch("ibkr.get_ib"), \
+             patch("ibkr.get_client"), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("ibkr.place_market_order") as mock_order, \
+             patch("market_data.get_priced_quote", return_value=self._fresh_quote()), \
+             patch("market_data.check_gap_confirmation",
+                   return_value={"status": "pending", "gap_pct": 0.10, "retracement_pct": 0.2,
+                                 "open_price": 110.0, "prior_close": 100.0, "current_price": 108.0}), \
+             patch("market_data.is_market_hours", return_value=True), \
+             patch("tasks.retry_deferred_entry") as mock_retry_task, \
+             patch("alerts._send") as mock_alert:
+            mock_rm_cls.return_value.is_halted.return_value = False
+            result = execution.execute_approved(approval, gap_retry_attempt=1)
+
+        assert result is False
+        mock_order.assert_not_called()
+        mock_retry_task.apply_async.assert_called_once()
+        assert mock_retry_task.apply_async.call_args.kwargs["args"] == [approval["id"], 2]
+        assert "WAITING FOR CONFIRMATION" in mock_alert.call_args[0][0]
+
+    def test_buy_gives_up_when_gap_pending_at_max_retries(self):
+        """Bounded retry chain -- must not defer forever."""
+        approval = _approval(action="ADD", price_at_sizing=108.0)
+
+        with patch("ibkr.get_ib"), \
+             patch("ibkr.get_client"), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("ibkr.place_market_order") as mock_order, \
+             patch("market_data.get_priced_quote", return_value=self._fresh_quote()), \
+             patch("market_data.check_gap_confirmation",
+                   return_value={"status": "pending", "gap_pct": 0.10, "retracement_pct": 0.2,
+                                 "open_price": 110.0, "prior_close": 100.0, "current_price": 108.0}), \
+             patch("market_data.is_market_hours", return_value=True), \
+             patch("tasks.retry_deferred_entry") as mock_retry_task, \
+             patch("alerts._send") as mock_alert:
+            mock_rm_cls.return_value.is_halted.return_value = False
+            result = execution.execute_approved(approval, gap_retry_attempt=3)
+
+        assert result is False
+        mock_order.assert_not_called()
+        mock_retry_task.apply_async.assert_not_called()
+        assert "Gap Unconfirmed" in mock_alert.call_args[0][0]
+
+    def test_sell_never_calls_gap_confirmation(self):
+        approval = _approval(action="EXIT", shares_initial=100)
+        position = MagicMock(qty=100.0)
+
+        with patch("ibkr.get_ib"), \
+             patch("ibkr.get_client") as mock_client, \
+             patch("ibkr.place_market_order") as mock_order, \
+             patch("ibkr.cancel_stop_orders_for", return_value=0), \
+             patch("market_data.get_priced_quote", return_value=self._fresh_quote(price=100.0)), \
+             patch("market_data.check_gap_confirmation") as mock_gap, \
+             patch("db.log_trade"), patch("db.log_order"), patch("db.delete_position_stop"), \
+             patch("db.close_trade_outcome"), patch("db.log_trade_outcome"), \
+             patch("alerts._send"), patch("alerts.send_trade_alert"):
+            mock_client.return_value.get_open_position.return_value = position
+            mock_order.return_value = {"order_id": 58, "fill_price": 100.0, "filled_qty": 100.0}
+            result = execution.execute_approved(approval)
+
+        assert result is True
+        mock_gap.assert_not_called()

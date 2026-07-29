@@ -505,25 +505,27 @@ def analyze_candidates(self, candidates: list, max_per_run: int = 5):
 
 
 @app.task(name="tasks.retry_deferred_entry", bind=True, max_retries=0)
-def retry_deferred_entry(self, approval_id: int):
+def retry_deferred_entry(self, approval_id: int, gap_retry_attempt: int = 1):
     """
-    Single retry for a new-entry (OPEN/ADD) approval that execution.
-    execute_approved deferred because the market was closed at analysis
-    time — scheduled via market_data.next_market_open() at the moment of
-    deferral (see execute_approved's market-hours gate). Added 2026-07-28
-    alongside the move to a 5:00 AM ET wake: pre-market analysis now
-    routinely finishes well before 9:30, and without this the
-    recommendation would just sit FAILED until something else happened to
-    re-trigger fresh analysis.
+    Retry for a new-entry (OPEN/ADD) approval that execution.execute_approved
+    deferred, either because the market was closed at analysis time
+    (scheduled via market_data.next_market_open() -- see execute_approved's
+    market-hours gate, added 2026-07-28 alongside the 5:00 AM ET wake) or
+    because an opening gap hasn't yet been confirmed as holding vs. fading
+    (scheduled via config.GAP_CONFIRMATION_RETRY_MINUTES -- see
+    execute_approved's gap-confirmation block, added 2026-07-29).
+    gap_retry_attempt threads through only the latter case, counting
+    against config.GAP_CONFIRMATION_MAX_RETRIES so that chain is bounded
+    to a fixed window after the open rather than deferring indefinitely.
 
     Deliberately does NOT re-run the 72B analysis — reuses
-    execute_approved's own price-drift guard (aborts if price moved >8%
-    since the original sizing) as the safety check against firing a
-    now-stale decision. If the market is somehow still closed when this
-    fires (holiday, clock skew), execute_approved's gate defers it again
-    with a fresh retry scheduled for the next computed open — self-
-    correcting, not a tight loop, since each retry target is strictly
-    later than the last and real time keeps moving forward.
+    execute_approved's own price-drift and gap-confirmation guards as the
+    safety check against firing a now-stale decision. If the market is
+    somehow still closed when this fires (holiday, clock skew), or the gap
+    still hasn't resolved, execute_approved's gates defer it again with a
+    fresh retry — self-correcting, not a tight loop, since each retry
+    target is strictly later than the last and real time keeps moving
+    forward (and the gap-confirmation path has its own hard retry cap).
     """
     import db
     from execution import execute_approved
@@ -540,10 +542,10 @@ def retry_deferred_entry(self, approval_id: int):
         return
 
     ticker = approval.get("ticker", "?")
-    success = execute_approved(approval, trigger="auto_retry")
+    success = execute_approved(approval, trigger="auto_retry", gap_retry_attempt=gap_retry_attempt)
     db.update_approval_status(approval_id, "APPROVED" if success else "FAILED")
     log.info(f"retry_deferred_entry: [{ticker}] approval #{approval_id} "
-             f"{'executed' if success else 'still failed'} on market-open retry")
+             f"{'executed' if success else 'still failed'} on retry (gap_attempt={gap_retry_attempt})")
 
 
 @app.task(name="tasks.reconcile_unconfirmed_orders", bind=True, max_retries=2)

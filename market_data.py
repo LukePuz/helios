@@ -120,6 +120,73 @@ def get_priced_quote(ticker: str) -> dict | None:
         return None
 
 
+def check_gap_confirmation(ticker: str) -> dict:
+    """
+    Judges whether an opening gap (today's open vs. the prior day's close)
+    is holding or already fading. Added 2026-07-29 after TER: a stock that
+    gaps up hard on an overnight catalyst can give the whole move back
+    within the first half hour once real regular-session volume shows up --
+    premarket/opening price discovery runs on a fraction of normal volume
+    and isn't a reliable "this is the new price" signal on its own.
+
+    Returns {"status": "no_gap"|"confirmed"|"pending"|"failed",
+             "gap_pct": float|None, "retracement_pct": float|None,
+             "open_price": float|None, "prior_close": float|None,
+             "current_price": float|None}
+
+    - "no_gap": the open didn't move enough from the prior close (below
+      config.GAP_CONFIRMATION_THRESHOLD_PCT) for this check to apply --
+      the ordinary drift guard governs.
+    - "pending": a real gap, but not enough 1-min bars yet since the open
+      to tell whether it's holding or fading.
+    - "confirmed": a real gap, and price hasn't given back
+      config.GAP_FAIL_RETRACEMENT_PCT of it after enough bars to judge.
+    - "failed": a real gap that has already given back that fraction or
+      more -- judged to be reversing, not holding.
+    """
+    from config import GAP_CONFIRMATION_THRESHOLD_PCT, GAP_FAIL_RETRACEMENT_PCT
+
+    empty = {"status": "no_gap", "gap_pct": None, "retracement_pct": None,
+             "open_price": None, "prior_close": None, "current_price": None}
+    try:
+        daily = get_historical_bars(ticker, duration="2 D", bar_size="1 day")
+        intraday = get_historical_bars(ticker, duration="1 D", bar_size="1 min")
+        if not daily or not intraday:
+            return empty
+
+        prior_close = float(daily[-1]["close"])
+        open_price = float(intraday[0]["open"])
+        current_price = float(intraday[-1]["close"])
+        bars_since_open = len(intraday)
+
+        if not prior_close:
+            return empty
+
+        gap_pct = (open_price - prior_close) / prior_close
+        if abs(gap_pct) < GAP_CONFIRMATION_THRESHOLD_PCT:
+            return {**empty, "gap_pct": gap_pct, "open_price": open_price,
+                    "prior_close": prior_close, "current_price": current_price}
+
+        gap_size = open_price - prior_close
+        retracement = ((open_price - current_price) / gap_size) if gap_size else 0.0
+
+        result = {
+            "gap_pct": gap_pct, "retracement_pct": retracement,
+            "open_price": open_price, "prior_close": prior_close,
+            "current_price": current_price,
+        }
+        if retracement >= GAP_FAIL_RETRACEMENT_PCT:
+            result["status"] = "failed"
+        elif bars_since_open < 10:
+            result["status"] = "pending"
+        else:
+            result["status"] = "confirmed"
+        return result
+    except Exception as e:
+        log.warning(f"check_gap_confirmation({ticker}) failed: {e}")
+        return empty
+
+
 def get_latest_quotes(symbols: list[str]) -> dict[str, dict]:
     """
     Returns latest known price per symbol with staleness metadata.

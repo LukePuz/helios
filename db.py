@@ -682,17 +682,32 @@ def has_active_approval(ticker: str) -> bool:
 
 
 def get_last_executed_approval(ticker: str, hours: int) -> dict | None:
-    """Most recent APPROVED OPEN/ADD for this ticker within the lookback
+    """Most recent decided OPEN/ADD for this ticker within the lookback
     window, or None. Used to cool down repeat buys — auto-execute completes
     a decision within seconds, so has_active_approval's PENDING/PROCESSING
     check alone doesn't stop the next independent event from re-buying the
-    same ticker minutes later."""
+    same ticker minutes later.
+
+    Originally matched status='APPROVED' only -- but a market-closed
+    deferral (execution.execute_approved's market-hours gate, 2026-07-28)
+    leaves an approval at status='FAILED' with a retry scheduled for the
+    next open, and an APPROVED-only filter couldn't see that as "already
+    decided." Incident 2026-07-29: the same Teradyne earnings release,
+    covered by six different outlets, independently triggered six full
+    analyses pre-market; each deferred (never reached APPROVED), so this
+    cooldown never blocked the next one, and all six retried and executed
+    within the same 20-second window at the open -- 6x the intended
+    position, bought chasing the top of the day's gap. FAILED now counts
+    too, so the first analysis's deferral alone is enough to cool down a
+    same-or-lower-conviction duplicate. EXPIRED/REJECTED are deliberately
+    excluded -- a stale-and-discarded or human-vetoed recommendation
+    shouldn't suppress a fresh, independent read on the same ticker."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT conviction, decided_at FROM pending_approvals "
-                "WHERE ticker=%s AND action IN ('OPEN','ADD') AND status='APPROVED' "
+                "WHERE ticker=%s AND action IN ('OPEN','ADD') AND status IN ('APPROVED','FAILED') "
                 "AND decided_at > NOW() - (%s || ' hours')::interval "
                 "ORDER BY decided_at DESC LIMIT 1",
                 (ticker, hours),

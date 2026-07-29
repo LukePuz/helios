@@ -156,6 +156,25 @@ def execute_approved(approval: dict, trigger: str = "telegram") -> bool:
         try:
             from market_data import get_priced_quote
             pq = get_priced_quote(ticker)
+            if pq and pq["is_stale"] and side == "BUY":
+                # Incident 2026-07-29 (TER): right at the open, IBKR's
+                # intraday 1-min bars aren't populated yet ("HMDS query
+                # returned no data"), so get_priced_quote falls back to a
+                # daily-bar close that can be many hours old. The staleness
+                # was correctly detected and logged/alerted below, but the
+                # drift check still used that stale price for the
+                # comparison -- against a price_at_sizing computed from the
+                # same pre-gap close, so it looked like ~0% drift and six
+                # queued market-open retries all bought straight into a
+                # ~13% earnings gap with the guard never firing. Give the
+                # intraday feed a few seconds to catch up (it usually does)
+                # before treating the price as unusable for a BUY.
+                import time as _time
+                for _ in range(3):
+                    _time.sleep(3)
+                    pq = get_priced_quote(ticker)
+                    if pq and not pq["is_stale"]:
+                        break
             if pq:
                 current_price_pre = pq["price"]
                 if pq["is_stale"]:
@@ -163,6 +182,30 @@ def execute_approved(approval: dict, trigger: str = "telegram") -> bool:
                         f"[{ticker}] Price is STALE (age={pq['age_minutes']}min, "
                         f"market_open={pq['market_open']}) — drift check unreliable"
                     )
+                    if side == "BUY":
+                        # A stale price can't rule out a large gap since
+                        # sizing -- proceeding would compare a stale price
+                        # to itself and silently defeat the drift guard
+                        # (exactly what let TER's six retries chase a 13%
+                        # gap). Abort rather than buy blind; sells are
+                        # unaffected -- a risk-reducing order already
+                        # proceeds through drift by design (see below).
+                        log.error(
+                            f"[{ticker}] Could not get a fresh price after retries — "
+                            f"aborting {action} rather than risk an unguarded gap"
+                        )
+                        try:
+                            alert_module._send(
+                                f"⚠️ ORDER ABORTED — Price Unavailable\n"
+                                f"<b>{ticker}</b> {action}: only a stale price "
+                                f"(${current_price_pre:.2f}, from a bar the freshness "
+                                f"check rejected) was available — can't rule out a "
+                                f"large gap since this was sized. Re-run analysis or "
+                                f"check TWS."
+                            )
+                        except Exception:
+                            pass
+                        return False
                     try:
                         alert_module._send(
                             f"⚠️ STALE PRICE — {ticker}\n"

@@ -216,3 +216,88 @@ class TestMarketHoursGate:
             execution.execute_approved(approval)
 
         mock_order.assert_called_once()
+
+
+class TestStalePriceBuyGuard:
+    """Regression coverage for the 2026-07-29 TER incident: right at market
+    open, IBKR's intraday bars aren't populated yet, so get_priced_quote
+    falls back to a stale daily close. That stale price used to be fed
+    straight into the drift check, which then compared it against a
+    price_at_sizing computed from the same pre-gap close -- ~0% apparent
+    drift, guard never fires. Six queued retries all bought into a ~13%
+    earnings gap this way. A BUY now retries briefly for a fresh quote and
+    aborts rather than compare stale-to-stale; SELLs are unaffected."""
+
+    def _stale_quote(self, price=100.0):
+        return {"price": price, "is_stale": True, "age_minutes": 2251.0, "market_open": True}
+
+    def _fresh_quote(self, price=100.0):
+        return {"price": price, "is_stale": False, "age_minutes": 1.0, "market_open": True}
+
+    def test_buy_aborts_when_price_stays_stale_after_retries(self):
+        approval = _approval(action="ADD", price_at_sizing=100.0)
+
+        with patch("ibkr.get_ib"), \
+             patch("ibkr.get_client"), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("ibkr.place_market_order") as mock_order, \
+             patch("market_data.get_priced_quote", return_value=self._stale_quote()), \
+             patch("market_data.is_market_hours", return_value=True), \
+             patch("time.sleep"), \
+             patch("alerts._send") as mock_alert:
+            mock_rm_cls.return_value.is_halted.return_value = False
+            result = execution.execute_approved(approval)
+
+        assert result is False
+        mock_order.assert_not_called()
+        assert "Price Unavailable" in mock_alert.call_args[0][0]
+
+    def test_buy_proceeds_once_price_turns_fresh_within_retries(self):
+        """The intraday feed catching up mid-retry (the common case) must
+        let the order proceed with the now-fresh price, not abort."""
+        approval = _approval(action="ADD", price_at_sizing=100.0)
+        quotes = [self._stale_quote(), self._stale_quote(), self._fresh_quote(price=102.0)]
+
+        with patch("ibkr.get_ib"), \
+             patch("ibkr.get_client"), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("ibkr.place_market_order") as mock_order, \
+             patch("ibkr.get_latest_price", return_value=102.0), \
+             patch("market_data.get_priced_quote", side_effect=quotes), \
+             patch("market_data.is_market_hours", return_value=True), \
+             patch("config.USE_BRACKET_ORDERS", False), \
+             patch("time.sleep"), \
+             patch("db.log_trade"), patch("db.log_order", return_value=1), \
+             patch("db.upsert_position_stop"), patch("db.set_stop_broker_order_id"), \
+             patch("db.log_trade_outcome"), patch("alerts._send"), \
+             patch("alerts.send_trade_alert"):
+            mock_rm_cls.return_value.is_halted.return_value = False
+            mock_order.return_value = {"order_id": 1, "fill_price": 102.0, "filled_qty": 100.0}
+            result = execution.execute_approved(approval)
+
+        assert result is True
+        mock_order.assert_called_once()
+
+    def test_sell_proceeds_despite_stale_price_no_retry(self):
+        """A stale price must never block or delay a risk-reducing sell --
+        only BUYs get the retry-then-abort treatment."""
+        approval = _approval(action="EXIT", shares_initial=100)
+        position = MagicMock(qty=100.0)
+
+        with patch("ibkr.get_ib"), \
+             patch("ibkr.get_client") as mock_client, \
+             patch("ibkr.place_market_order") as mock_order, \
+             patch("ibkr.cancel_stop_orders_for", return_value=0), \
+             patch("market_data.get_priced_quote", return_value=self._stale_quote(price=100.0)) as mock_quote, \
+             patch("db.log_trade"), patch("db.log_order"), patch("db.delete_position_stop"), \
+             patch("db.close_trade_outcome"), patch("db.log_trade_outcome"), \
+             patch("time.sleep") as mock_sleep, \
+             patch("alerts._send"), patch("alerts.send_trade_alert"):
+            mock_client.return_value.get_open_position.return_value = position
+            mock_order.return_value = {"order_id": 57, "fill_price": 100.0, "filled_qty": 100.0}
+            result = execution.execute_approved(approval)
+
+        assert result is True
+        mock_order.assert_called_once()
+        mock_sleep.assert_not_called()
+        assert mock_quote.call_count == 1  # no retry loop for a SELL

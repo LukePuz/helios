@@ -154,7 +154,16 @@ class TestReconciliationAlertThrottle:
     2026-07-28: this task no longer sends to Telegram at all (user
     request) — the per-issue throttle below still governs the WARNING-
     level log line, which is what these tests now check via caplog
-    instead of an alerts._send mock."""
+    instead of an alerts._send mock.
+
+    2026-07-30 (KLAC): the orphan-cancel branch now requires a ticker to
+    look positionless on two consecutive cycles before actually
+    cancelling anything (see reconcile_stop_orders' docstring) — a
+    single missing-this-cycle reading just arms a marker and waits, since
+    a real incident showed that single reading can be a momentarily-stale
+    portfolio cache rather than a genuinely closed position. Tests below
+    call _run_reconcile an extra time to reach the confirmed cycle before
+    asserting on the cancel/alert."""
 
     def _run_reconcile(self, state, open_orders, caplog, cancel_returns=True):
         import logging
@@ -178,12 +187,25 @@ class TestReconciliationAlertThrottle:
             tasks.reconcile_stop_orders.run()
         return sum(1 for r in caplog.records if "new/unthrottled" in r.message)
 
+    def test_single_cycle_miss_does_not_cancel_orphaned_stop(self, caplog):
+        """The KLAC bug this guards against: one cycle reading a position
+        as missing must not be enough to cancel its stop -- only arm the
+        pending-confirmation marker."""
+        order = {"order_id": 999, "ticker": "SNDK", "action": "SELL", "order_type": "STP",
+                 "qty": 12.0, "stop_price": 1332.93, "status": "PreSubmitted"}
+        state = {}
+        armed_count = self._run_reconcile(state, [order], caplog)
+
+        assert armed_count == 0
+        assert state.get("orphan_pending_SNDK")  # marker set, nothing cancelled yet
+
     def test_repeat_orphan_cancel_for_same_order_does_not_realert(self, caplog):
         order = {"order_id": 999, "ticker": "SNDK", "action": "SELL", "order_type": "STP",
                  "qty": 12.0, "stop_price": 1332.93, "status": "PreSubmitted"}
         state = {}
-        first_count  = self._run_reconcile(state, [order], caplog)
-        second_count = self._run_reconcile(state, [order], caplog)  # same order still "orphaned" next cycle
+        self._run_reconcile(state, [order], caplog)                # cycle 1: arms the marker
+        first_count  = self._run_reconcile(state, [order], caplog)  # cycle 2: confirmed -> cancels + alerts
+        second_count = self._run_reconcile(state, [order], caplog)  # cycle 3: marker cleared post-cancel -> re-arms, no alert
 
         assert first_count == 1
         assert second_count == 0
@@ -195,11 +217,13 @@ class TestReconciliationAlertThrottle:
         order_b = {"order_id": 2, "ticker": "BBB", "action": "SELL", "order_type": "STP",
                    "qty": 1.0, "stop_price": 20.0, "status": "PreSubmitted"}
 
-        first_count  = self._run_reconcile(state, [order_a], caplog)
-        second_count = self._run_reconcile(state, [order_b], caplog)
+        self._run_reconcile(state, [order_a], caplog)                # arm A
+        first_count  = self._run_reconcile(state, [order_a], caplog)  # confirm + cancel A
+        self._run_reconcile(state, [order_b], caplog)                # arm B (independent marker)
+        second_count = self._run_reconcile(state, [order_b], caplog)  # confirm + cancel B
 
         assert first_count == 1
-        assert second_count == 1  # a genuinely new/different order still logs promptly
+        assert second_count == 1  # a genuinely new/different order still logs promptly, once confirmed
 
     def test_ingestion_health_same_stale_sources_do_not_realert(self):
         state = {}
@@ -466,3 +490,102 @@ class TestSystemStateKeyLength:
         issue_key = "ingestion_" + "_".join(sorted(stale_sources))
         state_key = f"reconcile_alert_{issue_key}"
         assert len(state_key) <= 200
+
+
+class TestNoStopTelegramEscalation:
+    """2026-07-30 (AMD): the "no protective stop" case was silent (log
+    only) since 2026-07-28, alongside the routine orphan-cancel noise it
+    was actually meant to quiet. A real 50-share naked AMD position fired
+    this check every 15 minutes for ~30 hours with nobody seeing it.
+    Escalates to Telegram once a ticker has been continuously unstopped
+    for 45+ minutes (not on first sighting -- a TRIM/replace can leave a
+    position briefly unstopped for one ordinary cycle), throttled after
+    that on the normal RECONCILE_ALERT_THROTTLE_HOURS cadence."""
+
+    def _run(self, state, held_qty=50.0):
+        client = MagicMock()
+        client.get_all_positions.return_value = [MagicMock(symbol="AMD", qty=held_qty)]
+
+        def fake_get_state(key, default=None):
+            return state.get(key, default)
+
+        def fake_set_state(key, value):
+            state[key] = value
+
+        with patch("ibkr.get_client", return_value=client), \
+             patch("ibkr.get_open_orders", return_value=[]), \
+             patch("db.get_all_position_stops", return_value=[]), \
+             patch("db.get_state", side_effect=fake_get_state), \
+             patch("db.set_state", side_effect=fake_set_state), \
+             patch("alerts._send") as mock_alert:
+            tasks.reconcile_stop_orders.run()
+        return mock_alert
+
+    def test_first_sighting_does_not_alert_telegram(self):
+        state = {}
+        mock_alert = self._run(state)
+
+        mock_alert.assert_not_called()
+        assert state.get("no_stop_since_AMD")  # marker armed for next cycle
+
+    def test_sustained_45_minutes_escalates_to_telegram(self):
+        from datetime import datetime, timedelta, timezone
+        state = {"no_stop_since_AMD": (datetime.now(timezone.utc) - timedelta(minutes=50)).isoformat()}
+
+        mock_alert = self._run(state)
+
+        mock_alert.assert_called_once()
+        assert "AMD" in mock_alert.call_args[0][0]
+
+    def test_escalation_is_throttled_on_repeat_cycles(self):
+        from datetime import datetime, timedelta, timezone
+        state = {"no_stop_since_AMD": (datetime.now(timezone.utc) - timedelta(minutes=50)).isoformat()}
+        self._run(state)  # first escalation fires and sets its own throttle key
+
+        mock_alert = self._run(state)  # still unstopped 15 min later, throttle window not elapsed
+
+        mock_alert.assert_not_called()
+
+
+class TestBackstopSellRetry:
+    """2026-07-29 (AMD): a backstop sell that got no fill (submitted
+    after-hours -- IBKR queues rather than fills within the 30s wait) used
+    to just log an error and give up. The exact position this function
+    exists to protect sat naked for ~30 hours because nothing ever
+    retried. A zero-fill result now schedules retry_backstop_sell instead
+    of dropping the problem."""
+
+    def _alert(self):
+        return {"ticker": "AMD", "action": "EXIT", "current_price": 500.0,
+                "stop_price": 425.02, "reason": "Stop triggered at $425.02 (current $500.00)"}
+
+    def test_zero_fill_schedules_retry(self):
+        alert = self._alert()
+        with patch("ibkr.get_client") as mock_get_client, \
+             patch("ibkr.cancel_stop_orders_for"), \
+             patch("ibkr.place_market_order", return_value={"filled_qty": 0, "order_id": 1122}), \
+             patch("market_data.is_market_hours", return_value=False), \
+             patch("market_data.next_market_open") as mock_next_open, \
+             patch("tasks.retry_backstop_sell") as mock_retry_task:
+            mock_get_client.return_value.get_open_position.return_value = MagicMock(qty=50.0)
+            result = tasks._execute_backstop_sell("AMD", alert)
+
+        assert result is False
+        mock_retry_task.apply_async.assert_called_once()
+        _, kwargs = mock_retry_task.apply_async.call_args
+        assert kwargs["args"] == ["AMD", alert]
+        assert kwargs["eta"] == mock_next_open.return_value
+
+    def test_successful_fill_does_not_schedule_retry(self):
+        alert = self._alert()
+        with patch("ibkr.get_client") as mock_get_client, \
+             patch("ibkr.cancel_stop_orders_for"), \
+             patch("ibkr.place_market_order",
+                   return_value={"filled_qty": 50.0, "fill_price": 424.0, "order_id": 1122}), \
+             patch("db.log_trade"), patch("db.delete_position_stop"), patch("db.close_trade_outcome"), \
+             patch("tasks.retry_backstop_sell") as mock_retry_task:
+            mock_get_client.return_value.get_open_position.return_value = MagicMock(qty=50.0)
+            result = tasks._execute_backstop_sell("AMD", alert)
+
+        assert result is True
+        mock_retry_task.apply_async.assert_not_called()

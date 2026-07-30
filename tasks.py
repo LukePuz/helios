@@ -579,19 +579,31 @@ def reconcile_unconfirmed_orders(self):
     record -- invisible to every other safety system, since they all read
     the DB, not the broker directly.
 
-    Runs against every 'unconfirmed' order from the last 24h, checking
+    Runs against every 'unconfirmed' order from the last 30 days, checking
     IBKR's own execution record (ibkr.get_fill_for_order) rather than
     trusting the original wait-window snapshot. A match here is a
     confirmed broker execution, not a guess -- recording it doesn't fall
     under the "never fabricate a fill" rule that governs the unconfirmed
     path itself.
+
+    Incident 2026-07-30: this originally looked back only 24h, on the
+    assumption a stale snapshot would get caught quickly. In practice 8
+    orders across 7 tickers (SNOW, AMD x2, TSLA, CRM, AMKR, ORCL, CRWD)
+    aged past that window unreconciled over the course of a week -- for
+    AMD and ORCL specifically, the un-reconciled fill left real shares at
+    the broker with no DB record and no stop, invisible to every other
+    safety check the same way the original CRWD incident was. 30 days is
+    deliberately generous rather than tuned to "how long this should
+    normally take" -- an order stuck unconfirmed this long is itself a
+    symptom of a bug elsewhere, and the check is cheap (one indexed query)
+    however far back it looks.
     """
     import db
     import ibkr
     import alerts
 
     try:
-        pending = db.get_unconfirmed_orders(max_age_hours=24)
+        pending = db.get_unconfirmed_orders(max_age_hours=24 * 30)
     except Exception as e:
         log.error(f"reconcile_unconfirmed_orders: could not load unconfirmed orders: {e}")
         raise self.retry(exc=e, countdown=120)
@@ -748,10 +760,38 @@ def review_positions(self):
         raise self.retry(exc=e, countdown=300)
 
 
-def _execute_backstop_sell(ticker: str, alert: dict) -> bool:
+def _schedule_backstop_retry(ticker: str, alert: dict) -> None:
+    """Queue a retry_backstop_sell for a backstop attempt that placed an
+    order but got no fill (most commonly: submitted after the close, so
+    IBKR queued it for next open per warning 399 instead of filling within
+    the 30s wait). Retries at next_market_open() if the market's closed,
+    else in 5 minutes (covers a transient broker/connectivity hiccup during
+    market hours)."""
+    try:
+        from datetime import datetime, timedelta, timezone
+        from market_data import is_market_hours, next_market_open
+        eta = next_market_open() if not is_market_hours() else (
+            datetime.now(timezone.utc) + timedelta(minutes=5))
+        retry_backstop_sell.apply_async(args=[ticker, alert], eta=eta, queue="ops")
+        log.warning(f"[{ticker}] Backstop sell retry scheduled for {eta.isoformat()}")
+    except Exception as e:
+        log.error(f"[{ticker}] Could not schedule backstop-sell retry: {e}")
+
+
+def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) -> bool:
     """Market-sell the full position when its stop level is breached and no
     protective stop exists at the broker. This monitor is the last line of
-    defence for exactly that case; the sell only ever reduces exposure."""
+    defence for exactly that case; the sell only ever reduces exposure.
+
+    Incident 2026-07-29 (AMD): this used to just log an error and give up
+    when the market-sell got no fill (both attempts that evening were
+    submitted after the close and IBKR queued them for next open rather
+    than filling within the 30s wait). Nothing ever revisited it, so 50
+    shares -- the exact position this function exists to protect -- sat
+    fully naked for ~30 hours until a manual review caught it the next
+    day. A zero-fill result now schedules retry_backstop_sell instead of
+    dropping the problem.
+    """
     try:
         import ibkr
         import db
@@ -772,11 +812,13 @@ def _execute_backstop_sell(ticker: str, alert: dict) -> bool:
         if filled <= 0:
             log.error(f"[{ticker}] Backstop sell submitted but no fill confirmed "
                       f"(id={result.get('order_id')}) — nothing recorded")
+            _schedule_backstop_retry(ticker, alert)
             return False
 
         fill_price = result.get("fill_price") or alert["current_price"]
         db.log_trade(symbol=ticker, side="SELL", quantity=filled, price=fill_price,
-                     reason=f"Backstop stop-breach sell (stop ${alert['stop_price']:.2f})")
+                     reason=f"Backstop stop-breach sell (stop ${alert['stop_price']:.2f})"
+                            + (" [retry]" if _is_retry else ""))
         db.delete_position_stop(ticker)
         try:
             db.close_trade_outcome(ticker, exit_price=fill_price)
@@ -786,7 +828,24 @@ def _execute_backstop_sell(ticker: str, alert: dict) -> bool:
         return True
     except Exception as e:
         log.error(f"[{ticker}] Backstop sell FAILED: {e}")
+        if not _is_retry:
+            _schedule_backstop_retry(ticker, alert)
         return False
+
+
+@app.task(name="tasks.retry_backstop_sell", bind=True, max_retries=0)
+def retry_backstop_sell(self, ticker: str, alert: dict):
+    """Retry for a backstop stop-breach sell that _execute_backstop_sell
+    couldn't complete on the first attempt -- see that function's docstring
+    for the AMD incident this closes the loop on. Deliberately does not
+    re-check whether the stop condition still holds: if this fired, the
+    position already has zero broker-side protection, and the only open
+    question is whether the sell can go through now."""
+    success = _execute_backstop_sell(ticker, alert, _is_retry=True)
+    if success:
+        log.info(f"[{ticker}] Backstop sell succeeded on retry")
+    else:
+        log.error(f"[{ticker}] Backstop sell retry ALSO failed — still unprotected")
 
 
 @app.task(name="tasks.check_trailing_stops", bind=True, max_retries=2)
@@ -1515,15 +1574,33 @@ def reconcile_stop_orders(self):
     WARNING (see _reconcile_alert_due for the per-issue throttle) but no
     longer sent to Telegram — 2026-07-28, user request, after the
     unthrottled-repeat bug that caused this was already fixed the day
-    before. NOTE: this includes the "no protective stop" case, which is
-    the same category of gap behind the AMKR incident that same day — it's
-    silent now too, not just the routine auto-corrections. Check
-    logs/celery_worker.log for "Stop reconciliation" WARNING lines, or the
-    dashboard, if you want to keep an eye on this some other way.
+    before. That silence originally covered the "no protective stop" case
+    too (the same category of gap behind the AMKR incident that same day)
+    — as of 2026-07-30 it's escalated to Telegram again, on its own
+    sustained-duration + throttle rule below, after AMD sat fully naked
+    for ~30 hours with this firing to the log every 15 minutes the whole
+    time and nobody reading it. The routine orphan-cancel/stale-record
+    actions stay log-only. Check logs/celery_worker.log for "Stop
+    reconciliation" WARNING lines, or the dashboard, for everything else.
+
+    Incident 2026-07-29 (KLAC): client.get_all_positions() reads
+    ib_async's local portfolio cache (ib.portfolio()), populated
+    asynchronously from TWS's updatePortfolio stream rather than a
+    synchronous snapshot -- right around market open that cache can
+    briefly lag a real position by a cycle or two. This task ran at 09:32
+    ET, read a cache that didn't yet include KLAC, and cancelled its
+    legitimate 56-share stop as "orphaned" -- deleting real stop coverage
+    based on a momentarily-stale read. The orphan-cancel branch now
+    requires the SAME ticker to look positionless on two consecutive
+    15-minute cycles (a system_state-backed marker, since Celery workers
+    are stateless across runs) before actually cancelling anything. A
+    transient cache lag self-corrects within one cycle; a genuinely closed
+    position is still gone 15 minutes later.
     """
     try:
         import db
         import ibkr
+        from datetime import datetime, timezone
 
         client    = ibkr.get_client()
         held      = {p.symbol: round(abs(float(p.qty)), 4)
@@ -1534,13 +1611,30 @@ def reconcile_stop_orders(self):
         all_actions: list[str] = []   # every cycle, for the debug log
         new_actions: list[str] = []   # unthrottled — logged as warning + alerted
 
-        # 1. Orphaned broker stops — stop order with no position → cancel
+        # Clear any pending-orphan marker for tickers confirmed held this
+        # cycle -- a marker set during a transient cache lag shouldn't
+        # linger and cause a cancel on some unrelated future cycle.
+        for ticker in held:
+            db.set_state(f"orphan_pending_{ticker}", "")
+
+        # 1. Orphaned broker stops — stop order with no position on TWO
+        # consecutive cycles → cancel. A single missing-this-cycle reading
+        # just arms the marker and waits.
         for o in stops:
             if o["ticker"] not in held:
+                pending_key = f"orphan_pending_{o['ticker']}"
+                if not db.get_state(pending_key):
+                    db.set_state(pending_key, datetime.now(timezone.utc).isoformat())
+                    log.info(f"[{o['ticker']}] Stop order {o['order_id']} looks orphaned "
+                             f"(no position in this cycle's snapshot) — waiting for the next "
+                             f"cycle to confirm before cancelling")
+                    continue
                 if ibkr.cancel_order(o["order_id"]):
                     msg = (f"Cancelled ORPHANED stop: SELL {o['qty']} {o['ticker']} "
-                           f"@ ${o['stop_price'] or 0:.2f} (no position held — would have shorted)")
+                           f"@ ${o['stop_price'] or 0:.2f} (no position held on 2 consecutive "
+                           f"checks — would have shorted)")
                     all_actions.append(msg)
+                    db.set_state(pending_key, "")
                     # Found 2026-07-27: this was deliberately left unthrottled
                     # on the assumption a successful cancel can't recur for
                     # the same order -- SNDK proved that wrong (a cross-
@@ -1567,14 +1661,52 @@ def reconcile_stop_orders(self):
                 all_actions.append(msg)
                 new_actions.append(msg)  # self-resolving, won't repeat next cycle
 
-        # 3. Positions with no protective stop at the broker → alert
+        # 3. Positions with no protective stop at the broker → alert, and
+        # escalate to Telegram once it's been genuinely sustained.
+        #
+        # Incident 2026-07-29/30 (AMD): this case was silenced to log-only
+        # on 2026-07-28 along with the routine orphan-cancel/stale-record
+        # noise, but it's a different kind of event -- it's the one thing
+        # standing between a real gap and someone actually finding out.
+        # AMD sat fully naked for ~30 hours while this fired to the log
+        # every 15 minutes (49x) and nobody saw it. Full silence traded too
+        # much for the noise fix it was solving.
+        #
+        # Compromise: still no Telegram ping for a stop that's merely
+        # mid-transition (a TRIM/replace can leave a position briefly
+        # unstopped for one cycle in the ordinary course of things) -- only
+        # once the SAME ticker has been continuously unstopped across 3
+        # consecutive cycles (~45 min) does it escalate, and then on the
+        # normal RECONCILE_ALERT_THROTTLE_HOURS cadence after that so it
+        # doesn't spam every 15 minutes for a known, ongoing issue either.
         stopped_tickers = {o["ticker"] for o in stops}
+        for ticker in stopped_tickers:
+            db.set_state(f"no_stop_since_{ticker}", "")  # has a stop again -- reset
         for ticker, qty in held.items():
             if ticker not in stopped_tickers:
                 msg = f"⚠️ {ticker} ({qty} shares) has NO protective stop at the broker"
                 all_actions.append(msg)
                 if _reconcile_alert_due(f"no_stop_{ticker}"):
                     new_actions.append(msg)
+
+                since_key = f"no_stop_since_{ticker}"
+                since = db.get_state(since_key)
+                if not since:
+                    db.set_state(since_key, datetime.now(timezone.utc).isoformat())
+                else:
+                    elapsed_min = (datetime.now(timezone.utc)
+                                   - datetime.fromisoformat(since)).total_seconds() / 60
+                    if elapsed_min >= 45 and _reconcile_alert_due(f"no_stop_telegram_{ticker}"):
+                        try:
+                            import alerts
+                            alerts._send(
+                                f"🚨 UNPROTECTED POSITION — <b>{ticker}</b>\n"
+                                f"{qty:g} shares with no protective stop at the broker for "
+                                f"{elapsed_min / 60:.1f}+ hours. Place a stop manually in TWS "
+                                f"or check why one wasn't placed."
+                            )
+                        except Exception as e:
+                            log.error(f"[{ticker}] Could not send unprotected-position alert: {e}")
 
         if all_actions:
             log.info("Stop reconciliation status: " + " | ".join(all_actions))

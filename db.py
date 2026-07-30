@@ -144,7 +144,7 @@ CREATE TABLE IF NOT EXISTS scanner_candidates (
 );
 
 CREATE TABLE IF NOT EXISTS system_state (
-    key         VARCHAR(50) PRIMARY KEY,
+    key         VARCHAR(200) PRIMARY KEY,
     value       TEXT,
     updated_at  TIMESTAMPTZ DEFAULT NOW()
 );
@@ -387,6 +387,15 @@ _MIGRATIONS: list[tuple[int, str]] = [
     # (yfinance carries one ~90-100% of the time) or, failing that, a
     # company-related fallback image (ingestion/company_photos.py).
     (26, "ALTER TABLE news_log ADD COLUMN IF NOT EXISTS image_url TEXT;"),
+    # Incident 2026-07-30: tasks._reconcile_alert_due builds throttle keys
+    # like "reconcile_alert_ingestion_<all stale source names joined>" --
+    # with several sources stale at once this routinely exceeded 50 chars,
+    # so every set_state() call silently failed (caught and logged, not
+    # raised) and the throttle could never actually persist. The ingestion-
+    # health alert re-fired on every hourly check instead of respecting its
+    # cooldown -- the exact "same alert every cycle" bug this table's
+    # throttle mechanism exists to prevent, just via a different path.
+    (27, "ALTER TABLE system_state ALTER COLUMN key TYPE VARCHAR(200);"),
 ]
 
 _SCHEMA_VERSION_TABLE = """

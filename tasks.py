@@ -42,7 +42,24 @@ app.conf.update(
     # "sorted" makes a worker consuming multiple queues drain them in name
     # order — llm_p0 (events touching currently-held tickers) strictly before
     # llm_p1 (everything else). The names are chosen to sort that way.
-    broker_transport_options = {"queue_order_strategy": "sorted"},
+    #
+    # visibility_timeout: incident 2026-07-30 -- tasks.retry_deferred_entry is
+    # scheduled with an eta up to several days out (a Friday-evening deferral
+    # retries at Monday's open). Celery's Redis transport tracks a delivered-
+    # but-not-yet-executed eta task as "unacked" the whole time it's waiting
+    # in the worker's internal timer, regardless of task_acks_late -- if
+    # visibility_timeout (default 3600s/1h) elapses before the eta arrives,
+    # Redis assumes the message was lost and redelivers it. With the 1h
+    # default, an evening deferral got redelivered roughly once an hour
+    # overnight, so by market open several duplicate copies of the same
+    # approval fired back-to-back (5+ redundant "ORDER ABORTED" alerts for
+    # one ticker, and a real risk of two copies executing concurrently).
+    # Set well past the longest eta this app schedules (next_market_open()
+    # across a weekend), with margin for a long weekend/holiday.
+    broker_transport_options = {
+        "queue_order_strategy": "sorted",
+        "visibility_timeout": 6 * 24 * 3600,
+    },
 )
 
 # LLM analysis queues — see task_default_queue comment above.

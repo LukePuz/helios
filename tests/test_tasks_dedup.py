@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import db
 import tasks
 
 
@@ -418,3 +419,50 @@ class TestReconcileUnconfirmedOrders:
             tasks.reconcile_unconfirmed_orders.run()
 
         mock_stop.assert_not_called()
+
+
+class TestBrokerVisibilityTimeout:
+    """Regression guard for the 2026-07-30 incident: tasks.retry_deferred_entry
+    schedules etas up to several days out (a Friday deferral retries Monday's
+    open), but Celery's Redis transport treats a not-yet-fired eta task as
+    "unacked" the whole time it waits -- with the 1-hour default
+    visibility_timeout, it got redelivered roughly hourly overnight, so by
+    market open several duplicate copies of the same approval fired back to
+    back (5+ duplicate "ORDER ABORTED" alerts for one ticker, and a real race
+    risk of two copies executing concurrently). Must stay set well past the
+    longest eta this app schedules."""
+
+    def test_visibility_timeout_covers_a_weekend_deferral(self):
+        timeout = tasks.app.conf.broker_transport_options.get("visibility_timeout")
+        assert timeout is not None
+        # A Friday-evening deferral to Monday's open is ~65h out -- require
+        # comfortable margin beyond that (here, at least 4 days).
+        assert timeout >= 4 * 24 * 3600
+
+
+class TestSystemStateKeyLength:
+    """Regression guard for the 2026-07-30 incident: tasks._reconcile_alert_due
+    builds throttle keys like "reconcile_alert_ingestion_<all stale source
+    names joined>" -- with several sources stale at once this routinely
+    exceeded the old VARCHAR(50) limit on system_state.key, so db.set_state
+    silently failed every time (caught and logged, not raised) and the
+    throttle could never persist. check_ingestion_health's alert then re-fired
+    on every hourly check instead of respecting its cooldown."""
+
+    def test_schema_defines_a_wide_enough_key_column(self):
+        assert "key         VARCHAR(200) PRIMARY KEY" in db._CREATE_TABLES
+
+    def test_migration_27_widens_the_column(self):
+        versions = dict(db._MIGRATIONS)
+        assert 27 in versions
+        assert "system_state" in versions[27]
+        assert "VARCHAR(200)" in versions[27]
+
+    def test_a_realistic_long_throttle_key_fits_in_200_chars(self):
+        """The actual key shape that broke at 50 chars -- many stale
+        ingestion sources joined together -- must comfortably fit now."""
+        stale_sources = ["analyst_ratings", "congressional", "edgar", "insider",
+                          "macro", "news", "options_flow", "sp500_history"]
+        issue_key = "ingestion_" + "_".join(sorted(stale_sources))
+        state_key = f"reconcile_alert_{issue_key}"
+        assert len(state_key) <= 200

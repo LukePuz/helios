@@ -23,3 +23,9 @@ tws-latest-standalone-*.sh
 
 # Local Claude Code notes (not shared via git)
 CLAUDE.md
+
+# Local-only Claude Code state (per-machine permissions/lock files) --
+# .claude/skills and .claude/commands ARE tracked, since those are shared
+# project workflows (e.g. /eod-review), not per-user local state.
+.claude/settings.local.json
+.claude/scheduled_tasks.lock

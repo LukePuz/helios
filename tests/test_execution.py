@@ -234,7 +234,15 @@ class TestStalePriceBuyGuard:
     def _fresh_quote(self, price=100.0):
         return {"price": price, "is_stale": False, "age_minutes": 1.0, "market_open": True}
 
-    def test_buy_aborts_when_price_stays_stale_after_retries(self):
+    def test_buy_defers_and_retries_when_price_stays_stale(self):
+        """First miss must schedule a retry, not permanently abort.
+
+        Incident 2026-07-30/31: this path used to be a dead end -- no
+        retry at all, unlike the market-hours-closed and gap-confirmation
+        gates -- and IBKR's HMDS intraday-bar service reliably has no data
+        for the first few minutes after the open, so this silently killed
+        5 conviction-7/8 approvals on 2026-07-31 alone. Now retries on the
+        same bounded shape as GAP_CONFIRMATION_*."""
         approval = _approval(action="ADD", price_at_sizing=100.0)
 
         with patch("ibkr.get_ib"), \
@@ -243,14 +251,41 @@ class TestStalePriceBuyGuard:
              patch("ibkr.place_market_order") as mock_order, \
              patch("market_data.get_priced_quote", return_value=self._stale_quote()), \
              patch("market_data.is_market_hours", return_value=True), \
+             patch("tasks.retry_deferred_entry") as mock_retry_task, \
              patch("time.sleep"), \
              patch("alerts._send") as mock_alert:
             mock_rm_cls.return_value.is_halted.return_value = False
-            result = execution.execute_approved(approval)
+            result = execution.execute_approved(approval, price_retry_attempt=1)
+
+        assert result is False
+        mock_order.assert_not_called()
+        assert "WAITING FOR FRESH PRICE" in mock_alert.call_args[0][0]
+        mock_retry_task.apply_async.assert_called_once()
+        _, kwargs = mock_retry_task.apply_async.call_args
+        assert kwargs["args"] == [approval["id"], 1, 2]  # gap unchanged, price attempt 1 -> 2
+
+    def test_buy_aborts_when_price_stays_stale_after_max_retries(self):
+        """Once STALE_PRICE_MAX_RETRIES is reached, give up for good rather
+        than defer forever."""
+        from config import STALE_PRICE_MAX_RETRIES
+        approval = _approval(action="ADD", price_at_sizing=100.0)
+
+        with patch("ibkr.get_ib"), \
+             patch("ibkr.get_client"), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("ibkr.place_market_order") as mock_order, \
+             patch("market_data.get_priced_quote", return_value=self._stale_quote()), \
+             patch("market_data.is_market_hours", return_value=True), \
+             patch("tasks.retry_deferred_entry") as mock_retry_task, \
+             patch("time.sleep"), \
+             patch("alerts._send") as mock_alert:
+            mock_rm_cls.return_value.is_halted.return_value = False
+            result = execution.execute_approved(approval, price_retry_attempt=STALE_PRICE_MAX_RETRIES)
 
         assert result is False
         mock_order.assert_not_called()
         assert "Price Unavailable" in mock_alert.call_args[0][0]
+        mock_retry_task.apply_async.assert_not_called()
 
     def test_buy_proceeds_once_price_turns_fresh_within_retries(self):
         """The intraday feed catching up mid-retry (the common case) must

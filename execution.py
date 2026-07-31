@@ -23,7 +23,10 @@ log = logging.getLogger(__name__)
 # Approval-driven execution (auto-execute pipeline + Telegram Approve button)
 # ---------------------------------------------------------------------------
 
-def execute_approved(approval: dict, trigger: str = "telegram", gap_retry_attempt: int = 1) -> bool:
+def execute_approved(
+    approval: dict, trigger: str = "telegram",
+    gap_retry_attempt: int = 1, price_retry_attempt: int = 1,
+) -> bool:
     """
     Submit the approved order to IBKR via TWS, log the trade and stop.
 
@@ -33,9 +36,11 @@ def execute_approved(approval: dict, trigger: str = "telegram", gap_retry_attemp
     execution is identical regardless of trigger.
 
     gap_retry_attempt counts opening-gap-confirmation re-checks (see the
-    gap-confirmation block below and tasks.retry_deferred_entry) -- distinct
-    from the market-hours-closed retry, which always starts a fresh attempt
-    count of 1.
+    gap-confirmation block below and tasks.retry_deferred_entry).
+    price_retry_attempt counts stale-price re-checks (see the price-
+    freshness block below) -- a separate counter, since a BUY can hit either
+    gate independently of the other. Both are distinct from the
+    market-hours-closed retry, which always starts fresh attempt counts of 1.
 
     Returns True on success.
     """
@@ -195,18 +200,60 @@ def execute_approved(approval: dict, trigger: str = "telegram", gap_retry_attemp
                         # gap). Abort rather than buy blind; sells are
                         # unaffected -- a risk-reducing order already
                         # proceeds through drift by design (see below).
+                        #
+                        # Incident 2026-07-30/31: this used to just abort
+                        # for good here, with no retry at all -- unlike the
+                        # market-hours-closed gate and the gap-confirmation
+                        # gate below, both of which reschedule themselves.
+                        # IBKR's HMDS intraday-bar service reliably has no
+                        # data for the first few minutes after the open, so
+                        # this fired (and permanently killed) 5 conviction
+                        # 7-8 approvals on 2026-07-31 alone, every one of
+                        # them a data feed catching up, not a real problem.
+                        # Now retries on the same bounded, ever-later-eta
+                        # shape as GAP_CONFIRMATION_* instead of giving up
+                        # on the first miss.
+                        from config import STALE_PRICE_MAX_RETRIES, STALE_PRICE_RETRY_MINUTES
+                        if price_retry_attempt < STALE_PRICE_MAX_RETRIES:
+                            from datetime import datetime, timedelta, timezone
+                            eta = datetime.now(timezone.utc) + timedelta(minutes=STALE_PRICE_RETRY_MINUTES)
+                            log.warning(
+                                f"[{ticker}] Could not get a fresh price "
+                                f"(attempt {price_retry_attempt}/{STALE_PRICE_MAX_RETRIES}) — "
+                                f"re-checking at {eta.isoformat()} rather than risk an unguarded gap"
+                            )
+                            try:
+                                from tasks import retry_deferred_entry
+                                retry_deferred_entry.apply_async(
+                                    args=[approval["id"], gap_retry_attempt, price_retry_attempt + 1],
+                                    eta=eta, queue="ops",
+                                )
+                            except Exception as e:
+                                log.error(f"[{ticker}] Could not schedule stale-price re-check: {e}")
+                            try:
+                                alert_module._send(
+                                    f"⏸️ WAITING FOR FRESH PRICE — {ticker}\n"
+                                    f"Only a stale price (${current_price_pre:.2f}) was available "
+                                    f"(check {price_retry_attempt}/{STALE_PRICE_MAX_RETRIES}) — IBKR's "
+                                    f"intraday feed usually catches up within a few minutes of the open. "
+                                    f"Will re-check in {STALE_PRICE_RETRY_MINUTES} min."
+                                )
+                            except Exception:
+                                pass
+                            return False
                         log.error(
-                            f"[{ticker}] Could not get a fresh price after retries — "
-                            f"aborting {action} rather than risk an unguarded gap"
+                            f"[{ticker}] Could not get a fresh price after "
+                            f"{STALE_PRICE_MAX_RETRIES} checks — giving up rather than "
+                            f"risk an unguarded gap"
                         )
                         try:
                             alert_module._send(
                                 f"⚠️ ORDER ABORTED — Price Unavailable\n"
-                                f"<b>{ticker}</b> {action}: only a stale price "
-                                f"(${current_price_pre:.2f}, from a bar the freshness "
-                                f"check rejected) was available — can't rule out a "
-                                f"large gap since this was sized. Re-run analysis or "
-                                f"check TWS."
+                                f"<b>{ticker}</b> {action}: still only a stale price "
+                                f"(${current_price_pre:.2f}) after {STALE_PRICE_MAX_RETRIES} "
+                                f"checks over ~{STALE_PRICE_MAX_RETRIES * STALE_PRICE_RETRY_MINUTES} min "
+                                f"— can't rule out a large gap since this was sized. "
+                                f"Re-run analysis or check TWS."
                             )
                         except Exception:
                             pass

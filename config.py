@@ -129,6 +129,18 @@ GAP_FAIL_RETRACEMENT_PCT = 0.5
 GAP_CONFIRMATION_MAX_RETRIES = 3
 GAP_CONFIRMATION_RETRY_MINUTES = 5
 
+# How many times to re-check a BUY that aborted because only a stale price
+# was available (IBKR's HMDS intraday-bar service routinely has no data for
+# the first few minutes after the open) before giving up -- found
+# 2026-07-30/31: this abort path used to be a dead end with no retry at all,
+# unlike the two gates above, silently losing every ADD/OPEN signal that
+# happened to be in-flight right at market open (5 conviction-7/8 signals
+# lost 2026-07-31 alone). Same shape as GAP_CONFIRMATION_*: bounded retries,
+# each strictly later than the last, so a persistently-down data feed still
+# gives up rather than deferring forever.
+STALE_PRICE_MAX_RETRIES = 4
+STALE_PRICE_RETRY_MINUTES = 3
+
 # ---------------------------------------------------------------------------
 # Sell behaviour
 # ---------------------------------------------------------------------------

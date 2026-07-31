@@ -522,27 +522,31 @@ def analyze_candidates(self, candidates: list, max_per_run: int = 5):
 
 
 @app.task(name="tasks.retry_deferred_entry", bind=True, max_retries=0)
-def retry_deferred_entry(self, approval_id: int, gap_retry_attempt: int = 1):
+def retry_deferred_entry(self, approval_id: int, gap_retry_attempt: int = 1, price_retry_attempt: int = 1):
     """
     Retry for a new-entry (OPEN/ADD) approval that execution.execute_approved
-    deferred, either because the market was closed at analysis time
-    (scheduled via market_data.next_market_open() -- see execute_approved's
-    market-hours gate, added 2026-07-28 alongside the 5:00 AM ET wake) or
-    because an opening gap hasn't yet been confirmed as holding vs. fading
-    (scheduled via config.GAP_CONFIRMATION_RETRY_MINUTES -- see
-    execute_approved's gap-confirmation block, added 2026-07-29).
-    gap_retry_attempt threads through only the latter case, counting
-    against config.GAP_CONFIRMATION_MAX_RETRIES so that chain is bounded
-    to a fixed window after the open rather than deferring indefinitely.
+    deferred, for any of three reasons: the market was closed at analysis
+    time (scheduled via market_data.next_market_open() -- see
+    execute_approved's market-hours gate, added 2026-07-28 alongside the
+    5:00 AM ET wake), an opening gap hasn't yet been confirmed as holding vs.
+    fading (scheduled via config.GAP_CONFIRMATION_RETRY_MINUTES -- see
+    execute_approved's gap-confirmation block, added 2026-07-29), or only a
+    stale price was available (scheduled via config.STALE_PRICE_RETRY_MINUTES
+    -- see execute_approved's price-freshness block, added 2026-07-31).
+    gap_retry_attempt and price_retry_attempt thread through the latter two
+    cases independently, each counting against its own config.*_MAX_RETRIES
+    so every retry chain is bounded to a fixed window after the open rather
+    than deferring indefinitely.
 
     Deliberately does NOT re-run the 72B analysis — reuses
-    execute_approved's own price-drift and gap-confirmation guards as the
-    safety check against firing a now-stale decision. If the market is
-    somehow still closed when this fires (holiday, clock skew), or the gap
-    still hasn't resolved, execute_approved's gates defer it again with a
-    fresh retry — self-correcting, not a tight loop, since each retry
-    target is strictly later than the last and real time keeps moving
-    forward (and the gap-confirmation path has its own hard retry cap).
+    execute_approved's own price-drift, gap-confirmation, and price-
+    freshness guards as the safety check against firing a now-stale
+    decision. If the market is somehow still closed when this fires
+    (holiday, clock skew), or the gap/price still hasn't resolved,
+    execute_approved's gates defer it again with a fresh retry —
+    self-correcting, not a tight loop, since each retry target is strictly
+    later than the last and real time keeps moving forward (and both the
+    gap-confirmation and stale-price paths have their own hard retry cap).
     """
     import db
     from execution import execute_approved
@@ -559,10 +563,14 @@ def retry_deferred_entry(self, approval_id: int, gap_retry_attempt: int = 1):
         return
 
     ticker = approval.get("ticker", "?")
-    success = execute_approved(approval, trigger="auto_retry", gap_retry_attempt=gap_retry_attempt)
+    success = execute_approved(
+        approval, trigger="auto_retry",
+        gap_retry_attempt=gap_retry_attempt, price_retry_attempt=price_retry_attempt,
+    )
     db.update_approval_status(approval_id, "APPROVED" if success else "FAILED")
     log.info(f"retry_deferred_entry: [{ticker}] approval #{approval_id} "
-             f"{'executed' if success else 'still failed'} on retry (gap_attempt={gap_retry_attempt})")
+             f"{'executed' if success else 'still failed'} on retry "
+             f"(gap_attempt={gap_retry_attempt}, price_attempt={price_retry_attempt})")
 
 
 @app.task(name="tasks.reconcile_unconfirmed_orders", bind=True, max_retries=2)

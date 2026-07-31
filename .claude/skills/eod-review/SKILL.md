@@ -1,6 +1,6 @@
 ---
 name: eod-review
-description: End-of-day full system review for Helios — every agent's decisions, execution/broker reconciliation, pipeline health, trade-volume-vs-market correlation, and watchlist ideas. Use when the user asks for an end-of-day review, daily wrap-up, or runs /eod-review.
+description: End-of-day full system review for Helios — every agent's decisions, execution/broker reconciliation, pipeline health, trade-volume-vs-market correlation, and watchlist ideas — then fixes what it finds (code fixes, DB reconciliation, live protective orders) and deploys (test, commit, push, restart affected services) before reporting. Use when the user asks for an end-of-day review, daily wrap-up, or runs /eod-review.
 ---
 
 Run a full end-of-day review of the Helios trading system for today. Use
@@ -140,8 +140,58 @@ decisions that suggests a missing safeguard or a new pipeline step
 all came from patterns like this). Ground each idea in what actually
 happened today, not a generic best-practice list.
 
-## 11. Action plan
-End with a prioritized punch list: what should be fixed right now vs.
-worth a longer discussion. Flag anything requiring a live order or DB
-write and stop for explicit confirmation before taking it — don't fix
-silently.
+## 11. Action plan — then execute it
+Compile a prioritized punch list, then work through it — this skill fixes
+what it finds, it doesn't just report it. Distinguish two kinds of items:
+
+**Bug fixes and reconciliation — execute automatically, no need to stop
+and ask:**
+- Code fixes for a root-caused bug (a missing retry, a stale-data guard, a
+  throttle that broke, a reconciliation gap). Follow the pattern already
+  established in this codebase: identify the specific incident/evidence,
+  write the fix, add or update a regression test that encodes the incident
+  (not just the happy path), run the full suite, and only proceed once
+  it's green.
+- DB corrections that close a data-integrity gap found in Section 1/2/9
+  (e.g. reconciling a stuck `unconfirmed` order once there's solid
+  evidence it filled) — use existing `db.py` functions where they exist.
+- Placing or adjusting a live protective order to close a real risk gap
+  found in Section 2 (e.g. a naked or under-covered position) — verify
+  against the broker afterward that the gap is actually closed.
+- Restarting Celery workers/beat if a fix touches `tasks.py`, `config.py`,
+  or anything else read at process start — a fix sitting in committed code
+  that the running processes haven't picked up isn't actually deployed.
+
+If a specific write gets blocked by the Claude Code auto-mode permission
+classifier, don't try to work around it — note it plainly in the final
+report as still-pending and move on to the rest of the plan.
+
+**Discretionary trading/investment decisions — surface, don't execute:**
+Anything that isn't a bug fix but an actual judgment call about the
+portfolio (exit a position, resize it, override a thesis, hold through a
+known event like earnings) is not this skill's call to make
+autonomously. Flag it clearly with the evidence (Section 5's largest
+movers, an activity_feed thesis check) and let the user decide — this is
+the one category still worth stopping for.
+
+## 12. Deploy
+Once the action-plan fixes are implemented and tested:
+- If the working checkout and the live deployment are separate clones of
+  the same repo (check `git remote -v` / compare `git rev-parse HEAD` in
+  each), export the diff as a patch (`git diff -- <files> > patch`) and
+  apply it to the other clone (`git apply`) rather than hand-editing twice
+  — then diff the changed files between the two to confirm byte-identical
+  before trusting either copy.
+- Run the full test suite once more against whichever checkout actually
+  has a runnable venv.
+- `git add` the changed files (not `-A`), commit with a message that
+  explains the root cause and the fix (mirroring this session's commit
+  style — what broke, why, what changes), and push to `origin`.
+- If any restarted Celery workers are needed (see Section 11), do that
+  restart and verify the new config/code is actually live (e.g. check
+  `app.conf` for a config change, or grep fresh log output for the new
+  code path) rather than assuming a restart alone means it worked.
+- Report what was fixed, what got deployed, what's still pending (blocked
+  writes, discretionary decisions left for the user), and the commit(s)
+  pushed — don't let a successful deploy go unmentioned in the final
+  summary.

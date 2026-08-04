@@ -16,6 +16,7 @@ Intended to run every 10 minutes, 08:50-19:00 ET on weekdays (the awake
 window) via helios-watchdog.timer.
 """
 import os
+import socket
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -95,6 +96,20 @@ def _check_processes() -> list[str]:
     return problems
 
 
+def _ibkr_port_reachable(host: str = "127.0.0.1", port: int = 7497, timeout: float = 3.0) -> bool:
+    """Cheap TCP-connect probe against TWS's API port -- no API handshake,
+    just "is anything listening." Same check launch.sh does before startup.
+    Deliberately doesn't try a real ib_async connection here: this script
+    has to stay independent of the rest of the app being healthy (see
+    module docstring), and a full API login is slow and has its own
+    failure modes that would muddy a simple reachability check."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def _check_snapshot_freshness() -> list[str]:
     try:
         import db
@@ -113,8 +128,22 @@ def _check_snapshot_freshness() -> list[str]:
 
     age_minutes = (datetime.now(timezone.utc) - row[0]).total_seconds() / 60
     if age_minutes > _SNAPSHOT_STALE_MINUTES:
+        # Incident 2026-08-03: TWS hung (application-level -- no crash, no
+        # systemd restart, port 7497 stopped accepting connections) for 9+
+        # hours after a routine paper-trading reminder dialog. This message
+        # used to blame "the ops worker" unconditionally in that case,
+        # which is wrong and sent whoever's triaging looking in the wrong
+        # place (Celery, not TWS) for 39 separate alerts that day. A quick
+        # reachability probe against TWS's own port tells the two apart --
+        # the ops worker itself was never actually stuck, every task was
+        # failing fast on a broker connection that wasn't there.
+        if not _ibkr_port_reachable():
+            return [f"Last portfolio snapshot is {age_minutes:.0f} min old "
+                    f"(expected every 5 min) — IBKR/TWS is NOT reachable on "
+                    f"port 7497 (likely hung or down, not just the ops worker)"]
         return [f"Last portfolio snapshot is {age_minutes:.0f} min old "
-                f"(expected every 5 min) — ops worker may be stuck or dead"]
+                f"(expected every 5 min) — IBKR/TWS port is reachable, so "
+                f"the ops worker itself may be stuck or dead"]
     return []
 
 

@@ -86,3 +86,92 @@ class TestPlaceMarketOrderWaitTiming:
         assert elapsed < 2.0
         assert result["filled_qty"] == 10.0
         assert result["fill_price"] == 181.30
+
+
+class _FakeStopOrder:
+    def __init__(self, order_id, action="SELL", order_type="STP", qty=10.0):
+        self.orderId = order_id
+        self.action = action
+        self.orderType = order_type
+        self.totalQuantity = qty
+        self.auxPrice = 100.0
+
+
+class _FakeStopTrade:
+    def __init__(self, symbol, order_id, status="PreSubmitted"):
+        self.contract = MagicMock(symbol=symbol)
+        self.order = _FakeStopOrder(order_id)
+        self.orderStatus = MagicMock(status=status)
+
+
+class TestCancelStopOrdersForVerification:
+    """Regression coverage for the 2026-08-03 incident: this used to
+    fire-and-forget ib.cancelOrder() and count every matching order as
+    cancelled regardless of whether IBKR actually confirmed it -- the same
+    silent-failure shape cancel_order() was hardened against on 2026-07-27
+    (SNDK), where a client that doesn't own an order can call cancelOrder()
+    without IBKR raising anything and the order just stays open. Every
+    caller here treats a nonzero return as "safe to place a replacement
+    stop", so a silent failure meant a fresh stop landed on top of a still-
+    live old one -- exactly what happened to ORCL/SNDK/VRT that day."""
+
+    def test_only_confirmed_cancels_are_counted(self):
+        """One order's status actually flips to Cancelled after the
+        cancelOrder() call (this connection owns it); the other's status
+        never changes (owned by a different clientId) -- only the first
+        should count, and the second must be logged as stuck, not silently
+        treated as gone."""
+        owned_trade   = _FakeStopTrade("ORCL", order_id=8,   status="PreSubmitted")
+        foreign_trade = _FakeStopTrade("ORCL", order_id=322, status="PreSubmitted")
+
+        def fake_cancel_order(order):
+            if order.orderId == 8:
+                owned_trade.orderStatus.status = "Cancelled"
+            # foreign_trade's status deliberately does not change --
+            # simulates a cross-clientId cancel that IBKR silently ignores
+
+        fake_ib = MagicMock()
+        fake_ib.openTrades.return_value = [owned_trade, foreign_trade]
+        fake_ib.cancelOrder.side_effect = fake_cancel_order
+
+        with patch("ibkr.get_ib", return_value=fake_ib):
+            confirmed = ibkr.cancel_stop_orders_for("ORCL")
+
+        assert confirmed == 1
+        fake_ib.cancelOrder.assert_any_call(owned_trade.order)
+        fake_ib.cancelOrder.assert_any_call(foreign_trade.order)
+
+    def test_all_confirmed_returns_full_count(self):
+        trade_a = _FakeStopTrade("KLAC", order_id=1, status="PreSubmitted")
+        trade_b = _FakeStopTrade("KLAC", order_id=2, status="PreSubmitted")
+
+        def fake_cancel_order(order):
+            {1: trade_a, 2: trade_b}[order.orderId].orderStatus.status = "Cancelled"
+
+        fake_ib = MagicMock()
+        fake_ib.openTrades.return_value = [trade_a, trade_b]
+        fake_ib.cancelOrder.side_effect = fake_cancel_order
+
+        with patch("ibkr.get_ib", return_value=fake_ib):
+            confirmed = ibkr.cancel_stop_orders_for("KLAC")
+
+        assert confirmed == 2
+
+    def test_ignores_orders_for_other_tickers_and_non_stop_types(self):
+        stop_for_ticker    = _FakeStopTrade("AMD", order_id=1)
+        stop_other_ticker  = _FakeStopTrade("NVDA", order_id=2)
+        buy_order          = _FakeStopTrade("AMD", order_id=3)
+        buy_order.order.action = "BUY"
+
+        def fake_cancel_order(order):
+            {1: stop_for_ticker}[order.orderId].orderStatus.status = "Cancelled"
+
+        fake_ib = MagicMock()
+        fake_ib.openTrades.return_value = [stop_for_ticker, stop_other_ticker, buy_order]
+        fake_ib.cancelOrder.side_effect = fake_cancel_order
+
+        with patch("ibkr.get_ib", return_value=fake_ib):
+            confirmed = ibkr.cancel_stop_orders_for("AMD")
+
+        assert confirmed == 1
+        fake_ib.cancelOrder.assert_called_once_with(stop_for_ticker.order)

@@ -509,28 +509,51 @@ def place_stop_order(ticker: str, qty: float, stop_price: float) -> dict:
     return {"order_id": trade.order.orderId, "stop_price": stop_price}
 
 
-def cancel_order(order_id: int) -> bool:
+def cancel_order(order_id: int, _poll_seconds: int = 5) -> bool:
     """Cancel an open order by orderId. Returns True only if the broker
-    actually confirms the cancel (order status moves to a cancelled/
-    pending-cancel state) — a client that doesn't own the order (wrong
-    clientId) can send cancelOrder() without IBKR raising anything, and
-    the order just stays open. Trusting a clean call here caused
-    reconcile_stop_orders to report the same orphaned stop "cancelled"
-    every 15-minute cycle forever without it ever actually going away."""
+    actually confirms the cancel (order status reaches a genuinely
+    terminal Cancelled/ApiCancelled state) — a client that doesn't own the
+    order (wrong clientId) can send cancelOrder() without IBKR raising
+    anything, and the order just stays open. Trusting a clean call here
+    caused reconcile_stop_orders to report the same orphaned stop
+    "cancelled" every 15-minute cycle forever without it ever actually
+    going away.
+
+    Incident 2026-08-04 (MRVL): accepting "PendingCancel" itself as
+    confirmed (as this used to) is not enough -- it's a genuinely
+    transient in-flight state, not a terminal one. A cross-clientId
+    cancel request live-tested that day showed status flip to
+    PendingCancel within a second (exactly what the old check trusted),
+    then silently revert to PreSubmitted three minutes later once IBKR
+    finished rejecting it -- by then the caller had already placed a
+    replacement stop on top, believing the old one gone. Polling
+    synchronously for the full multi-minute window a rejection can take
+    isn't practical here (this runs inline in time-sensitive execution
+    paths), so this now polls for up to _poll_seconds for the status to
+    reach an actually-terminal state instead of trusting the first read.
+    This doesn't fully close the gap -- a rejection slower than the poll
+    window still reads as "confirmed" -- but it converts the common case
+    (a real same-clientId cancel usually resolves within a second or two)
+    into a real confirmation instead of guessing from an intermediate
+    state, and callers should still treat "True" here as "very likely",
+    not "certain", for a stop they didn't place themselves.
+    """
     ib = get_ib()
     for trade in ib.openTrades():
         if trade.order.orderId == order_id:
             ib.cancelOrder(trade.order)
-            ib.sleep(1)
-            status = trade.orderStatus.status
-            if status in ("Cancelled", "ApiCancelled", "PendingCancel"):
-                log.info(f"Cancel confirmed for orderId={order_id} "
-                         f"({trade.order.action} {trade.order.totalQuantity} "
-                         f"{trade.contract.symbol}) status={status}")
-                return True
+            for _ in range(_poll_seconds):
+                ib.sleep(1)
+                status = trade.orderStatus.status
+                if status in ("Cancelled", "ApiCancelled"):
+                    log.info(f"Cancel confirmed for orderId={order_id} "
+                             f"({trade.order.action} {trade.order.totalQuantity} "
+                             f"{trade.contract.symbol}) status={status}")
+                    return True
             log.warning(f"Cancel sent for orderId={order_id} but status is still "
-                        f"'{status}' — broker likely ignored it (owned by a "
-                        f"different clientId); needs manual cancel in TWS")
+                        f"'{status}' after {_poll_seconds}s — broker likely ignored "
+                        f"it (owned by a different clientId) or hasn't resolved yet; "
+                        f"needs manual cancel/verification in TWS")
             return False
     log.warning(f"cancel_order: orderId={order_id} not found among open orders")
     return False

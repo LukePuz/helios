@@ -88,6 +88,76 @@ class TestPlaceMarketOrderWaitTiming:
         assert result["fill_price"] == 181.30
 
 
+class TestCancelOrderPollsForTerminalStatus:
+    """Regression coverage for the 2026-08-04 MRVL incident: cancel_order
+    used to accept "PendingCancel" itself as confirmed -- a genuinely
+    transient in-flight state, not a terminal one. Live in production,
+    a cross-clientId cancel flipped to PendingCancel within a second
+    (exactly what the old check trusted) then silently reverted to
+    PreSubmitted three minutes later once IBKR finished rejecting it --
+    by then a replacement stop had already been placed on top, believing
+    the old one gone. Now polls for a few seconds for a genuinely
+    terminal status instead of trusting the first read."""
+
+    def _trade(self, order_id=1, symbol="NVDA"):
+        return _FakeStopTrade(symbol, order_id=order_id, status="PreSubmitted")
+
+    def test_immediate_cancelled_status_returns_true_fast(self):
+        """A same-clientId cancel that resolves on the very first check
+        must not need to burn the whole poll window."""
+        trade = self._trade()
+        fake_ib = MagicMock()
+        fake_ib.openTrades.return_value = [trade]
+        fake_ib.sleep.side_effect = lambda _: setattr(trade.orderStatus, "status", "Cancelled")
+
+        with patch("ibkr.get_ib", return_value=fake_ib):
+            result = ibkr.cancel_order(1)
+
+        assert result is True
+        assert fake_ib.sleep.call_count == 1
+
+    def test_pending_cancel_that_resolves_to_cancelled_returns_true(self):
+        trade = self._trade()
+        statuses = iter(["PendingCancel", "PendingCancel", "Cancelled"])
+        fake_ib = MagicMock()
+        fake_ib.openTrades.return_value = [trade]
+        fake_ib.sleep.side_effect = lambda _: setattr(
+            trade.orderStatus, "status", next(statuses, "Cancelled"))
+
+        with patch("ibkr.get_ib", return_value=fake_ib):
+            result = ibkr.cancel_order(1)
+
+        assert result is True
+
+    def test_pending_cancel_that_never_resolves_returns_false(self):
+        trade = self._trade(order_id=2167, symbol="MRVL")
+        fake_ib = MagicMock()
+        fake_ib.openTrades.return_value = [trade]
+        fake_ib.sleep.side_effect = lambda _: setattr(trade.orderStatus, "status", "PendingCancel")
+
+        with patch("ibkr.get_ib", return_value=fake_ib):
+            result = ibkr.cancel_order(2167)
+
+        assert result is False
+
+    def test_pending_cancel_that_reverts_returns_false(self):
+        """The exact MRVL sequence: PendingCancel, then reverts back to
+        PreSubmitted -- must not be trusted just because it briefly looked
+        like a real cancel was in flight."""
+        trade = self._trade(order_id=2167, symbol="MRVL")
+        statuses = iter(["PendingCancel", "PendingCancel", "PreSubmitted",
+                          "PreSubmitted", "PreSubmitted"])
+        fake_ib = MagicMock()
+        fake_ib.openTrades.return_value = [trade]
+        fake_ib.sleep.side_effect = lambda _: setattr(
+            trade.orderStatus, "status", next(statuses, "PreSubmitted"))
+
+        with patch("ibkr.get_ib", return_value=fake_ib):
+            result = ibkr.cancel_order(2167)
+
+        assert result is False
+
+
 class _FakeStopOrder:
     def __init__(self, order_id, action="SELL", order_type="STP", qty=10.0):
         self.orderId = order_id

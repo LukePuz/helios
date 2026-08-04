@@ -641,6 +641,19 @@ def get_fill_for_order(broker_order_id: int) -> dict | None:
     lets a periodic reconciliation pass find such late fills using IBKR's
     own execution record, rather than trusting whatever place_market_order
     observed in its own limited wait window.
+
+    2026-08-04: confirmed (live, against the real broker, clientId 999) that
+    reqExecutions() only ever returns the CURRENT TRADING DAY's executions,
+    across all clientIds -- and that passing ExecutionFilter(time=<30 days
+    ago>) makes zero difference: identical result sets with and without it.
+    This is a hard TWS/IB API limitation, not something this call can work
+    around -- do not "fix" this by adding an ExecutionFilter time bound,
+    that was tried and verified not to work. CRM, CRWD, and ORCL order 40
+    (2026-07-26) are confirmed real broker fills with no DB trade record
+    that this function cannot recover once the fill has aged past the
+    current session -- closing that gap needs either IBKR's separate Flex
+    Query historical-reports API or manual reconciliation against a broker
+    statement, not reqExecutions.
     """
     ib = get_ib()
     execs = ib.reqExecutions()

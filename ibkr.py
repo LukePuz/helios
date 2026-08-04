@@ -560,21 +560,50 @@ def get_open_orders() -> list[dict]:
 
 
 def cancel_stop_orders_for(ticker: str) -> int:
-    """Cancel all open SELL stop orders for a ticker. Returns count cancelled."""
+    """Cancel all open SELL stop orders for a ticker. Returns the count
+    the broker actually CONFIRMED cancelled, not just requested.
+
+    Incident 2026-08-03: this used to fire-and-forget ib.cancelOrder() and
+    count every matching order as cancelled regardless of whether IBKR
+    actually accepted it -- the same silent-failure shape cancel_order()
+    was hardened against on 2026-07-27 (SNDK), where a client that doesn't
+    own an order (a different clientId placed it) can call cancelOrder()
+    without IBKR raising anything, and the order just stays open. Every
+    caller here (the SELL-side stop cleanup, the trailing-stop conversion)
+    treats a nonzero return as "the old stop is gone, safe to place a new
+    one" -- so a silent failure meant a fresh stop landed ON TOP of a
+    still-live old one instead of replacing it. Found via the 2026-08-03
+    EOD review: ORCL, SNDK, and VRT each ended that day carrying a stale
+    duplicate stop this way when the ops worker's clientId didn't match
+    whichever session had originally placed the old order. Over-coverage,
+    not a naked position that time -- but that was luck, not a guarantee.
+    Now reuses cancel_order()'s verification per order and logs a clear
+    warning for anything that didn't actually go away, so a caller placing
+    a replacement stop right after at least has the fact on record even
+    though it can't force a cross-clientId cancel to succeed.
+    """
     ib = get_ib()
-    cancelled = 0
-    for trade in ib.openTrades():
-        o = trade.order
-        if (trade.contract.symbol == ticker
-                and o.action == "SELL"
-                and o.orderType in ("STP", "STP LMT", "TRAIL")):
-            ib.cancelOrder(o)
-            cancelled += 1
-            log.info(f"[{ticker}] Cancelled stop orderId={o.orderId} "
-                     f"(qty={o.totalQuantity} @ ${getattr(o, 'auxPrice', 0)})")
-    if cancelled:
-        ib.sleep(1)
-    return cancelled
+    matches = [
+        trade.order for trade in ib.openTrades()
+        if trade.contract.symbol == ticker
+        and trade.order.action == "SELL"
+        and trade.order.orderType in ("STP", "STP LMT", "TRAIL")
+    ]
+    confirmed = 0
+    stuck = []
+    for order in matches:
+        if cancel_order(order.orderId):
+            confirmed += 1
+        else:
+            stuck.append(order.orderId)
+    if stuck:
+        log.warning(
+            f"[{ticker}] {len(stuck)} stop order(s) did NOT actually cancel "
+            f"(orderIds={stuck}) — likely owned by a different clientId. Any "
+            f"new stop placed now will overlap with these, not replace them. "
+            f"Cancel manually in TWS."
+        )
+    return confirmed
 
 
 def get_fill_for_order(broker_order_id: int) -> dict | None:

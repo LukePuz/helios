@@ -667,6 +667,46 @@ def get_fill_for_order(broker_order_id: int) -> dict | None:
     return {"filled_qty": total_qty, "fill_price": avg_price}
 
 
+def get_recent_sell_fill(ticker: str) -> dict | None:
+    """Looks up today's SELL execution(s) for a ticker by symbol rather than
+    a specific orderId, aggregating same-day partials into one (filled_qty,
+    fill_price). Returns None if there's no SELL execution for this ticker
+    today.
+
+    Added 2026-08-09 alongside reconcile_stop_orders' stale-DB-stop cleanup:
+    that cleanup used to just delete a position_stops row once its ticker
+    was no longer held, with no attempt to find out *why* it disappeared.
+    DDOG (2026-08-06) went from 84 shares to 0 with no bot-initiated sell on
+    record and no confirmed fill on its OWN tracked resting stop order
+    (which sat orphaned, uncancellable -- a different clientId owned it --
+    for the rest of that day) -- the position just vanished from every DB
+    table with no trade or trade_outcome record, and the cleanup logged it
+    as routine "deleted stale DB stop record" noise.
+
+    Searching by symbol (matching get_fill_for_order's already-verified-
+    working reqExecutions() call, just filtered client-side on
+    contract.symbol + execution.side instead of orderId -- see that
+    function's docstring for why an ExecutionFilter isn't used here either)
+    catches an exit through ANY sell order for this ticker -- the tracked
+    stop, a backstop sell that somehow wasn't logged, or a manual sale
+    placed directly in TWS -- not just the one order this system happened
+    to be watching. Same same-trading-day cap as get_fill_for_order
+    (confirmed live 2026-08-04): this only finds an exit that happened
+    earlier today. Anything older needs a Flex Query or a manual
+    broker-statement pull, same as that function.
+    """
+    ib = get_ib()
+    execs = ib.reqExecutions()
+    sells = [e for e in execs if e.contract.symbol == ticker and e.execution.side == "SLD"]
+    if not sells:
+        return None
+    total_qty = sum(float(e.execution.shares) for e in sells)
+    if total_qty <= 0:
+        return None
+    avg_price = sum(float(e.execution.shares) * float(e.execution.avgPrice) for e in sells) / total_qty
+    return {"filled_qty": total_qty, "fill_price": avg_price}
+
+
 # ---------------------------------------------------------------------------
 # Alpaca-compatible adapter (used by RiskManager and tasks)
 # ---------------------------------------------------------------------------

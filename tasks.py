@@ -1661,13 +1661,78 @@ def reconcile_stop_orders(self):
                     if _reconcile_alert_due(f"cancel_fail_{o['order_id']}"):
                         new_actions.append(msg)
 
-        # 2. Stale DB stop records with no position → delete
+        # 2. Stale DB stop records with no position → reconcile the exit
+        # against today's broker execution history, THEN delete.
+        #
+        # Incident 2026-08-06 (DDOG): this used to just delete the record
+        # and move on -- an 84-share position disappeared (its own tracked
+        # stop order never filled; it sat orphaned/uncancellable the rest
+        # of the day) with no bot-initiated sell anywhere in the logs, and
+        # this branch logged it as routine "deleted stale DB stop record"
+        # noise. No trade or trade_outcome row was ever written -- the
+        # exit, and whatever was gained or lost on it, vanished from every
+        # DB table with nothing pointing back at it.
+        #
+        # Now searches by symbol (ibkr.get_recent_sell_fill) for ANY SELL
+        # execution today, not just the specific stop order this system
+        # was tracking -- catches an exit via the tracked stop, an
+        # unlogged backstop sell, or a manual sale placed directly in TWS.
+        # A match gets written as a real trade and closes out the
+        # trade_outcome row properly. Same same-trading-day cap as
+        # get_fill_for_order (confirmed 2026-08-04): only catches an exit
+        # from earlier today. If nothing is found, this no longer silently
+        # deletes and forgets -- it escalates to Telegram immediately, same
+        # urgency as an unprotected position, since "we don't know what
+        # happened to a real position" is at least as serious as "this one
+        # doesn't have a stop yet."
         for rec in db.get_all_position_stops():
             if rec["ticker"] not in held:
-                db.delete_position_stop(rec["ticker"])
-                msg = f"Deleted stale DB stop record for {rec['ticker']} (no position)"
-                all_actions.append(msg)
-                new_actions.append(msg)  # self-resolving, won't repeat next cycle
+                ticker = rec["ticker"]
+                fill = None
+                try:
+                    fill = ibkr.get_recent_sell_fill(ticker)
+                except Exception as e:
+                    log.warning(f"[{ticker}] Exit-fill lookup failed while reconciling "
+                                f"stale stop record: {e}")
+
+                if fill:
+                    db.log_trade(
+                        symbol=ticker, side="SELL", quantity=fill["filled_qty"],
+                        price=fill["fill_price"],
+                        reason="Reconciled exit — position closed at the broker with no "
+                               "bot-initiated sell on record (resting stop fill or manual "
+                               "close); matched to today's broker execution history during "
+                               "stale-stop cleanup",
+                    )
+                    try:
+                        db.close_trade_outcome(ticker, exit_price=fill["fill_price"])
+                    except Exception as e:
+                        log.error(f"[{ticker}] close_trade_outcome failed after reconciling "
+                                  f"exit: {e}")
+                    msg = (f"Reconciled untracked exit for {ticker}: SELL "
+                           f"{fill['filled_qty']:g} @ ${fill['fill_price']:.2f}")
+                    all_actions.append(msg)
+                    new_actions.append(msg)
+                else:
+                    msg = (f"{ticker} position disappeared with NO matching SELL execution "
+                           f"found in today's broker history — trade/outcome NOT recorded, "
+                           f"needs manual reconciliation against a broker statement")
+                    all_actions.append(msg)
+                    new_actions.append(msg)
+                    log.error(f"[{ticker}] {msg}")
+                    if _reconcile_alert_due(f"unreconciled_exit_{ticker}"):
+                        try:
+                            import alerts
+                            alerts._send(
+                                f"🚨 UNRECONCILED EXIT — <b>{ticker}</b>\n"
+                                f"Position closed at the broker but no matching SELL execution "
+                                f"was found in today's history. Trade and outcome NOT recorded. "
+                                f"Check TWS/account statement to reconstruct manually."
+                            )
+                        except Exception as e:
+                            log.error(f"[{ticker}] Could not send unreconciled-exit alert: {e}")
+
+                db.delete_position_stop(ticker)
 
         # 3. Positions with no protective stop at the broker → alert, and
         # escalate to Telegram once it's been genuinely sustained.

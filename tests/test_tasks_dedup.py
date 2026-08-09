@@ -549,6 +549,72 @@ class TestNoStopTelegramEscalation:
         mock_alert.assert_not_called()
 
 
+class TestStaleStopReconciliation:
+    """2026-08-06 (DDOG): a position disappeared from the broker (its own
+    tracked stop order never filled -- it sat orphaned/uncancellable, a
+    different clientId owned it) with no bot-initiated sell anywhere in
+    the logs. The stale-DB-stop cleanup used to just delete the
+    position_stops record and log it as routine noise -- no trade or
+    trade_outcome row was ever written, so the exit and whatever was
+    gained or lost on it vanished with nothing pointing back at it. Now
+    it searches today's broker execution history by symbol before
+    deleting: a match gets written as a real trade and closes the
+    trade_outcome; no match escalates to Telegram immediately instead of
+    disappearing silently."""
+
+    def _run(self, fill_return, alert_due=True):
+        client = MagicMock()
+        client.get_all_positions.return_value = []  # DDOG no longer held
+
+        stale_rec = {"ticker": "DDOG", "entry_price": 270.79, "stop_price": 228.74,
+                     "broker_order_id": 11}
+
+        with patch("ibkr.get_client", return_value=client), \
+             patch("ibkr.get_open_orders", return_value=[]), \
+             patch("db.get_all_position_stops", return_value=[stale_rec]), \
+             patch("db.get_state", return_value=None), \
+             patch("db.set_state"), \
+             patch("ibkr.get_recent_sell_fill", return_value=fill_return) as mock_fill, \
+             patch("db.log_trade") as mock_log_trade, \
+             patch("db.close_trade_outcome") as mock_close_outcome, \
+             patch("db.delete_position_stop") as mock_delete, \
+             patch("tasks._reconcile_alert_due", return_value=alert_due), \
+             patch("alerts._send") as mock_alert:
+            tasks.reconcile_stop_orders.run()
+        return mock_fill, mock_log_trade, mock_close_outcome, mock_delete, mock_alert
+
+    def test_found_fill_is_logged_as_a_trade_and_closes_the_outcome(self):
+        fill = {"filled_qty": 84.0, "fill_price": 227.80}
+        mock_fill, mock_log_trade, mock_close_outcome, mock_delete, mock_alert = self._run(fill)
+
+        mock_fill.assert_called_once_with("DDOG")
+        mock_log_trade.assert_called_once()
+        assert mock_log_trade.call_args.kwargs["symbol"] == "DDOG"
+        assert mock_log_trade.call_args.kwargs["side"] == "SELL"
+        assert mock_log_trade.call_args.kwargs["quantity"] == 84.0
+        assert mock_log_trade.call_args.kwargs["price"] == 227.80
+        mock_close_outcome.assert_called_once_with("DDOG", exit_price=227.80)
+        mock_delete.assert_called_once_with("DDOG")
+        # A reconciled exit is real information, not an emergency -- no Telegram ping.
+        mock_alert.assert_not_called()
+
+    def test_no_fill_found_does_not_fabricate_a_trade_and_alerts_instead(self):
+        mock_fill, mock_log_trade, mock_close_outcome, mock_delete, mock_alert = self._run(None)
+
+        mock_log_trade.assert_not_called()
+        mock_close_outcome.assert_not_called()
+        # The stale record is still cleared (it genuinely doesn't match a
+        # held position) but the disappearance itself must not be silent.
+        mock_delete.assert_called_once_with("DDOG")
+        mock_alert.assert_called_once()
+        assert "DDOG" in mock_alert.call_args[0][0]
+
+    def test_no_fill_found_respects_alert_throttle(self):
+        _, _, _, _, mock_alert = self._run(None, alert_due=False)
+
+        mock_alert.assert_not_called()
+
+
 class TestBackstopSellRetry:
     """2026-07-29 (AMD): a backstop sell that got no fill (submitted
     after-hours -- IBKR queues rather than fills within the 30s wait) used

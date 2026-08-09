@@ -158,6 +158,81 @@ class TestCancelOrderPollsForTerminalStatus:
         assert result is False
 
 
+class _FakeExecution:
+    def __init__(self, order_id, shares, avg_price, side):
+        self.orderId = order_id
+        self.shares = shares
+        self.avgPrice = avg_price
+        self.side = side  # "BOT" or "SLD"
+
+
+class _FakeFillRecord:
+    def __init__(self, symbol, order_id, shares, avg_price, side):
+        self.contract = MagicMock(symbol=symbol)
+        self.execution = _FakeExecution(order_id, shares, avg_price, side)
+
+
+class TestGetRecentSellFill:
+    """Regression coverage for the 2026-08-06 DDOG incident: a position
+    can disappear from the broker (its own tracked stop order never
+    fills, or someone sells it directly in TWS) with no bot-initiated
+    sell on record. This searches by symbol rather than a specific
+    orderId so reconcile_stop_orders can find that exit through ANY sell
+    order for the ticker, not just the one this system happened to be
+    watching."""
+
+    def test_finds_a_sell_by_symbol_ignoring_other_tickers_and_buys(self):
+        fake_ib = MagicMock()
+        fake_ib.reqExecutions.return_value = [
+            _FakeFillRecord("DDOG", order_id=11, shares=84.0, avg_price=227.80, side="SLD"),
+            _FakeFillRecord("DDOG", order_id=99, shares=10.0, avg_price=500.0, side="BOT"),  # different order, a BUY -- must be ignored
+            _FakeFillRecord("NVDA", order_id=12, shares=50.0, avg_price=200.0, side="SLD"),  # different ticker -- must be ignored
+        ]
+
+        with patch("ibkr.get_ib", return_value=fake_ib):
+            result = ibkr.get_recent_sell_fill("DDOG")
+
+        assert result["filled_qty"] == 84.0
+        assert result["fill_price"] == 227.80
+
+    def test_aggregates_partial_sells_across_multiple_orders(self):
+        """The exit doesn't have to be the tracked stop order -- e.g. a
+        manual sale placed directly in TWS uses a different orderId
+        entirely, and must still be found and aggregated correctly."""
+        fake_ib = MagicMock()
+        fake_ib.reqExecutions.return_value = [
+            _FakeFillRecord("DDOG", order_id=11, shares=50.0, avg_price=228.00, side="SLD"),
+            _FakeFillRecord("DDOG", order_id=847, shares=34.0, avg_price=226.50, side="SLD"),
+        ]
+
+        with patch("ibkr.get_ib", return_value=fake_ib):
+            result = ibkr.get_recent_sell_fill("DDOG")
+
+        assert result["filled_qty"] == 84.0
+        expected_avg = (50.0 * 228.00 + 34.0 * 226.50) / 84.0
+        assert result["fill_price"] == expected_avg
+
+    def test_no_sell_execution_today_returns_none(self):
+        fake_ib = MagicMock()
+        fake_ib.reqExecutions.return_value = [
+            _FakeFillRecord("DDOG", order_id=99, shares=10.0, avg_price=500.0, side="BOT"),
+        ]
+
+        with patch("ibkr.get_ib", return_value=fake_ib):
+            result = ibkr.get_recent_sell_fill("DDOG")
+
+        assert result is None
+
+    def test_no_executions_at_all_returns_none(self):
+        fake_ib = MagicMock()
+        fake_ib.reqExecutions.return_value = []
+
+        with patch("ibkr.get_ib", return_value=fake_ib):
+            result = ibkr.get_recent_sell_fill("DDOG")
+
+        assert result is None
+
+
 class _FakeStopOrder:
     def __init__(self, order_id, action="SELL", order_type="STP", qty=10.0):
         self.orderId = order_id

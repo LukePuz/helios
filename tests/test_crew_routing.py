@@ -111,4 +111,94 @@ class TestRebuyCooldown:
             }
             crew._route_to_approval(result, {"regime": "Neutral"}, client)
 
+
+class TestConcentrationCapping:
+    """2026-08-11: a failed concentration check used to only append text to
+    a flags field nobody reviews in real time -- the portfolio sat over its
+    own 60% AI-infra limit for a week-plus while every new ADD kept sailing
+    through anyway. check_concentration now returns ai_infra_size_cap_pct;
+    _route_to_approval must actually scale sizing down to it instead of
+    just logging the breach."""
+
+    def _base_sizing(self):
+        return {
+            "shares_initial": 10, "initial_dollar": 1000.0, "position_size_pct": 0.10,
+            "initial_entry_pct": 0.55, "flags": [], "stop_loss_price": 90.0,
+        }
+
+    def test_size_is_scaled_down_to_the_cap(self):
+        result = _analyst_result(action="ADD", ticker="PLTR", conviction=8)
+        client = MagicMock()
+
+        with patch("db.has_active_approval", return_value=False), \
+             patch("db.get_last_executed_approval", return_value=None), \
+             patch("agents.crew._get_price", return_value=100.0), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("db.log_pending_approval", return_value=-1) as mock_log_approval, \
+             patch("catalyst_service.gates.catalyst_gate_check", return_value={"approved": True}):
+            mock_rm_cls.return_value.size_position.return_value = self._base_sizing()
+            mock_rm_cls.return_value.check_concentration.return_value = {
+                "passed": False,
+                "flags": ["AI infrastructure exposure 65.0% exceeds 60% limit"],
+                "ai_infrastructure_total": 0.65,
+                "ai_infra_size_cap_pct": 0.05,  # half of the proposed 10%
+            }
+            mock_rm_cls.return_value.check_correlation.return_value = {"reduce_by": 0}
+            crew._route_to_approval(result, {"regime": "Neutral"}, client)
+
+        mock_log_approval.assert_called_once()
+        kwargs = mock_log_approval.call_args.kwargs
+        assert kwargs["size_pct"] == pytest.approx(0.05, abs=1e-6)
+        assert kwargs["risk_json"]["shares_initial"] == 5  # 10 * (0.05/0.10)
+
+    def test_zero_headroom_skips_the_entry_entirely(self):
+        result = _analyst_result(action="ADD", ticker="PLTR", conviction=8)
+        client = MagicMock()
+
+        with patch("db.has_active_approval", return_value=False), \
+             patch("db.get_last_executed_approval", return_value=None), \
+             patch("agents.crew._get_price", return_value=100.0), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("db.log_pending_approval") as mock_log_approval, \
+             patch("catalyst_service.gates.catalyst_gate_check", return_value={"approved": True}):
+            mock_rm_cls.return_value.size_position.return_value = self._base_sizing()
+            mock_rm_cls.return_value.check_concentration.return_value = {
+                "passed": False,
+                "flags": ["AI infrastructure exposure 70.0% exceeds 60% limit"],
+                "ai_infrastructure_total": 0.70,
+                "ai_infra_size_cap_pct": 0.0,  # already at/over the limit
+            }
+            mock_rm_cls.return_value.check_correlation.return_value = {"reduce_by": 0}
+            crew._route_to_approval(result, {"regime": "Neutral"}, client)
+
+        mock_log_approval.assert_not_called()
+
+    def test_a_ticker_not_itself_ai_infra_is_never_capped(self):
+        """cap=None means this ticker isn't what's driving the breach --
+        must proceed at full proposed size, not get scaled to 0 by a stray
+        None being treated as "no room"."""
+        result = _analyst_result(action="ADD", ticker="JPM", conviction=8)
+        client = MagicMock()
+
+        with patch("db.has_active_approval", return_value=False), \
+             patch("db.get_last_executed_approval", return_value=None), \
+             patch("agents.crew._get_price", return_value=100.0), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("db.log_pending_approval", return_value=-1) as mock_log_approval, \
+             patch("catalyst_service.gates.catalyst_gate_check", return_value={"approved": True}):
+            mock_rm_cls.return_value.size_position.return_value = self._base_sizing()
+            mock_rm_cls.return_value.check_concentration.return_value = {
+                "passed": False,
+                "flags": ["AI infrastructure exposure 65.0% exceeds 60% limit"],
+                "ai_infrastructure_total": 0.65,
+                "ai_infra_size_cap_pct": None,
+            }
+            mock_rm_cls.return_value.check_correlation.return_value = {"reduce_by": 0}
+            crew._route_to_approval(result, {"regime": "Neutral"}, client)
+
+        mock_log_approval.assert_called_once()
+        kwargs = mock_log_approval.call_args.kwargs
+        assert kwargs["size_pct"] == pytest.approx(0.10, abs=1e-6)  # unchanged
+        assert kwargs["risk_json"]["shares_initial"] == 10  # unchanged
+
         mock_rm_cls.return_value.size_position.assert_called_once()

@@ -353,12 +353,28 @@ app.conf.beat_schedule = {
     # after place_market_order's wait window gave up (see
     # tasks.reconcile_unconfirmed_orders docstring for the 2026-07-28 CRWD
     # incident this closes); short interval since an unprotected live
-    # position is the failure mode, and short expiry so a delayed run never
-    # stacks behind another.
+    # position is the failure mode.
+    #
+    # 2026-08-11: expires used to be 280 -- tighter than this task's own
+    # 300s schedule, unlike every other periodic safety task here (they all
+    # use expires == their own schedule interval, e.g. reconcile-stops
+    # below is 900/900, check-stops is 1800/1800). The idea was "a delayed
+    # run shouldn't stack behind another," but Celery's expires just DROPS
+    # an expired task outright rather than collapsing duplicates -- found
+    # this was actually discarding a large fraction of runs (~24% on a
+    # sampled trading day, ~60% over a longer window) whenever the shared
+    # ops queue fell even slightly behind, not just in rare pileups. A NET
+    # order sat unreconciled for over a day because of this -- every single
+    # scheduled check for it that day was either dropped by this expiry or
+    # hit a real IBKR connectivity gap, and the two together meant zero
+    # actual reconciliation attempts landed. Widened well past the 5-minute
+    # schedule: a late run of this specific task is cheap and idempotent
+    # (it only acts on orders still genuinely unconfirmed), so "eventually
+    # correct" beats "silently skipped" here.
     "reconcile-unconfirmed-orders": {
         "task":     "tasks.reconcile_unconfirmed_orders",
         "schedule": 300,
-        "options":  {"expires": 280},
+        "options":  {"expires": 3600},
     },
     # Low-frequency overnight-dead-with-no-traffic safety net — every 30
     # minutes, not 10. The 72B server only handles one request at a time

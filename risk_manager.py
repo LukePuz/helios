@@ -431,9 +431,25 @@ class RiskManager:
                             bucket: str | None = None) -> dict:
         """
         Checks if adding ticker at proposed_size_pct would breach any limit.
-        Returns {passed, flags, ai_infrastructure_total}.
+        Returns {passed, flags, ai_infrastructure_total, ai_infra_size_cap_pct}.
         FAIL-CLOSED: an errored check counts as failed so a broken data feed
         can never wave a trade through unchecked.
+
+        2026-08-11: this used to be advisory only — a "failed" check just
+        appended text to entry_strategy's flags field, which nobody reviews
+        in real time since auto-execution has no human-in-the-loop tap
+        (2026-07-14 decision). The portfolio sat over its own stated 60% AI
+        infra limit for a week-plus (65.3%-65.8% observed) while every new
+        ADD to an AI-infra name kept sailing through anyway. ai_infra_total
+        exceeding the limit is still only informational for the *other*
+        sub-checks below (theme/moonshot/single-position) — but for AI
+        infra specifically, the caller now gets ai_infra_size_cap_pct: the
+        largest proposed_size_pct for THIS ticker that would bring the
+        total back to exactly the limit, so sizing can be capped instead of
+        just flagged. Only meaningful when ticker itself is an AI-infra
+        name (only then does its own size actually drive the total) — None
+        otherwise, since capping an unrelated ticker wouldn't address an
+        AI-infra breach caused entirely by other, pre-existing positions.
         """
         try:
             positions = self._client.get_all_positions()
@@ -443,7 +459,8 @@ class RiskManager:
             return {"passed": False,
                     "flags": [f"RISK CHECK FAILED — could not verify concentration: {e}. "
                               "Verify manually before approving."],
-                    "ai_infrastructure_total": 0}
+                    "ai_infrastructure_total": 0,
+                    "ai_infra_size_cap_pct": None}
 
         flags: list[str] = []
 
@@ -462,6 +479,11 @@ class RiskManager:
                              "LRCX", "AMAT", "MU", "CRWV", "ORCL", "CLS", "PLTR", "SNOW",
                              "DDOG", "VRT", "PWR", "GEV", "CEG"}
         ai_infra_total = sum(v for t, v in pos_values.items() if t in ai_infra_keywords)
+
+        ai_infra_size_cap_pct = None
+        if ticker in ai_infra_keywords:
+            ai_infra_total_without_this = ai_infra_total - proposed_size_pct
+            ai_infra_size_cap_pct = max(0.0, MAX_AI_INFRA_PCT - ai_infra_total_without_this)
 
         if ai_infra_total > MAX_AI_INFRA_PCT:
             flags.append(f"AI infrastructure exposure {ai_infra_total:.1%} exceeds {MAX_AI_INFRA_PCT:.0%} limit")
@@ -504,6 +526,8 @@ class RiskManager:
             "passed": len(flags) == 0,
             "flags":  flags,
             "ai_infrastructure_total": round(ai_infra_total, 4),
+            "ai_infra_size_cap_pct": (round(ai_infra_size_cap_pct, 4)
+                                      if ai_infra_size_cap_pct is not None else None),
         }
 
     def check_correlation(self, ticker: str, corr_threshold: float = 0.7,

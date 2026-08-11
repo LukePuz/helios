@@ -86,6 +86,65 @@ class TestConcentrationFailsClosed:
         assert result["passed"] is True
 
 
+def _position(symbol, pct_of_portfolio, portfolio_value=100_000.0):
+    return MagicMock(symbol=symbol, market_value=pct_of_portfolio * portfolio_value)
+
+
+class TestConcentrationSizeCap:
+    """2026-08-11: check_concentration used to be advisory only -- a failed
+    check just appended text to a field nobody reviews in real time (auto-
+    execution has no human-in-the-loop tap). The portfolio sat over its own
+    60% AI-infra limit for a week-plus while every new ADD to an AI-infra
+    name kept sailing through anyway. ai_infra_size_cap_pct is the actual
+    enforcement mechanism now -- the largest proposed_size_pct for THIS
+    ticker that keeps the total at or under the limit."""
+
+    def test_cap_reflects_generous_headroom_when_well_under_the_limit(self):
+        """cap is always a number for an AI-infra ticker (its own headroom),
+        never None just because the check passed -- None specifically means
+        "not an AI-infra ticker," not "under the limit." crew.py only acts
+        when cap < proposed size, so a generous cap like this is a no-op."""
+        client = _make_client(positions=[_position("NVDA", 0.30)])
+        rm = risk_manager.RiskManager.__new__(risk_manager.RiskManager)
+        rm._client = client
+        result = rm.check_concentration("MSFT", 0.10)  # 30% + 10% = 40%, well under 60%
+
+        assert result["passed"] is True
+        assert result["ai_infra_size_cap_pct"] == pytest.approx(0.30, abs=1e-6)
+
+    def test_cap_is_none_for_a_non_ai_infra_ticker_even_when_total_already_breached(self):
+        """A breach caused entirely by other, pre-existing AI-infra
+        positions must not cap an unrelated ticker's size -- capping it
+        wouldn't address the actual breach."""
+        client = _make_client(positions=[_position("NVDA", 0.45), _position("AMD", 0.20)])
+        rm = risk_manager.RiskManager.__new__(risk_manager.RiskManager)
+        rm._client = client
+        result = rm.check_concentration("JPM", 0.05)  # not in ai_infra_keywords
+
+        assert result["passed"] is False  # still flagged -- the breach is real
+        assert result["ai_infra_size_cap_pct"] is None  # but not this ticker's to fix
+
+    def test_cap_reflects_remaining_headroom_for_an_ai_infra_ticker(self):
+        """55% already held in AI infra names, proposing another 10% PLTR
+        (also AI infra) would hit 65% -- cap should be exactly the 5%
+        headroom left under the 60% limit."""
+        client = _make_client(positions=[_position("NVDA", 0.35), _position("AMD", 0.20)])
+        rm = risk_manager.RiskManager.__new__(risk_manager.RiskManager)
+        rm._client = client
+        result = rm.check_concentration("PLTR", 0.10)
+
+        assert result["passed"] is False
+        assert result["ai_infra_size_cap_pct"] == pytest.approx(0.05, abs=1e-6)
+
+    def test_cap_is_zero_when_already_at_or_over_the_limit(self):
+        client = _make_client(positions=[_position("NVDA", 0.45), _position("AMD", 0.20)])
+        rm = risk_manager.RiskManager.__new__(risk_manager.RiskManager)
+        rm._client = client
+        result = rm.check_concentration("MSFT", 0.05)  # 65% + 5% = 70%, already over before adding
+
+        assert result["ai_infra_size_cap_pct"] == 0.0
+
+
 class TestCorrelation:
     def test_price_correlation_perfect_positive(self):
         dates = [f"2026-01-{d:02d}" for d in range(1, 26)]

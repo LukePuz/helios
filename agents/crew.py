@@ -533,8 +533,30 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
         conc = rm.check_concentration(ticker, sizing["position_size_pct"], bucket=bucket)
         if not conc["passed"]:
             log.info(f"[{ticker}] Concentration check failed: {conc['flags']}")
-            # Still queue but with a flag in entry_strategy
             sizing["flags"].extend(conc["flags"])
+            # 2026-08-11: this used to only flag AI-infra breaches in text
+            # nobody reviews (auto-execution has no human-in-the-loop tap) —
+            # the portfolio sat over its own 60% limit for a week-plus while
+            # every new ADD kept sailing through anyway. cap is None for a
+            # ticker that isn't itself AI-infra (capping it wouldn't address
+            # a breach caused by other positions) — only scale size down
+            # when it's actually this ticker's own contribution pushing the
+            # total over.
+            cap = conc.get("ai_infra_size_cap_pct")
+            if cap is not None and cap < sizing["position_size_pct"]:
+                original_pct = sizing["position_size_pct"]
+                scale = (cap / original_pct) if original_pct > 0 else 0.0
+                sizing["position_size_pct"] = round(cap, 4)
+                sizing["shares_initial"] = int(sizing["shares_initial"] * scale)
+                sizing["initial_dollar"] = round(sizing["initial_dollar"] * scale, 2)
+                sizing["flags"].append(
+                    f"Size capped to {cap:.1%} target ({sizing['shares_initial']} shares) "
+                    f"to stay within the AI infra limit"
+                )
+                if sizing["shares_initial"] <= 0:
+                    log.info(f"[{ticker}] AI infra concentration leaves 0 shares of room — "
+                             f"skipping entry (already at/over the limit)")
+                    return
 
         # Correlation check
         corr = rm.check_correlation(ticker)

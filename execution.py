@@ -68,6 +68,7 @@ def execute_approved(
 
     try:
         import ibkr
+        import tasks
         import db
         import alerts as alert_module
 
@@ -366,7 +367,7 @@ def execute_approved(
             # definitely going ahead, so the fill can't race the stop and
             # leave an order that would short the account.
             try:
-                cancelled = ibkr.cancel_stop_orders_for(ticker)
+                cancelled = tasks.manage_cancel_stop_orders_for(ticker)
                 if cancelled:
                     log.info(f"[{ticker}] Cancelled {cancelled} stop order(s) before {action}")
             except Exception as e:
@@ -482,7 +483,7 @@ def execute_approved(
                 stop_rec = db.get_position_stop(ticker)
                 if remaining > 0 and stop_rec:
                     try:
-                        new_stop = ibkr.place_stop_order(ticker, remaining, stop_rec["stop_price"])
+                        new_stop = tasks.manage_stop_place(ticker, remaining, stop_rec["stop_price"])
                         db.set_stop_broker_order_id(ticker, new_stop["order_id"])
                         log.info(f"[{ticker}] Stop re-placed for remaining {remaining} shares")
                     except Exception as e:
@@ -524,7 +525,7 @@ def execute_approved(
             stop_placed = False
             for stop_attempt in range(1, 4):
                 try:
-                    stop_result = ibkr.place_stop_order(ticker, filled_qty, float(stop_price))
+                    stop_result = tasks.manage_stop_place(ticker, filled_qty, float(stop_price))
                     db.set_stop_broker_order_id(ticker, stop_result["order_id"])
                     stop_placed = True
                     break
@@ -617,6 +618,7 @@ def execute_manual(
     "message": str, "stop_price": float | None}.
     """
     import ibkr
+    import tasks
     import db
     import alerts as alert_module
     from risk_manager import RiskManager
@@ -643,7 +645,7 @@ def execute_manual(
         # Cancel existing stops first so the fill can't race the stop and
         # leave an order that would short the account.
         try:
-            cancelled = ibkr.cancel_stop_orders_for(ticker)
+            cancelled = tasks.manage_cancel_stop_orders_for(ticker)
             if cancelled:
                 log.info(f"[{ticker}] Cancelled {cancelled} stop order(s) before manual SELL")
         except Exception as e:
@@ -686,7 +688,7 @@ def execute_manual(
             stop_rec = db.get_position_stop(ticker)
             if stop_rec:
                 try:
-                    new_stop = ibkr.place_stop_order(ticker, remaining, stop_rec["stop_price"])
+                    new_stop = tasks.manage_stop_place(ticker, remaining, stop_rec["stop_price"])
                     db.set_stop_broker_order_id(ticker, new_stop["order_id"])
                 except Exception as e:
                     log.error(f"[{ticker}] Failed to re-place stop after manual sell: {e}")
@@ -705,7 +707,7 @@ def execute_manual(
             stop_placed = False
             for attempt in range(1, 4):
                 try:
-                    stop_result = ibkr.place_stop_order(ticker, filled_qty, float(stop_price))
+                    stop_result = tasks.manage_stop_place(ticker, filled_qty, float(stop_price))
                     db.set_stop_broker_order_id(ticker, stop_result["order_id"])
                     stop_placed = True
                     break

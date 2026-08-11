@@ -24,6 +24,9 @@ else:
 
 _OPS_POOL_ARGS    = ["--pool=solo"] if sys.platform == "win32" else ["--pool=prefork", "-c", "3"]
 _LLM_POOL_ARGS    = ["--pool=solo"] if sys.platform == "win32" else ["--pool=prefork", "-c", "1"]
+# Single concurrency is load-bearing, not a performance choice — see
+# celery_orders_worker's comment below.
+_ORDERS_POOL_ARGS = ["--pool=solo"] if sys.platform == "win32" else ["--pool=prefork", "-c", "1"]
 # Screening is CPU-forced 7B inference (see agents/screener.py num_gpu=0) —
 # unlike the 72B stage, concurrent CPU calls don't serialize on GPU memory,
 # so a few can genuinely run in parallel. 3 on a 24-core host leaves room
@@ -71,6 +74,36 @@ SERVICES: dict[str, dict] = {
         "cmd":   [CELERY, "-A", "tasks", "worker", "--loglevel=info",
                   "-Q", "screen", "-n", "screen@%h"] + _SCREEN_POOL_ARGS,
         "log":   LOG_DIR / "celery_screen_worker.log",
+    },
+    # Orders worker — the ONLY process in the system allowed to place or
+    # cancel a stop order at the broker. Added 2026-08-11 after tracing
+    # MRVL/SNDK/VRT/ORCL/DDOG's stuck-order incidents to a single root
+    # cause: IBKR silently ignores cancelOrder()/modify calls from a
+    # clientId that didn't place the order (confirmed repeatedly, including
+    # live-testing that clientId=0's documented "master client" status does
+    # NOT actually grant cancel rights over another client's order in this
+    # account/TWS config — see tasks.py's manage_stop_* docstrings). Before
+    # this, a stop got PLACED under whichever process handled the entry
+    # (celery_llm_worker, clientId=20, or main.py, clientId=1) but every
+    # LATER touch — trailing-stop conversion, orphan cleanup, a manual
+    # sell's pre-cancel — ran from celery_worker's ops pool (clientId
+    # 10/11/12, whichever of its 3 forks happened to pick up the task) —
+    # a guaranteed mismatch, not an intermittent one, for every stop this
+    # system has ever placed.
+    #
+    # Fix: exactly one process, one clientId, one order of operations for
+    # a stop's entire lifecycle. Every other process (LLM worker, ops
+    # worker, main.py, dashboard) now dispatches here via
+    # tasks.manage_stop_place/manage_cancel_stop_orders_for/
+    # manage_cancel_order instead of calling ibkr.py's placement/cancel
+    # functions directly. Concurrency MUST stay at 1 — the whole point is
+    # a single, unfragmented clientId; forking this the way celery_worker
+    # forks would just reintroduce the same bug one level down.
+    "celery_orders_worker": {
+        "label": "Celery Worker (orders)",
+        "cmd":   [CELERY, "-A", "tasks", "worker", "--loglevel=info",
+                  "-Q", "orders", "-n", "orders@%h"] + _ORDERS_POOL_ARGS,
+        "log":   LOG_DIR / "celery_orders_worker.log",
     },
     "celery_beat": {
         "label": "Celery Beat",
@@ -229,6 +262,16 @@ def start(name: str) -> str:
             # No IB_CLIENT_ID — screening never touches IBKR (just Ollama,
             # vector store, and db.log_signal), so it doesn't need a
             # broker connection at all.
+            extra["DB_MAXCONN"] = "2"
+        elif name == "celery_orders_worker":
+            # Base 30 -- clear of every other worker's base+fork-index range
+            # (10-12, 20). -c 1 (see _ORDERS_POOL_ARGS) means this base is
+            # never offset by a fork index, so IB_CLIENT_ID=30 IS this
+            # worker's clientId, always -- other code checks os.environ for
+            # exactly this value to decide whether it's already running
+            # inside the one true orders process (see tasks.py's
+            # manage_stop_* functions).
+            extra["IB_CLIENT_ID"] = "30"
             extra["DB_MAXCONN"] = "2"
         env      = {**__import__("os").environ, **extra}
         _rotate_log_if_large(svc["log"])

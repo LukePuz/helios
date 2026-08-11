@@ -700,13 +700,13 @@ class RiskManager:
                         method_label = f"{trail_pct}% (ATR unavailable, flat-% fallback)"
 
                     try:
-                        import ibkr
+                        import tasks
                         qty = round(abs(float(pos.qty)), 4)
-                        ibkr.cancel_stop_orders_for(ticker)
+                        tasks.manage_cancel_stop_orders_for(ticker)
                         if trail_amount is not None:
-                            result = ibkr.place_trailing_stop_order(ticker, qty, trail_amount=trail_amount)
+                            result = tasks.manage_place_trailing_stop(ticker, qty, trail_amount=trail_amount)
                         else:
-                            result = ibkr.place_trailing_stop_order(ticker, qty, trail_percent=trail_pct)
+                            result = tasks.manage_place_trailing_stop(ticker, qty, trail_percent=trail_pct)
                         db.set_stop_broker_order_id(ticker, result["order_id"])
                         db.update_trailing_stop(ticker, new_stop, current)
                         log.info(f"[{ticker}] Converted to native TRAIL stop ({method_label}), "
@@ -717,10 +717,10 @@ class RiskManager:
                         prev_high = stop_record.get("trailing_high") or entry
                         if current > prev_high and new_stop > stop_px:
                             try:
-                                import ibkr
-                                ibkr.cancel_stop_orders_for(ticker)
+                                import tasks
+                                tasks.manage_cancel_stop_orders_for(ticker)
                                 qty = round(abs(float(pos.qty)), 4)
-                                result = ibkr.place_stop_order(ticker, qty, new_stop)
+                                result = tasks.manage_stop_place(ticker, qty, new_stop)
                                 db.set_stop_broker_order_id(ticker, result["order_id"])
                                 db.update_trailing_stop(ticker, new_stop, current)
                                 log.info(f"[{ticker}] Broker stop moved to ${new_stop:.2f} (fallback path)")

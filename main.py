@@ -142,7 +142,7 @@ def _reconcile_positions() -> None:
 
         if in_ibkr_not_db:
             from risk_manager import RiskManager
-            from ibkr import place_stop_order
+            from tasks import manage_stop_place
             rm = RiskManager(client)
             adopted: list[str] = []
             for symbol, qty in in_ibkr_not_db.items():
@@ -156,7 +156,7 @@ def _reconcile_positions() -> None:
                         bucket="Accelerator", conviction=5, trail_distance_pct=None,
                     )
                     try:
-                        stop_result = place_stop_order(symbol, abs(qty), stop_price)
+                        stop_result = manage_stop_place(symbol, abs(qty), stop_price)
                         db.set_stop_broker_order_id(symbol, stop_result["order_id"])
                         adopted.append(f"{symbol} ({qty} shares, stop placed @ ${stop_price:.2f})")
                     except Exception as e:
@@ -198,7 +198,8 @@ def _reconcile_open_orders() -> None:
     what this incident was about.
     """
     try:
-        from ibkr import get_client, get_open_orders, cancel_order
+        from ibkr import get_client, get_open_orders
+        from tasks import manage_cancel_order
         get_client()  # ensure connected before querying
         stale = [
             o for o in get_open_orders()
@@ -210,7 +211,7 @@ def _reconcile_open_orders() -> None:
 
         cancelled = []
         for o in stale:
-            if cancel_order(o["order_id"]):
+            if manage_cancel_order(o["order_id"]):
                 cancelled.append(f"{o['ticker']} ({o['qty']} shares, orderId={o['order_id']})")
             else:
                 cancelled.append(f"{o['ticker']} — COULD NOT CANCEL orderId={o['order_id']}, check TWS manually")

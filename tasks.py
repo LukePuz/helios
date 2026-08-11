@@ -86,6 +86,126 @@ SCREEN_EVENT_EXPIRES_SECONDS = 2 * 3600
 # An event analyzed hours late is analyzing a stale market — discard instead.
 LLM_EVENT_EXPIRES_SECONDS = 4 * 3600
 
+# ── Order lifecycle (the ONE clientId that ever touches a stop order) ──────────
+# 2026-08-11: MRVL/SNDK/VRT/ORCL/DDOG were all the same root cause. A stop got
+# PLACED under whichever process handled the entry (celery_llm_worker,
+# clientId=20, or main.py's Telegram path, clientId=1), but every LATER touch
+# — trailing-stop conversion, orphan cleanup, a manual sell's pre-cancel — ran
+# from celery_worker's ops pool (clientId 10/11/12, whichever of its 3 forks
+# happened to pick up the task). IBKR silently ignores a cancel/modify from a
+# clientId that didn't place the order, so that mismatch is guaranteed, not
+# intermittent, for every stop this system has ever placed. Confirmed live
+# that clientId=0's documented "master client" status does not actually grant
+# cancel rights over another client's order in this account/TWS config either
+# — the cancel *looked* to succeed locally but a neutral third connection
+# showed the order still resting at the broker afterward, the same
+# looks-cancelled-isn't shape ibkr.cancel_order was hardened against for the
+# MRVL incident.
+#
+# Fix: exactly one process (celery_orders_worker, IB_CLIENT_ID=30, -c 1 so
+# that base is never fork-offset) is allowed to place or cancel a stop.
+# Everything else calls the three functions below instead of ibkr.py's
+# placement/cancel functions directly. Each checks whether it's ALREADY
+# running inside that one process (cheap: just the env var process_manager.py
+# sets for it) — if so, call the broker directly; if not, dispatch a task to
+# the "orders" queue and wait for the result. The direct-call branch also
+# means celery_orders_worker's own tasks never call back into themselves.
+ORDERS_QUEUE = "orders"
+_ORDERS_WORKER_CLIENT_ID = "30"
+
+
+def _is_orders_worker() -> bool:
+    return os.getenv("IB_CLIENT_ID") == _ORDERS_WORKER_CLIENT_ID
+
+
+@app.task(name="tasks._broker_place_stop_order", bind=True, max_retries=1)
+def _broker_place_stop_order(self, ticker: str, qty: float, stop_price: float) -> dict:
+    import ibkr
+    return ibkr.place_stop_order(ticker, qty, stop_price)
+
+
+@app.task(name="tasks._broker_cancel_stop_orders_for", bind=True, max_retries=1)
+def _broker_cancel_stop_orders_for(self, ticker: str) -> int:
+    import ibkr
+    return ibkr.cancel_stop_orders_for(ticker)
+
+
+@app.task(name="tasks._broker_cancel_order", bind=True, max_retries=1)
+def _broker_cancel_order(self, order_id: int) -> bool:
+    import ibkr
+    return ibkr.cancel_order(order_id)
+
+
+def manage_stop_place(ticker: str, qty: float, stop_price: float, timeout: int = 30) -> dict:
+    """Place a protective stop — see the module-level comment above for why
+    this exists instead of calling ibkr.place_stop_order directly. Every
+    caller anywhere in the codebase should go through this, including code
+    that happens to already be running in the orders worker (that branch is
+    just a direct call, essentially free) — the point is there being exactly
+    one way to do this, so a future direct ibkr.place_stop_order call can't
+    quietly reintroduce the bug."""
+    if _is_orders_worker():
+        import ibkr
+        return ibkr.place_stop_order(ticker, qty, stop_price)
+    from celery.result import allow_join_result
+    with allow_join_result():
+        return _broker_place_stop_order.apply_async(
+            args=[ticker, qty, stop_price], queue=ORDERS_QUEUE,
+        ).get(timeout=timeout)
+
+
+def manage_cancel_stop_orders_for(ticker: str, timeout: int = 30) -> int:
+    """Cancel all resting stop orders for a ticker — see manage_stop_place."""
+    if _is_orders_worker():
+        import ibkr
+        return ibkr.cancel_stop_orders_for(ticker)
+    from celery.result import allow_join_result
+    with allow_join_result():
+        return _broker_cancel_stop_orders_for.apply_async(
+            args=[ticker], queue=ORDERS_QUEUE,
+        ).get(timeout=timeout)
+
+
+@app.task(name="tasks._broker_place_trailing_stop_order", bind=True, max_retries=1)
+def _broker_place_trailing_stop_order(self, ticker: str, qty: float,
+                                       trail_amount: float | None = None,
+                                       trail_percent: float | None = None) -> dict:
+    import ibkr
+    return ibkr.place_trailing_stop_order(ticker, qty, trail_amount=trail_amount,
+                                           trail_percent=trail_percent)
+
+
+def manage_place_trailing_stop(ticker: str, qty: float, trail_amount: float | None = None,
+                               trail_percent: float | None = None, timeout: int = 30) -> dict:
+    """Place a native TRAIL stop (the trailing-stop conversion path) — see
+    manage_stop_place. Exactly one of trail_amount/trail_percent, matching
+    ibkr.place_trailing_stop_order's own contract."""
+    if _is_orders_worker():
+        import ibkr
+        return ibkr.place_trailing_stop_order(ticker, qty, trail_amount=trail_amount,
+                                               trail_percent=trail_percent)
+    from celery.result import allow_join_result
+    with allow_join_result():
+        return _broker_place_trailing_stop_order.apply_async(
+            args=[ticker, qty], kwargs={"trail_amount": trail_amount, "trail_percent": trail_percent},
+            queue=ORDERS_QUEUE,
+        ).get(timeout=timeout)
+
+
+def manage_cancel_order(order_id: int, timeout: int = 30) -> bool:
+    """Cancel a specific order by id — see manage_stop_place. Also used for
+    the stale-market-BUY-order cleanup at startup (main.py), not just stops:
+    the same ownership rule applies to any order type, not only STP."""
+    if _is_orders_worker():
+        import ibkr
+        return ibkr.cancel_order(order_id)
+    from celery.result import allow_join_result
+    with allow_join_result():
+        return _broker_cancel_order.apply_async(
+            args=[order_id], queue=ORDERS_QUEUE,
+        ).get(timeout=timeout)
+
+
 # ── Periodic schedule ─────────────────────────────────────────────────────────
 # Every entry carries "expires": a task not picked up within that window is
 # discarded by the worker instead of executed late. Interval tasks expire
@@ -645,7 +765,7 @@ def reconcile_unconfirmed_orders(self):
             stop_price = approval.get("stop_loss_price") or risk_json.get("stop_loss_price")
             if stop_price:
                 try:
-                    stop_result = ibkr.place_stop_order(ticker, fill_qty, float(stop_price))
+                    stop_result = manage_stop_place(ticker, fill_qty, float(stop_price))
                     db.upsert_position_stop(
                         ticker=ticker, entry_price=fill_price, stop_price=float(stop_price),
                         stop_method=risk_json.get("stop_method", ""),
@@ -814,7 +934,7 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
             db.delete_position_stop(ticker)
             return False
 
-        ibkr.cancel_stop_orders_for(ticker)  # belt-and-braces before selling
+        manage_cancel_stop_orders_for(ticker)  # belt-and-braces before selling
         result = ibkr.place_market_order(ticker, "SELL", owned)
         filled = float(result.get("filled_qty") or 0)
         if filled <= 0:
@@ -1637,7 +1757,7 @@ def reconcile_stop_orders(self):
                              f"(no position in this cycle's snapshot) — waiting for the next "
                              f"cycle to confirm before cancelling")
                     continue
-                if ibkr.cancel_order(o["order_id"]):
+                if manage_cancel_order(o["order_id"]):
                     msg = (f"Cancelled ORPHANED stop: SELL {o['qty']} {o['ticker']} "
                            f"@ ${o['stop_price'] or 0:.2f} (no position held on 2 consecutive "
                            f"checks — would have shorted)")

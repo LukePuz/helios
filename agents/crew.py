@@ -644,11 +644,43 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
         log.error(f"[{ticker}] Failed to log pending approval")
         return
 
-    # Paper trading only, no real capital at risk — auto-execute instead of
-    # waiting on a Telegram approval tap. Per explicit user request 2026-07-14
-    # (see CLAUDE.md); every other risk control (drawdown halt, concentration
-    # caps, price-drift abort, ATR stop placement) still applies unchanged,
-    # only the human-in-the-loop tap is removed.
+    from config import AUTO_EXECUTE
+
+    if not AUTO_EXECUTE:
+        # Live trading with no explicit LIVE_TRADING_ENABLED opt-in (see
+        # config.py) — added 2026-08-13 ahead of the live rollout. Route
+        # through the same Telegram Approve/Reject flow paper trading used
+        # before 2026-07-14 (alerts.send_approval_request /
+        # telegram_bot._handle_callback) instead of firing unattended.
+        # Leaves the approval PENDING; a human tap executes it from there.
+        msg_id = alert_module.send_approval_request(
+            approval_id=approval_id,
+            ticker=ticker,
+            action=result["action"],
+            conviction=conviction,
+            bucket=bucket,
+            size_pct=sizing["position_size_pct"],
+            stop_price=sizing.get("stop_loss_price"),
+            entry_strategy=entry_strategy,
+            reasoning=result.get("reasoning", ""),
+        )
+        if msg_id is not None:
+            db.set_approval_telegram_id(approval_id, msg_id)
+        else:
+            log.error(f"[{ticker}] Failed to send approval request for #{approval_id}")
+        if _feed_emit:
+            _feed_emit("execution", ticker,
+                       f"Queued for approval: {result['action']} {sizing['shares_initial']} shares "
+                       f"({sizing['position_size_pct']:.1%} portfolio) — awaiting Telegram tap",
+                       "neutral")
+        return
+
+    # Paper trading, or live with LIVE_TRADING_ENABLED explicitly set — auto-
+    # execute instead of waiting on a Telegram approval tap. Per explicit
+    # user request 2026-07-14 for paper (see CLAUDE.md); every other risk
+    # control (drawdown halt, concentration caps, price-drift abort, ATR
+    # stop placement) still applies unchanged, only the human-in-the-loop
+    # tap is removed.
     from execution import execute_approved
 
     if not db.claim_approval_for_execution(approval_id):

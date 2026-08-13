@@ -216,6 +216,62 @@ MIN_COMPOSITE_SCORE_HIGH  = 75     # scanner score threshold for HIGH priority
 MIN_COMPOSITE_SCORE_MEDIUM = 50    # scanner score threshold for MEDIUM priority
 
 # ---------------------------------------------------------------------------
+# Account-size tiers — added 2026-08-13 ahead of the live rollout.
+# risk_manager.py's size_position is whole-shares-only; BUCKET_SIZE_TABLE's
+# percentages, tuned for the ~$1M paper account, produce sub-1-share
+# (unexecutable) tranches on most of the watchlist well before the account
+# is actually "small" in any other sense. Below $25,000 (also the PDT
+# threshold for margin accounts — a second, independent reason a small
+# live account needs different handling), sizing tightens instead of
+# silently failing.
+#
+# Evaluated live off actual portfolio value via get_active_limits(balance)
+# — not a one-time constant — so an account re-tiers automatically as it
+# grows or shrinks, no restart or manual edit needed.
+# ---------------------------------------------------------------------------
+ACCOUNT_TIER_STANDARD_MIN = 25_000.0   # >= this: today's rules, unchanged
+ACCOUNT_TIER_REDUCED_MIN  = 5_000.0    # >= this (and < standard): "reduced"
+                                        # below this: "micro"
+
+TIER_MAX_CONCURRENT_POSITIONS = {"standard": None, "reduced": 6, "micro": 5}
+TIER_MIN_CONVICTION_TO_QUEUE  = {"standard": MIN_CONVICTION_TO_QUEUE, "reduced": 6, "micro": 7}
+# Moonshot's normal 2% cap is structurally too small to ever clear the
+# whole-share floor at Reduced/Micro balances — raised per-tier instead of
+# excluding the bucket outright. Confirmed intentional 2026-08-13 despite
+# being a 5-10x jump in single-bet risk: a $202 moonshot at $1,010 (Micro)
+# vs. today's $20.
+TIER_MAX_POSITION_PCT_MOONSHOT = {"standard": MAX_POSITION_PCT_MOONSHOT, "reduced": 0.10, "micro": 0.20}
+# No single share purchase may itself already represent more than this
+# fraction of portfolio value — guards against one expensive share (e.g. an
+# $800 stock on a $1,010 account) structurally dominating the position.
+# None at Standard (never binding there in practice; not worth the extra
+# code path at that scale).
+TIER_SINGLE_SHARE_CAP_PCT = {"standard": None, "reduced": 0.50, "micro": 0.50}
+
+
+def get_account_tier(balance: float) -> str:
+    if balance >= ACCOUNT_TIER_STANDARD_MIN:
+        return "standard"
+    if balance >= ACCOUNT_TIER_REDUCED_MIN:
+        return "reduced"
+    return "micro"
+
+
+def get_active_limits(balance: float) -> dict:
+    """Tier-appropriate sizing limits for the given live portfolio balance.
+    Call at the top of every sizing/queueing decision (RiskManager.size_position,
+    the analyst-conviction gate in agents/crew.py) rather than reading the
+    tier dicts directly, so all callers re-tier consistently."""
+    tier = get_account_tier(balance)
+    return {
+        "tier":                      tier,
+        "max_concurrent_positions":  TIER_MAX_CONCURRENT_POSITIONS[tier],
+        "min_conviction_to_queue":   TIER_MIN_CONVICTION_TO_QUEUE[tier],
+        "max_position_pct_moonshot": TIER_MAX_POSITION_PCT_MOONSHOT[tier],
+        "single_share_cap_pct":      TIER_SINGLE_SHARE_CAP_PCT[tier],
+    }
+
+# ---------------------------------------------------------------------------
 # Market regime
 # ---------------------------------------------------------------------------
 REGIME_CACHE_TTL_SECONDS = 1800   # 30 minutes — allows mid-session regime refresh

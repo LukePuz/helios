@@ -39,6 +39,7 @@ try:
         MAX_TRADE_PCT_OF_CASH_RESERVE,
         SWAP_MIN_CONVICTION_GAP,
         SWAP_MAX_CANDIDATE_CONVICTION,
+        get_active_limits,
     )
 except ImportError:
     DRAWDOWN_HALT_PCT             = 0.10
@@ -62,6 +63,12 @@ except ImportError:
     MAX_TRADE_PCT_OF_CASH_RESERVE = 0.20
     SWAP_MIN_CONVICTION_GAP       = 2
     SWAP_MAX_CANDIDATE_CONVICTION = 6
+
+    def get_active_limits(balance: float) -> dict:
+        return {"tier": "standard", "max_concurrent_positions": None,
+                "min_conviction_to_queue": 5,
+                "max_position_pct_moonshot": MAX_POSITION_PCT_MOONSHOT,
+                "single_share_cap_pct": None}
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +290,21 @@ class RiskManager:
                     "cash_blocked": False,
                     "flags": ["HALTED — portfolio drawdown limit reached"]}
 
-        pv    = self.portfolio_value()
+        pv     = self.portfolio_value()
+        limits = get_active_limits(pv)
+
+        # Account-tier conviction floor — added 2026-08-13 ahead of the live
+        # rollout. Below $25k the whole-shares-only constraint below makes
+        # low-conviction ideas structurally more likely to waste a scarce
+        # position slot on an unexecutable or marginal size; Reduced/Micro
+        # require a higher bar before sizing even begins. No effect at
+        # Standard (min_conviction_to_queue == today's MIN_CONVICTION_TO_QUEUE).
+        if conviction < limits["min_conviction_to_queue"]:
+            return {"position_size_pct": 0, "dollar_amount": 0, "shares_initial": 0,
+                    "cash_blocked": False,
+                    "flags": [f"Conviction {conviction} below the {limits['tier']}-tier minimum "
+                              f"({limits['min_conviction_to_queue']}) — skipping"]}
+
         band  = _conviction_band(conviction)
         sizes = BUCKET_SIZE_TABLE.get(bucket, BUCKET_SIZE_TABLE["Accelerator"])
         lo, hi = sizes.get(band, (0.01, 0.02))
@@ -293,16 +314,31 @@ class RiskManager:
                     "cash_blocked": False,
                     "flags": [f"Conviction {conviction} too low for {bucket} — WATCH only"]}
 
+        # BUCKET_SIZE_TABLE's Moonshot bands (0.25%-2%) are calibrated
+        # against the Standard-tier 2% hard cap — raising the hard cap alone
+        # (limits["max_position_pct_moonshot"]) doesn't change anything
+        # because these bands, not the cap, are what actually binds at
+        # Standard. At Reduced/Micro the tier cap IS the intended scale
+        # (10%/20%, per 2026-08-13 sign-off), so scale the bands themselves
+        # by the same ratio, preserving conviction-band shape instead of
+        # flattening it.
+        if bucket == "Moonshot" and limits["tier"] != "standard":
+            moonshot_scale = limits["max_position_pct_moonshot"] / MAX_POSITION_PCT_MOONSHOT
+            lo, hi = lo * moonshot_scale, hi * moonshot_scale
+
         # Midpoint of range, then apply regime multiplier
         base_pct  = (lo + hi) / 2
         mult      = REGIME_MULTIPLIER.get(regime, 0.75)
         target    = base_pct * mult
 
-        # Enforce hard caps
+        # Enforce hard caps — Moonshot's cap is tier-dependent (see
+        # config.TIER_MAX_POSITION_PCT_MOONSHOT): its normal 2% is
+        # structurally too small to clear the whole-share floor below at
+        # Reduced/Micro balances, so it's raised per-tier instead.
         hard_cap = {
             "Compounder":  MAX_POSITION_PCT_COMPOUNDER,
             "Accelerator": MAX_POSITION_PCT_ACCELERATOR,
-            "Moonshot":    MAX_POSITION_PCT_MOONSHOT,
+            "Moonshot":    limits["max_position_pct_moonshot"],
         }.get(bucket, MAX_POSITION_PCT_ACCELERATOR)
 
         target = min(target, hard_cap)
@@ -310,6 +346,25 @@ class RiskManager:
         # Check if adding would exceed current position cap
         held = self.current_position_value(ticker)
         held_pct = held / pv if pv > 0 else 0
+
+        # Max-concurrent-positions cap — Reduced/Micro tiers only, and only
+        # for a genuinely NEW position (held_pct == 0); adding to something
+        # already held doesn't consume a new slot. Checked here rather than
+        # upstream in crew.py so it applies uniformly to every caller of
+        # size_position, not just the auto-execution path.
+        if held_pct == 0 and limits["max_concurrent_positions"] is not None:
+            try:
+                open_count = len(self._client.get_all_positions())
+            except Exception as e:
+                log.error(f"Could not fetch position count for max-concurrent check: {e}")
+                open_count = None
+            if open_count is not None and open_count >= limits["max_concurrent_positions"]:
+                return {"position_size_pct": 0, "dollar_amount": 0, "shares_initial": 0,
+                        "cash_blocked": False,
+                        "flags": [f"At the {limits['tier']}-tier max of "
+                                  f"{limits['max_concurrent_positions']} concurrent positions "
+                                  f"({open_count} held) — skipping new {ticker} position"]}
+
         remaining = max(0, target - held_pct)
         if remaining < 0.005:
             return {"position_size_pct": 0, "dollar_amount": 0, "shares_initial": 0,
@@ -320,6 +375,21 @@ class RiskManager:
             return {"position_size_pct": 0, "dollar_amount": 0, "shares_initial": 0,
                     "cash_blocked": False,
                     "flags": [f"Invalid price ({price!r}) — cannot size position"]}
+
+        # Single-share cap — Reduced/Micro tiers only (see
+        # config.TIER_SINGLE_SHARE_CAP_PCT). One share alone can't already
+        # represent more than this fraction of the account; guards against
+        # one expensive share structurally dominating a small portfolio in
+        # a way the % sizing bands above don't otherwise catch, since those
+        # operate on target allocation, not on what a single indivisible
+        # share costs.
+        share_cap_pct = limits["single_share_cap_pct"]
+        if share_cap_pct is not None and price > pv * share_cap_pct:
+            return {"position_size_pct": 0, "dollar_amount": 0, "shares_initial": 0,
+                    "cash_blocked": False,
+                    "flags": [f"{ticker} share price ${price:,.2f} exceeds the {limits['tier']}-tier "
+                              f"single-share cap of {share_cap_pct:.0%} portfolio "
+                              f"(${pv * share_cap_pct:,.2f}) — skipping"]}
 
         dollar_amount  = pv * remaining
         initial_pct    = 0.55  # 55% initial tranche (midpoint of 50-60%)

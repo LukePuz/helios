@@ -220,10 +220,17 @@ MIN_COMPOSITE_SCORE_MEDIUM = 50    # scanner score threshold for MEDIUM priority
 # risk_manager.py's size_position is whole-shares-only; BUCKET_SIZE_TABLE's
 # percentages, tuned for the ~$1M paper account, produce sub-1-share
 # (unexecutable) tranches on most of the watchlist well before the account
-# is actually "small" in any other sense. Below $25,000 (also the PDT
-# threshold for margin accounts — a second, independent reason a small
-# live account needs different handling), sizing tightens instead of
-# silently failing.
+# is actually "small" in any other sense. Below $25,000, sizing tightens
+# instead of silently failing.
+#
+# $25,000 is our own risk/diversification threshold, not a regulatory one —
+# FINRA's Pattern Day Trader rule (which used to carry this same number as
+# its minimum-equity line) was eliminated 2026-06-04, replaced by real-time
+# intraday margin monitoring (FINRA Notice 26-10; SR-FINRA-2025-017). IBKR
+# specifically now applies the standard Reg T $2,000 minimum for margin/
+# short-sale trading instead of the old $25k PDT floor. Below that $2,000
+# Reg T line (which covers the live account's current [balance redacted] balance), the
+# account effectively can't use margin regardless of this tiering.
 #
 # Evaluated live off actual portfolio value via get_active_limits(balance)
 # — not a one-time constant — so an account re-tiers automatically as it

@@ -202,3 +202,124 @@ class TestConcentrationCapping:
         assert kwargs["risk_json"]["shares_initial"] == 10  # unchanged
 
         mock_rm_cls.return_value.size_position.assert_called_once()
+
+
+class TestConvictionSwap:
+    """2026-08-13: when sizing is blocked purely by a cash shortage (not a
+    halt, not "already at target," not low conviction), _route_to_approval
+    now checks for a swap candidate before giving up on a high-conviction
+    idea. These tests guard the wiring in crew.py specifically — the
+    swap-eligibility logic itself is tested in test_risk_manager.py's
+    TestFindSwapCandidate."""
+
+    def _cash_blocked_sizing(self):
+        return {"shares_initial": 0, "flags": ["Allocation too small"], "cash_blocked": True,
+                "position_size_pct": 0}
+
+    def _funded_sizing(self):
+        return {
+            "shares_initial": 8, "initial_dollar": 800.0, "position_size_pct": 0.08,
+            "initial_entry_pct": 0.55, "flags": [], "stop_loss_price": 90.0,
+        }
+
+    def test_swap_found_resizes_and_proceeds(self):
+        result = _analyst_result(action="ADD", ticker="PLTR", conviction=9)
+        client = MagicMock()
+
+        with patch("db.has_active_approval", return_value=False), \
+             patch("db.get_last_executed_approval", return_value=None), \
+             patch("agents.crew._get_price", return_value=100.0), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("db.log_pending_approval", return_value=-1) as mock_log_approval, \
+             patch("catalyst_service.gates.catalyst_gate_check", return_value={"approved": True}), \
+             patch("execution.execute_manual", return_value={"success": True}) as mock_sell, \
+             patch("alerts._send") as mock_alert:
+            mock_rm_cls.return_value.size_position.side_effect = [
+                self._cash_blocked_sizing(), self._funded_sizing(),
+            ]
+            mock_rm_cls.return_value.find_swap_candidate.return_value = {
+                "ticker": "SNOW", "conviction": 4, "qty": 10.0,
+                "market_value": 1000.0, "unrealized_pl": 150.0,
+            }
+            mock_rm_cls.return_value.check_concentration.return_value = {
+                "passed": True, "flags": [], "ai_infrastructure_total": 0,
+                "ai_infra_size_cap_pct": None,
+            }
+            mock_rm_cls.return_value.check_correlation.return_value = {"reduce_by": 0}
+            crew._route_to_approval(result, {"regime": "Neutral"}, client)
+
+        mock_sell.assert_called_once()
+        assert mock_sell.call_args[0][0] == "SNOW"
+        assert mock_sell.call_args[0][1] == "SELL"
+        mock_alert.assert_called_once()
+        assert "SNOW" in mock_alert.call_args[0][0]
+        assert "PLTR" in mock_alert.call_args[0][0]
+        mock_log_approval.assert_called_once()
+        assert mock_log_approval.call_args.kwargs["risk_json"]["shares_initial"] == 8
+
+    def test_no_swap_candidate_falls_through_to_existing_behavior(self):
+        """Nothing qualifies -- must behave exactly as before this feature
+        existed: log and drop, no sell attempted."""
+        result = _analyst_result(action="ADD", ticker="PLTR", conviction=9)
+        client = MagicMock()
+
+        with patch("db.has_active_approval", return_value=False), \
+             patch("db.get_last_executed_approval", return_value=None), \
+             patch("agents.crew._get_price", return_value=100.0), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("db.log_pending_approval") as mock_log_approval, \
+             patch("catalyst_service.gates.catalyst_gate_check", return_value={"approved": True}), \
+             patch("execution.execute_manual") as mock_sell:
+            mock_rm_cls.return_value.size_position.return_value = self._cash_blocked_sizing()
+            mock_rm_cls.return_value.find_swap_candidate.return_value = None
+            crew._route_to_approval(result, {"regime": "Neutral"}, client)
+
+        mock_sell.assert_not_called()
+        mock_log_approval.assert_not_called()
+
+    def test_swap_lookup_never_attempted_for_non_cash_blocks(self):
+        """0 shares for a reason OTHER than cash (e.g. already at target)
+        must never trigger a swap lookup at all."""
+        result = _analyst_result(action="ADD", ticker="PLTR", conviction=9)
+        client = MagicMock()
+
+        with patch("db.has_active_approval", return_value=False), \
+             patch("db.get_last_executed_approval", return_value=None), \
+             patch("agents.crew._get_price", return_value=100.0), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("db.log_pending_approval") as mock_log_approval:
+            mock_rm_cls.return_value.size_position.return_value = {
+                "shares_initial": 0, "flags": ["Position already at/near target"],
+                "cash_blocked": False, "position_size_pct": 0,
+            }
+            crew._route_to_approval(result, {"regime": "Neutral"}, client)
+
+        mock_rm_cls.return_value.find_swap_candidate.assert_not_called()
+        mock_log_approval.assert_not_called()
+
+    def test_swap_sell_failure_falls_through_gracefully(self):
+        """The sell didn't actually go through (e.g. broker error) -- must
+        not pretend it did or crash; falls back to dropping the new idea,
+        same as no candidate being found."""
+        result = _analyst_result(action="ADD", ticker="PLTR", conviction=9)
+        client = MagicMock()
+
+        with patch("db.has_active_approval", return_value=False), \
+             patch("db.get_last_executed_approval", return_value=None), \
+             patch("agents.crew._get_price", return_value=100.0), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("db.log_pending_approval") as mock_log_approval, \
+             patch("execution.execute_manual",
+                   return_value={"success": False, "message": "no fill"}), \
+             patch("alerts._send") as mock_alert:
+            mock_rm_cls.return_value.size_position.return_value = self._cash_blocked_sizing()
+            mock_rm_cls.return_value.find_swap_candidate.return_value = {
+                "ticker": "SNOW", "conviction": 4, "qty": 10.0,
+                "market_value": 1000.0, "unrealized_pl": 150.0,
+            }
+            crew._route_to_approval(result, {"regime": "Neutral"}, client)
+
+        mock_alert.assert_not_called()
+        mock_log_approval.assert_not_called()
+        # Only the initial sizing call -- must not re-size after a failed sell.
+        mock_rm_cls.return_value.size_position.assert_called_once()

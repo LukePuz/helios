@@ -560,6 +560,35 @@ def get_chat_history(user_id: str, limit: int = 12, max_age_hours: float = 4) ->
         _put_conn(conn)
 
 
+def get_latest_signal_for(ticker: str) -> dict | None:
+    """Most recent analysis result for a ticker, regardless of verdict —
+    every call to agents.analyst.analyze() logs here (see analyst.py's
+    db.log_signal call), including routine HOLDs on positions already
+    held, not just actionable OPEN/ADD/TRIM/EXIT ones. This is the
+    freshest conviction reading available for a held position between
+    its entry and whenever position_stops.conviction next gets touched
+    (only on a fresh ADD) — used by RiskManager.find_swap_candidate to
+    judge whether a held position still deserves its size, not just what
+    conviction it was entered at."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT signal, confidence, timestamp FROM signals "
+                "WHERE symbol=%s ORDER BY timestamp DESC LIMIT 1",
+                (ticker,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            return {"signal": row[0], "confidence": float(row[1] or 0), "timestamp": row[2]}
+    except Exception as e:
+        logging.error(f"get_latest_signal_for({ticker}) failed: {e}")
+        return None
+    finally:
+        _put_conn(conn)
+
+
 def get_recent_signals(limit: int = 50) -> list[dict]:
     conn = _get_conn()
     try:

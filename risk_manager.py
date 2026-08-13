@@ -37,6 +37,8 @@ try:
         MAX_AI_INFRA_PCT,
         MAX_MOONSHOT_TOTAL_PCT,
         MAX_TRADE_PCT_OF_CASH_RESERVE,
+        SWAP_MIN_CONVICTION_GAP,
+        SWAP_MAX_CANDIDATE_CONVICTION,
     )
 except ImportError:
     DRAWDOWN_HALT_PCT             = 0.10
@@ -58,6 +60,8 @@ except ImportError:
     MAX_AI_INFRA_PCT              = 0.60
     MAX_MOONSHOT_TOTAL_PCT        = 0.10
     MAX_TRADE_PCT_OF_CASH_RESERVE = 0.20
+    SWAP_MIN_CONVICTION_GAP       = 2
+    SWAP_MAX_CANDIDATE_CONVICTION = 6
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +280,7 @@ class RiskManager:
         """
         if self.is_halted():
             return {"position_size_pct": 0, "dollar_amount": 0, "shares_initial": 0,
+                    "cash_blocked": False,
                     "flags": ["HALTED — portfolio drawdown limit reached"]}
 
         pv    = self.portfolio_value()
@@ -285,6 +290,7 @@ class RiskManager:
 
         if lo is None:
             return {"position_size_pct": 0, "dollar_amount": 0, "shares_initial": 0,
+                    "cash_blocked": False,
                     "flags": [f"Conviction {conviction} too low for {bucket} — WATCH only"]}
 
         # Midpoint of range, then apply regime multiplier
@@ -307,10 +313,12 @@ class RiskManager:
         remaining = max(0, target - held_pct)
         if remaining < 0.005:
             return {"position_size_pct": 0, "dollar_amount": 0, "shares_initial": 0,
+                    "cash_blocked": False,
                     "flags": [f"Position already at/near target ({held_pct:.1%} held)"]}
 
         if not price or price <= 0:
             return {"position_size_pct": 0, "dollar_amount": 0, "shares_initial": 0,
+                    "cash_blocked": False,
                     "flags": [f"Invalid price ({price!r}) — cannot size position"]}
 
         dollar_amount  = pv * remaining
@@ -336,13 +344,21 @@ class RiskManager:
         # Whole shares only — IBKR rejects fractional stock orders on most tickers
         shares_initial = int(initial_dollar / price)
         if shares_initial < 1:
-            if cash_reserve <= 0 or cash_capped:
+            cash_blocked = cash_reserve <= 0 or cash_capped
+            if cash_blocked:
                 # This is buys silently vanishing at crew.py's "0 shares"
                 # drop with no one told why — surface it, throttled to once
                 # a day so a busy morning doesn't spam the same alert on
                 # every subsequent buy attempt.
                 self._alert_cash_blocked(cash_reserve)
+            # cash_blocked distinguishes "genuinely out of room" from every
+            # other reason size_position can return 0 shares (halted,
+            # conviction too low for the bucket, already at target, bad
+            # price) — 2026-08-13, this is what tells the conviction-swap
+            # check in crew.py whether it's even worth looking for a
+            # position to rotate out of.
             return {"position_size_pct": 0, "dollar_amount": 0, "shares_initial": 0,
+                    "cash_blocked": cash_blocked,
                     "flags": flags + [f"Allocation ${initial_dollar:,.2f} buys less than 1 share "
                               f"of {ticker} at ${price:,.2f} — skipping"]}
 
@@ -610,6 +626,100 @@ class RiskManager:
                     else "Sector unknown",
             "reduce_by": reduce_by,
         }
+
+    def _latest_conviction(self, ticker: str) -> int | None:
+        """Freshest available conviction reading for a held position — the
+        most recent analyst signal (logged on every review, including
+        routine HOLDs, see db.get_latest_signal_for's docstring) if one
+        exists, otherwise the conviction the position was last entered/
+        added at. Returns None only if neither exists (shouldn't happen
+        for a genuinely held position)."""
+        import db
+        signal = db.get_latest_signal_for(ticker)
+        if signal is not None:
+            return round(signal["confidence"] * 10)
+        stop_rec = db.get_position_stop(ticker)
+        if stop_rec and stop_rec.get("conviction") is not None:
+            return int(stop_rec["conviction"])
+        return None
+
+    def find_swap_candidate(self, new_ticker: str, new_conviction: int) -> dict | None:
+        """
+        Added 2026-08-13, ahead of a live-money switch: when cash is too
+        tight to size a high-conviction new idea, the old behavior was to
+        just cap or block it outright, even if the portfolio was sitting on
+        a position nobody's excited about anymore. This looks for an
+        existing Accelerator/Moonshot holding that has independently fallen
+        weak enough to be worth exiting anyway, so the new idea can be
+        funded by rotation instead of by force.
+
+        Deliberately opportunistic, never forced — by explicit design
+        decision (2026-08-13), not just an implementation detail:
+          - Compounder-bucket holdings (the long-term core) are never
+            eligible, regardless of conviction gap.
+          - A candidate needs BOTH new_conviction - candidate_conviction >=
+            SWAP_MIN_CONVICTION_GAP AND the candidate's own fresh conviction
+            <= SWAP_MAX_CANDIDATE_CONVICTION. The second condition is the
+            one that actually matters: a held position at 7+/10 is never
+            touched by this no matter how much higher the new idea scores,
+            because it hasn't independently earned an exit — this isn't a
+            relative ranking that always finds a "weakest" position to
+            sacrifice, it's a check for whether anything already looks like
+            it deserves to go.
+          - If multiple positions qualify, prefers realizing a LOSS (or the
+            smallest gain) over a bigger gain — this is a real, deliberate
+            tax consideration, not an afterthought: in a taxable account,
+            selling a position that's up triggers a capital gain (almost
+            certainly short-term given how this system holds positions,
+            taxed at ordinary income rates, not the lower long-term rate).
+            Preferring losses here both minimizes that drag and tends to
+            align with "this one probably isn't working out anyway."
+          - Returns None if nothing qualifies — callers must fall through
+            to the existing cash-cap/block behavior unchanged, never invent
+            a sale just because cash is tight.
+
+        Returns {"ticker", "conviction", "qty", "market_value",
+        "unrealized_pl"} for the single best candidate, or None.
+        """
+        import db
+        try:
+            positions = self._client.get_all_positions()
+        except Exception as e:
+            log.error(f"find_swap_candidate: could not fetch positions: {e}")
+            return None
+
+        candidates = []
+        for p in positions:
+            ticker = p.symbol
+            if ticker == new_ticker:
+                continue
+            stop_rec = db.get_position_stop(ticker)
+            bucket = (stop_rec or {}).get("thesis_bucket")
+            if bucket not in ("Accelerator", "Moonshot"):
+                continue
+            conviction = self._latest_conviction(ticker)
+            if conviction is None:
+                continue
+            if new_conviction - conviction < SWAP_MIN_CONVICTION_GAP:
+                continue
+            if conviction > SWAP_MAX_CANDIDATE_CONVICTION:
+                continue
+            try:
+                candidates.append({
+                    "ticker":         ticker,
+                    "conviction":     conviction,
+                    "qty":            abs(float(p.qty)),
+                    "market_value":   float(p.market_value),
+                    "unrealized_pl":  float(p.unrealized_pl),
+                })
+            except (TypeError, ValueError) as e:
+                log.warning(f"[{ticker}] find_swap_candidate: skipping, bad position data: {e}")
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda c: (c["unrealized_pl"], c["conviction"]))
+        return candidates[0]
 
     # ------------------------------------------------------------------
     # Backward-compatible methods (used by remaining code)

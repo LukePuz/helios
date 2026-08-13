@@ -62,6 +62,20 @@ MAX_MOONSHOT_TOTAL_PCT = 0.10   # 10% total moonshots
 # account (see agents/crew.py auto-execute, no human tap since 2026-07-14).
 MAX_TRADE_PCT_OF_CASH_RESERVE = 0.20   # 20% of remaining cash per trade
 
+# Conviction-swap — 2026-08-13, added ahead of a live-money switch: when cash
+# is too tight to size a high-conviction new idea, check whether an existing
+# Accelerator/Moonshot holding has independently fallen weak enough to be
+# worth exiting anyway, and if so sell it to free up room. Deliberately
+# opportunistic, never forced: SWAP_MIN_CONVICTION_GAP and
+# SWAP_MAX_CANDIDATE_CONVICTION must BOTH hold before a position is even
+# eligible — a held position at 7+/10 is never touched by this, no matter
+# how much higher the new idea scores, because it hasn't independently
+# earned an exit. If nothing qualifies, sizing falls through to the existing
+# cash-cap/block behavior unchanged. Compounder-bucket holdings (the
+# long-term core) are never eligible regardless of conviction.
+SWAP_MIN_CONVICTION_GAP        = 2      # new idea must beat the held position by at least this much
+SWAP_MAX_CANDIDATE_CONVICTION  = 6      # held position's OWN fresh conviction must be at or below this
+
 # Sizing table: (bucket, conviction_band) → (min_pct, max_pct) of portfolio
 # conviction_band is the lower bound of the 2-point band
 BUCKET_SIZE_TABLE: dict[str, dict[int, tuple[float, float]]] = {

@@ -145,6 +145,128 @@ class TestConcentrationSizeCap:
         assert result["ai_infra_size_cap_pct"] == 0.0
 
 
+def _holding(symbol, qty=10.0, market_value=1000.0, unrealized_pl=0.0):
+    return MagicMock(symbol=symbol, qty=qty, market_value=market_value, unrealized_pl=unrealized_pl)
+
+
+class TestLatestConviction:
+    def test_prefers_the_most_recent_signal_over_entry_conviction(self):
+        rm = risk_manager.RiskManager.__new__(risk_manager.RiskManager)
+        with patch("db.get_latest_signal_for", return_value={"confidence": 0.4, "signal": "HOLD",
+                                                               "timestamp": "2026-08-12"}), \
+             patch("db.get_position_stop", return_value={"conviction": 8}):
+            assert rm._latest_conviction("NVDA") == 4
+
+    def test_falls_back_to_entry_conviction_when_no_signal_exists(self):
+        rm = risk_manager.RiskManager.__new__(risk_manager.RiskManager)
+        with patch("db.get_latest_signal_for", return_value=None), \
+             patch("db.get_position_stop", return_value={"conviction": 7}):
+            assert rm._latest_conviction("NVDA") == 7
+
+    def test_returns_none_when_neither_exists(self):
+        rm = risk_manager.RiskManager.__new__(risk_manager.RiskManager)
+        with patch("db.get_latest_signal_for", return_value=None), \
+             patch("db.get_position_stop", return_value=None):
+            assert rm._latest_conviction("NVDA") is None
+
+
+class TestFindSwapCandidate:
+    """2026-08-13: added ahead of a live-money switch, so a genuinely
+    high-conviction idea isn't just capped/blocked outright whenever cash is
+    tight while the portfolio might be sitting on a position nobody's
+    excited about anymore. Deliberately conservative by explicit design
+    (not just implementation detail) -- see find_swap_candidate's own
+    docstring for the full reasoning. These tests guard the three
+    guarantees that actually matter: never forced, never touches
+    Compounders, and prefers realizing a loss over a gain when there's a
+    choice (the tax-aware part)."""
+
+    def _rm(self, positions):
+        client = _make_client(positions=positions)
+        rm = risk_manager.RiskManager.__new__(risk_manager.RiskManager)
+        rm._client = client
+        return rm
+
+    def test_no_candidate_when_gap_is_too_small(self):
+        """new conviction 8, held conviction 7 -- only a 1-point gap,
+        short of SWAP_MIN_CONVICTION_GAP (2). Must not force anything."""
+        rm = self._rm([_holding("SNOW", qty=10, unrealized_pl=100.0)])
+        with patch("db.get_position_stop", return_value={"thesis_bucket": "Accelerator"}), \
+             patch("db.get_latest_signal_for", return_value={"confidence": 0.7, "signal": "HOLD"}):
+            result = rm.find_swap_candidate("PLTR", new_conviction=8)
+        assert result is None
+
+    def test_no_candidate_when_held_conviction_is_too_high(self):
+        """This is the core guarantee the user asked for explicitly: a
+        held position at 7+/10 must NEVER be sold just because something
+        else scores even higher -- the gap alone (9 vs 7 = 2, meets
+        SWAP_MIN_CONVICTION_GAP) is not sufficient on its own. It hasn't
+        independently earned an exit."""
+        rm = self._rm([_holding("SNOW", qty=10, unrealized_pl=100.0)])
+        with patch("db.get_position_stop", return_value={"thesis_bucket": "Accelerator"}), \
+             patch("db.get_latest_signal_for", return_value={"confidence": 0.7, "signal": "HOLD"}):
+            result = rm.find_swap_candidate("PLTR", new_conviction=9)
+        assert result is None
+
+    def test_compounder_bucket_is_never_eligible(self):
+        """Even a genuinely weak, low-conviction Compounder holding must
+        never be swapped out -- that bucket is the long-term core by
+        design, exempt regardless of conviction."""
+        rm = self._rm([_holding("MSFT", qty=10, unrealized_pl=100.0)])
+        with patch("db.get_position_stop", return_value={"thesis_bucket": "Compounder"}), \
+             patch("db.get_latest_signal_for", return_value={"confidence": 0.3, "signal": "HOLD"}):
+            result = rm.find_swap_candidate("PLTR", new_conviction=9)
+        assert result is None
+
+    def test_eligible_accelerator_holding_is_found(self):
+        rm = self._rm([_holding("SNOW", qty=10, unrealized_pl=100.0)])
+        with patch("db.get_position_stop", return_value={"thesis_bucket": "Accelerator"}), \
+             patch("db.get_latest_signal_for", return_value={"confidence": 0.4, "signal": "HOLD"}):
+            result = rm.find_swap_candidate("PLTR", new_conviction=9)  # gap=5, candidate=4 <= 6
+        assert result is not None
+        assert result["ticker"] == "SNOW"
+        assert result["conviction"] == 4
+
+    def test_prefers_a_loss_over_a_gain_when_multiple_qualify(self):
+        """The tax-aware part: given a choice, realize the loss (or
+        smaller gain) rather than the bigger gain, to minimize capital
+        gains drag in a real taxable account."""
+        rm = self._rm([
+            _holding("SNOW", qty=10, unrealized_pl=500.0),   # up big
+            _holding("CRWD", qty=5,  unrealized_pl=-200.0),  # down
+        ])
+
+        def fake_stop(ticker):
+            return {"thesis_bucket": "Accelerator"}
+
+        def fake_signal(ticker):
+            return {"confidence": 0.4, "signal": "HOLD"}  # both conviction 4
+
+        with patch("db.get_position_stop", side_effect=fake_stop), \
+             patch("db.get_latest_signal_for", side_effect=fake_signal):
+            result = rm.find_swap_candidate("PLTR", new_conviction=9)
+
+        assert result["ticker"] == "CRWD"
+        assert result["unrealized_pl"] == -200.0
+
+    def test_the_new_ticker_itself_is_never_a_candidate(self):
+        """Guards against a held position with the same symbol as the new
+        idea (e.g. an ADD to an existing name) being treated as its own
+        swap target."""
+        rm = self._rm([_holding("PLTR", qty=10, unrealized_pl=100.0)])
+        with patch("db.get_position_stop", return_value={"thesis_bucket": "Accelerator"}), \
+             patch("db.get_latest_signal_for", return_value={"confidence": 0.4, "signal": "HOLD"}):
+            result = rm.find_swap_candidate("PLTR", new_conviction=9)
+        assert result is None
+
+    def test_broker_error_returns_none_not_an_exception(self):
+        client = MagicMock()
+        client.get_all_positions.side_effect = Exception("IBKR down")
+        rm = risk_manager.RiskManager.__new__(risk_manager.RiskManager)
+        rm._client = client
+        assert rm.find_swap_candidate("PLTR", new_conviction=9) is None
+
+
 class TestCorrelation:
     def test_price_correlation_perfect_positive(self):
         dates = [f"2026-01-{d:02d}" for d in range(1, 26)]

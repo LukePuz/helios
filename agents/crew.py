@@ -525,9 +525,65 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
         sizing = rm.size_position(ticker, conviction, bucket, regime_str, price)
         sizing["price_at_sizing"] = price
         if sizing.get("shares_initial", 0) <= 0:
-            flags = sizing.get("flags", [])
-            log.info(f"[{ticker}] Risk sizing returned 0 shares: {flags}")
-            return
+            # 2026-08-13: if this is specifically a cash shortage (not a
+            # halt, not "already at target," not conviction too low for the
+            # bucket), check whether an existing Accelerator/Moonshot
+            # holding has independently fallen weak enough to be worth
+            # exiting anyway before giving up on this idea — see
+            # RiskManager.find_swap_candidate's docstring for the exact,
+            # deliberately conservative eligibility rule (never forced;
+            # returns None and changes nothing if no position qualifies).
+            if sizing.get("cash_blocked"):
+                try:
+                    swap = rm.find_swap_candidate(ticker, conviction)
+                except Exception as e:
+                    log.warning(f"[{ticker}] Swap candidate lookup failed: {e}")
+                    swap = None
+                if swap:
+                    log.info(
+                        f"[{ticker}] Cash-blocked at conviction {conviction}/10 — swapping "
+                        f"out of {swap['ticker']} (conviction {swap['conviction']}/10, "
+                        f"unrealized P&L ${swap['unrealized_pl']:,.2f}) to fund it"
+                    )
+                    try:
+                        from execution import execute_manual
+                        sell_result = execute_manual(
+                            swap["ticker"], "SELL", swap["qty"],
+                            reason=(f"Swap — freeing capital for {ticker} (conviction "
+                                    f"{conviction}/10); {swap['ticker']}'s own conviction had "
+                                    f"already fallen to {swap['conviction']}/10, not a new "
+                                    f"concern introduced by this trade"),
+                            bucket=bucket, conviction=swap["conviction"],
+                        )
+                    except Exception as e:
+                        log.error(f"[{swap['ticker']}] Swap sell failed: {e}")
+                        sell_result = {"success": False, "message": str(e)}
+                    if sell_result.get("success"):
+                        try:
+                            import alerts as alert_module
+                            pl = swap["unrealized_pl"]
+                            pl_word = "gain" if pl >= 0 else "loss"
+                            alert_module._send(
+                                f"🔄 <b>SWAP</b> — sold {swap['qty']:g} {swap['ticker']} "
+                                f"(conviction {swap['conviction']}/10, realized "
+                                f"${abs(pl):,.2f} {pl_word}) to fund <b>{ticker}</b> "
+                                f"(conviction {conviction}/10). Not a thesis change on "
+                                f"{swap['ticker']} — its own conviction had already fallen; "
+                                f"this just acted on it instead of leaving it sitting."
+                            )
+                        except Exception:
+                            pass
+                        # Re-size now that the sale has freed up cash.
+                        sizing = rm.size_position(ticker, conviction, bucket, regime_str, price)
+                        sizing["price_at_sizing"] = price
+                    else:
+                        log.warning(f"[{swap['ticker']}] Swap sell did not complete: "
+                                    f"{sell_result.get('message')}")
+
+            if sizing.get("shares_initial", 0) <= 0:
+                flags = sizing.get("flags", [])
+                log.info(f"[{ticker}] Risk sizing returned 0 shares: {flags}")
+                return
 
         # Concentration check
         conc = rm.check_concentration(ticker, sizing["position_size_pct"], bucket=bucket)

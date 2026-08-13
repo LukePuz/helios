@@ -28,16 +28,52 @@ def _load_symbols() -> list[str]:
 SYMBOLS: list[str] = _load_symbols()
 
 # ---------------------------------------------------------------------------
-# Portfolio baseline — must match this account's actual starting net
-# liquidation value, not an arbitrary round number. Used as the P&L=0 line
-# on the dashboard and as the fallback high-water-mark seed for the
-# drawdown-halt circuit breaker (tasks.check_portfolio_drawdown) the first
-# time it ever runs against a given database. IBKR paper accounts seed at
-# $1,000,000 by default, not $100k — a mismatch here either makes the
-# dashboard show a fake multi-hundred-thousand-dollar "profit," or, worse,
-# could false-trigger the drawdown halt on first run if the real balance is
-# ever *below* this constant.
-START_VALUE = 1_001_433.51
+# Trading environment — paper vs. live
+# ---------------------------------------------------------------------------
+# Single switch that derives every paper/live-dependent constant below
+# (broker port, clientId range, portfolio baseline, auto-execution
+# permission) so a half-flipped state — e.g. IB_PORT pointed at live while
+# START_VALUE is still paper's ~$1M — can't happen from editing one value.
+# Added 2026-08-13 ahead of the live rollout; defaults to paper.
+import os
+TRADING_ENV = os.getenv("TRADING_ENV", "paper").strip().lower()
+if TRADING_ENV not in ("paper", "live"):
+    raise ValueError(f"TRADING_ENV must be 'paper' or 'live', got {TRADING_ENV!r}")
+
+# Belt-and-suspenders on top of TRADING_ENV: auto-execution
+# (agents/crew.py:_route_to_approval) only fires without a human tap when
+# this is ALSO explicitly true. Live recommendations instead go through the
+# existing Telegram Approve/Reject flow (alerts.send_approval_request) —
+# the same human-in-the-loop gate paper trading used before 2026-07-14.
+# Two separate, deliberate opt-ins required to reach unattended live
+# execution, not one.
+LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true"
+AUTO_EXECUTE = (TRADING_ENV == "paper") or LIVE_TRADING_ENABLED
+
+if TRADING_ENV == "live":
+    _IB_PORT_DEFAULT = "7496"
+    _IB_CLIENT_ID_DEFAULT = "40"   # dedicated, distinct from every paper clientId (1, 2, 10-12, 20, 30)
+    # Real account balance, set from check_live_account.py's read on
+    # 2026-08-13. Used as the P&L=0 dashboard line and the drawdown-halt
+    # high-water-mark seed — update via LIVE_START_VALUE in .env if the
+    # account is funded further before live trading actually starts; a
+    # stale value here makes the halt fire (or fail to fire) on the wrong
+    # number.
+    START_VALUE = float(os.getenv("LIVE_START_VALUE", "1010.00"))
+else:
+    _IB_PORT_DEFAULT = "7497"
+    _IB_CLIENT_ID_DEFAULT = "1"
+    # Portfolio baseline — must match this account's actual starting net
+    # liquidation value, not an arbitrary round number. Used as the P&L=0
+    # line on the dashboard and as the fallback high-water-mark seed for
+    # the drawdown-halt circuit breaker (tasks.check_portfolio_drawdown)
+    # the first time it ever runs against a given database. IBKR paper
+    # accounts seed at $1,000,000 by default, not $100k — a mismatch here
+    # either makes the dashboard show a fake multi-hundred-thousand-dollar
+    # "profit," or, worse, could false-trigger the drawdown halt on first
+    # run if the real balance is ever *below* this constant.
+    START_VALUE = 1_001_433.51
+
 POLL_INTERVAL_SECONDS = 300  # 5 minutes (portfolio snapshots)
 
 # ---------------------------------------------------------------------------
@@ -226,6 +262,11 @@ CHAT_MODEL       = os.getenv("CHAT_MODEL",    "qwen2.5:3b")   # never use 72b �
 # ---------------------------------------------------------------------------
 # Interactive Brokers connection
 # ---------------------------------------------------------------------------
+# Defaults derived from TRADING_ENV above (7497/clientId 1 for paper,
+# 7496/clientId 40 for live) — IB_PORT/IB_CLIENT_ID in .env can still
+# override explicitly, but the common case (just setting TRADING_ENV) now
+# gets the right port and clientId range for free instead of relying on
+# .env being edited consistently across multiple separate values.
 IB_HOST      = os.getenv("IB_HOST",      "127.0.0.1")
-IB_PORT      = int(os.getenv("IB_PORT",      "7497"))   # 7497=paper, 7496=live
-IB_CLIENT_ID = int(os.getenv("IB_CLIENT_ID", "1"))
+IB_PORT      = int(os.getenv("IB_PORT",      _IB_PORT_DEFAULT))
+IB_CLIENT_ID = int(os.getenv("IB_CLIENT_ID", _IB_CLIENT_ID_DEFAULT))

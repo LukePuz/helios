@@ -12,9 +12,11 @@ TWS must be running with API enabled:
   - Live trading port:  7496  (IB_PORT=7496)
 
 Set in .env:
+  TRADING_ENV=paper          # or "live" — see config.py; derives IB_PORT,
+                              # IB_CLIENT_ID and START_VALUE defaults below
   IB_HOST=127.0.0.1
-  IB_PORT=7497
-  IB_CLIENT_ID=1
+  IB_PORT=7497                # optional override; normally derived from TRADING_ENV
+  IB_CLIENT_ID=1               # optional override; normally derived from TRADING_ENV
 """
 import logging
 import os
@@ -31,9 +33,10 @@ load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 log = logging.getLogger(__name__)
 
-IB_HOST      = os.getenv("IB_HOST",      "127.0.0.1")
-IB_PORT      = int(os.getenv("IB_PORT",      "7497"))   # 7497=paper, 7496=live
-_IB_CLIENT_ID_BASE = int(os.getenv("IB_CLIENT_ID", "1"))
+# Sourced from config.py (not read directly from the environment here) so
+# this can never drift from config.TRADING_ENV's derived paper/live
+# defaults — see config.py's "Trading environment" section.
+from config import IB_HOST, IB_PORT, IB_CLIENT_ID as _IB_CLIENT_ID_BASE
 
 _ib: ibi.IB | None = None
 _client_id: int | None = None   # resolved lazily on first connect

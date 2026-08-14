@@ -1512,7 +1512,8 @@ def send_daily_digest(self):
             log.debug(f"Catalyst lookup unavailable for digest: {e}")
 
         pending_count = len(db.get_pending_approvals())
-        halted = db.get_state("trading_halted", "false") == "true"
+        from config import TRADING_ENV as _TRADING_ENV
+        halted = db.get_state(f"trading_halted_{_TRADING_ENV}", "false") == "true"
         ingestion_issues = _get_stale_ingestion_sources()
 
         alerts.send_daily_digest(
@@ -1633,13 +1634,25 @@ def check_portfolio_drawdown(self):
     try:
         import db
         import alerts
-        from config import START_VALUE, MAX_DRAWDOWN_PCT
+        from config import START_VALUE, MAX_DRAWDOWN_PCT, TRADING_ENV
+
+        # Keys scoped by TRADING_ENV (high_water_mark_paper vs
+        # high_water_mark_live, etc.) -- found 2026-08-14: an unscoped
+        # "high_water_mark" held paper's ~$1.09M baseline, and reconnecting
+        # live (~$2k) would hit the implausible-value guard below on EVERY
+        # check, not just a transient bad read (what that guard is actually
+        # for) -- silently disabling this exact circuit breaker for live.
+        hwm_key    = f"high_water_mark_{TRADING_ENV}"
+        halted_key = f"trading_halted_{TRADING_ENV}"
+        reason_key = f"halt_reason_{TRADING_ENV}"
+        breach_key = f"drawdown_breach_count_{TRADING_ENV}"
 
         client = _get_client()
         pv     = float(client.get_account().portfolio_value)
 
-        # Maintain the persisted high-water mark (seed from START_VALUE)
-        hwm = float(db.get_state("high_water_mark") or START_VALUE)
+        # Maintain the persisted high-water mark (seed from START_VALUE,
+        # which is itself TRADING_ENV-derived — see config.py)
+        hwm = float(db.get_state(hwm_key) or START_VALUE)
 
         # Plausibility guard: a transient broker read of $0 (e.g. an IBKR
         # clientId collision or cold-morning connection race) previously
@@ -1649,11 +1662,11 @@ def check_portfolio_drawdown(self):
         if pv <= 0 or pv < 0.5 * hwm:
             log.warning(f"Implausible portfolio value ${pv:,.2f} (HWM ${hwm:,.2f}) — "
                        f"skipping drawdown check, not updating HWM")
-            db.set_state("drawdown_breach_count", "0")
+            db.set_state(breach_key, "0")
             return
 
         if pv > hwm:
-            db.set_state("high_water_mark", str(pv))
+            db.set_state(hwm_key, str(pv))
             hwm = pv
 
         drawdown = (hwm - pv) / hwm if hwm > 0 else 0
@@ -1662,21 +1675,21 @@ def check_portfolio_drawdown(self):
             # Require 2 consecutive breaching reads (this task runs every 30
             # min) before halting — a single noisy tick shouldn't be enough,
             # only a sustained drawdown.
-            breach_count = int(db.get_state("drawdown_breach_count", "0") or 0) + 1
-            db.set_state("drawdown_breach_count", str(breach_count))
+            breach_count = int(db.get_state(breach_key, "0") or 0) + 1
+            db.set_state(breach_key, str(breach_count))
             if breach_count < 2:
                 log.warning(f"Drawdown {drawdown:.1%} breach #1 — waiting for confirmation "
                            f"before halting")
                 return
-            already_halted = db.get_state("trading_halted", "false") == "true"
-            db.set_state("trading_halted", "true")
-            db.set_state("halt_reason",
+            already_halted = db.get_state(halted_key, "false") == "true"
+            db.set_state(halted_key, "true")
+            db.set_state(reason_key,
                          f"Auto: drawdown {drawdown:.1%} from HWM ${hwm:,.2f}")
             log.critical(f"DRAWDOWN LIMIT HIT: {drawdown:.1%} — trading HALTED")
             if not already_halted:
                 alerts.send_halt_alert(pv, hwm)
         else:
-            db.set_state("drawdown_breach_count", "0")
+            db.set_state(breach_key, "0")
             log.debug(f"Drawdown: {drawdown:.1%} (limit: {MAX_DRAWDOWN_PCT:.0%})")
     except Exception as e:
         log.error(f"check_portfolio_drawdown failed: {e}")

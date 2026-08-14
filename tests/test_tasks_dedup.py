@@ -61,10 +61,19 @@ class TestOptionsFlowDedup:
 
 
 class TestDrawdownGuard:
+    """Keys are trading_env-scoped in the real code (high_water_mark_paper
+    vs high_water_mark_live, etc. — see tasks.check_portfolio_drawdown's
+    2026-08-14 fix, same incident as risk_manager.is_halted's). Every test
+    here pins config.TRADING_ENV to "paper" explicitly (tasks.py does a
+    fresh `from config import TRADING_ENV` inside the function body, so
+    patching config.TRADING_ENV takes effect on the next call) rather than
+    relying on whatever this machine's real .env currently says."""
+
     def _run_with_pv(self, pv, hwm="100000"):
         client = MagicMock()
         client.get_account.return_value = MagicMock(portfolio_value=pv)
-        state = {"high_water_mark": hwm, "trading_halted": "false", "drawdown_breach_count": "0"}
+        state = {"high_water_mark_paper": hwm, "trading_halted_paper": "false",
+                 "drawdown_breach_count_paper": "0"}
 
         def fake_get_state(key, default=None):
             return state.get(key, default)
@@ -73,6 +82,7 @@ class TestDrawdownGuard:
             state[key] = value
 
         with patch("tasks._get_client", return_value=client), \
+             patch("config.TRADING_ENV", "paper"), \
              patch("db.get_state", side_effect=fake_get_state), \
              patch("db.set_state", side_effect=fake_set_state), \
              patch("alerts.send_halt_alert") as mock_alert, \
@@ -85,22 +95,22 @@ class TestDrawdownGuard:
         """A transient pv=0 read (clientId collision, cold-morning
         connection race) must not compute as a 100% drawdown."""
         state, mock_alert = self._run_with_pv(0.0)
-        assert state["trading_halted"] == "false"
+        assert state["trading_halted_paper"] == "false"
         mock_alert.assert_not_called()
 
     def test_single_real_breach_does_not_halt_yet(self):
         """First breaching read waits for confirmation — only a sustained
         drawdown (2 consecutive breaching reads) should halt."""
         state, mock_alert = self._run_with_pv(80_000.0)  # 20% down, >15% limit
-        assert state["trading_halted"] == "false"
-        assert state["drawdown_breach_count"] == "1"
+        assert state["trading_halted_paper"] == "false"
+        assert state["drawdown_breach_count_paper"] == "1"
         mock_alert.assert_not_called()
 
     def test_second_consecutive_breach_halts(self):
         client = MagicMock()
         client.get_account.return_value = MagicMock(portfolio_value=80_000.0)
-        state = {"high_water_mark": "100000", "trading_halted": "false",
-                 "drawdown_breach_count": "1"}  # already breached once
+        state = {"high_water_mark_paper": "100000", "trading_halted_paper": "false",
+                 "drawdown_breach_count_paper": "1"}  # already breached once
 
         def fake_get_state(key, default=None):
             return state.get(key, default)
@@ -109,6 +119,7 @@ class TestDrawdownGuard:
             state[key] = value
 
         with patch("tasks._get_client", return_value=client), \
+             patch("config.TRADING_ENV", "paper"), \
              patch("db.get_state", side_effect=fake_get_state), \
              patch("db.set_state", side_effect=fake_set_state), \
              patch("alerts.send_halt_alert") as mock_alert, \
@@ -116,14 +127,14 @@ class TestDrawdownGuard:
              patch("config.MAX_DRAWDOWN_PCT", 0.15):
             tasks.check_portfolio_drawdown.run()
 
-        assert state["trading_halted"] == "true"
+        assert state["trading_halted_paper"] == "true"
         mock_alert.assert_called_once()
 
     def test_healthy_portfolio_resets_breach_count(self):
         client = MagicMock()
         client.get_account.return_value = MagicMock(portfolio_value=100_000.0)
-        state = {"high_water_mark": "100000", "trading_halted": "false",
-                 "drawdown_breach_count": "1"}
+        state = {"high_water_mark_paper": "100000", "trading_halted_paper": "false",
+                 "drawdown_breach_count_paper": "1"}
 
         def fake_get_state(key, default=None):
             return state.get(key, default)
@@ -132,6 +143,7 @@ class TestDrawdownGuard:
             state[key] = value
 
         with patch("tasks._get_client", return_value=client), \
+             patch("config.TRADING_ENV", "paper"), \
              patch("db.get_state", side_effect=fake_get_state), \
              patch("db.set_state", side_effect=fake_set_state), \
              patch("alerts.send_halt_alert"), \
@@ -139,7 +151,7 @@ class TestDrawdownGuard:
              patch("config.MAX_DRAWDOWN_PCT", 0.15):
             tasks.check_portfolio_drawdown.run()
 
-        assert state["drawdown_breach_count"] == "0"
+        assert state["drawdown_breach_count_paper"] == "0"
 
 
 class TestReconciliationAlertThrottle:

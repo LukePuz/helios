@@ -23,12 +23,18 @@ def _make_client(portfolio_value=100_000.0, positions=None, cash=None):
     return client
 
 
+# Keys are trading_env-scoped in the real code (see risk_manager.is_halted's
+# 2026-08-14 fix) -- every test here pins risk_manager.TRADING_ENV to
+# "paper" explicitly rather than relying on whatever this machine's real
+# .env currently says, same reasoning as config.AUTO_EXECUTE being patched
+# explicitly in test_crew_routing.py.
 class TestSizing:
     def test_shares_initial_is_integer(self):
         client = _make_client()
         with patch.object(risk_manager.RiskManager, "calculate_stop", return_value=(120.0, "mocked")), \
-             patch("db.get_state", side_effect=lambda k, d=None: {"trading_halted": "false",
-                                                                    "high_water_mark": "100000"}.get(k, d)), \
+             patch("risk_manager.TRADING_ENV", "paper"), \
+             patch("db.get_state", side_effect=lambda k, d=None: {"trading_halted_paper": "false",
+                                                                    "high_water_mark_paper": "100000"}.get(k, d)), \
              patch("db.set_state"):
             rm = risk_manager.RiskManager(client)
             sizing = rm.size_position("NVDA", conviction=8, bucket="Compounder",
@@ -39,8 +45,9 @@ class TestSizing:
     def test_sub_one_share_allocation_skips_gracefully(self):
         client = _make_client()
         with patch.object(risk_manager.RiskManager, "calculate_stop", return_value=(650_000.0, "mocked")), \
-             patch("db.get_state", side_effect=lambda k, d=None: {"trading_halted": "false",
-                                                                    "high_water_mark": "100000"}.get(k, d)), \
+             patch("risk_manager.TRADING_ENV", "paper"), \
+             patch("db.get_state", side_effect=lambda k, d=None: {"trading_halted_paper": "false",
+                                                                    "high_water_mark_paper": "100000"}.get(k, d)), \
              patch("db.set_state"):
             rm = risk_manager.RiskManager(client)
             sizing = rm.size_position("BRKA", conviction=5, bucket="Moonshot",
@@ -52,14 +59,16 @@ class TestSizing:
 class TestHalt:
     def test_persisted_halt_flag_blocks_trading(self):
         client = _make_client()
-        with patch("db.get_state", side_effect=lambda k, d=None: {"trading_halted": "true"}.get(k, d)):
+        with patch("risk_manager.TRADING_ENV", "paper"), \
+             patch("db.get_state", side_effect=lambda k, d=None: {"trading_halted_paper": "true"}.get(k, d)):
             rm = risk_manager.RiskManager(client)
             assert rm.is_halted() is True
 
     def test_no_halt_flag_allows_trading(self):
         client = _make_client()
-        with patch("db.get_state", side_effect=lambda k, d=None: {"trading_halted": "false",
-                                                                    "high_water_mark": "100000"}.get(k, d)), \
+        with patch("risk_manager.TRADING_ENV", "paper"), \
+             patch("db.get_state", side_effect=lambda k, d=None: {"trading_halted_paper": "false",
+                                                                    "high_water_mark_paper": "100000"}.get(k, d)), \
              patch("db.set_state"):
             rm = risk_manager.RiskManager(client)
             assert rm.is_halted() is False

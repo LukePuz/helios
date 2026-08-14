@@ -40,8 +40,10 @@ try:
         SWAP_MIN_CONVICTION_GAP,
         SWAP_MAX_CANDIDATE_CONVICTION,
         get_active_limits,
+        TRADING_ENV,
     )
 except ImportError:
+    TRADING_ENV                   = "paper"
     DRAWDOWN_HALT_PCT             = 0.10
     BUCKET_SIZE_TABLE             = {
         "Compounder":  {9: (0.08, 0.12), 7: (0.05, 0.08), 5: (0.03, 0.05), 3: (0.02, 0.03)},
@@ -202,14 +204,23 @@ class RiskManager:
         Halt if (a) the persisted manual/auto halt flag is set, or
         (b) drawdown from the persisted high-water mark exceeds the limit.
         Baselines live in the system_state table so every process agrees.
+
+        Keys are trading_env-scoped (high_water_mark_paper vs
+        high_water_mark_live, etc.) -- found 2026-08-14: a shared
+        unscoped "high_water_mark" key held paper's ~$1.09M baseline, and
+        reconnecting to the live account (~$2k) would have hit the
+        implausible-value guard below on EVERY check, permanently
+        (not just on one transient bad read, which is what that guard is
+        actually for) -- silently disabling the drawdown halt, the single
+        most important safety mechanism in the system, for live trading.
         """
         # Persisted halt flag (set manually via /halt or by the drawdown task)
         try:
             import db
-            if db.get_state("trading_halted", "false") == "true":
-                log.warning("HALT — trading_halted flag is set in system_state")
+            if db.get_state(f"trading_halted_{TRADING_ENV}", "false") == "true":
+                log.warning(f"HALT — trading_halted_{TRADING_ENV} flag is set in system_state")
                 return True
-            hwm_str = db.get_state("high_water_mark")
+            hwm_str = db.get_state(f"high_water_mark_{TRADING_ENV}")
         except Exception as e:
             log.warning(f"Halt state read failed ({e}) — falling back to instance baseline")
             hwm_str = None
@@ -240,8 +251,8 @@ class RiskManager:
             )
             try:
                 import db
-                db.set_state("trading_halted", "true")
-                db.set_state("halt_reason",
+                db.set_state(f"trading_halted_{TRADING_ENV}", "true")
+                db.set_state(f"halt_reason_{TRADING_ENV}",
                              f"Auto: drawdown {drawdown:.1%} from HWM ${baseline:,.2f}")
             except Exception:
                 pass
@@ -251,7 +262,7 @@ class RiskManager:
         try:
             import db
             if current > baseline:
-                db.set_state("high_water_mark", str(current))
+                db.set_state(f"high_water_mark_{TRADING_ENV}", str(current))
         except Exception:
             pass
         return False

@@ -12,6 +12,17 @@ from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
+# Scopes every position_stops read/write to the account this process is
+# actually connected to -- added 2026-08-14 after switching a live-connected
+# process onto a DB whose position_stops table only ever held paper-account
+# rows. reconcile_stop_orders read those 41 paper stops, found none of them
+# on the (empty) live account, concluded all 41 "disappeared with no
+# matching SELL execution," alerted on every one, and deleted all 41
+# records -- while the actual paper positions sat completely untouched at
+# the broker the whole time. The table had no notion of which account a
+# stop belonged to at all.
+from config import TRADING_ENV
+
 _pool: psycopg2.pool.ThreadedConnectionPool | None = None
 
 _CREATE_TABLES = """
@@ -102,7 +113,8 @@ CREATE TABLE IF NOT EXISTS earnings_calendar (
 
 CREATE TABLE IF NOT EXISTS position_stops (
     id                  SERIAL PRIMARY KEY,
-    ticker              VARCHAR(10) UNIQUE,
+    ticker              VARCHAR(10),
+    trading_env         VARCHAR(10) NOT NULL DEFAULT 'paper',
     entry_price         DECIMAL,
     stop_price          DECIMAL,
     stop_method         TEXT,
@@ -112,7 +124,8 @@ CREATE TABLE IF NOT EXISTS position_stops (
     thesis_bucket       VARCHAR(20),
     conviction          INTEGER,
     opened_at           TIMESTAMPTZ DEFAULT NOW(),
-    updated_at          TIMESTAMPTZ DEFAULT NOW()
+    updated_at          TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (ticker, trading_env)
 );
 
 CREATE TABLE IF NOT EXISTS activity_feed (
@@ -396,6 +409,21 @@ _MIGRATIONS: list[tuple[int, str]] = [
     # cooldown -- the exact "same alert every cycle" bug this table's
     # throttle mechanism exists to prevent, just via a different path.
     (27, "ALTER TABLE system_state ALTER COLUMN key TYPE VARCHAR(200);"),
+    # position_stops had no notion of which broker account a stop belonged
+    # to -- switching a live-connected process onto the same DB that held
+    # 41 paper-account stop rows made reconcile_stop_orders conclude all 41
+    # positions had "disappeared with no matching SELL execution" (none of
+    # them existed on the empty live account) and delete every record,
+    # while the real paper positions sat untouched at the broker the whole
+    # time. Existing rows default to 'paper' -- true for every row that
+    # could exist before this migration, since live wasn't reachable until
+    # tonight. DROP the old single-column UNIQUE (its default Postgres name
+    # for an inline `ticker VARCHAR(10) UNIQUE`) before adding the
+    # composite one, or the same ticker in both envs would still collide.
+    (28, "ALTER TABLE position_stops ADD COLUMN IF NOT EXISTS trading_env VARCHAR(10) NOT NULL DEFAULT 'paper'; "
+         "ALTER TABLE position_stops DROP CONSTRAINT IF EXISTS position_stops_ticker_key; "
+         "ALTER TABLE position_stops DROP CONSTRAINT IF EXISTS position_stops_ticker_trading_env_key; "
+         "ALTER TABLE position_stops ADD CONSTRAINT position_stops_ticker_trading_env_key UNIQUE (ticker, trading_env);"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -1020,10 +1048,10 @@ def upsert_position_stop(
             cur.execute(
                 """
                 INSERT INTO position_stops
-                    (ticker, entry_price, stop_price, stop_method, thesis_bucket,
+                    (ticker, trading_env, entry_price, stop_price, stop_method, thesis_bucket,
                      conviction, trail_distance_pct, updated_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,NOW())
-                ON CONFLICT (ticker) DO UPDATE SET
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                ON CONFLICT (ticker, trading_env) DO UPDATE SET
                     entry_price       = EXCLUDED.entry_price,
                     stop_price        = EXCLUDED.stop_price,
                     stop_method       = EXCLUDED.stop_method,
@@ -1034,7 +1062,7 @@ def upsert_position_stop(
                     trailing_high     = NULL,
                     updated_at        = NOW()
                 """,
-                (ticker, entry_price, stop_price, stop_method, bucket, conviction, trail_distance_pct),
+                (ticker, TRADING_ENV, entry_price, stop_price, stop_method, bucket, conviction, trail_distance_pct),
             )
         conn.commit()
     except Exception as e:
@@ -1050,8 +1078,8 @@ def update_trailing_stop(ticker: str, new_stop: float, trailing_high: float) -> 
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE position_stops SET stop_price=%s, trailing_high=%s, "
-                "trailing_active=TRUE, updated_at=NOW() WHERE ticker=%s",
-                (new_stop, trailing_high, ticker),
+                "trailing_active=TRUE, updated_at=NOW() WHERE ticker=%s AND trading_env=%s",
+                (new_stop, trailing_high, ticker, TRADING_ENV),
             )
         conn.commit()
     except Exception as e:
@@ -1068,8 +1096,8 @@ def get_position_stop(ticker: str) -> dict | None:
             cur.execute(
                 "SELECT ticker, entry_price, stop_price, stop_method, trailing_active, "
                 "trailing_high, trail_distance_pct, thesis_bucket, conviction, opened_at "
-                "FROM position_stops WHERE ticker=%s",
-                (ticker,),
+                "FROM position_stops WHERE ticker=%s AND trading_env=%s",
+                (ticker, TRADING_ENV),
             )
             row = cur.fetchone()
         if not row:
@@ -1092,7 +1120,7 @@ def delete_position_stop(ticker: str) -> None:
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM position_stops WHERE ticker=%s", (ticker,))
+            cur.execute("DELETE FROM position_stops WHERE ticker=%s AND trading_env=%s", (ticker, TRADING_ENV))
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -1108,7 +1136,8 @@ def get_all_position_stops() -> list[dict]:
             cur.execute(
                 "SELECT ticker, entry_price, stop_price, stop_method, trailing_active, "
                 "trailing_high, trail_distance_pct, thesis_bucket, conviction, broker_order_id "
-                "FROM position_stops ORDER BY ticker"
+                "FROM position_stops WHERE trading_env=%s ORDER BY ticker",
+                (TRADING_ENV,),
             )
             rows = cur.fetchall()
         return [
@@ -1134,7 +1163,7 @@ def get_open_position_symbols() -> set[str]:
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT ticker FROM position_stops")
+            cur.execute("SELECT ticker FROM position_stops WHERE trading_env=%s", (TRADING_ENV,))
             return {row[0] for row in cur.fetchall()}
     except Exception as e:
         logging.error(f"get_open_position_symbols failed: {e}")
@@ -1148,8 +1177,8 @@ def set_stop_broker_order_id(ticker: str, broker_order_id: int | None) -> None:
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE position_stops SET broker_order_id=%s, updated_at=NOW() WHERE ticker=%s",
-                (broker_order_id, ticker),
+                "UPDATE position_stops SET broker_order_id=%s, updated_at=NOW() WHERE ticker=%s AND trading_env=%s",
+                (broker_order_id, ticker, TRADING_ENV),
             )
         conn.commit()
     except Exception as e:

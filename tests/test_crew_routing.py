@@ -39,7 +39,14 @@ class TestSellRouting:
              patch("db.get_approval_by_id", return_value={"id": 10}), \
              patch("execution.execute_approved", return_value=True) as mock_execute, \
              patch("agents.crew._get_price", return_value=100.0), \
-             patch("risk_manager.RiskManager") as mock_rm_cls:
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("config.AUTO_EXECUTE", True):
+            # AUTO_EXECUTE explicitly forced True -- this test asserts the
+            # auto-execute path actually completes, which must not depend
+            # on the ambient .env's TRADING_ENV (e.g. a machine configured
+            # for live trading would otherwise silently route this through
+            # the approval-request branch instead and mock_execute would
+            # never be called, unrelated to what this test is checking).
             crew._route_to_approval(result, {"regime": "Neutral"}, client)
 
         # size_position must never have been called for a TRIM/EXIT

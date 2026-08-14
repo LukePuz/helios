@@ -388,19 +388,21 @@ def _handle_mention(update: dict, is_urgent: bool) -> None:
     if cmd in ("/halt", "halt trading"):
         try:
             import db
-            db.set_state("trading_halted", "true")
-            db.set_state("halt_reason", f"Manual halt by {display}")
-            _reply(chat_id, "🛑 <b>Trading HALTED.</b> No new BUY orders will execute. "
-                            "Send /resume to lift the halt.", msg_id)
+            from config import TRADING_ENV
+            db.set_state(f"trading_halted_{TRADING_ENV}", "true")
+            db.set_state(f"halt_reason_{TRADING_ENV}", f"Manual halt by {display}")
+            _reply(chat_id, f"🛑 <b>Trading HALTED</b> ({TRADING_ENV}). No new BUY orders will "
+                            "execute. Send /resume to lift the halt.", msg_id)
         except Exception as e:
             _reply(chat_id, f"⚠️ Could not set halt flag: {e}", msg_id)
         return
     if cmd in ("/resume", "resume trading"):
         try:
             import db
-            db.set_state("trading_halted", "false")
-            db.set_state("halt_reason", "")
-            _reply(chat_id, "🟢 <b>Trading RESUMED.</b> Halt flag cleared.", msg_id)
+            from config import TRADING_ENV
+            db.set_state(f"trading_halted_{TRADING_ENV}", "false")
+            db.set_state(f"halt_reason_{TRADING_ENV}", "")
+            _reply(chat_id, f"🟢 <b>Trading RESUMED</b> ({TRADING_ENV}). Halt flag cleared.", msg_id)
         except Exception as e:
             _reply(chat_id, f"⚠️ Could not clear halt flag: {e}", msg_id)
         return

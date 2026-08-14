@@ -4,6 +4,20 @@ Symbol universe is now driven by knowledge/watchlist.md via knowledge_loader.
 """
 from __future__ import annotations
 
+# .env must be loaded HERE, not assumed already-loaded by whatever imports
+# this module first. Every os.getenv() call below (TRADING_ENV in
+# particular, now that it's the single source of truth for paper/live)
+# silently fell back to its default if config.py happened to be the first
+# module imported in the process -- found 2026-08-14 testing the live
+# rollout: a standalone `import config` returned TRADING_ENV=paper despite
+# .env correctly saying "live", because nothing had loaded .env into
+# os.environ yet. ibkr.py/risk_manager.py already do this defensively for
+# the same reason; config.py never did despite being what they both defer
+# to.
+from pathlib import Path as _Path
+from dotenv import load_dotenv as _load_dotenv
+_load_dotenv(dotenv_path=_Path(__file__).parent / ".env")
+
 # ---------------------------------------------------------------------------
 # Symbol universe — derived from watchlist at import time
 # Keep SYMBOLS for any module that still references it directly.

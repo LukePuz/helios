@@ -496,12 +496,14 @@ def _held_tickers() -> set[str]:
     every 5 min by take_portfolio_snapshot — fresh enough for routing)."""
     try:
         import db
+        from config import TRADING_ENV
         conn = db._get_conn()
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT positions_json FROM portfolio_snapshots "
-                    "ORDER BY timestamp DESC LIMIT 1"
+                    "WHERE trading_env=%s ORDER BY timestamp DESC LIMIT 1",
+                    (TRADING_ENV,),
                 )
                 row = cur.fetchone()
         finally:

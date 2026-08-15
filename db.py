@@ -29,6 +29,7 @@ _CREATE_TABLES = """
 CREATE TABLE IF NOT EXISTS trades (
     id          SERIAL PRIMARY KEY,
     symbol      VARCHAR(10),
+    trading_env VARCHAR(10) NOT NULL DEFAULT 'paper',
     side        VARCHAR(4),
     quantity    DECIMAL,
     price       DECIMAL,
@@ -48,6 +49,7 @@ CREATE TABLE IF NOT EXISTS signals (
 CREATE TABLE IF NOT EXISTS portfolio_snapshots (
     id             SERIAL PRIMARY KEY,
     timestamp      TIMESTAMPTZ DEFAULT NOW(),
+    trading_env    VARCHAR(10) NOT NULL DEFAULT 'paper',
     total_value    DECIMAL,
     cash           DECIMAL,
     positions_json JSONB
@@ -67,6 +69,7 @@ CREATE TABLE IF NOT EXISTS market_regime_log (
 CREATE TABLE IF NOT EXISTS pending_approvals (
     id                  SERIAL PRIMARY KEY,
     timestamp           TIMESTAMPTZ DEFAULT NOW(),
+    trading_env         VARCHAR(10) NOT NULL DEFAULT 'paper',
     ticker              VARCHAR(10),
     action              VARCHAR(10),
     conviction          INTEGER,
@@ -86,6 +89,7 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
 CREATE TABLE IF NOT EXISTS trade_outcomes (
     id              SERIAL PRIMARY KEY,
     approval_id     INTEGER REFERENCES pending_approvals(id),
+    trading_env     VARCHAR(10) NOT NULL DEFAULT 'paper',
     ticker          VARCHAR(10),
     action          VARCHAR(10),
     conviction      INTEGER,
@@ -207,6 +211,7 @@ CREATE INDEX IF NOT EXISTS price_history_ticker_date_idx ON price_history (ticke
 CREATE TABLE IF NOT EXISTS orders (
     id                SERIAL PRIMARY KEY,
     broker_order_id   BIGINT,
+    trading_env       VARCHAR(10) NOT NULL DEFAULT 'paper',
     ticker            VARCHAR(10),
     side              VARCHAR(4),
     order_type        VARCHAR(20),
@@ -424,6 +429,25 @@ _MIGRATIONS: list[tuple[int, str]] = [
          "ALTER TABLE position_stops DROP CONSTRAINT IF EXISTS position_stops_ticker_key; "
          "ALTER TABLE position_stops DROP CONSTRAINT IF EXISTS position_stops_ticker_trading_env_key; "
          "ALTER TABLE position_stops ADD CONSTRAINT position_stops_ticker_trading_env_key UNIQUE (ticker, trading_env);"),
+    # Same class of gap as position_stops (28), audited 2026-08-15 ahead of
+    # enabling full unattended live auto-execution -- found by going
+    # looking this time, not by another incident. pending_approvals is the
+    # actual execution queue (has_active_approval/get_last_executed_approval
+    # gate duplicate signals and the rebuy cooldown off it); trade_outcomes
+    # feeds agents/analyst.py's real-time conviction calibration
+    # (get_subscore_calibration) -- paper's much larger, differently-sized
+    # trade history would otherwise silently bias live's own decisions;
+    # orders drives fill/slippage reconciliation, keyed in part by
+    # broker_order_id, which is NOT globally unique -- paper and live can
+    # each independently produce the same order id for two completely
+    # unrelated orders. trades/portfolio_snapshots are lower-severity
+    # (dashboard/day-P&L display, no decision-making reads) but scoped too
+    # for consistency, now that this pass is already being done.
+    (29, "ALTER TABLE pending_approvals ADD COLUMN IF NOT EXISTS trading_env VARCHAR(10) NOT NULL DEFAULT 'paper'; "
+         "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS trading_env VARCHAR(10) NOT NULL DEFAULT 'paper'; "
+         "ALTER TABLE orders ADD COLUMN IF NOT EXISTS trading_env VARCHAR(10) NOT NULL DEFAULT 'paper'; "
+         "ALTER TABLE trades ADD COLUMN IF NOT EXISTS trading_env VARCHAR(10) NOT NULL DEFAULT 'paper'; "
+         "ALTER TABLE portfolio_snapshots ADD COLUMN IF NOT EXISTS trading_env VARCHAR(10) NOT NULL DEFAULT 'paper';"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -471,8 +495,9 @@ def log_trade(symbol: str, side: str, quantity: int, price: float, reason: str) 
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO trades (symbol, side, quantity, price, reason) VALUES (%s,%s,%s,%s,%s)",
-                (symbol, side, quantity, price, reason),
+                "INSERT INTO trades (symbol, trading_env, side, quantity, price, reason) "
+                "VALUES (%s,%s,%s,%s,%s,%s)",
+                (symbol, TRADING_ENV, side, quantity, price, reason),
             )
         conn.commit()
     except Exception as e:
@@ -509,9 +534,9 @@ def log_snapshot(total_value: float, cash: float, positions: dict,
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO portfolio_snapshots (total_value, cash, positions_json, benchmark_json) "
-                "VALUES (%s,%s,%s,%s)",
-                (total_value, cash, psycopg2.extras.Json(positions),
+                "INSERT INTO portfolio_snapshots (total_value, trading_env, cash, positions_json, benchmark_json) "
+                "VALUES (%s,%s,%s,%s,%s)",
+                (total_value, TRADING_ENV, cash, psycopg2.extras.Json(positions),
                  psycopg2.extras.Json(benchmark) if benchmark else None),
             )
         conn.commit()
@@ -528,8 +553,8 @@ def get_recent_trades(limit: int = 50) -> list[dict]:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT symbol, side, quantity, price, timestamp, reason "
-                "FROM trades ORDER BY timestamp DESC LIMIT %s",
-                (limit,),
+                "FROM trades WHERE trading_env=%s ORDER BY timestamp DESC LIMIT %s",
+                (TRADING_ENV, limit),
             )
             return [
                 {"symbol": r[0], "side": r[1], "quantity": r[2],
@@ -645,8 +670,8 @@ def get_portfolio_history(limit: int = 288) -> list[dict]:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT timestamp, total_value, cash, benchmark_json FROM portfolio_snapshots "
-                "ORDER BY timestamp DESC LIMIT %s",
-                (limit,),
+                "WHERE trading_env=%s ORDER BY timestamp DESC LIMIT %s",
+                (TRADING_ENV, limit),
             )
             rows = cur.fetchall()
         return [
@@ -736,8 +761,8 @@ def has_active_approval(ticker: str) -> bool:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT 1 FROM pending_approvals "
-                "WHERE ticker=%s AND status IN ('PENDING','PROCESSING') LIMIT 1",
-                (ticker,),
+                "WHERE ticker=%s AND trading_env=%s AND status IN ('PENDING','PROCESSING') LIMIT 1",
+                (ticker, TRADING_ENV),
             )
             return cur.fetchone() is not None
     except Exception as e:
@@ -773,10 +798,11 @@ def get_last_executed_approval(ticker: str, hours: int) -> dict | None:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT conviction, decided_at FROM pending_approvals "
-                "WHERE ticker=%s AND action IN ('OPEN','ADD') AND status IN ('APPROVED','FAILED') "
+                "WHERE ticker=%s AND trading_env=%s AND action IN ('OPEN','ADD') "
+                "AND status IN ('APPROVED','FAILED') "
                 "AND decided_at > NOW() - (%s || ' hours')::interval "
                 "ORDER BY decided_at DESC LIMIT 1",
-                (ticker, hours),
+                (ticker, TRADING_ENV, hours),
             )
             row = cur.fetchone()
             if not row:
@@ -809,11 +835,11 @@ def log_pending_approval(
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO pending_approvals "
-                "(ticker, action, conviction, thesis_bucket, position_size_pct, stop_loss_price, "
+                "(ticker, trading_env, action, conviction, thesis_bucket, position_size_pct, stop_loss_price, "
                 "entry_strategy, reasoning, analyst_json, risk_json, expires_at) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
                 (
-                    ticker, action, conviction, bucket, size_pct, stop_price,
+                    ticker, TRADING_ENV, action, conviction, bucket, size_pct, stop_price,
                     entry_strategy, reasoning,
                     psycopg2.extras.Json(analyst_json),
                     psycopg2.extras.Json(risk_json),
@@ -951,15 +977,16 @@ def get_pending_approvals(status: str | None = "PENDING") -> list[dict]:
                     "SELECT id, ticker, action, conviction, thesis_bucket, position_size_pct, "
                     "stop_loss_price, entry_strategy, reasoning, analyst_json, risk_json, "
                     "status, timestamp, decided_at, expires_at "
-                    "FROM pending_approvals ORDER BY timestamp DESC",
+                    "FROM pending_approvals WHERE trading_env=%s ORDER BY timestamp DESC",
+                    (TRADING_ENV,),
                 )
             else:
                 cur.execute(
                     "SELECT id, ticker, action, conviction, thesis_bucket, position_size_pct, "
                     "stop_loss_price, entry_strategy, reasoning, analyst_json, risk_json, "
                     "status, timestamp, decided_at, expires_at "
-                    "FROM pending_approvals WHERE status=%s ORDER BY timestamp DESC",
-                    (status,),
+                    "FROM pending_approvals WHERE status=%s AND trading_env=%s ORDER BY timestamp DESC",
+                    (status, TRADING_ENV),
                 )
             rows = cur.fetchall()
         return [
@@ -1589,12 +1616,12 @@ def log_order(
             cur.execute(
                 """
                 INSERT INTO orders
-                    (broker_order_id, ticker, side, order_type, qty, limit_price,
+                    (broker_order_id, trading_env, ticker, side, order_type, qty, limit_price,
                      stop_price, decision_price, approval_id, parent_order_id, status)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 RETURNING id
                 """,
-                (broker_order_id, ticker, side, order_type, qty, limit_price,
+                (broker_order_id, TRADING_ENV, ticker, side, order_type, qty, limit_price,
                  stop_price, decision_price, approval_id, parent_order_id, status),
             )
             order_id = cur.fetchone()[0]
@@ -1653,15 +1680,22 @@ def get_unconfirmed_orders(max_age_hours: int = 24) -> list[dict]:
     tasks.reconcile_unconfirmed_orders -- see get_fill_for_order's docstring
     in ibkr.py for the incident (CRWD 2026-07-28) that motivated checking
     these against the broker's own execution record instead of assuming
-    "unconfirmed" means "never filled"."""
+    "unconfirmed" means "never filled".
+
+    Scoped to trading_env -- broker_order_id is NOT globally unique across
+    accounts (paper and live can each independently produce the same id
+    for two unrelated orders), so an unscoped read here could look up a
+    stale paper order's fill status against whichever broker is currently
+    connected and get a nonsensical or wrong-order match."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT id, ticker, side, qty, broker_order_id, decision_price, approval_id "
                 "FROM orders WHERE status='unconfirmed' AND broker_order_id IS NOT NULL "
+                "AND trading_env=%s "
                 "AND created_at > NOW() - INTERVAL '%s hours' ORDER BY created_at",
-                (max_age_hours,),
+                (TRADING_ENV, max_age_hours),
             )
             rows = cur.fetchall()
         return [
@@ -1687,8 +1721,8 @@ def get_recent_orders(limit: int = 50) -> list[dict]:
             cur.execute(
                 "SELECT id, broker_order_id, ticker, side, order_type, qty, limit_price, "
                 "stop_price, decision_price, fill_price, filled_qty, slippage_pct, status, "
-                "created_at FROM orders ORDER BY created_at DESC LIMIT %s",
-                (limit,),
+                "created_at FROM orders WHERE trading_env=%s ORDER BY created_at DESC LIMIT %s",
+                (TRADING_ENV, limit),
             )
             rows = cur.fetchall()
         return [
@@ -1718,7 +1752,9 @@ def get_slippage_summary() -> dict:
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT COUNT(*), AVG(slippage_pct) FROM orders WHERE slippage_pct IS NOT NULL"
+                "SELECT COUNT(*), AVG(slippage_pct) FROM orders "
+                "WHERE slippage_pct IS NOT NULL AND trading_env=%s",
+                (TRADING_ENV,),
             )
             count, avg = cur.fetchone()
         return {"count": count or 0, "avg_slippage_pct": round(float(avg), 4) if avg else None}
@@ -1798,12 +1834,12 @@ def log_trade_outcome(
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO trade_outcomes "
-                "(approval_id, ticker, action, conviction, thesis_bucket, entry_price, "
+                "(approval_id, trading_env, ticker, action, conviction, thesis_bucket, entry_price, "
                 " entry_benchmark_price, thesis_strength, catalyst_quality, "
                 " valuation_risk_reward, data_completeness, chase_risk, "
                 " chase_risk_pct_from_kijun, price_action, price_action_structure) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                (approval_id, ticker, action, conviction, bucket, entry_price,
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (approval_id, TRADING_ENV, ticker, action, conviction, bucket, entry_price,
                  entry_benchmark_price, thesis_strength, catalyst_quality,
                  valuation_risk_reward, data_completeness, chase_risk,
                  chase_risk_pct_from_kijun, price_action, price_action_structure),
@@ -1860,9 +1896,9 @@ def close_trade_outcome(ticker: str, exit_price: float, exit_date=None) -> bool:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT id, entry_price, entry_benchmark_price FROM trade_outcomes "
-                "WHERE ticker=%s AND exit_date IS NULL "
+                "WHERE ticker=%s AND trading_env=%s AND exit_date IS NULL "
                 "ORDER BY entry_date DESC LIMIT 1",
-                (ticker,),
+                (ticker, TRADING_ENV),
             )
             row = cur.fetchone()
             if not row:
@@ -1925,8 +1961,9 @@ def get_conviction_calibration() -> list[dict]:
                 "  COUNT(*) FILTER (WHERE was_correct = TRUE) AS wins, "
                 "  AVG(outcome_pct) AS avg_pct, AVG(alpha_pct) AS avg_alpha "
                 "FROM trade_outcomes "
-                "WHERE outcome_pct IS NOT NULL "
-                "GROUP BY conviction ORDER BY conviction DESC"
+                "WHERE outcome_pct IS NOT NULL AND trading_env=%s "
+                "GROUP BY conviction ORDER BY conviction DESC",
+                (TRADING_ENV,),
             )
             rows = cur.fetchall()
         return [
@@ -1965,13 +2002,21 @@ def get_subscore_calibration(dimension: str) -> list[dict]:
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
+            # Scoped to the current trading_env deliberately -- feeds
+            # agents/analyst.py's real-time conviction calibration, so
+            # paper's much larger and differently-sized trade history must
+            # not silently bias live's own decisions (or vice versa). Live
+            # simply has no calibration signal until it accumulates its own
+            # trades; analyst.py already handles an empty result gracefully
+            # (checks `if r.get("total")` before using a bucket).
             cur.execute(
                 f"SELECT {dimension}, COUNT(*) AS total, "
                 f"  COUNT(*) FILTER (WHERE was_correct = TRUE) AS wins, "
                 f"  AVG(outcome_pct) AS avg_pct, AVG(alpha_pct) AS avg_alpha "
                 f"FROM trade_outcomes "
-                f"WHERE outcome_pct IS NOT NULL AND {dimension} IS NOT NULL "
-                f"GROUP BY {dimension} ORDER BY {dimension} DESC"
+                f"WHERE outcome_pct IS NOT NULL AND {dimension} IS NOT NULL AND trading_env=%s "
+                f"GROUP BY {dimension} ORDER BY {dimension} DESC",
+                (TRADING_ENV,),
             )
             rows = cur.fetchall()
         return [
@@ -2018,7 +2063,8 @@ def get_open_outcomes() -> list[dict]:
             cur.execute(
                 "SELECT approval_id, ticker, action, conviction, thesis_bucket, "
                 "entry_price, entry_date, review_30d_price, review_60d_price, review_90d_price "
-                "FROM trade_outcomes WHERE exit_date IS NULL ORDER BY entry_date"
+                "FROM trade_outcomes WHERE exit_date IS NULL AND trading_env=%s ORDER BY entry_date",
+                (TRADING_ENV,),
             )
             rows = cur.fetchall()
         return [
@@ -2047,8 +2093,8 @@ def get_all_outcomes(limit: int = 100) -> list[dict]:
                 "SELECT approval_id, ticker, action, conviction, thesis_bucket, "
                 "entry_price, entry_date, review_30d_price, review_60d_price, review_90d_price, "
                 "exit_price, exit_date, outcome_pct, was_correct, alpha_pct "
-                "FROM trade_outcomes ORDER BY entry_date DESC LIMIT %s",
-                (limit,),
+                "FROM trade_outcomes WHERE trading_env=%s ORDER BY entry_date DESC LIMIT %s",
+                (TRADING_ENV, limit),
             )
             rows = cur.fetchall()
         return [
@@ -2086,8 +2132,9 @@ def get_outcomes_summary() -> dict:
                 "  COUNT(*) FILTER (WHERE was_correct = TRUE) AS wins, "
                 "  AVG(outcome_pct) AS avg_pct "
                 "FROM trade_outcomes "
-                "WHERE outcome_pct IS NOT NULL "
-                "GROUP BY thesis_bucket"
+                "WHERE outcome_pct IS NOT NULL AND trading_env=%s "
+                "GROUP BY thesis_bucket",
+                (TRADING_ENV,),
             )
             rows = cur.fetchall()
         return {
@@ -2130,9 +2177,11 @@ def get_bucket_attribution() -> list[dict]:
                 JOIN pending_approvals pa ON pa.id = o.approval_id
                 WHERE o.outcome_pct IS NOT NULL
                   AND pa.risk_json ? 'initial_dollar'
+                  AND o.trading_env = %s
                 GROUP BY o.thesis_bucket
                 ORDER BY dollar_pnl DESC NULLS LAST
-                """
+                """,
+                (TRADING_ENV,),
             )
             rows = cur.fetchall()
         return [

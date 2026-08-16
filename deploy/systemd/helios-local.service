@@ -1,8 +1,15 @@
 [Unit]
 Description=Helios Hedgefund trading bot (local checkout)
-After=network-online.target ibc.service
+# Deliberately NOT tied to a specific IBC unit (ibc.service/ibc-live.service)
+# via After=/Requires= -- this unit serves both paper and live depending on
+# .env's TRADING_ENV, and hard-wiring the paper one here meant a live-mode
+# restart would try to start paper's TWS (needing its own unrelated 2FA
+# scan) while wait-for-ibkr.sh's protocol-level check is what actually
+# verifies the correct account's port is reachable anyway. Found 2026-08-16
+# the night before enabling live. Both IBC units already self-heal via
+# their own Restart=always.
+After=network-online.target
 Wants=network-online.target
-Requires=ibc.service
 # Telegram alert when this unit gives up restarting (see StartLimit* below)
 # — covers the "TWS 2FA hung waiting for a factor no script can provide"
 # case, which previously just retried every 10s forever with nobody told

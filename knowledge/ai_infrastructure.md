@@ -124,6 +124,7 @@ Do NOT reduce solely due to:
 |---|---|---|
 | MU | HBM3/4, DRAM, NAND for AI | Accelerator |
 | SNDK | NAND / storage for AI infrastructure | Accelerator |
+| DRAM | Roundhill Memory ETF — diversified basket across the memory-chip sector rather than a single name | Accelerator |
 
 ### Memory Supply Chain
 | Ticker | Role | Bucket |

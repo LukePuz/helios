@@ -572,20 +572,37 @@ class TestStaleStopReconciliation:
     it searches today's broker execution history by symbol before
     deleting: a match gets written as a real trade and closes the
     trade_outcome; no match escalates to Telegram immediately instead of
-    disappearing silently."""
+    disappearing silently.
 
-    def _run(self, fill_return, alert_due=True):
+    2026-08-17 (QBTS, live's first trade): this branch had no protection
+    against a momentarily-stale positions cache -- the same shape as the
+    2026-07-30 KLAC incident that gave branch 1 (orphan-cancel, above) its
+    two-consecutive-cycles requirement. A fresh fill's position hadn't
+    synced into client.get_all_positions() yet when this branch happened
+    to run, so it declared the position "disappeared" and deleted the
+    (accurate) DB stop record on the very first read. Now requires the
+    same two-consecutive-cycles confirmation as branch 1 -- tests below
+    call .run() an extra time to reach the confirmed cycle before
+    asserting, same pattern as TestReconciliationAlertThrottle above."""
+
+    def _run(self, state, fill_return, alert_due=True):
         client = MagicMock()
         client.get_all_positions.return_value = []  # DDOG no longer held
 
         stale_rec = {"ticker": "DDOG", "entry_price": 270.79, "stop_price": 228.74,
                      "broker_order_id": 11}
 
+        def fake_get_state(key, default=None):
+            return state.get(key, default)
+
+        def fake_set_state(key, value):
+            state[key] = value
+
         with patch("ibkr.get_client", return_value=client), \
              patch("ibkr.get_open_orders", return_value=[]), \
              patch("db.get_all_position_stops", return_value=[stale_rec]), \
-             patch("db.get_state", return_value=None), \
-             patch("db.set_state"), \
+             patch("db.get_state", side_effect=fake_get_state), \
+             patch("db.set_state", side_effect=fake_set_state), \
              patch("ibkr.get_recent_sell_fill", return_value=fill_return) as mock_fill, \
              patch("db.log_trade") as mock_log_trade, \
              patch("db.close_trade_outcome") as mock_close_outcome, \
@@ -595,9 +612,27 @@ class TestStaleStopReconciliation:
             tasks.reconcile_stop_orders.run()
         return mock_fill, mock_log_trade, mock_close_outcome, mock_delete, mock_alert
 
+    def test_single_cycle_miss_does_not_reconcile_yet(self):
+        """A single missing-this-cycle reading must only arm the pending
+        marker, not touch trade/outcome/stop records at all -- this is
+        exactly what QBTS needed and didn't have."""
+        state = {}
+        mock_fill, mock_log_trade, mock_close_outcome, mock_delete, mock_alert = \
+            self._run(state, fill_return=None)
+
+        mock_fill.assert_not_called()
+        mock_log_trade.assert_not_called()
+        mock_close_outcome.assert_not_called()
+        mock_delete.assert_not_called()
+        mock_alert.assert_not_called()
+        assert state.get("stale_stop_pending_DDOG")
+
     def test_found_fill_is_logged_as_a_trade_and_closes_the_outcome(self):
+        state = {}
         fill = {"filled_qty": 84.0, "fill_price": 227.80}
-        mock_fill, mock_log_trade, mock_close_outcome, mock_delete, mock_alert = self._run(fill)
+        self._run(state, fill_return=fill)  # cycle 1: arms the marker
+        mock_fill, mock_log_trade, mock_close_outcome, mock_delete, mock_alert = \
+            self._run(state, fill_return=fill)  # cycle 2: confirmed -> reconciles
 
         mock_fill.assert_called_once_with("DDOG")
         mock_log_trade.assert_called_once()
@@ -611,7 +646,10 @@ class TestStaleStopReconciliation:
         mock_alert.assert_not_called()
 
     def test_no_fill_found_does_not_fabricate_a_trade_and_alerts_instead(self):
-        mock_fill, mock_log_trade, mock_close_outcome, mock_delete, mock_alert = self._run(None)
+        state = {}
+        self._run(state, fill_return=None)  # cycle 1: arms the marker
+        mock_fill, mock_log_trade, mock_close_outcome, mock_delete, mock_alert = \
+            self._run(state, fill_return=None)  # cycle 2: confirmed -> reconciles
 
         mock_log_trade.assert_not_called()
         mock_close_outcome.assert_not_called()
@@ -622,7 +660,9 @@ class TestStaleStopReconciliation:
         assert "DDOG" in mock_alert.call_args[0][0]
 
     def test_no_fill_found_respects_alert_throttle(self):
-        _, _, _, _, mock_alert = self._run(None, alert_due=False)
+        state = {}
+        self._run(state, fill_return=None, alert_due=False)  # cycle 1: arms
+        _, _, _, _, mock_alert = self._run(state, fill_return=None, alert_due=False)  # cycle 2
 
         mock_alert.assert_not_called()
 

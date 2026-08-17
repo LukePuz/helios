@@ -1770,11 +1770,13 @@ def reconcile_stop_orders(self):
         all_actions: list[str] = []   # every cycle, for the debug log
         new_actions: list[str] = []   # unthrottled — logged as warning + alerted
 
-        # Clear any pending-orphan marker for tickers confirmed held this
-        # cycle -- a marker set during a transient cache lag shouldn't
-        # linger and cause a cancel on some unrelated future cycle.
+        # Clear any pending-orphan/pending-stale-stop marker for tickers
+        # confirmed held this cycle -- a marker set during a transient
+        # cache lag shouldn't linger and cause an action on some unrelated
+        # future cycle.
         for ticker in held:
             db.set_state(f"orphan_pending_{ticker}", "")
+            db.set_state(f"stale_stop_pending_{ticker}", "")
 
         # 1. Orphaned broker stops — stop order with no position on TWO
         # consecutive cycles → cancel. A single missing-this-cycle reading
@@ -1813,7 +1815,9 @@ def reconcile_stop_orders(self):
                         new_actions.append(msg)
 
         # 2. Stale DB stop records with no position → reconcile the exit
-        # against today's broker execution history, THEN delete.
+        # against today's broker execution history, THEN delete. Requires
+        # the SAME ticker to look positionless on TWO consecutive cycles
+        # before acting, same as branch 1's orphan-cancel above.
         #
         # Incident 2026-08-06 (DDOG): this used to just delete the record
         # and move on -- an 84-share position disappeared (its own tracked
@@ -1836,9 +1840,31 @@ def reconcile_stop_orders(self):
         # urgency as an unprotected position, since "we don't know what
         # happened to a real position" is at least as serious as "this one
         # doesn't have a stop yet."
+        #
+        # Incident 2026-08-17 (QBTS, live's first trade): client.get_all_
+        # positions() read its cache moments after a fresh fill, before
+        # the new position had synced -- the exact same cache-lag shape as
+        # the 2026-07-29 KLAC incident that motivated branch 1's two-cycle
+        # requirement above, just hitting this branch instead. This branch
+        # had no such protection, so it declared QBTS's position
+        # "disappeared with no matching SELL execution" on the very first
+        # read and deleted the (accurate) DB stop record -- the real
+        # broker-side stop order was untouched throughout (branch 1's own
+        # two-cycle guard protected it correctly), but local tracking
+        # (trailing-stop management, entry/bucket/conviction metadata) was
+        # gone until manually restored. Same pending-marker pattern as
+        # branch 1 closes this.
         for rec in db.get_all_position_stops():
             if rec["ticker"] not in held:
                 ticker = rec["ticker"]
+                pending_key = f"stale_stop_pending_{ticker}"
+                if not db.get_state(pending_key):
+                    db.set_state(pending_key, datetime.now(timezone.utc).isoformat())
+                    log.info(f"[{ticker}] Position stop record looks stale (no matching "
+                             f"position in this cycle's snapshot) — waiting for the next "
+                             f"cycle to confirm before reconciling")
+                    continue
+                db.set_state(pending_key, "")
                 fill = None
                 try:
                     fill = ibkr.get_recent_sell_fill(ticker)

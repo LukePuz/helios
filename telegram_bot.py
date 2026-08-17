@@ -413,7 +413,16 @@ def _handle_mention(update: dict, is_urgent: bool) -> None:
         try:
             from chat_assistant import parse_trade_intent
             intent = parse_trade_intent(clean)
-        except Exception:
+        except Exception as e:
+            # Was a bare `except: intent = None` -- a real parse/import
+            # failure here silently fell through to the general chat
+            # assistant with zero trace anywhere. Found 2026-08-17: a
+            # correctly-formatted "!urgent buy 2 DRAM" from the group chat
+            # produced no error, no trade, and no clue why -- only a
+            # get_portfolio tool call from the general-assistant fallback,
+            # discovered by re-testing parse_trade_intent standalone (which
+            # worked fine) and having no log line to explain the mismatch.
+            log.error(f"[chat] parse_trade_intent failed for {clean!r}: {e}")
             intent = None
 
         if intent:

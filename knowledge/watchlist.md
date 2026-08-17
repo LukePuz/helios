@@ -98,6 +98,7 @@ Treatment:
 |---|---|---|---|
 | MU | Micron Technology | Accelerator | Core |
 | SNDK | SanDisk | Accelerator | Watch |
+| DRAM | Roundhill Memory ETF | Accelerator | Watch |
 
 ### AI Infrastructure — Memory Supply Chain
 

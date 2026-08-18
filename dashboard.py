@@ -16,7 +16,7 @@ load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 import alerts
 import db
 import process_manager as pm
-from config import SYMBOLS, START_VALUE
+from config import SYMBOLS, START_VALUE, IB_PORT
 from market_data import get_latest_quotes
 from ibkr import IBKRClient, place_market_order
 
@@ -62,17 +62,23 @@ def _get_workflow_status() -> dict[str, bool]:
         except Exception:
             db_ok = False
 
-    # IBKR TWS: socket probe on paper port
-    ib_port = int(os.getenv("IB_PORT", "7497"))
+    # IBKR TWS: socket probe on whichever port TRADING_ENV actually resolves
+    # to (config.IB_PORT), not a raw os.getenv("IB_PORT", "7497") -- that
+    # always fell back to paper's port regardless of TRADING_ENV, since
+    # IB_PORT is deliberately absent from .env now (see config.py's
+    # "Trading environment" section). Found 2026-08-18 while tracing the
+    # ops-queue starvation incident; happened not to be visible only
+    # because paper's ibc.service was coincidentally also still running.
     try:
-        with socket.create_connection(("127.0.0.1", ib_port), timeout=0.5):
+        with socket.create_connection(("127.0.0.1", IB_PORT), timeout=0.5):
             ibkr_ok = True
     except Exception:
         ibkr_ok = False
 
     telegram_ok = bool(os.getenv("TELEGRAM_BOT_TOKEN"))
     pipeline_ok = (svc.get("celery_worker", False) and svc.get("celery_llm_worker", False)
-                   and svc.get("celery_screen_worker", False) and ollama_ok)
+                   and svc.get("celery_screen_worker", False)
+                   and svc.get("celery_ingestion_worker", False) and ollama_ok)
 
     return {
         "redis":     svc.get("redis", False),
@@ -223,7 +229,8 @@ with st.sidebar:
         st.rerun()
 
     _SERVICE_INFO = {
-        "celery_worker": "Runs the background ingestion tasks — pulls SEC filings, FRED macro data, arXiv quantum/AI papers, options flow, congressional trades, and insider filings. Each event gets stored in the vector database and queued for the AI pipeline.",
+        "celery_worker": "Fast I/O ops tasks only — trailing-stop checks, portfolio snapshots, the drawdown circuit breaker, and stop-order reconciliation. Ingestion polling moved to its own worker below (2026-08-18) after a degraded SEC EDGAR endpoint was found monopolizing this queue for 28+ minutes at a stretch, silently starving these safety-critical checks.",
+        "celery_ingestion_worker": "Runs the background ingestion tasks — pulls SEC filings, FRED macro data, arXiv quantum/AI papers, options flow, congressional trades, insider filings, news, fundamentals, and price history. Isolated from the ops worker above so a slow or degraded external data source can never delay the drawdown check or stop monitoring. Each event gets stored in the vector database and queued for the AI pipeline.",
         "celery_llm_worker": "Dedicated worker for the 72B analyst — only receives events that already passed screening (see celery_screen_worker). Drains the priority lane (events about currently-held positions) before the bulk lane (new-idea analyses), and runs one inference at a time so the GPU isn't contended.",
         "celery_screen_worker": "Fast 7B relevance filter, CPU-only, runs several in parallel. Rejects most incoming news/filings/options events cheaply so only genuine survivors reach the expensive 72B worker above.",
         "celery_beat": "The scheduler. Fires each ingestion task on a timer: options flow every 5 min, SEC filings every 10 min, macro data every hour, congressional trades every 6 hours, arXiv papers once daily at 9 AM ET. Also triggers daily regime assessment at 9:30 AM and scanner at 9:35 AM ET.",

@@ -71,6 +71,27 @@ LLM_QUEUE_BULK     = "llm_p1"   # scanner candidates and non-held-ticker events
 # llm_p1 under queue_order_strategy=sorted above, same worker/concurrency.
 LLM_QUEUE_RESEARCH = "llm_p2"
 
+# External-data pollers (EDGAR, options flow, macro, arXiv, congressional,
+# insider, analyst ratings, news, fundamentals, price history) get their own
+# queue/worker, separate from "ops" — added 2026-08-18 after poll_edgar was
+# found taking 28-31 minutes per run (SEC's servers degraded, "Read timed
+# out" on nearly every request) while sharing ops's 3 workers with
+# check_portfolio_drawdown, take_portfolio_snapshot, reconcile_stop_orders,
+# and auto_expire_approvals. With prefetch=1, one worker stuck 30 minutes on
+# a slow EDGAR poll is a third of ops's capacity gone; several of these
+# tasks piling up at once backed the whole queue up past every other
+# scheduled task's `expires`, which Celery just silently drops rather than
+# running late -- 752 "Discarding revoked task" events in a single day,
+# spanning task types with no ingestion involvement at all (check_ollama_
+# gpu_health, check_portfolio_drawdown, auto_expire_approvals among them).
+# The visible symptom was hourly repeat Telegram alerts from
+# check_ingestion_health ("options_flow: last success 48min ago, expected
+# <15min") that never resolved, because poll_options_flow itself kept
+# getting starved the same way. Same fix shape as the llm_p*/screen split
+# below: an unreliable external data source must never be able to starve
+# safety-critical or fast local tasks just by sharing a worker pool.
+INGESTION_QUEUE = "ingestion"
+
 # Screening (7B, CPU-forced) gets its own queue/worker, separate from the
 # llm_p* queues (72B, GPU-bound) — added 2026-07-16 after a busy news day
 # backed llm_p1 up past 700 items. Before this, screen+analyze ran as one
@@ -271,37 +292,37 @@ app.conf.beat_schedule = {
     "poll-edgar": {
         "task":     "tasks.poll_edgar",
         "schedule": 600,  # 10 minutes
-        "options":  {"expires": 600},
+        "options":  {"queue": INGESTION_QUEUE, "expires": 600},
     },
     # Options flow — every 5 minutes during market hours
     "poll-options": {
         "task":     "tasks.poll_options_flow",
         "schedule": 300,
-        "options":  {"expires": 300},
+        "options":  {"queue": INGESTION_QUEUE, "expires": 300},
     },
     # Macro data snapshot — every hour
     "poll-macro": {
         "task":     "tasks.poll_macro",
         "schedule": 3600,
-        "options":  {"expires": 3600},
+        "options":  {"queue": INGESTION_QUEUE, "expires": 3600},
     },
     # arXiv papers — once per day at 9 AM ET
     "poll-arxiv": {
         "task":     "tasks.poll_arxiv",
         "schedule": crontab(hour=9, minute=0),
-        "options":  {"expires": 24 * 3600},
+        "options":  {"queue": INGESTION_QUEUE, "expires": 24 * 3600},
     },
     # Congressional trades — every 6 hours
     "poll-congressional": {
         "task":     "tasks.poll_congressional",
         "schedule": 21600,
-        "options":  {"expires": 21600},
+        "options":  {"queue": INGESTION_QUEUE, "expires": 21600},
     },
     # Insider trades — every 30 minutes
     "poll-insider": {
         "task":     "tasks.poll_insider",
         "schedule": 1800,
-        "options":  {"expires": 1800},
+        "options":  {"queue": INGESTION_QUEUE, "expires": 1800},
     },
     # Analyst rating changes (yfinance, free) — every 30 minutes, same
     # cadence as insider (both are "check for something new," not
@@ -309,7 +330,7 @@ app.conf.beat_schedule = {
     "poll-analyst-ratings": {
         "task":     "tasks.poll_analyst_ratings",
         "schedule": 1800,
-        "options":  {"expires": 1800},
+        "options":  {"queue": INGESTION_QUEUE, "expires": 1800},
     },
     # Portfolio snapshot — every 5 minutes during market hours
     "portfolio-snapshot": {
@@ -329,7 +350,7 @@ app.conf.beat_schedule = {
     "refresh-earnings": {
         "task":     "tasks.refresh_earnings_calendar",
         "schedule": crontab(hour=8, minute=0, day_of_week="mon"),
-        "options":  {"expires": 24 * 3600},
+        "options":  {"queue": INGESTION_QUEUE, "expires": 24 * 3600},
     },
     # Catalyst conflicts — weekdays 8:10 AM ET (pre-wake; catch-up on wake)
     "alert-catalyst-conflicts": {
@@ -426,7 +447,7 @@ app.conf.beat_schedule = {
     "poll-news": {
         "task":     "tasks.poll_news",
         "schedule": 900,
-        "options":  {"expires": 900},
+        "options":  {"queue": INGESTION_QUEUE, "expires": 900},
     },
     # Fundamentals refresh — 5:00 PM ET. Must run inside the awake window
     # (currently 05:00-19:00): the old 2:00 AM slot predated even the
@@ -436,14 +457,14 @@ app.conf.beat_schedule = {
     "refresh-fundamentals": {
         "task":     "tasks.refresh_fundamentals",
         "schedule": crontab(hour=17, minute=0, day_of_week="mon-fri"),
-        "options":  {"expires": 2 * 3600},  # must finish before the 19:00 stack-down
+        "options":  {"queue": INGESTION_QUEUE, "expires": 2 * 3600},  # must finish before the 19:00 stack-down
     },
     # Price history cache refresh — 4:45 PM ET (before fundamentals, after
     # close; same awake-window constraint as above).
     "refresh-price-history": {
         "task":     "tasks.refresh_price_history",
         "schedule": crontab(hour=16, minute=45, day_of_week="mon-fri"),
-        "options":  {"expires": 2 * 3600},
+        "options":  {"queue": INGESTION_QUEUE, "expires": 2 * 3600},
     },
     # S&P 500 universe price history — weekly, Saturday 9:00 AM. Same
     # down-all-weekend caveat as prune-vector-store/prune-seen-items above:
@@ -453,7 +474,7 @@ app.conf.beat_schedule = {
     "refresh-sp500-history": {
         "task":     "tasks.refresh_sp500_history",
         "schedule": crontab(hour=9, minute=0, day_of_week="sat"),
-        "options":  {"expires": 48 * 3600},
+        "options":  {"queue": INGESTION_QUEUE, "expires": 48 * 3600},
     },
     # Ingestion health check — hourly
     "check-ingestion-health": {

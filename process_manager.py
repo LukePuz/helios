@@ -33,6 +33,11 @@ _ORDERS_POOL_ARGS = ["--pool=solo"] if sys.platform == "win32" else ["--pool=pre
 # for the 72B's own CPU-offloaded portion (it doesn't fully fit in 48GB
 # combined VRAM) and the ops worker.
 _SCREEN_POOL_ARGS = ["--pool=solo"] if sys.platform == "win32" else ["--pool=prefork", "-c", "3"]
+# Ingestion pollers are pure I/O-wait (external HTTP calls) — higher
+# concurrency than the CPU-bound workers above is cheap and lets several
+# slow/degraded sources (EDGAR, options flow, etc.) run in parallel instead
+# of queueing behind each other on top of already being isolated from ops.
+_INGESTION_POOL_ARGS = ["--pool=solo"] if sys.platform == "win32" else ["--pool=prefork", "-c", "4"]
 
 LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
@@ -46,6 +51,23 @@ SERVICES: dict[str, dict] = {
         "cmd":   [CELERY, "-A", "tasks", "worker", "--loglevel=info",
                   "-Q", "ops", "-n", "ops@%h"] + _OPS_POOL_ARGS,
         "log":   LOG_DIR / "celery_worker.log",
+    },
+    # Ingestion worker — external-data pollers only (EDGAR, options flow,
+    # macro, arXiv, congressional, insider, analyst ratings, news,
+    # fundamentals, price history). Added 2026-08-18 after poll_edgar was
+    # found taking 28-31 minutes per run against a degraded SEC endpoint
+    # while sharing ops's 3 workers with check_portfolio_drawdown,
+    # take_portfolio_snapshot, and reconcile_stop_orders — see
+    # tasks.INGESTION_QUEUE's comment for the full incident (752 unrelated
+    # tasks silently discarded as expired in one day, surfacing as an
+    # hourly repeat Telegram alert that never resolved). An unreliable
+    # external data source must never be able to starve safety-critical or
+    # fast local tasks just by sharing a worker pool with them.
+    "celery_ingestion_worker": {
+        "label": "Celery Worker (ingestion)",
+        "cmd":   [CELERY, "-A", "tasks", "worker", "--loglevel=info",
+                  "-Q", "ingestion", "-n", "ingestion@%h"] + _INGESTION_POOL_ARGS,
+        "log":   LOG_DIR / "celery_ingestion_worker.log",
     },
     # LLM worker — drains llm_p0 (events on held tickers) strictly before
     # llm_p1 (new-idea analyses); queue_order_strategy=sorted in tasks.py
@@ -262,6 +284,11 @@ def start(name: str) -> str:
             # No IB_CLIENT_ID — screening never touches IBKR (just Ollama,
             # vector store, and db.log_signal), so it doesn't need a
             # broker connection at all.
+            extra["DB_MAXCONN"] = "2"
+        elif name == "celery_ingestion_worker":
+            # No IB_CLIENT_ID — pollers only hit external HTTP APIs (EDGAR,
+            # yfinance, etc.) and the DB, never IBKR. -c 4 forks, so cap
+            # tight like the other multi-fork workers above.
             extra["DB_MAXCONN"] = "2"
         elif name == "celery_orders_worker":
             # Base 30 -- clear of every other worker's base+fork-index range

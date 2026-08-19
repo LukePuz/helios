@@ -588,7 +588,13 @@ class RiskManager:
         if pos_values.get(ticker, 0) > MAX_POSITION_PCT_COMPOUNDER:
             flags.append(f"{ticker} position {pos_values[ticker]:.1%} exceeds Compounder cap {MAX_POSITION_PCT_COMPOUNDER:.0%}")
 
-        # Theme concentration — positions sharing the proposed ticker's sector
+        # Theme concentration — positions sharing the proposed ticker's sector.
+        # theme_size_cap_pct mirrors ai_infra_size_cap_pct's shape below --
+        # found 2026-08-18 that this breach, like moonshot's, was flagged in
+        # text but never actually capped (only AI-infra got that fix on
+        # 2026-08-11). Only meaningful for a ticker that's actually in the
+        # breaching sector; None otherwise.
+        theme_size_cap_pct = None
         try:
             from knowledge_loader import load_watchlist
             watchlist = load_watchlist()
@@ -598,13 +604,20 @@ class RiskManager:
                     v for t, v in pos_values.items()
                     if watchlist.get(t, {}).get("sector", "") == sector
                 )
+                theme_total_without_this = theme_total - proposed_size_pct
+                theme_size_cap_pct = max(0.0, MAX_SINGLE_THEME_PCT - theme_total_without_this)
                 if theme_total > MAX_SINGLE_THEME_PCT:
                     flags.append(f"'{sector}' theme exposure {theme_total:.1%} exceeds "
                                  f"{MAX_SINGLE_THEME_PCT:.0%} limit")
         except Exception as e:
             log.warning(f"Theme concentration sub-check unavailable: {e}")
 
-        # Total moonshot exposure
+        # Total moonshot exposure — RGTI incident 2026-08-18: flagged
+        # correctly ("13.7% exceeds 10% limit") but nothing capped it,
+        # since only ai_infra_size_cap_pct existed at the time. moonshot_
+        # size_cap_pct only computed when bucket=="Moonshot", since that's
+        # the only case this ticker's own size drives the total.
+        moonshot_size_cap_pct = None
         if bucket == "Moonshot":
             try:
                 from knowledge_loader import load_watchlist
@@ -613,6 +626,8 @@ class RiskManager:
                     v for t, v in pos_values.items()
                     if watchlist.get(t, {}).get("role", "") == "Moonshot"
                 )
+                moonshot_total_without_this = moonshot_total - proposed_size_pct
+                moonshot_size_cap_pct = max(0.0, MAX_MOONSHOT_TOTAL_PCT - moonshot_total_without_this)
                 if moonshot_total > MAX_MOONSHOT_TOTAL_PCT:
                     flags.append(f"Total moonshot exposure {moonshot_total:.1%} exceeds "
                                  f"{MAX_MOONSHOT_TOTAL_PCT:.0%} limit")
@@ -625,6 +640,10 @@ class RiskManager:
             "ai_infrastructure_total": round(ai_infra_total, 4),
             "ai_infra_size_cap_pct": (round(ai_infra_size_cap_pct, 4)
                                       if ai_infra_size_cap_pct is not None else None),
+            "theme_size_cap_pct": (round(theme_size_cap_pct, 4)
+                                    if theme_size_cap_pct is not None else None),
+            "moonshot_size_cap_pct": (round(moonshot_size_cap_pct, 4)
+                                       if moonshot_size_cap_pct is not None else None),
         }
 
     def check_correlation(self, ticker: str, corr_threshold: float = 0.7,

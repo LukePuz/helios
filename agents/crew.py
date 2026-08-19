@@ -593,12 +593,22 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
             # 2026-08-11: this used to only flag AI-infra breaches in text
             # nobody reviews (auto-execution has no human-in-the-loop tap) —
             # the portfolio sat over its own 60% limit for a week-plus while
-            # every new ADD kept sailing through anyway. cap is None for a
-            # ticker that isn't itself AI-infra (capping it wouldn't address
-            # a breach caused by other positions) — only scale size down
-            # when it's actually this ticker's own contribution pushing the
-            # total over.
-            cap = conc.get("ai_infra_size_cap_pct")
+            # every new ADD kept sailing through anyway. Generalized
+            # 2026-08-18 after the identical gap recurred for RGTI's
+            # moonshot-total breach (flagged "13.7% exceeds 10% limit",
+            # executed at full size anyway) -- theme_size_cap_pct and
+            # moonshot_size_cap_pct now exist alongside ai_infra_size_cap_pct
+            # for exactly this reason. Each is None for a ticker whose own
+            # size doesn't drive that particular breach (capping it wouldn't
+            # address a breach caused by other positions) -- take the
+            # tightest of whichever apply, since more than one can breach
+            # at once (e.g. a moonshot name in an over-concentrated theme).
+            caps = [c for c in (
+                conc.get("ai_infra_size_cap_pct"),
+                conc.get("theme_size_cap_pct"),
+                conc.get("moonshot_size_cap_pct"),
+            ) if c is not None]
+            cap = min(caps) if caps else None
             if cap is not None and cap < sizing["position_size_pct"]:
                 original_pct = sizing["position_size_pct"]
                 scale = (cap / original_pct) if original_pct > 0 else 0.0
@@ -607,10 +617,10 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
                 sizing["initial_dollar"] = round(sizing["initial_dollar"] * scale, 2)
                 sizing["flags"].append(
                     f"Size capped to {cap:.1%} target ({sizing['shares_initial']} shares) "
-                    f"to stay within the AI infra limit"
+                    f"to stay within concentration limits"
                 )
                 if sizing["shares_initial"] <= 0:
-                    log.info(f"[{ticker}] AI infra concentration leaves 0 shares of room — "
+                    log.info(f"[{ticker}] Concentration limits leave 0 shares of room — "
                              f"skipping entry (already at/over the limit)")
                     return
 

@@ -56,6 +56,54 @@ class TestSizing:
         assert sizing["flags"]
 
 
+class TestMicroTierBandRescaling:
+    """Incident 2026-08-21: Compounder/Accelerator never got the same
+    tier-rescaling Moonshot got on 2026-08-13 — their BUCKET_SIZE_TABLE
+    bands stayed at the values tuned for the ~$1M paper account at every
+    tier. On the live account's actual ~$2,000 balance ("micro" tier),
+    that meant every Accelerator ADD priced above roughly $45-70/share
+    (NVDA, MSFT, GOOG, META, AVGO, ANET, NOW, CRWD, MRVL, TSLA, LRCX —
+    real conviction-7/8 analyst output, dozens/day) computed a dollar
+    allocation too small to clear the whole-share floor and was silently
+    dropped — no DB row, no alert, just a log.info line — while only the
+    3 existing Moonshot positions (all under $21/share, since Moonshot's
+    bands *did* rescale) could ever size. The account went 4 days without
+    a single trade as a result. This asserts a conviction-8 Accelerator
+    ADD on a $1,990 micro-tier account actually sizes to >=1 share of a
+    ~$217 stock (NVDA's real price that day) instead of silently
+    returning 0."""
+
+    def test_accelerator_add_sizes_on_micro_tier_account(self):
+        # $1,990 portfolio value -> "micro" tier (< config.ACCOUNT_TIER_REDUCED_MIN)
+        client = _make_client(portfolio_value=1_990.26)
+        with patch.object(risk_manager.RiskManager, "calculate_stop", return_value=(180.0, "mocked")), \
+             patch("risk_manager.TRADING_ENV", "live"), \
+             patch("db.get_state", side_effect=lambda k, d=None: {"trading_halted_live": "false",
+                                                                    "high_water_mark_live": "2010.54"}.get(k, d)), \
+             patch("db.set_state"):
+            rm = risk_manager.RiskManager(client)
+            sizing = rm.size_position("NVDA", conviction=8, bucket="Accelerator",
+                                      regime="Risk-On", price=216.99)
+        assert sizing["shares_initial"] >= 1, (
+            f"Accelerator conviction-8 ADD failed to size on a micro-tier account: {sizing['flags']}"
+        )
+
+    def test_moonshot_still_rescales_unchanged(self):
+        # Regression guard: the pre-existing Moonshot tier-rescaling
+        # (2026-08-13) must keep working exactly as before this fix
+        # generalized the same code path to Compounder/Accelerator.
+        client = _make_client(portfolio_value=1_990.26)
+        with patch.object(risk_manager.RiskManager, "calculate_stop", return_value=(12.0, "mocked")), \
+             patch("risk_manager.TRADING_ENV", "live"), \
+             patch("db.get_state", side_effect=lambda k, d=None: {"trading_halted_live": "false",
+                                                                    "high_water_mark_live": "2010.54"}.get(k, d)), \
+             patch("db.set_state"):
+            rm = risk_manager.RiskManager(client)
+            sizing = rm.size_position("RGTI", conviction=7, bucket="Moonshot",
+                                      regime="Risk-On", price=18.635)
+        assert sizing["shares_initial"] >= 1
+
+
 class TestHalt:
     def test_persisted_halt_flag_blocks_trading(self):
         client = _make_client()

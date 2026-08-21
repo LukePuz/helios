@@ -262,6 +262,21 @@ TIER_MIN_CONVICTION_TO_QUEUE  = {"standard": MIN_CONVICTION_TO_QUEUE, "reduced":
 # being a 5-10x jump in single-bet risk: a $202 moonshot at $1,010 (Micro)
 # vs. today's $20.
 TIER_MAX_POSITION_PCT_MOONSHOT = {"standard": MAX_POSITION_PCT_MOONSHOT, "reduced": 0.10, "micro": 0.20}
+# 2026-08-21: Compounder/Accelerator never got the same tier-scaling
+# Moonshot did above — their BUCKET_SIZE_TABLE bands and hard caps stayed
+# at the values tuned for the ~$1M paper account at every tier. On the
+# live account's actual $1,990 (Micro), that meant every ADD priced above
+# roughly $45-70/share (NVDA, MSFT, GOOG, META, AVGO, ANET, NOW, CRWD,
+# MRVL, TSLA, LRCX — dozens/day, real conviction-7/8 analyst output)
+# computed a dollar allocation too small to clear the whole-share floor
+# and got silently dropped with just a log.info line — no DB row, no
+# alert. Only the 3 existing Moonshot positions (RGTI/LUNR/QBTS, all
+# under $21/share) could ever size, which is why the account went 4 days
+# without a single trade. Scaled up using the same ratio-preserving
+# approach as Moonshot's own 2026-08-13 fix (size_position() rescales
+# BUCKET_SIZE_TABLE bands by cap-ratio, not just the cap itself).
+TIER_MAX_POSITION_PCT_COMPOUNDER  = {"standard": MAX_POSITION_PCT_COMPOUNDER,  "reduced": 0.28, "micro": 0.40}
+TIER_MAX_POSITION_PCT_ACCELERATOR = {"standard": MAX_POSITION_PCT_ACCELERATOR, "reduced": 0.20, "micro": 0.35}
 # No single share purchase may itself already represent more than this
 # fraction of portfolio value — guards against one expensive share (e.g. an
 # $800 stock on a $1,010 account) structurally dominating the position.
@@ -288,7 +303,9 @@ def get_active_limits(balance: float) -> dict:
         "tier":                      tier,
         "max_concurrent_positions":  TIER_MAX_CONCURRENT_POSITIONS[tier],
         "min_conviction_to_queue":   TIER_MIN_CONVICTION_TO_QUEUE[tier],
-        "max_position_pct_moonshot": TIER_MAX_POSITION_PCT_MOONSHOT[tier],
+        "max_position_pct_moonshot":    TIER_MAX_POSITION_PCT_MOONSHOT[tier],
+        "max_position_pct_compounder":  TIER_MAX_POSITION_PCT_COMPOUNDER[tier],
+        "max_position_pct_accelerator": TIER_MAX_POSITION_PCT_ACCELERATOR[tier],
         "single_share_cap_pct":      TIER_SINGLE_SHARE_CAP_PCT[tier],
     }
 

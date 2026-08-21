@@ -70,6 +70,8 @@ except ImportError:
         return {"tier": "standard", "max_concurrent_positions": None,
                 "min_conviction_to_queue": 5,
                 "max_position_pct_moonshot": MAX_POSITION_PCT_MOONSHOT,
+                "max_position_pct_compounder": MAX_POSITION_PCT_COMPOUNDER,
+                "max_position_pct_accelerator": MAX_POSITION_PCT_ACCELERATOR,
                 "single_share_cap_pct": None}
 
 
@@ -325,32 +327,40 @@ class RiskManager:
                     "cash_blocked": False,
                     "flags": [f"Conviction {conviction} too low for {bucket} — WATCH only"]}
 
-        # BUCKET_SIZE_TABLE's Moonshot bands (0.25%-2%) are calibrated
-        # against the Standard-tier 2% hard cap — raising the hard cap alone
-        # (limits["max_position_pct_moonshot"]) doesn't change anything
-        # because these bands, not the cap, are what actually binds at
-        # Standard. At Reduced/Micro the tier cap IS the intended scale
-        # (10%/20%, per 2026-08-13 sign-off), so scale the bands themselves
-        # by the same ratio, preserving conviction-band shape instead of
-        # flattening it.
-        if bucket == "Moonshot" and limits["tier"] != "standard":
-            moonshot_scale = limits["max_position_pct_moonshot"] / MAX_POSITION_PCT_MOONSHOT
-            lo, hi = lo * moonshot_scale, hi * moonshot_scale
+        # BUCKET_SIZE_TABLE's bands are calibrated against each bucket's
+        # Standard-tier hard cap — raising the hard cap alone doesn't change
+        # anything because these bands, not the cap, are what actually binds
+        # at Standard. At Reduced/Micro the tier cap IS the intended scale,
+        # so scale the bands themselves by the same ratio, preserving
+        # conviction-band shape instead of flattening it. Originally
+        # Moonshot-only (2026-08-13 sign-off); extended to Compounder/
+        # Accelerator 2026-08-21 after the same silent-drop failure mode
+        # (sub-1-share allocations, no alert) turned out to affect them too
+        # — see TIER_MAX_POSITION_PCT_COMPOUNDER/ACCELERATOR in config.py.
+        standard_cap = {
+            "Compounder":  MAX_POSITION_PCT_COMPOUNDER,
+            "Accelerator": MAX_POSITION_PCT_ACCELERATOR,
+            "Moonshot":    MAX_POSITION_PCT_MOONSHOT,
+        }.get(bucket)
+        tier_cap = {
+            "Compounder":  limits.get("max_position_pct_compounder"),
+            "Accelerator": limits.get("max_position_pct_accelerator"),
+            "Moonshot":    limits.get("max_position_pct_moonshot"),
+        }.get(bucket)
+        if limits["tier"] != "standard" and standard_cap and tier_cap:
+            tier_scale = tier_cap / standard_cap
+            lo, hi = lo * tier_scale, hi * tier_scale
 
         # Midpoint of range, then apply regime multiplier
         base_pct  = (lo + hi) / 2
         mult      = REGIME_MULTIPLIER.get(regime, 0.75)
         target    = base_pct * mult
 
-        # Enforce hard caps — Moonshot's cap is tier-dependent (see
-        # config.TIER_MAX_POSITION_PCT_MOONSHOT): its normal 2% is
+        # Enforce hard caps — tier-dependent for all three buckets (see
+        # config.TIER_MAX_POSITION_PCT_*): the Standard-tier caps are
         # structurally too small to clear the whole-share floor below at
-        # Reduced/Micro balances, so it's raised per-tier instead.
-        hard_cap = {
-            "Compounder":  MAX_POSITION_PCT_COMPOUNDER,
-            "Accelerator": MAX_POSITION_PCT_ACCELERATOR,
-            "Moonshot":    limits["max_position_pct_moonshot"],
-        }.get(bucket, MAX_POSITION_PCT_ACCELERATOR)
+        # Reduced/Micro balances, so each is raised per-tier instead.
+        hard_cap = tier_cap if tier_cap is not None else MAX_POSITION_PCT_ACCELERATOR
 
         target = min(target, hard_cap)
 

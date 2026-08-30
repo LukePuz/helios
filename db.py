@@ -1229,7 +1229,7 @@ def mark_profit_target_taken(ticker: str, new_stop: float) -> None:
     records that the target's been taken (so it isn't re-sold on the next
     check) and moves the recorded stop to breakeven in the same write, so
     a crash between the partial sell and the stop update can't leave the
-    remainder both unmarked and unprotected."""
+    remainder both unmarked AND unprotected."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:

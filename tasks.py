@@ -362,6 +362,20 @@ app.conf.beat_schedule = {
         "schedule": crontab(hour=8, minute=0, day_of_week="mon"),
         "options":  {"queue": INGESTION_QUEUE, "expires": 24 * 3600},
     },
+    # Macro calendar (FOMC/CPI/jobs/election) — weekly is plenty since the
+    # underlying schedule is fixed months out; idempotent upsert either way.
+    "refresh-macro-calendar": {
+        "task":     "tasks.refresh_macro_calendar",
+        "schedule": crontab(hour=8, minute=5, day_of_week="mon"),
+        "options":  {"queue": INGESTION_QUEUE, "expires": 24 * 3600},
+    },
+    # Sector earnings-cluster detection — after refresh-earnings (8:00) so
+    # this week's per-ticker dates are already fresh.
+    "refresh-sector-calendar": {
+        "task":     "tasks.refresh_sector_calendar",
+        "schedule": crontab(hour=8, minute=15, day_of_week="mon"),
+        "options":  {"queue": INGESTION_QUEUE, "expires": 24 * 3600},
+    },
     # Catalyst conflicts — weekdays 8:10 AM ET (pre-wake; catch-up on wake)
     "alert-catalyst-conflicts": {
         "task":     "tasks.alert_catalyst_conflicts",
@@ -1698,6 +1712,34 @@ def refresh_earnings_calendar(self):
         log.info(f"Earnings calendar refreshed: {count} tickers updated")
     except Exception as e:
         log.error(f"refresh_earnings_calendar failed: {e}")
+        raise self.retry(exc=e, countdown=300)
+
+
+@app.task(name="tasks.refresh_macro_calendar", bind=True, max_retries=2)
+def refresh_macro_calendar(self):
+    """Upsert the FOMC/CPI/jobs-report/election calendar (2026-08-30, user
+    request) -- see ingestion/macro_calendar.py's module docstring for why
+    this is a maintained table rather than a live feed."""
+    try:
+        from ingestion.macro_calendar import refresh_macro_calendar as _refresh
+        count = _refresh()
+        log.info(f"Macro calendar refreshed: {count} events upserted")
+    except Exception as e:
+        log.error(f"refresh_macro_calendar failed: {e}")
+        raise self.retry(exc=e, countdown=300)
+
+
+@app.task(name="tasks.refresh_sector_calendar", bind=True, max_retries=2)
+def refresh_sector_calendar(self):
+    """Derive sector-level earnings-cluster events from the already-
+    refreshed per-ticker earnings calendar (2026-08-30, user request).
+    Scheduled after refresh-earnings so it sees this week's fresh dates."""
+    try:
+        from ingestion.sector_calendar import refresh_sector_calendar as _refresh
+        count = _refresh()
+        log.info(f"Sector calendar refreshed: {count} cluster events upserted")
+    except Exception as e:
+        log.error(f"refresh_sector_calendar failed: {e}")
         raise self.retry(exc=e, countdown=300)
 
 

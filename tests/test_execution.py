@@ -458,3 +458,92 @@ class TestGapConfirmationGuard:
 
         assert result is True
         mock_gap.assert_not_called()
+
+
+class TestCatalystTrackingPersistence:
+    """2026-08-30, user request: catalyst description, expected-return
+    target, and cited sources used to only live transiently in
+    pending_approvals.analyst_json -- these tests guard that
+    execute_approved actually promotes them into the log_trade_outcome
+    call (which persists to trade_outcomes), not just that they exist
+    somewhere in the approval dict."""
+
+    def _fresh_quote(self, price=110.0):
+        return {"price": price, "is_stale": False, "age_minutes": 1.0, "market_open": True}
+
+    def _approval_with_analyst_json(self, analyst_json):
+        return {
+            "id": 1, "ticker": "NVDA", "action": "ADD", "conviction": 8,
+            "thesis_bucket": "Accelerator", "stop_loss_price": 90.0,
+            "risk_json": {"shares_initial": 100, "price_at_sizing": 108.0, "stop_loss_price": 90.0},
+            "analyst_json": analyst_json,
+        }
+
+    def test_catalyst_and_expected_return_are_passed_through(self):
+        analyst_json = {
+            "catalyst": {"event": "Q3 earnings beat + raised guidance",
+                          "date": "2026-11", "is_priced_in": False},
+            "expected_return_pct": 28.5,
+            "expected_downside_pct": -12.0,
+            "thesis_summary": "AI datacenter demand still under-modeled by consensus.",
+            "sources": [{"type": "news", "detail": "Reuters"}, {"type": "fundamentals_data", "detail": "Q2 beat"}],
+            "source_count": 2,
+        }
+        approval = self._approval_with_analyst_json(analyst_json)
+
+        with patch("ibkr.get_ib"), \
+             patch("ibkr.get_client"), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("ibkr.place_market_order") as mock_order, \
+             patch("market_data.get_priced_quote", return_value=self._fresh_quote()), \
+             patch("market_data.check_gap_confirmation",
+                   return_value={"status": "confirmed", "gap_pct": 0.10, "retracement_pct": 0.1,
+                                 "open_price": 110.0, "prior_close": 100.0, "current_price": 109.0}), \
+             patch("market_data.is_market_hours", return_value=True), \
+             patch("config.USE_BRACKET_ORDERS", False), \
+             patch("db.log_trade"), patch("db.log_order", return_value=1), \
+             patch("db.upsert_position_stop"), patch("db.set_stop_broker_order_id"), \
+             patch("db.log_trade_outcome") as mock_log_outcome, \
+             patch("alerts._send"), patch("alerts.send_trade_alert"):
+            mock_rm_cls.return_value.is_halted.return_value = False
+            mock_order.return_value = {"order_id": 1, "fill_price": 110.0, "filled_qty": 100.0}
+            execution.execute_approved(approval)
+
+        _, kwargs = mock_log_outcome.call_args
+        assert kwargs["catalyst_event"] == "Q3 earnings beat + raised guidance"
+        assert kwargs["catalyst_date"] == "2026-11"
+        assert kwargs["catalyst_is_priced_in"] is False
+        assert kwargs["expected_return_pct"] == 28.5
+        assert kwargs["expected_downside_pct"] == -12.0
+        assert kwargs["thesis_summary"] == "AI datacenter demand still under-modeled by consensus."
+        assert kwargs["source_count"] == 2
+        assert len(kwargs["sources"]) == 2
+
+    def test_missing_catalyst_data_does_not_crash(self):
+        # A stub recommendation (Ollama unavailable) has an empty/None
+        # analyst_json in some paths -- this must not blow up execution.
+        approval = self._approval_with_analyst_json({})
+
+        with patch("ibkr.get_ib"), \
+             patch("ibkr.get_client"), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("ibkr.place_market_order") as mock_order, \
+             patch("market_data.get_priced_quote", return_value=self._fresh_quote()), \
+             patch("market_data.check_gap_confirmation",
+                   return_value={"status": "confirmed", "gap_pct": 0.10, "retracement_pct": 0.1,
+                                 "open_price": 110.0, "prior_close": 100.0, "current_price": 109.0}), \
+             patch("market_data.is_market_hours", return_value=True), \
+             patch("config.USE_BRACKET_ORDERS", False), \
+             patch("db.log_trade"), patch("db.log_order", return_value=1), \
+             patch("db.upsert_position_stop"), patch("db.set_stop_broker_order_id"), \
+             patch("db.log_trade_outcome") as mock_log_outcome, \
+             patch("alerts._send"), patch("alerts.send_trade_alert"):
+            mock_rm_cls.return_value.is_halted.return_value = False
+            mock_order.return_value = {"order_id": 1, "fill_price": 110.0, "filled_qty": 100.0}
+            result = execution.execute_approved(approval)
+
+        assert result is True
+        _, kwargs = mock_log_outcome.call_args
+        assert kwargs["catalyst_event"] is None
+        assert kwargs["expected_return_pct"] is None
+        assert kwargs["sources"] is None

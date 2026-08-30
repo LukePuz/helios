@@ -249,6 +249,8 @@ Then output ONLY valid JSON in exactly this format (no markdown, no explanation 
     "bull_case_target": "$X (12 months)",
     "downside_scenario": "$X"
   }},
+  "expected_return_pct": <float -- your single-number bull-case % upside from the Current Price to bull_case_target, e.g. 25.0 for +25%. Same figure as catalyst.expected_upside_if_positive / valuation.bull_case_target, just as one clean number instead of a range string, so it can be tracked against the actual outcome later.>,
+  "expected_downside_pct": <float -- same idea for the downside_scenario, as a negative number, e.g. -15.0>,
   "sources": [
     {{"type": "news or edgar_filing or options_flow or insider_trade or congressional_trade or analyst_rating or fundamentals_data or price_action or arxiv_paper or other", "detail": "The specific fact this source contributes -- not a repeat of the catalyst description"}}
   ],
@@ -393,6 +395,8 @@ def _extract_json(raw: str) -> dict | None:
         ("reasoning",     r'"reasoning"\s*:\s*"([^"]+)"'),
         ("pass_to_risk",  r'"pass_to_risk"\s*:\s*(true|false)'),
         ("upside_downside_ratio", r'"upside_downside_ratio"\s*:\s*([0-9.]+)'),
+        ("expected_return_pct", r'"expected_return_pct"\s*:\s*(-?[0-9.]+)'),
+        ("expected_downside_pct", r'"expected_downside_pct"\s*:\s*(-?[0-9.]+)'),
     ]:
         m = re.search(pattern, cleaned, re.IGNORECASE)
         if m:
@@ -402,7 +406,7 @@ def _extract_json(raw: str) -> dict | None:
                 extracted[field] = int(val)
             elif field == "pass_to_risk":
                 extracted[field] = val.lower() == "true"
-            elif field == "upside_downside_ratio":
+            elif field in ("upside_downside_ratio", "expected_return_pct", "expected_downside_pct"):
                 extracted[field] = float(val)
             else:
                 extracted[field] = val
@@ -533,6 +537,8 @@ def _stub_recommendation(candidate: dict, reason: str) -> dict:
         "key_risks":       [f"Model unavailable: {reason}"],
         "sources": [],
         "source_count": 0,
+        "expected_return_pct": None,
+        "expected_downside_pct": None,
         "options_opportunity": False,
         "options_notes":   None,
         "pass_to_risk":    False,
@@ -615,6 +621,16 @@ def analyze(
         if value is None:
             value = 3
         return max(1, min(5, int(value)))
+
+    def _optional_float(field: str) -> float | None:
+        value = parsed.get(field)
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            log.debug(f"[{ticker}] Non-numeric {field}: {value!r}")
+            return None
 
     thesis_strength        = _sub_score("thesis_strength")
     catalyst_quality       = _sub_score("catalyst_quality")
@@ -778,6 +794,8 @@ def analyze(
         "expectation_gap": parsed.get("expectation_gap", {}),
         "catalyst":  parsed.get("catalyst", {}),
         "valuation": parsed.get("valuation", {}),
+        "expected_return_pct": _optional_float("expected_return_pct"),
+        "expected_downside_pct": _optional_float("expected_downside_pct"),
         "upside_downside_ratio": udr,
         "key_risks": parsed.get("key_risks", []),
         "sources": sources,

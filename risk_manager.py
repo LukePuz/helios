@@ -1185,7 +1185,6 @@ class RiskManager:
 
         return flagged
 
-
 if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv(dotenv_path=Path(__file__).parent / ".env")

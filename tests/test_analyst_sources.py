@@ -85,7 +85,12 @@ class TestSourceGateIntegration:
         response = _json.dumps({
             "action": "OPEN", "conviction": 8, "thesis_strength": 4, "catalyst_quality": 4,
             "valuation_risk_reward": 4, "data_completeness": 4, "thesis_bucket": "Accelerator",
-            "thesis_summary": "test", "expectation_gap": {}, "catalyst": {}, "valuation": {},
+            "thesis_summary": "test", "expectation_gap": {},
+            # Catalyst date + expected_return_pct populated so this OPEN
+            # also clears the separate expected-return-RATE gate (2026-08-30)
+            # — this test is only exercising the source-count gate.
+            "catalyst": {"event": "earnings", "date": "2026-09-20", "is_priced_in": False},
+            "valuation": {}, "expected_return_pct": 5.0,
             "upside_downside_ratio": 3.0, "key_risks": [], "pass_to_risk": True,
             "reasoning": "per Q2 fundamentals, revenue grew 40%",
             "sources": [

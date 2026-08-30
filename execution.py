@@ -579,6 +579,8 @@ def execute_approved(
             thesis_summary=analyst_json.get("thesis_summary"),
             sources=analyst_json.get("sources"),
             source_count=analyst_json.get("source_count"),
+            weeks_to_catalyst=analyst_json.get("weeks_to_catalyst"),
+            expected_return_per_week=analyst_json.get("expected_return_per_week"),
         )
 
         # Send trade alert — full rationale + all conviction scores + bucket,

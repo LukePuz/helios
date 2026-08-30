@@ -343,6 +343,8 @@ def backfill_catalyst_tracking(max_per_run: int = 10) -> list[dict]:
             thesis_summary=result.get("thesis_summary"),
             sources=result.get("sources"),
             source_count=result.get("source_count"),
+            weeks_to_catalyst=result.get("weeks_to_catalyst"),
+            expected_return_per_week=result.get("expected_return_per_week"),
         )
         log.info(f"[{ticker}] Catalyst backfilled: {catalyst.get('event', 'none identified')} "
                  f"(sources={result.get('source_count', 0)}, expected_return={result.get('expected_return_pct')})")

@@ -24,6 +24,11 @@ load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env")
 
 log = logging.getLogger(__name__)
 
+try:
+    from config import MIN_EXPECTED_RETURN_PCT_PER_WEEK
+except ImportError:
+    MIN_EXPECTED_RETURN_PCT_PER_WEEK = 1.0
+
 OLLAMA_HOST   = os.getenv("OLLAMA_HOST",    "http://localhost:11434")
 ANALYST_MODEL = os.getenv("ANALYST_MODEL",  "qwen2.5:72b")
 
@@ -238,7 +243,7 @@ Then output ONLY valid JSON in exactly this format (no markdown, no explanation 
   }},
   "catalyst": {{
     "event": "Description of catalyst",
-    "date": "YYYY-MM or ongoing",
+    "date": "The MOST PRECISE date you actually know: YYYY-MM-DD if a specific day is confirmed (e.g. a scheduled earnings date, or 'the next session' after a report you're reading right now), YYYY-MM if only the month is known, or 'ongoing' if there's no defined timing at all. Use day-level precision whenever the brief supports it -- 'YYYY-MM' for something you actually know happens tomorrow understates how soon it is.",
     "expected_upside_if_positive": "+X to +Y%",
     "expected_downside_if_negative": "-X to -Y%",
     "is_priced_in": false
@@ -357,6 +362,59 @@ def count_distinct_sources(sources: list) -> int:
         (s.get("type"), (s.get("detail") or "")[:80])
         for s in (sources or []) if isinstance(s, dict) and s.get("type")
     })
+
+
+def compute_weeks_to_catalyst(catalyst_date: str | None, as_of: datetime | None = None) -> float | None:
+    """Pure helper for the minimum-expected-return-rate gate (2026-08-30,
+    user request). Parses the model's catalyst.date field, trying the
+    most precise format first:
+      - "YYYY-MM-DD": exact date.
+      - "YYYY-MM": month known, day unknown -- assumes the 15th (a
+        reasonable midpoint, not a real prediction of the exact day).
+      - "ongoing", empty, or anything unparseable: no defined timeframe
+        at all -- returns None. Callers must treat None as "can't compute
+        a rate," not as passing or failing the gate on its own; analyze()
+        chooses to fail closed (see its own comment) since "ongoing" is
+        also literally what catalyst_quality's own 1/5 rubric calls a
+        weak catalyst.
+    A catalyst dated today or in the past is floored to 1 day (1/7 week)
+    rather than returning zero or a negative number -- "reading an
+    earnings report and expecting a move the next session" is meant to
+    describe an imminent, not-yet-priced-in catalyst, not a broken one;
+    the floor keeps the resulting rate large and finite instead of
+    infinite or negative."""
+    if not catalyst_date:
+        return None
+    text = catalyst_date.strip().lower()
+    if text == "ongoing":
+        return None
+    now = as_of or datetime.now(timezone.utc)
+
+    parsed = None
+    for fmt in ("%Y-%m-%d", "%Y-%m"):
+        try:
+            parsed = datetime.strptime(catalyst_date.strip(), fmt)
+            break
+        except ValueError:
+            continue
+    if parsed is None:
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    days = (parsed - now).total_seconds() / 86400
+    return max(days, 1.0) / 7.0
+
+
+def expected_return_per_week(expected_return_pct: float | None, weeks_to_catalyst: float | None) -> float | None:
+    """Pure helper: the rate the minimum-expected-return-rate gate
+    actually checks. Returns None (not a default of 0 or an exception)
+    if either input is missing -- callers decide how to treat that,
+    same "None means can't compute, don't guess" posture as
+    compute_weeks_to_catalyst above."""
+    if expected_return_pct is None or weeks_to_catalyst is None or weeks_to_catalyst <= 0:
+        return None
+    return expected_return_pct / weeks_to_catalyst
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +597,8 @@ def _stub_recommendation(candidate: dict, reason: str) -> dict:
         "source_count": 0,
         "expected_return_pct": None,
         "expected_downside_pct": None,
+        "weeks_to_catalyst": None,
+        "expected_return_per_week": None,
         "options_opportunity": False,
         "options_notes":   None,
         "pass_to_risk":    False,
@@ -721,6 +781,27 @@ def analyze(
         parsed["reasoning"] = (parsed.get("reasoning", "") +
                                f" [Downgraded: {source_count} distinct source(s) cited, need >=2]")
 
+    # Minimum expected-return RATE gate (2026-08-30, user request) --
+    # scoped to Accelerator/Moonshot only, see config.py's
+    # MIN_EXPECTED_RETURN_PCT_PER_WEEK docstring for the full rationale
+    # and worked examples. A catalyst with no defined timeframe at all
+    # ("ongoing") can't have a rate computed -- fails CLOSED (downgrades)
+    # rather than passing by default, consistent with catalyst_quality's
+    # own rubric already treating vague/ongoing timing as weak (1/5).
+    weeks_to_catalyst = None
+    per_week = None
+    if bucket in ("Accelerator", "Moonshot") and action in ("OPEN", "ADD"):
+        catalyst_date = (parsed.get("catalyst") or {}).get("date")
+        weeks_to_catalyst = compute_weeks_to_catalyst(catalyst_date)
+        per_week = expected_return_per_week(_optional_float("expected_return_pct"), weeks_to_catalyst)
+        if per_week is None or per_week < MIN_EXPECTED_RETURN_PCT_PER_WEEK:
+            reason = ("no computable catalyst timeframe" if weeks_to_catalyst is None
+                      else f"{per_week:.2f}%/week < {MIN_EXPECTED_RETURN_PCT_PER_WEEK}%/week minimum")
+            log.info(f"[{ticker}] Expected-return rate check failed ({reason}) — downgrading to WATCH")
+            action = "WATCH"
+            parsed["pass_to_risk"] = False
+            parsed["reasoning"] = parsed.get("reasoning", "") + f" [Downgraded: {reason}]"
+
     # Moonshots need conviction >= 7 for OPEN
     if bucket == "Moonshot" and action == "OPEN" and conviction < 7:
         log.info(f"[{ticker}] Moonshot conviction {conviction} < 7 — downgrading to WATCH")
@@ -796,6 +877,8 @@ def analyze(
         "valuation": parsed.get("valuation", {}),
         "expected_return_pct": _optional_float("expected_return_pct"),
         "expected_downside_pct": _optional_float("expected_downside_pct"),
+        "weeks_to_catalyst": weeks_to_catalyst,
+        "expected_return_per_week": per_week,
         "upside_downside_ratio": udr,
         "key_risks": parsed.get("key_risks", []),
         "sources": sources,

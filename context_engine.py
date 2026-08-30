@@ -56,6 +56,37 @@ def _get_macro_summary(macro_mod) -> str:
     return macro_mod.get_macro_summary_text()
 
 
+def _catalyst_calendar_section(ticker: str) -> str:
+    """
+    Structured, dated catalyst events (2026-08-30, user request): ticker's
+    own (earnings/etc), its sector's (earnings clusters), and market-wide
+    (FOMC/CPI/jobs/election) -- so the model can reason about "expected
+    return by WHEN" against a real calendar instead of only whatever it
+    happens to recall. Distinct from the news-search-based catalyst
+    discovery elsewhere in both brief builders: this is the dated,
+    confidence-tagged calendar (catalyst_service), not free-text search.
+    Shared by assemble_brief and build_scan_brief so both get the same
+    view without duplicating the query/formatting logic.
+    """
+    try:
+        from catalyst_service.client import upcoming_events
+        cal_events = upcoming_events(ticker=ticker, days_ahead=45)
+        if not cal_events:
+            return ""
+        cal_lines = ["=== UPCOMING CATALYST CALENDAR (next 45 days) ==="]
+        for e in cal_events:
+            scope_tag = {"ticker": ticker, "sector": e.get("ticker"), "macro": "MARKET"}[e["scope"]]
+            cal_lines.append(
+                f"  [{e['scope'].upper():<6}] {e['event_date']} — {scope_tag} "
+                f"{e['event_type']} ({e['confidence']}): "
+                f"{e.get('thesis_note') or e['event_type']}"
+            )
+        return "\n".join(cal_lines)
+    except Exception as e:
+        log.debug(f"Catalyst calendar unavailable for {ticker}: {e}")
+        return ""
+
+
 def _fundamentals_section(ticker: str) -> str:
     """
     Real revenue growth, margins, FCF, and valuation multiples (see
@@ -192,6 +223,11 @@ Buying Power:    ${float(account.buying_power):,.2f}""")
         except Exception as e:
             log.warning(f"Macro data unavailable: {e}")
 
+    # ── Catalyst Calendar ────────────────────────────────────────────────────
+    cal_section = _catalyst_calendar_section(ticker)
+    if cal_section:
+        sections.append(cal_section)
+
     # ── Technical Picture ────────────────────────────────────────────────────
     polygon_mod = _safe_import("ingestion.polygon_stream")
     if polygon_mod:
@@ -318,6 +354,11 @@ Buying Power:    ${float(account.buying_power):,.2f}""")
             sections.append(_get_macro_summary(macro_mod))
         except Exception as e:
             log.warning(f"Macro data unavailable: {e}")
+
+    # ── Catalyst Calendar ────────────────────────────────────────────────────
+    cal_section = _catalyst_calendar_section(ticker)
+    if cal_section:
+        sections.append(cal_section)
 
     # ── Technical Picture ────────────────────────────────────────────────────
     polygon_mod = _safe_import("ingestion.polygon_stream")

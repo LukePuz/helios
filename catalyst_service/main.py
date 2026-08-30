@@ -11,6 +11,12 @@ app = FastAPI(title="Catalyst Calendar Service")
 
 
 class CatalystEventIn(BaseModel):
+    # scope="ticker" (default) -- ticker holds the actual symbol.
+    # scope="sector" -- ticker holds the sector's SPDR ETF symbol (XLK, ...).
+    # scope="macro" -- ticker holds storage.MACRO_SENTINEL ("MARKET").
+    # See catalyst_service/storage.py's SCOPES docstring for the full
+    # rationale (2026-08-30, user request).
+    scope: Literal["ticker", "sector", "macro"] = "ticker"
     ticker: str
     related_ticker: str | None = None
     event_date: str
@@ -18,13 +24,15 @@ class CatalystEventIn(BaseModel):
     window_start: str | None = None
     window_end: str | None = None
     event_type: Literal[
-        "earnings",
-        "conference",
-        "regulatory",
-        "press",
-        "indirect_readthrough",
-        "insider_filing",
-        "other",
+        # ticker-level
+        "earnings", "conference", "regulatory", "press",
+        "indirect_readthrough", "insider_filing", "other",
+        # sector-level
+        "sector_earnings_cluster", "sector_regulatory", "index_rebalance",
+        "sector_conference", "sector_other",
+        # macro-level
+        "fomc_meeting", "cpi_release", "jobs_report", "gdp_release",
+        "election", "geopolitical", "macro_other",
     ]
     bucket_relevance: str | None = None
     confidence: Literal["confirmed", "estimated", "conflicting", "rumored"]
@@ -56,6 +64,7 @@ def query_events(
     end: str | None = None,
     confidence: str | None = None,
     event_type: str | None = None,
+    scope: str | None = None,
 ):
     return storage.query_events(
         ticker=ticker,
@@ -64,6 +73,7 @@ def query_events(
         end=end,
         confidence=confidence,
         event_type=event_type,
+        scope=scope,
     )
 
 

@@ -2432,6 +2432,31 @@ def is_near_earnings(ticker: str, days: int = 5) -> bool:
         _put_conn(conn)
 
 
+def get_earnings_in_range(start, end) -> list[dict]:
+    """All watchlist tickers with an earnings_calendar row in [start, end]
+    (inclusive), for sector-level earnings-cluster detection (2026-08-30,
+    user request) -- ingestion.sector_calendar.refresh_sector_calendar()
+    groups these by GICS sector to flag "3+ of a sector's names report
+    within the same week" as its own sector-scope catalyst event, distinct
+    from any single ticker's own earnings date."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ticker, earnings_date, confirmed FROM earnings_calendar "
+                "WHERE earnings_date >= %s AND earnings_date <= %s "
+                "ORDER BY earnings_date ASC",
+                (start, end),
+            )
+            rows = cur.fetchall()
+        return [{"ticker": r[0], "earnings_date": r[1], "confirmed": r[2]} for r in rows]
+    except Exception as e:
+        logging.error(f"get_earnings_in_range failed: {e}")
+        return []
+    finally:
+        _put_conn(conn)
+
+
 # ---------------------------------------------------------------------------
 # Scanner candidates
 # ---------------------------------------------------------------------------

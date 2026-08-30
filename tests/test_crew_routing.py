@@ -330,3 +330,65 @@ class TestConvictionSwap:
         mock_log_approval.assert_not_called()
         # Only the initial sizing call -- must not re-size after a failed sell.
         mock_rm_cls.return_value.size_position.assert_called_once()
+
+
+class TestReviewAllHeldPositionsPriority:
+    """2026-08-29, user request: priority_tickers puts stale-flagged
+    positions at the FRONT of the review rotation regardless of when
+    they were last reviewed -- fed by risk_manager.flag_stale_positions()
+    via tasks.review_positions. These tests guard that ordering directly,
+    against review_all_held_positions itself rather than the task
+    wrapper (see TestReviewPositionsStalePriority in
+    test_tasks_dedup.py for the wiring-through test)."""
+
+    def _client_with(self, tickers):
+        client = MagicMock()
+        client.get_all_positions.return_value = [
+            MagicMock(symbol=t, qty=10.0, avg_entry_price=100.0,
+                      current_price=100.0, market_value=1000.0)
+            for t in tickers
+        ]
+        return client
+
+    def test_priority_ticker_reviewed_first_despite_recent_review(self):
+        # SNOW was reviewed most recently (should normally be LAST in the
+        # rotation) but is flagged stale -- must still go first.
+        client = self._client_with(["SNOW", "NVDA", "AMD"])
+        last_reviewed = {
+            "AMD":  "2026-08-01T00:00:00+00:00",
+            "NVDA": "2026-08-15T00:00:00+00:00",
+            "SNOW": "2026-08-28T00:00:00+00:00",  # most recent
+        }
+        reviewed_order = []
+
+        def fake_review(ticker, *a, **kw):
+            reviewed_order.append(ticker)
+            return {"ticker": ticker}
+
+        with patch("ibkr.IBKRClient", return_value=client), \
+             patch("agents.market_regime.get_cached_regime", return_value={}), \
+             patch("db.get_state", return_value=__import__("json").dumps(last_reviewed)), \
+             patch("db.set_state"), \
+             patch("agents.crew.review_held_position", side_effect=fake_review):
+            crew.review_all_held_positions(max_per_run=10, priority_tickers=["SNOW"])
+
+        assert reviewed_order[0] == "SNOW"
+        assert reviewed_order[1:] == ["AMD", "NVDA"]  # rest stay oldest-first
+
+    def test_no_priority_tickers_behaves_exactly_as_before(self):
+        client = self._client_with(["AMD", "NVDA"])
+        last_reviewed = {"NVDA": "2026-08-01T00:00:00+00:00", "AMD": "2026-08-15T00:00:00+00:00"}
+        reviewed_order = []
+
+        def fake_review(ticker, *a, **kw):
+            reviewed_order.append(ticker)
+            return {"ticker": ticker}
+
+        with patch("ibkr.IBKRClient", return_value=client), \
+             patch("agents.market_regime.get_cached_regime", return_value={}), \
+             patch("db.get_state", return_value=__import__("json").dumps(last_reviewed)), \
+             patch("db.set_state"), \
+             patch("agents.crew.review_held_position", side_effect=fake_review):
+            crew.review_all_held_positions(max_per_run=10)
+
+        assert reviewed_order == ["NVDA", "AMD"]

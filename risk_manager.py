@@ -1016,28 +1016,30 @@ class RiskManager:
         the same buy-and-hold posture rode gains up and gave them back).
 
         For each Accelerator/Moonshot position that hasn't already taken
-        its target: reads the CURRENT trade_style from
-        agents.market_regime.get_cached_regime() (falls back to the more
-        conservative "Choppy/Distribution" table if regime data isn't
-        available or the packet is stale/missing, rather than silently
-        skipping every position), computes that style+bucket's profit
-        target (midpoint of the configured range, same convention
-        check_trailing_stops uses for ATR_STOP_MULTIPLIER above), and if
-        unrealized gain has crossed it, sells PARTIAL_SELL_PCT_BY_STYLE
-        of the position and moves the remainder's stop to breakeven in
-        one atomic DB write (db.mark_profit_target_taken) -- so a crash
-        between the sell and the stop update can't leave the remainder
-        both unmarked (re-sold again next run) and unprotected (no
-        breakeven floor recorded).
+        its target: reads that TICKER'S OWN sector trade_style (2026-08-29
+        -- agents.market_regime.get_trade_style_for_ticker(), falling back
+        to the whole-market get_cached_regime()["trade_style"] if the
+        ticker isn't a current S&P 500 constituent or its sector hasn't
+        been assessed yet; falls back further to the more conservative
+        "Choppy/Distribution" table if no regime data is available at
+        all, rather than silently skipping every position). A healthcare
+        holding is evaluated against healthcare's own regime, not
+        whatever the broad market or an unrelated sector happens to be
+        doing -- see agents.market_regime.get_trade_style_for_ticker's
+        docstring for why that distinction matters (a sector can trend
+        while the broad market chops, or vice versa). Computes that
+        style+bucket's profit target (midpoint of the configured range,
+        same convention check_trailing_stops uses for ATR_STOP_MULTIPLIER
+        above), and if unrealized gain has crossed it, sells
+        PARTIAL_SELL_PCT_BY_STYLE of the position and moves the
+        remainder's stop to breakeven in one atomic DB write
+        (db.mark_profit_target_taken) -- so a crash between the sell and
+        the stop update can't leave the remainder both unmarked (re-sold
+        again next run) and unprotected (no breakeven floor recorded).
 
         Compounder positions are never touched -- PROFIT_TARGET_PCT_BY_STYLE
         has no Compounder entry at all, so this loop skips them by
         construction, not a special-cased check.
-
-        NOT wired into tasks.py's beat_schedule as of 2026-08-29 -- see
-        config.py's PROFIT_TARGET_PCT_BY_STYLE docstring for why running
-        this automatically against live capital is a deliberate, separate
-        step held pending explicit confirmation.
 
         Returns [{"ticker", "action": "PARTIAL_SELL", "shares_sold",
         "new_stop", "trade_style", "gain_pct", "order_result"}] for every
@@ -1048,12 +1050,21 @@ class RiskManager:
         try:
             from agents.market_regime import get_cached_regime
             regime_packet = get_cached_regime()
-            trade_style = regime_packet.get("trade_style") if regime_packet else None
+            market_trade_style = regime_packet.get("trade_style") if regime_packet else None
         except Exception as e:
-            log.warning(f"check_profit_targets: regime lookup failed, defaulting cautious: {e}")
-            trade_style = None
-        if trade_style not in PROFIT_TARGET_PCT_BY_STYLE:
-            trade_style = "Choppy/Distribution"
+            log.warning(f"check_profit_targets: market regime lookup failed, defaulting cautious: {e}")
+            market_trade_style = None
+        if market_trade_style not in PROFIT_TARGET_PCT_BY_STYLE:
+            market_trade_style = "Choppy/Distribution"
+
+        def _trade_style_for(ticker: str) -> str:
+            try:
+                from agents.market_regime import get_trade_style_for_ticker
+                style = get_trade_style_for_ticker(ticker)
+            except Exception as e:
+                log.debug(f"[{ticker}] sector trade_style lookup failed: {e}")
+                style = None
+            return style if style in PROFIT_TARGET_PCT_BY_STYLE else market_trade_style
 
         try:
             stops = db.get_all_position_stops()
@@ -1062,15 +1073,20 @@ class RiskManager:
             log.warning(f"check_profit_targets: could not fetch positions: {e}")
             return []
 
-        targets_by_bucket = PROFIT_TARGET_PCT_BY_STYLE[trade_style]
-        partial_pct = PARTIAL_SELL_PCT_BY_STYLE[trade_style]
         results: list[dict] = []
 
         for stop_record in stops:
             ticker = stop_record["ticker"]
             bucket = stop_record.get("thesis_bucket")
-            if bucket not in targets_by_bucket or stop_record.get("profit_target_taken"):
+            if stop_record.get("profit_target_taken"):
                 continue
+
+            trade_style = _trade_style_for(ticker)
+            targets_by_bucket = PROFIT_TARGET_PCT_BY_STYLE[trade_style]
+            if bucket not in targets_by_bucket:
+                continue  # Compounder, or any bucket not in this framework
+            partial_pct = PARTIAL_SELL_PCT_BY_STYLE[trade_style]
+
             pos = positions.get(ticker)
             entry = stop_record.get("entry_price")
             if not pos or not entry:
@@ -1137,12 +1153,21 @@ class RiskManager:
         try:
             from agents.market_regime import get_cached_regime
             regime_packet = get_cached_regime()
-            trade_style = regime_packet.get("trade_style") if regime_packet else None
+            market_trade_style = regime_packet.get("trade_style") if regime_packet else None
         except Exception as e:
-            log.warning(f"flag_stale_positions: regime lookup failed, defaulting cautious: {e}")
-            trade_style = None
-        if trade_style not in STALE_WINDOW_DAYS_BY_STYLE:
-            trade_style = "Choppy/Distribution"
+            log.warning(f"flag_stale_positions: market regime lookup failed, defaulting cautious: {e}")
+            market_trade_style = None
+        if market_trade_style not in STALE_WINDOW_DAYS_BY_STYLE:
+            market_trade_style = "Choppy/Distribution"
+
+        def _trade_style_for(ticker: str) -> str:
+            try:
+                from agents.market_regime import get_trade_style_for_ticker
+                style = get_trade_style_for_ticker(ticker)
+            except Exception as e:
+                log.debug(f"[{ticker}] sector trade_style lookup failed: {e}")
+                style = None
+            return style if style in STALE_WINDOW_DAYS_BY_STYLE else market_trade_style
 
         try:
             stops = db.get_all_position_stops()
@@ -1151,13 +1176,14 @@ class RiskManager:
             log.warning(f"flag_stale_positions: could not fetch positions: {e}")
             return []
 
-        windows = STALE_WINDOW_DAYS_BY_STYLE[trade_style]
         now = datetime.now(timezone.utc)
         flagged: list[dict] = []
 
         for stop_record in stops:
             ticker = stop_record["ticker"]
             bucket = stop_record.get("thesis_bucket")
+            trade_style = _trade_style_for(ticker)
+            windows = STALE_WINDOW_DAYS_BY_STYLE[trade_style]
             if bucket not in windows:
                 continue
             pos = positions.get(ticker)

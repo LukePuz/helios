@@ -249,6 +249,9 @@ Then output ONLY valid JSON in exactly this format (no markdown, no explanation 
     "bull_case_target": "$X (12 months)",
     "downside_scenario": "$X"
   }},
+  "sources": [
+    {{"type": "news or edgar_filing or options_flow or insider_trade or congressional_trade or analyst_rating or fundamentals_data or price_action or arxiv_paper or other", "detail": "The specific fact this source contributes -- not a repeat of the catalyst description"}}
+  ],
   "upside_downside_ratio": <your computed ratio: bull-case upside percent divided by downside percent>,
   "key_risks": ["Risk 1", "Risk 2", "Risk 3"],
   "options_opportunity": false,
@@ -263,6 +266,7 @@ Rules:
 - Score conviction on the evidence alone, regardless of regime — regime-based selectivity is applied downstream by position sizing, not by inflating or suppressing your stated score
 {'- Your stated conviction has a track record above — calibrate against it, not against how confident you feel' if track_record else ''}
 - reasoning and thesis_summary must be concrete, not persuasive prose: cite actual figures from the SITUATION BRIEF or FUNDAMENTALS section (a growth rate, a multiple, a dollar figure, a date) and name where each came from (e.g. "per Q2 fundamentals", "per the [source] article in the brief"). A sentence with no number and no named source is not acceptable reasoning — if the brief genuinely has no hard data to cite, say that explicitly instead of writing confident-sounding prose to fill the gap.
+- List every genuinely distinct piece of evidence you actually relied on in "sources" — not a single article's opinion restated in your own words as if it were confirmation. Two sources of the same type (e.g. two separate news articles independently reporting the same event) DO count as two if they are actually distinct reports, not the same fact cited twice. List real items only — never pad this list to clear the threshold below; an empty or short list is correct and expected when the brief genuinely only supports one piece of evidence, and OPEN/ADD will be downgraded to WATCH in that case rather than the call being forced through.
 - Output ONLY the JSON object, nothing else
 """
 
@@ -337,6 +341,20 @@ def _call_ollama(prompt: str, num_ctx: int = _NUM_CTX) -> str | None:
     except Exception as e:
         log.warning(f"Ollama call failed: {e}")
         return None
+
+
+def count_distinct_sources(sources: list) -> int:
+    """Pure helper for the multi-source corroboration gate (2026-08-30,
+    user request) -- deduplicates the model's "sources" list on
+    (type, detail-prefix) so it can't clear the >=2 threshold in analyze()
+    by listing the same fact twice under different wording. Extracted as
+    its own function (same pattern as agents/chase_risk.py and
+    agents/price_action.py) so the counting logic is unit-testable without
+    mocking the Ollama call."""
+    return len({
+        (s.get("type"), (s.get("detail") or "")[:80])
+        for s in (sources or []) if isinstance(s, dict) and s.get("type")
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -513,6 +531,8 @@ def _stub_recommendation(candidate: dict, reason: str) -> dict:
         },
         "upside_downside_ratio": 0.0,
         "key_risks":       [f"Model unavailable: {reason}"],
+        "sources": [],
+        "source_count": 0,
         "options_opportunity": False,
         "options_notes":   None,
         "pass_to_risk":    False,
@@ -665,6 +685,26 @@ def analyze(
         parsed["reasoning"] = (parsed.get("reasoning", "") +
                                f" [Downgraded: UDR {udr:.1f} < 2.0 minimum]")
 
+    # Multi-source corroboration gate (2026-08-30, user request): a thesis
+    # resting on a single piece of evidence -- one article's opinion, one
+    # filing, one options-flow blip -- isn't validated, it's a guess with
+    # conviction attached. The prompt asks the model to list every distinct
+    # piece of evidence it actually relied on in "sources"; this is the
+    # deterministic enforcement, same pattern as the UDR gate above -- a
+    # prompt instruction alone isn't reliable enough on its own (the
+    # fundamentals-missing conviction cap exists for the identical reason).
+    # Distinctness is checked on (type, detail) pairs, not raw list length,
+    # so the model can't clear the bar by listing the same fact twice under
+    # different wording.
+    sources = parsed.get("sources") or []
+    source_count = count_distinct_sources(sources)
+    if source_count < 2 and action in ("OPEN", "ADD"):
+        log.info(f"[{ticker}] Only {source_count} distinct source(s) cited — downgrading to WATCH")
+        action = "WATCH"
+        parsed["pass_to_risk"] = False
+        parsed["reasoning"] = (parsed.get("reasoning", "") +
+                               f" [Downgraded: {source_count} distinct source(s) cited, need >=2]")
+
     # Moonshots need conviction >= 7 for OPEN
     if bucket == "Moonshot" and action == "OPEN" and conviction < 7:
         log.info(f"[{ticker}] Moonshot conviction {conviction} < 7 — downgrading to WATCH")
@@ -740,6 +780,8 @@ def analyze(
         "valuation": parsed.get("valuation", {}),
         "upside_downside_ratio": udr,
         "key_risks": parsed.get("key_risks", []),
+        "sources": sources,
+        "source_count": source_count,
         "options_opportunity": bool(parsed.get("options_opportunity", False)),
         "options_notes": parsed.get("options_notes"),
         "pass_to_risk": bool(parsed.get("pass_to_risk", False)),

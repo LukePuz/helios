@@ -374,3 +374,190 @@ class TestCorrelation:
         with patch("db.get_price_history_bulk", return_value={}):
             result = rm.check_correlation("ZZZNOTCACHED")
         assert "price history not yet cached" in result["note"] or "Sector unknown" in result["note"]
+
+
+def _priced_holding(symbol, qty=10.0, current_price=100.0):
+    return MagicMock(symbol=symbol, qty=qty, current_price=current_price)
+
+
+class TestCheckProfitTargets:
+    """2026-08-29, user request: the profit-target/partial-exit piece
+    missing from the original protective-only stop path -- see
+    config.py's PROFIT_TARGET_PCT_BY_STYLE docstring for the full
+    rationale. These tests guard: regime-style selection actually changes
+    the target used, Compounder is never touched, an already-taken
+    position isn't re-sold, and a broker failure doesn't silently mark
+    the target as taken anyway."""
+
+    def _rm(self, positions):
+        client = _make_client(positions=positions)
+        rm = risk_manager.RiskManager.__new__(risk_manager.RiskManager)
+        rm._client = client
+        return rm
+
+    def test_hits_target_in_trending_style_and_partial_sells(self):
+        # Accelerator target in Trending/Expanding = (0.20, 0.30) -> 0.25
+        # midpoint. 30% gain clears it.
+        rm = self._rm([_priced_holding("SNOW", qty=100.0, current_price=130.0)])
+        stops = [{"ticker": "SNOW", "entry_price": 100.0, "thesis_bucket": "Accelerator",
+                  "profit_target_taken": False}]
+        with patch("agents.market_regime.get_cached_regime",
+                    return_value={"trade_style": "Trending/Expanding"}), \
+             patch("db.get_all_position_stops", return_value=stops), \
+             patch("db.mark_profit_target_taken") as mock_mark, \
+             patch("ibkr.place_market_order", return_value={"order_id": 1}) as mock_order:
+            result = rm.check_profit_targets()
+
+        assert len(result) == 1
+        assert result[0]["ticker"] == "SNOW"
+        assert result[0]["action"] == "PARTIAL_SELL"
+        # Trending/Expanding partial-sell fraction is 0.25 -> 25 shares
+        assert result[0]["shares_sold"] == 25.0
+        mock_order.assert_called_once_with("SNOW", "SELL", 25.0)
+        mock_mark.assert_called_once_with("SNOW", 100.0)  # breakeven = entry
+
+    def test_below_target_does_nothing(self):
+        # 10% gain, well short of Accelerator's Trending/Expanding target (~25%)
+        rm = self._rm([_priced_holding("SNOW", qty=100.0, current_price=110.0)])
+        stops = [{"ticker": "SNOW", "entry_price": 100.0, "thesis_bucket": "Accelerator",
+                  "profit_target_taken": False}]
+        with patch("agents.market_regime.get_cached_regime",
+                    return_value={"trade_style": "Trending/Expanding"}), \
+             patch("db.get_all_position_stops", return_value=stops), \
+             patch("db.mark_profit_target_taken") as mock_mark, \
+             patch("ibkr.place_market_order") as mock_order:
+            result = rm.check_profit_targets()
+        assert result == []
+        mock_order.assert_not_called()
+        mock_mark.assert_not_called()
+
+    def test_choppy_style_uses_a_lower_target_than_trending(self):
+        # Same 18% gain: below Trending/Expanding's Accelerator target (~25%)
+        # but at/above Choppy/Distribution's (~12.5%) -- proves the regime
+        # style actually changes which table is consulted, not just cosmetic.
+        rm = self._rm([_priced_holding("SNOW", qty=100.0, current_price=118.0)])
+        stops = [{"ticker": "SNOW", "entry_price": 100.0, "thesis_bucket": "Accelerator",
+                  "profit_target_taken": False}]
+        with patch("agents.market_regime.get_cached_regime",
+                    return_value={"trade_style": "Choppy/Distribution"}), \
+             patch("db.get_all_position_stops", return_value=stops), \
+             patch("db.mark_profit_target_taken"), \
+             patch("ibkr.place_market_order", return_value={"order_id": 1}) as mock_order:
+            result = rm.check_profit_targets()
+        assert len(result) == 1
+        # Choppy/Distribution partial-sell fraction is 0.45 -> 45 shares
+        mock_order.assert_called_once_with("SNOW", "SELL", 45.0)
+
+    def test_compounder_bucket_is_never_touched(self):
+        rm = self._rm([_priced_holding("MSFT", qty=100.0, current_price=200.0)])
+        stops = [{"ticker": "MSFT", "entry_price": 100.0, "thesis_bucket": "Compounder",
+                  "profit_target_taken": False}]
+        with patch("agents.market_regime.get_cached_regime",
+                    return_value={"trade_style": "Trending/Expanding"}), \
+             patch("db.get_all_position_stops", return_value=stops), \
+             patch("ibkr.place_market_order") as mock_order:
+            result = rm.check_profit_targets()
+        assert result == []
+        mock_order.assert_not_called()
+
+    def test_already_taken_is_never_resold(self):
+        rm = self._rm([_priced_holding("SNOW", qty=100.0, current_price=200.0)])
+        stops = [{"ticker": "SNOW", "entry_price": 100.0, "thesis_bucket": "Accelerator",
+                  "profit_target_taken": True}]
+        with patch("agents.market_regime.get_cached_regime",
+                    return_value={"trade_style": "Trending/Expanding"}), \
+             patch("db.get_all_position_stops", return_value=stops), \
+             patch("ibkr.place_market_order") as mock_order:
+            result = rm.check_profit_targets()
+        assert result == []
+        mock_order.assert_not_called()
+
+    def test_missing_regime_data_defaults_to_conservative_choppy_style(self):
+        # No cached regime available -- must default to the more
+        # conservative Choppy/Distribution table, not skip the check.
+        rm = self._rm([_priced_holding("SNOW", qty=100.0, current_price=118.0)])
+        stops = [{"ticker": "SNOW", "entry_price": 100.0, "thesis_bucket": "Accelerator",
+                  "profit_target_taken": False}]
+        with patch("agents.market_regime.get_cached_regime", return_value=None), \
+             patch("db.get_all_position_stops", return_value=stops), \
+             patch("db.mark_profit_target_taken"), \
+             patch("ibkr.place_market_order", return_value={"order_id": 1}) as mock_order:
+            result = rm.check_profit_targets()
+        # 18% gain clears Choppy/Distribution's ~12.5% Accelerator target
+        assert len(result) == 1
+        mock_order.assert_called_once_with("SNOW", "SELL", 45.0)
+
+    def test_broker_failure_does_not_mark_target_taken(self):
+        rm = self._rm([_priced_holding("SNOW", qty=100.0, current_price=130.0)])
+        stops = [{"ticker": "SNOW", "entry_price": 100.0, "thesis_bucket": "Accelerator",
+                  "profit_target_taken": False}]
+        with patch("agents.market_regime.get_cached_regime",
+                    return_value={"trade_style": "Trending/Expanding"}), \
+             patch("db.get_all_position_stops", return_value=stops), \
+             patch("db.mark_profit_target_taken") as mock_mark, \
+             patch("ibkr.place_market_order", side_effect=Exception("IBKR down")):
+            result = rm.check_profit_targets()
+        assert result == []
+        mock_mark.assert_not_called()
+
+
+class TestFlagStalePositions:
+    """2026-08-29, user request: staleness flagging never exits anything
+    itself -- these tests guard the trigger condition (time AND lack of
+    movement, not either alone) and that it's regime-style-conditional
+    just like the profit-target check."""
+
+    def _rm(self, positions):
+        client = _make_client(positions=positions)
+        rm = risk_manager.RiskManager.__new__(risk_manager.RiskManager)
+        rm._client = client
+        return rm
+
+    def test_stale_and_flat_position_is_flagged(self):
+        from datetime import datetime, timedelta, timezone
+        opened = datetime.now(timezone.utc) - timedelta(days=30)
+        rm = self._rm([_priced_holding("SNOW", qty=100.0, current_price=101.0)])
+        stops = [{"ticker": "SNOW", "entry_price": 100.0, "thesis_bucket": "Accelerator",
+                  "opened_at": opened}]
+        with patch("agents.market_regime.get_cached_regime",
+                    return_value={"trade_style": "Choppy/Distribution"}), \
+             patch("db.get_all_position_stops", return_value=stops):
+            result = rm.flag_stale_positions()
+        assert len(result) == 1
+        assert result[0]["ticker"] == "SNOW"
+
+    def test_stale_but_moved_a_lot_is_not_flagged(self):
+        from datetime import datetime, timedelta, timezone
+        opened = datetime.now(timezone.utc) - timedelta(days=30)
+        rm = self._rm([_priced_holding("SNOW", qty=100.0, current_price=130.0)])  # +30%
+        stops = [{"ticker": "SNOW", "entry_price": 100.0, "thesis_bucket": "Accelerator",
+                  "opened_at": opened}]
+        with patch("agents.market_regime.get_cached_regime",
+                    return_value={"trade_style": "Choppy/Distribution"}), \
+             patch("db.get_all_position_stops", return_value=stops):
+            result = rm.flag_stale_positions()
+        assert result == []
+
+    def test_flat_but_not_yet_stale_is_not_flagged(self):
+        from datetime import datetime, timedelta, timezone
+        opened = datetime.now(timezone.utc) - timedelta(days=2)  # well under any window
+        rm = self._rm([_priced_holding("SNOW", qty=100.0, current_price=101.0)])
+        stops = [{"ticker": "SNOW", "entry_price": 100.0, "thesis_bucket": "Accelerator",
+                  "opened_at": opened}]
+        with patch("agents.market_regime.get_cached_regime",
+                    return_value={"trade_style": "Choppy/Distribution"}), \
+             patch("db.get_all_position_stops", return_value=stops):
+            result = rm.flag_stale_positions()
+        assert result == []
+
+    def test_compounder_bucket_is_never_flagged(self):
+        from datetime import datetime, timedelta, timezone
+        opened = datetime.now(timezone.utc) - timedelta(days=60)
+        rm = self._rm([_priced_holding("MSFT", qty=100.0, current_price=101.0)])
+        stops = [{"ticker": "MSFT", "entry_price": 100.0, "thesis_bucket": "Compounder",
+                  "opened_at": opened}]
+        with patch("agents.market_regime.get_cached_regime",
+                    return_value={"trade_style": "Choppy/Distribution"}), \
+             patch("db.get_all_position_stops", return_value=stops):
+            result = rm.flag_stale_positions()
+        assert result == []

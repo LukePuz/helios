@@ -162,6 +162,72 @@ TRAILING_STOP_DISTANCE: dict[str, tuple[float, float]] = {
 }
 
 # ---------------------------------------------------------------------------
+# Regime-adaptive profit-taking / staleness (2026-08-29, user request)
+# ---------------------------------------------------------------------------
+# Everything above this point governs the ORIGINAL, protective-only exit
+# path (stop-loss, trailing stop after a large gain) -- it never proactively
+# banks a gain or questions whether a flat position still deserves capital.
+# This section adds that missing piece, scoped to Accelerator/Moonshot only
+# -- Compounder is deliberately excluded, it's the long-term core bucket by
+# explicit design (see find_swap_candidate's docstring) and stays
+# buy-and-hold on purpose.
+#
+# Both tables are keyed by agents.market_regime._score_trade_style()'s
+# output ("Trending/Expanding" / "Choppy/Distribution"), not the risk-on/
+# off `regime` score -- a trending market rewards patience (wide targets,
+# long staleness windows); a choppy/distributive one rewards banking gains
+# faster and cutting stale capital loose sooner. Concrete motivating
+# example: Q2 2026 was a clean uptrend where breakout entries held with a
+# wide trailing stop worked; by June/July the market flipped choppy and
+# the SAME posture rode gains up and gave them back. Nothing before this
+# distinguished the two regimes' correct behavior -- risk_manager.py reads
+# agents.market_regime.get_cached_regime()["trade_style"] to pick which
+# column applies at decision time.
+#
+# NOT YET WIRED INTO THE SCHEDULED TASK LOOP as of 2026-08-29 -- the
+# risk_manager.py methods that consume these exist and are tested, but
+# adding them to tasks.py's beat_schedule (making this run automatically
+# against live capital) is a deliberate separate step, held pending
+# explicit confirmation given this touches real order placement.
+PROFIT_TARGET_PCT_BY_STYLE: dict[str, dict[str, tuple[float, float]]] = {
+    "Trending/Expanding": {
+        "Accelerator": (0.20, 0.30),
+        "Moonshot":    (0.40, 0.60),
+    },
+    "Choppy/Distribution": {
+        "Accelerator": (0.10, 0.15),
+        "Moonshot":    (0.20, 0.30),
+    },
+}
+# Fraction of the position sold when the profit target is first crossed;
+# the rest gets its stop moved to breakeven and is otherwise left to run
+# until a real exit signal (existing trailing-stop/LLM-review path) --
+# same "bank real profit, protect the rest, don't cap the upside" shape
+# validated against momentum-scanner's live data this session. Choppy
+# regimes bank a bigger share on the theory that a move is less likely to
+# have much more room left once it's already up this much in a
+# non-trending market.
+PARTIAL_SELL_PCT_BY_STYLE: dict[str, float] = {
+    "Trending/Expanding": 0.25,
+    "Choppy/Distribution": 0.45,
+}
+# CALENDAR days held (not trading days -- computed straight from
+# position_stops.opened_at, no trading-calendar dependency) with less
+# than STALE_MOVE_THRESHOLD_PCT move (either direction) before a position
+# is bumped to the FRONT of review_all_held_positions's rotation -- not
+# auto-exited, just guaranteed a fresh LLM look instead of possibly
+# waiting weeks behind other positions in the oldest-reviewed-first queue
+# (see that function's docstring for why the queue can be that slow with
+# >10 open positions). Values are the ~20/15/10/7 TRADING-day intent
+# scaled by ~1.4x (5/7 trading-to-calendar ratio) to land on the same
+# real-world window.
+STALE_WINDOW_DAYS_BY_STYLE: dict[str, dict[str, int]] = {
+    "Trending/Expanding": {"Accelerator": 28, "Moonshot": 21},
+    "Choppy/Distribution": {"Accelerator": 14, "Moonshot": 10},
+}
+STALE_MOVE_THRESHOLD_PCT = 0.05
+
+# ---------------------------------------------------------------------------
 # Buy cooldown
 # ---------------------------------------------------------------------------
 # Minimum gap between auto-executed OPEN/ADD buys on the same ticker, unless

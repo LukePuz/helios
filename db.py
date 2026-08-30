@@ -448,6 +448,12 @@ _MIGRATIONS: list[tuple[int, str]] = [
          "ALTER TABLE orders ADD COLUMN IF NOT EXISTS trading_env VARCHAR(10) NOT NULL DEFAULT 'paper'; "
          "ALTER TABLE trades ADD COLUMN IF NOT EXISTS trading_env VARCHAR(10) NOT NULL DEFAULT 'paper'; "
          "ALTER TABLE portfolio_snapshots ADD COLUMN IF NOT EXISTS trading_env VARCHAR(10) NOT NULL DEFAULT 'paper';"),
+    # Regime-adaptive profit-taking (2026-08-29, see config.py's
+    # PROFIT_TARGET_PCT_BY_STYLE) -- tracks whether the partial-sell-at-
+    # target has already fired for a position, so check_profit_targets()
+    # doesn't re-sell a portion every time it runs (every 30 min once
+    # wired into the schedule) once the target's already been taken once.
+    (30, "ALTER TABLE position_stops ADD COLUMN IF NOT EXISTS profit_target_taken BOOLEAN DEFAULT FALSE;"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -1162,7 +1168,8 @@ def get_all_position_stops() -> list[dict]:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT ticker, entry_price, stop_price, stop_method, trailing_active, "
-                "trailing_high, trail_distance_pct, thesis_bucket, conviction, broker_order_id "
+                "trailing_high, trail_distance_pct, thesis_bucket, conviction, broker_order_id, "
+                "opened_at, profit_target_taken "
                 "FROM position_stops WHERE trading_env=%s ORDER BY ticker",
                 (TRADING_ENV,),
             )
@@ -1175,6 +1182,7 @@ def get_all_position_stops() -> list[dict]:
                 "trail_distance_pct": float(r[6]) if r[6] else None,
                 "thesis_bucket": r[7], "conviction": r[8],
                 "broker_order_id": int(r[9]) if r[9] else None,
+                "opened_at": r[10], "profit_target_taken": bool(r[11]),
             }
             for r in rows
         ]
@@ -1211,6 +1219,29 @@ def set_stop_broker_order_id(ticker: str, broker_order_id: int | None) -> None:
     except Exception as e:
         conn.rollback()
         logging.error(f"set_stop_broker_order_id failed: {e}")
+    finally:
+        _put_conn(conn)
+
+
+def mark_profit_target_taken(ticker: str, new_stop: float) -> None:
+    """Called once by risk_manager.check_profit_targets() the moment a
+    position's profit target is crossed and its partial-sell fires --
+    records that the target's been taken (so it isn't re-sold on the next
+    check) and moves the recorded stop to breakeven in the same write, so
+    a crash between the partial sell and the stop update can't leave the
+    remainder both unmarked and unprotected."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE position_stops SET profit_target_taken=TRUE, stop_price=%s, updated_at=NOW() "
+                "WHERE ticker=%s AND trading_env=%s",
+                (new_stop, ticker, TRADING_ENV),
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"mark_profit_target_taken failed: {e}")
     finally:
         _put_conn(conn)
 

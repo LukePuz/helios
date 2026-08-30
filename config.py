@@ -230,6 +230,30 @@ STALE_WINDOW_DAYS_BY_STYLE: dict[str, dict[str, int]] = {
 STALE_MOVE_THRESHOLD_PCT = 0.05
 
 # ---------------------------------------------------------------------------
+# Minimum expected-return RATE (2026-08-30, user request)
+# ---------------------------------------------------------------------------
+# A trade's expected_return_pct alone doesn't say whether it's actually a
+# good use of capital -- a 20% expected move is a great trade if it's
+# expected within a month, and a mediocre one if it's not expected for two
+# years. This normalizes by TIME: expected_return_pct / weeks_to_catalyst
+# must clear this floor. Examples the user gave, all of which clear 1%/week:
+#   - 5% expected run-up into an earnings call 3 weeks out: 5/3 = 1.67%/wk
+#   - 3% expected move the next session, reading an earnings report right
+#     now: with weeks_to_catalyst floored to 1 day (see
+#     agents.analyst.compute_weeks_to_catalyst), a huge implied rate --
+#     obviously clears the bar, this gate is about NOT missing that a
+#     same-day catalyst is a great trade, not about blocking it.
+#   - 20% expected move over the next quarter (~13 weeks): 20/13 = 1.54%/wk
+#
+# Scoped to Accelerator/Moonshot only, matching every other piece of the
+# 2026-08-29/30 swing-trading-focus work -- Compounder is the long-term
+# core bucket by explicit prior design (see find_swap_candidate's
+# docstring) and has no defined catalyst timeline to rate-check against;
+# forcing one onto it would fight that bucket's actual purpose, not
+# refine it.
+MIN_EXPECTED_RETURN_PCT_PER_WEEK = 1.0
+
+# ---------------------------------------------------------------------------
 # Buy cooldown
 # ---------------------------------------------------------------------------
 # Minimum gap between auto-executed OPEN/ADD buys on the same ticker, unless

@@ -473,6 +473,16 @@ _MIGRATIONS: list[tuple[int, str]] = [
          "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS thesis_summary TEXT; "
          "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS sources_json JSONB; "
          "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS source_count INTEGER;"),
+    # Expected-return RATE tracking (2026-08-30, user request): expected_return_pct
+    # alone doesn't say whether a trade actually cleared the >=1%/week bar --
+    # a 20% target 6 months out and a 3% target tomorrow read identically
+    # without the implied weekly rate alongside them. Both are derived at
+    # analysis time from catalyst_date/expected_return_pct (see
+    # agents/analyst.py's compute_weeks_to_catalyst/expected_return_per_week)
+    # and persisted here so the realized outcome can later be compared
+    # against what rate was actually predicted, not just the raw pct.
+    (32, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS weeks_to_catalyst DECIMAL; "
+         "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS expected_return_per_week DECIMAL;"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -1875,6 +1885,8 @@ def log_trade_outcome(
     thesis_summary: str | None = None,
     sources: list | None = None,
     source_count: int | None = None,
+    weeks_to_catalyst: float | None = None,
+    expected_return_per_week: float | None = None,
 ) -> None:
     # Stamp the SPY price at entry so we can compute alpha (return vs. benchmark)
     # when the trade eventually closes.
@@ -1898,15 +1910,16 @@ def log_trade_outcome(
                 " chase_risk_pct_from_kijun, price_action, price_action_structure, "
                 " catalyst_event, catalyst_date, catalyst_is_priced_in, "
                 " expected_return_pct, expected_downside_pct, thesis_summary, "
-                " sources_json, source_count) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                " sources_json, source_count, weeks_to_catalyst, expected_return_per_week) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (approval_id, TRADING_ENV, ticker, action, conviction, bucket, entry_price,
                  entry_benchmark_price, thesis_strength, catalyst_quality,
                  valuation_risk_reward, data_completeness, chase_risk,
                  chase_risk_pct_from_kijun, price_action, price_action_structure,
                  catalyst_event, catalyst_date, catalyst_is_priced_in,
                  expected_return_pct, expected_downside_pct, thesis_summary,
-                 psycopg2.extras.Json(sources) if sources is not None else None, source_count),
+                 psycopg2.extras.Json(sources) if sources is not None else None, source_count,
+                 weeks_to_catalyst, expected_return_per_week),
             )
         conn.commit()
     except Exception as e:
@@ -1957,6 +1970,8 @@ def backfill_catalyst_outcome(
     thesis_summary: str | None,
     sources: list | None,
     source_count: int | None,
+    weeks_to_catalyst: float | None = None,
+    expected_return_per_week: float | None = None,
 ) -> None:
     """Writes a fresh catalyst/expected-return snapshot for an ALREADY-HELD
     position (2026-08-30, user request) -- distinct from log_trade_outcome,
@@ -1981,22 +1996,24 @@ def backfill_catalyst_outcome(
                 cur.execute(
                     "UPDATE trade_outcomes SET catalyst_event=%s, catalyst_date=%s, "
                     "catalyst_is_priced_in=%s, expected_return_pct=%s, expected_downside_pct=%s, "
-                    "thesis_summary=%s, sources_json=%s, source_count=%s WHERE id=%s",
+                    "thesis_summary=%s, sources_json=%s, source_count=%s, "
+                    "weeks_to_catalyst=%s, expected_return_per_week=%s WHERE id=%s",
                     (catalyst_event, catalyst_date, catalyst_is_priced_in,
                      expected_return_pct, expected_downside_pct, thesis_summary,
-                     sources_json, source_count, row[0]),
+                     sources_json, source_count, weeks_to_catalyst, expected_return_per_week, row[0]),
                 )
             else:
                 cur.execute(
                     "INSERT INTO trade_outcomes "
                     "(approval_id, trading_env, ticker, action, conviction, thesis_bucket, "
                     " entry_price, entry_date, catalyst_event, catalyst_date, catalyst_is_priced_in, "
-                    " expected_return_pct, expected_downside_pct, thesis_summary, sources_json, source_count) "
-                    "VALUES (NULL,%s,%s,'BACKFILL',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    " expected_return_pct, expected_downside_pct, thesis_summary, sources_json, source_count, "
+                    " weeks_to_catalyst, expected_return_per_week) "
+                    "VALUES (NULL,%s,%s,'BACKFILL',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                     (TRADING_ENV, ticker, conviction, bucket, entry_price, entry_date,
                      catalyst_event, catalyst_date, catalyst_is_priced_in,
                      expected_return_pct, expected_downside_pct, thesis_summary,
-                     sources_json, source_count),
+                     sources_json, source_count, weeks_to_catalyst, expected_return_per_week),
                 )
         conn.commit()
     except Exception as e:

@@ -1916,6 +1916,96 @@ def log_trade_outcome(
         _put_conn(conn)
 
 
+def get_tickers_missing_catalyst_data(tickers: list[str]) -> list[str]:
+    """Backfill target list (2026-08-30, user request): a currently-held
+    ticker "is missing catalyst data" if its MOST RECENT trade_outcomes
+    row (by entry_date) has no catalyst_event -- covers both "bought
+    before this tracking existed" and "has a trade_outcomes row, but from
+    before this feature shipped." A ticker with zero trade_outcomes rows
+    at all also counts as missing (nothing to check against)."""
+    if not tickers:
+        return []
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT ON (ticker) ticker, catalyst_event "
+                "FROM trade_outcomes WHERE trading_env=%s AND ticker = ANY(%s) "
+                "ORDER BY ticker, entry_date DESC",
+                (TRADING_ENV, tickers),
+            )
+            latest = {row[0]: row[1] for row in cur.fetchall()}
+        return [t for t in tickers if not latest.get(t)]
+    except Exception as e:
+        logging.error(f"get_tickers_missing_catalyst_data failed: {e}")
+        return list(tickers)  # fail toward re-checking, not silently skipping
+    finally:
+        _put_conn(conn)
+
+
+def backfill_catalyst_outcome(
+    ticker: str,
+    conviction: int,
+    bucket: str,
+    entry_price: float,
+    entry_date,
+    catalyst_event: str | None,
+    catalyst_date: str | None,
+    catalyst_is_priced_in: bool | None,
+    expected_return_pct: float | None,
+    expected_downside_pct: float | None,
+    thesis_summary: str | None,
+    sources: list | None,
+    source_count: int | None,
+) -> None:
+    """Writes a fresh catalyst/expected-return snapshot for an ALREADY-HELD
+    position (2026-08-30, user request) -- distinct from log_trade_outcome,
+    which fires at real trade execution. If a trade_outcomes row already
+    exists for this ticker (bought before this feature shipped), updates
+    its MOST RECENT row's catalyst columns in place rather than creating a
+    confusing duplicate with a fabricated entry price; otherwise inserts a
+    new row using position_stops' real entry_price/opened_at as the best
+    available entry data, with approval_id left NULL (nullable FK -- no
+    real approval exists for a position that predates this tracking)."""
+    conn = _get_conn()
+    sources_json = psycopg2.extras.Json(sources) if sources is not None else None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM trade_outcomes WHERE trading_env=%s AND ticker=%s "
+                "ORDER BY entry_date DESC LIMIT 1",
+                (TRADING_ENV, ticker),
+            )
+            row = cur.fetchone()
+            if row:
+                cur.execute(
+                    "UPDATE trade_outcomes SET catalyst_event=%s, catalyst_date=%s, "
+                    "catalyst_is_priced_in=%s, expected_return_pct=%s, expected_downside_pct=%s, "
+                    "thesis_summary=%s, sources_json=%s, source_count=%s WHERE id=%s",
+                    (catalyst_event, catalyst_date, catalyst_is_priced_in,
+                     expected_return_pct, expected_downside_pct, thesis_summary,
+                     sources_json, source_count, row[0]),
+                )
+            else:
+                cur.execute(
+                    "INSERT INTO trade_outcomes "
+                    "(approval_id, trading_env, ticker, action, conviction, thesis_bucket, "
+                    " entry_price, entry_date, catalyst_event, catalyst_date, catalyst_is_priced_in, "
+                    " expected_return_pct, expected_downside_pct, thesis_summary, sources_json, source_count) "
+                    "VALUES (NULL,%s,%s,'BACKFILL',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (TRADING_ENV, ticker, conviction, bucket, entry_price, entry_date,
+                     catalyst_event, catalyst_date, catalyst_is_priced_in,
+                     expected_return_pct, expected_downside_pct, thesis_summary,
+                     sources_json, source_count),
+                )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"backfill_catalyst_outcome({ticker}) failed: {e}")
+    finally:
+        _put_conn(conn)
+
+
 def compute_outcome_metrics(
     entry_price: float,
     exit_price: float,

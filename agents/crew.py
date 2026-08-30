@@ -170,15 +170,16 @@ def deep_analyze(event: dict, screening: dict | None = None) -> dict:
 # worked correctly; this closes the actual gap upstream of it.
 # ---------------------------------------------------------------------------
 
-def review_held_position(ticker: str, client, positions: dict, regime: dict) -> dict:
-    """Reassess one already-held position via the same brief/analyze/route
-    pipeline as the event-driven path, using a synthetic 'scheduled review'
-    event instead of a real filing/news item."""
+def _analyze_held_position(ticker: str, client, positions: dict, regime: dict) -> dict:
+    """The brief-assembly + analyze() core shared by review_held_position
+    and backfill_catalyst_tracking (2026-08-30) -- extracted so the
+    backfill can get the same real catalyst/expected-return read every
+    scheduled review already produces, without ALSO triggering
+    review_held_position's approval-routing side effect (a backfill pass
+    exists to capture a catalyst snapshot, not to fire a new TRIM/EXIT)."""
     from agents.analyst import analyze
     from context_engine import assemble_brief
     from knowledge_loader import get_watchlist_entry
-
-    log.info(f"[{ticker}] Scheduled position review")
 
     event = {
         "ticker": ticker, "source": "portfolio_review", "type": "scheduled review",
@@ -197,13 +198,21 @@ def review_held_position(ticker: str, client, positions: dict, regime: dict) -> 
     }
 
     try:
-        result = analyze(candidate, situation_brief=brief, regime_packet=regime)
+        return analyze(candidate, situation_brief=brief, regime_packet=regime)
     except Exception as exc:
-        log.error(f"[{ticker}] Position review analyze() raised: {exc}", exc_info=True)
+        log.error(f"[{ticker}] analyze() raised: {exc}", exc_info=True)
         return {
             "action": "SKIP", "ticker": ticker, "conviction": 0, "pass_to_risk": False,
             "reasoning": f"Review failed with exception: {exc}",
         }
+
+
+def review_held_position(ticker: str, client, positions: dict, regime: dict) -> dict:
+    """Reassess one already-held position via the same brief/analyze/route
+    pipeline as the event-driven path, using a synthetic 'scheduled review'
+    event instead of a real filing/news item."""
+    log.info(f"[{ticker}] Scheduled position review")
+    result = _analyze_held_position(ticker, client, positions, regime)
 
     if result.get("pass_to_risk"):
         _route_to_approval(result, regime, client)
@@ -266,6 +275,80 @@ def review_all_held_positions(max_per_run: int = 10, priority_tickers: list[str]
         db.set_state("position_review_last_reviewed", json.dumps(last_reviewed))
     except Exception as e:
         log.warning(f"Position review cursor save failed: {e}")
+
+    return results
+
+
+def backfill_catalyst_tracking(max_per_run: int = 10) -> list[dict]:
+    """One-time gap-closer (2026-08-30, user request): none of the
+    positions held before the catalyst/expected-return tracking work
+    shipped today have a catalyst_event captured in trade_outcomes.
+    Real trades going forward get this automatically at execution time
+    (execution.py); this backfills what's already held.
+
+    Uses the exact same brief/analyze() pipeline as a scheduled position
+    review (_analyze_held_position) -- NOT review_held_position itself,
+    which would also fire _route_to_approval on a pass_to_risk result.
+    A backfill's job is to capture today's catalyst snapshot for
+    tracking, not to trigger a new TRIM/EXIT as a side effect of
+    checking.
+
+    Capped at max_per_run per call (same reasoning as review_all_held_
+    positions: each analysis is a full 72B call competing with real
+    candidate analysis on the same GPU queue) -- naturally resumable
+    across repeated calls, since "still missing catalyst data" IS the
+    remaining-work signal, no separate cursor needed the way the
+    oldest-reviewed-first rotation needs one.
+
+    Returns [{"ticker", "action": "BACKFILLED" or "SKIPPED", ...}] for
+    every ticker attempted this run.
+    """
+    import db
+    from ibkr import IBKRClient
+    from agents.market_regime import get_cached_regime
+
+    client = IBKRClient()
+    positions = _get_positions(client)
+    regime = get_cached_regime()
+
+    missing = db.get_tickers_missing_catalyst_data(list(positions.keys()))[:max_per_run]
+    log.info(f"Catalyst backfill: {len(missing)} of {len(positions)} held tickers missing catalyst data this run")
+
+    results = []
+    for ticker in missing:
+        result = _analyze_held_position(ticker, client, positions, regime)
+        if result.get("action") == "SKIP":
+            results.append({"ticker": ticker, "action": "SKIPPED", "reason": result.get("reasoning")})
+            continue
+
+        stop_rec = db.get_position_stop(ticker)
+        pos = positions.get(ticker, {})
+        entry_price = (stop_rec or {}).get("entry_price") or pos.get("entry_price")
+        entry_date = (stop_rec or {}).get("opened_at") or datetime.now(timezone.utc)
+        bucket = (stop_rec or {}).get("thesis_bucket") or result.get("thesis_bucket", "Accelerator")
+        conviction = (stop_rec or {}).get("conviction") or result.get("conviction", 5)
+
+        catalyst = result.get("catalyst") or {}
+        db.backfill_catalyst_outcome(
+            ticker=ticker,
+            conviction=conviction,
+            bucket=bucket,
+            entry_price=entry_price,
+            entry_date=entry_date,
+            catalyst_event=catalyst.get("event"),
+            catalyst_date=catalyst.get("date"),
+            catalyst_is_priced_in=catalyst.get("is_priced_in"),
+            expected_return_pct=result.get("expected_return_pct"),
+            expected_downside_pct=result.get("expected_downside_pct"),
+            thesis_summary=result.get("thesis_summary"),
+            sources=result.get("sources"),
+            source_count=result.get("source_count"),
+        )
+        log.info(f"[{ticker}] Catalyst backfilled: {catalyst.get('event', 'none identified')} "
+                 f"(sources={result.get('source_count', 0)}, expected_return={result.get('expected_return_pct')})")
+        results.append({"ticker": ticker, "action": "BACKFILLED",
+                         "catalyst_event": catalyst.get("event"),
+                         "source_count": result.get("source_count")})
 
     return results
 

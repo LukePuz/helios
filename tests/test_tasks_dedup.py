@@ -776,3 +776,23 @@ class TestReviewPositionsStalePriority:
              patch("agents.crew.review_all_held_positions") as mock_review:
             tasks.review_positions.run()
         mock_review.assert_called_once_with(max_per_run=10, priority_tickers=[])
+
+
+class TestBackfillCatalystTrackingTask:
+    """2026-08-30, user request: thin Celery wrapper around
+    agents.crew.backfill_catalyst_tracking -- on-demand only, not in
+    beat_schedule (see the task's own docstring for why)."""
+
+    def test_delegates_to_crew_function_and_returns_results(self):
+        with patch("agents.crew.backfill_catalyst_tracking",
+                    return_value=[{"ticker": "SNOW", "action": "BACKFILLED"},
+                                  {"ticker": "AMD", "action": "SKIPPED"}]) as mock_backfill:
+            result = tasks.backfill_catalyst_tracking.run(max_per_run=5)
+        mock_backfill.assert_called_once_with(max_per_run=5)
+        assert result == [{"ticker": "SNOW", "action": "BACKFILLED"},
+                           {"ticker": "AMD", "action": "SKIPPED"}]
+
+    def test_failure_retries_not_crashes(self):
+        with patch("agents.crew.backfill_catalyst_tracking", side_effect=Exception("db down")):
+            with pytest.raises(Exception):
+                tasks.backfill_catalyst_tracking.run()

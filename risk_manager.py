@@ -41,6 +41,10 @@ try:
         SWAP_MAX_CANDIDATE_CONVICTION,
         get_active_limits,
         TRADING_ENV,
+        PROFIT_TARGET_PCT_BY_STYLE,
+        PARTIAL_SELL_PCT_BY_STYLE,
+        STALE_WINDOW_DAYS_BY_STYLE,
+        STALE_MOVE_THRESHOLD_PCT,
     )
 except ImportError:
     TRADING_ENV                   = "paper"
@@ -65,6 +69,16 @@ except ImportError:
     MAX_TRADE_PCT_OF_CASH_RESERVE = 0.20
     SWAP_MIN_CONVICTION_GAP       = 2
     SWAP_MAX_CANDIDATE_CONVICTION = 6
+    PROFIT_TARGET_PCT_BY_STYLE    = {
+        "Trending/Expanding":  {"Accelerator": (0.20, 0.30), "Moonshot": (0.40, 0.60)},
+        "Choppy/Distribution": {"Accelerator": (0.10, 0.15), "Moonshot": (0.20, 0.30)},
+    }
+    PARTIAL_SELL_PCT_BY_STYLE     = {"Trending/Expanding": 0.25, "Choppy/Distribution": 0.45}
+    STALE_WINDOW_DAYS_BY_STYLE    = {
+        "Trending/Expanding":  {"Accelerator": 28, "Moonshot": 21},
+        "Choppy/Distribution": {"Accelerator": 14, "Moonshot": 10},
+    }
+    STALE_MOVE_THRESHOLD_PCT      = 0.05
 
     def get_active_limits(balance: float) -> dict:
         return {"tier": "standard", "max_concurrent_positions": None,
@@ -990,6 +1004,186 @@ class RiskManager:
                             log.warning(f"Failed to update trailing high for {ticker}: {e}")
 
         return alerts
+
+    def check_profit_targets(self) -> list[dict]:
+        """
+        Regime-adaptive profit-taking for Accelerator/Moonshot positions
+        (2026-08-29, user request) -- the piece missing from the
+        protective-only stop/trailing-stop path above: nothing there ever
+        proactively banks a gain, it only ever reacts to price falling
+        back. See config.py's PROFIT_TARGET_PCT_BY_STYLE docstring for
+        the full rationale (a concrete Q2->Q3 regime-shift example where
+        the same buy-and-hold posture rode gains up and gave them back).
+
+        For each Accelerator/Moonshot position that hasn't already taken
+        its target: reads the CURRENT trade_style from
+        agents.market_regime.get_cached_regime() (falls back to the more
+        conservative "Choppy/Distribution" table if regime data isn't
+        available or the packet is stale/missing, rather than silently
+        skipping every position), computes that style+bucket's profit
+        target (midpoint of the configured range, same convention
+        check_trailing_stops uses for ATR_STOP_MULTIPLIER above), and if
+        unrealized gain has crossed it, sells PARTIAL_SELL_PCT_BY_STYLE
+        of the position and moves the remainder's stop to breakeven in
+        one atomic DB write (db.mark_profit_target_taken) -- so a crash
+        between the sell and the stop update can't leave the remainder
+        both unmarked (re-sold again next run) and unprotected (no
+        breakeven floor recorded).
+
+        Compounder positions are never touched -- PROFIT_TARGET_PCT_BY_STYLE
+        has no Compounder entry at all, so this loop skips them by
+        construction, not a special-cased check.
+
+        NOT wired into tasks.py's beat_schedule as of 2026-08-29 -- see
+        config.py's PROFIT_TARGET_PCT_BY_STYLE docstring for why running
+        this automatically against live capital is a deliberate, separate
+        step held pending explicit confirmation.
+
+        Returns [{"ticker", "action": "PARTIAL_SELL", "shares_sold",
+        "new_stop", "trade_style", "gain_pct", "order_result"}] for every
+        position actually acted on this run.
+        """
+        import db
+
+        try:
+            from agents.market_regime import get_cached_regime
+            regime_packet = get_cached_regime()
+            trade_style = regime_packet.get("trade_style") if regime_packet else None
+        except Exception as e:
+            log.warning(f"check_profit_targets: regime lookup failed, defaulting cautious: {e}")
+            trade_style = None
+        if trade_style not in PROFIT_TARGET_PCT_BY_STYLE:
+            trade_style = "Choppy/Distribution"
+
+        try:
+            stops = db.get_all_position_stops()
+            positions = {p.symbol: p for p in self._client.get_all_positions()}
+        except Exception as e:
+            log.warning(f"check_profit_targets: could not fetch positions: {e}")
+            return []
+
+        targets_by_bucket = PROFIT_TARGET_PCT_BY_STYLE[trade_style]
+        partial_pct = PARTIAL_SELL_PCT_BY_STYLE[trade_style]
+        results: list[dict] = []
+
+        for stop_record in stops:
+            ticker = stop_record["ticker"]
+            bucket = stop_record.get("thesis_bucket")
+            if bucket not in targets_by_bucket or stop_record.get("profit_target_taken"):
+                continue
+            pos = positions.get(ticker)
+            entry = stop_record.get("entry_price")
+            if not pos or not entry:
+                continue
+
+            current = float(pos.current_price)
+            gain_pct = (current - entry) / entry
+            target_lo, target_hi = targets_by_bucket[bucket]
+            target = (target_lo + target_hi) / 2
+            if gain_pct < target:
+                continue
+
+            qty = abs(float(pos.qty))
+            sell_qty = round(qty * partial_pct, 4)
+            if sell_qty <= 0:
+                continue
+
+            try:
+                import ibkr
+                order_result = ibkr.place_market_order(ticker, "SELL", sell_qty)
+            except Exception as e:
+                log.error(f"[{ticker}] Profit-target partial sell FAILED: {e}")
+                continue
+
+            new_stop = entry  # breakeven on the remainder
+            db.mark_profit_target_taken(ticker, new_stop)
+            log.info(f"[{ticker}] Profit target hit ({gain_pct:.1%} >= {target:.1%}, "
+                     f"style={trade_style}): sold {sell_qty} shares, "
+                     f"remainder stop -> breakeven ${new_stop:.2f}")
+            results.append({
+                "ticker": ticker, "action": "PARTIAL_SELL", "shares_sold": sell_qty,
+                "new_stop": new_stop, "trade_style": trade_style, "gain_pct": gain_pct,
+                "order_result": order_result,
+            })
+
+        return results
+
+    def flag_stale_positions(self) -> list[dict]:
+        """
+        Identifies Accelerator/Moonshot positions that have gone nowhere
+        (less than STALE_MOVE_THRESHOLD_PCT move, either direction) for
+        longer than their style+bucket's stale window -- capital sitting
+        idle with no momentum, independent of whether it happens to be up
+        or down slightly. See config.py's STALE_WINDOW_DAYS_BY_STYLE
+        docstring (calendar days, not trading days -- computed straight
+        from position_stops.opened_at with no trading-calendar
+        dependency).
+
+        Deliberately does NOT exit anything itself -- returns the flagged
+        list for the caller (tasks.review_positions, once wired) to bump
+        to the FRONT of review_all_held_positions's oldest-reviewed-first
+        rotation, so a stale position gets a fresh LLM look promptly
+        instead of possibly waiting weeks behind other holdings in the
+        queue. The actual TRIM/EXIT/HOLD call stays the LLM's -- same
+        division of labor the rest of this system already uses
+        (risk_manager computes hard numbers, the LLM makes the
+        qualitative call).
+
+        Returns [{"ticker", "days_held", "pct_move", "trade_style",
+        "thesis_bucket"}] for every position past its stale window.
+        """
+        import db
+
+        try:
+            from agents.market_regime import get_cached_regime
+            regime_packet = get_cached_regime()
+            trade_style = regime_packet.get("trade_style") if regime_packet else None
+        except Exception as e:
+            log.warning(f"flag_stale_positions: regime lookup failed, defaulting cautious: {e}")
+            trade_style = None
+        if trade_style not in STALE_WINDOW_DAYS_BY_STYLE:
+            trade_style = "Choppy/Distribution"
+
+        try:
+            stops = db.get_all_position_stops()
+            positions = {p.symbol: p for p in self._client.get_all_positions()}
+        except Exception as e:
+            log.warning(f"flag_stale_positions: could not fetch positions: {e}")
+            return []
+
+        windows = STALE_WINDOW_DAYS_BY_STYLE[trade_style]
+        now = datetime.now(timezone.utc)
+        flagged: list[dict] = []
+
+        for stop_record in stops:
+            ticker = stop_record["ticker"]
+            bucket = stop_record.get("thesis_bucket")
+            if bucket not in windows:
+                continue
+            pos = positions.get(ticker)
+            opened_at = stop_record.get("opened_at")
+            entry = stop_record.get("entry_price")
+            if not pos or not opened_at or not entry:
+                continue
+
+            if opened_at.tzinfo is None:
+                opened_at = opened_at.replace(tzinfo=timezone.utc)
+            days_held = (now - opened_at).days
+            if days_held < windows[bucket]:
+                continue
+
+            pct_move = abs((float(pos.current_price) - entry) / entry)
+            if pct_move >= STALE_MOVE_THRESHOLD_PCT:
+                continue
+
+            flagged.append({
+                "ticker": ticker, "days_held": days_held, "pct_move": pct_move,
+                "trade_style": trade_style, "thesis_bucket": bucket,
+            })
+            log.info(f"[{ticker}] Flagged stale: held {days_held}d (window {windows[bucket]}d), "
+                     f"moved only {pct_move:.1%} (threshold {STALE_MOVE_THRESHOLD_PCT:.0%})")
+
+        return flagged
 
 
 if __name__ == "__main__":

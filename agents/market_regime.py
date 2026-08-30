@@ -99,6 +99,77 @@ def _score_trend(spy_bars: list[dict]) -> tuple[int, str]:
     return _SCORE[score_label], notes
 
 
+# Empirical: a genuinely clean trend clears this; pure chop/whipsaw sits
+# well below it. Not weight-tuned against historical data yet -- a
+# reasonable starting point, revisit once trade_style has run against
+# more real regime transitions (see docstring below for the motivating
+# example this was built from).
+TRADE_STYLE_ER_THRESHOLD = 0.35
+
+
+def _score_trade_style(spy_bars: list[dict], lookback: int = 20) -> tuple[str, float, str]:
+    """
+    Classifies TRADE STYLE -- trending/expanding vs choppy/distribution --
+    a dimension orthogonal to the risk-on/off score above. Risk-on/off
+    answers "bullish or bearish"; this answers "is there a clean,
+    tradeable trend right now, or is price chopping/topping without one."
+    Added 2026-08-29 (user request), motivated by a concrete real example:
+    Q2 2026 was a clean uptrend that favored breakout/momentum entries
+    with wide trailing stops (this system's current default posture); by
+    June/July it flipped to a choppy, distributive market where the same
+    buy-and-hold posture rode gains up and gave them back. Nothing in the
+    regime output distinguished the two -- assess_regime()'s score stayed
+    wherever the risk-on/off signals put it, with no signal for "the kind
+    of market that rewards momentum entries is over."
+
+    Uses Kaufman's Efficiency Ratio: net move over `lookback` sessions
+    divided by the sum of every bar-to-bar move in that window. 1.0 is a
+    perfectly smooth trend with zero chop; near 0 is pure noise with no
+    net progress regardless of how much the price moved intraday.
+    Combined with the 20DMA's own slope (rising vs falling over the prior
+    10 sessions), since a HIGH efficiency ratio during a FALLING 20DMA is
+    exactly the "topping" case -- a smooth move, just not an upward one
+    worth chasing with a momentum entry.
+
+    Returns (label, efficiency_ratio, notes). label is one of
+    "Trending/Expanding" or "Choppy/Distribution" -- deliberately binary,
+    not a 5-level scale like the risk-on/off score, since this is meant
+    to gate a concrete behavior switch (see config.py's
+    PROFIT_TARGET_PCT_BY_STYLE / STALE_WINDOW_DAYS_BY_STYLE), not another
+    shade of sentiment.
+    """
+    if len(spy_bars) < lookback + 10:
+        return ("Choppy/Distribution", 0.0,
+                "Insufficient bar data for trade-style analysis (defaulting cautious)")
+
+    closes = [b["close"] for b in spy_bars]
+    window = closes[-lookback:]
+    net_move = abs(window[-1] - window[0])
+    path_length = sum(abs(window[i] - window[i - 1]) for i in range(1, len(window)))
+    efficiency_ratio = round(net_move / path_length, 3) if path_length > 0 else 0.0
+
+    sma20_now = sum(closes[-20:]) / 20
+    sma20_10d_ago = sum(closes[-30:-10]) / 20
+    slope_up = sma20_now > sma20_10d_ago
+
+    if efficiency_ratio >= TRADE_STYLE_ER_THRESHOLD and slope_up:
+        label = "Trending/Expanding"
+        notes = (f"Efficiency ratio {efficiency_ratio:.2f} (>= {TRADE_STYLE_ER_THRESHOLD}) with a "
+                  f"rising 20DMA ({sma20_now:.2f} vs {sma20_10d_ago:.2f} 10d ago) -- clean, "
+                  f"tradeable uptrend")
+    elif efficiency_ratio >= TRADE_STYLE_ER_THRESHOLD:
+        label = "Choppy/Distribution"
+        notes = (f"Efficiency ratio {efficiency_ratio:.2f} is trend-like but the 20DMA is falling "
+                  f"({sma20_now:.2f} vs {sma20_10d_ago:.2f} 10d ago) -- a smooth move, just not one "
+                  f"worth chasing with momentum entries (distribution/breakdown, not expansion)")
+    else:
+        label = "Choppy/Distribution"
+        notes = (f"Efficiency ratio {efficiency_ratio:.2f} (< {TRADE_STYLE_ER_THRESHOLD}) -- no "
+                  f"clean net progress, price is chopping/whipsawing over the last {lookback} sessions")
+
+    return label, efficiency_ratio, notes
+
+
 def _score_volatility(
     vix: float | None,
     trend_raw: int | None = None,
@@ -529,6 +600,7 @@ def assess_regime() -> dict:
     # contrarian-bullish signal must be suppressed when both are Very Bearish
     # (Death Cross posture) — see _score_volatility's docstring.
     trend_raw,      trend_notes      = _score_trend(spy_bars)
+    trade_style, efficiency_ratio, trade_style_notes = _score_trade_style(spy_bars)
 
     watchlist_bars = _fetch_watchlist_bars_for_breadth()
     if watchlist_bars:
@@ -629,7 +701,8 @@ def assess_regime() -> dict:
         for name, (raw, notes) in scores_map.items()
     )
     reasoning = (
-        f"Regime: {regime} | Score: {score}/100 | Confidence: {confidence:.0f}%\n\n"
+        f"Regime: {regime} | Score: {score}/100 | Confidence: {confidence:.0f}%\n"
+        f"Trade style: {trade_style} (efficiency ratio {efficiency_ratio:.2f}) — {trade_style_notes}\n\n"
         f"Signal breakdown:\n{signal_lines}\n\n"
         f"Key drivers: {'; '.join(key_drivers) if key_drivers else 'None'}\n"
         f"Key risks: {'; '.join(key_risks) if key_risks else 'None'}"
@@ -642,8 +715,17 @@ def assess_regime() -> dict:
         "regime":     regime,
         "score":      score,
         "confidence": confidence,
+        # Orthogonal to `regime` above (bullish/bearish) -- answers "is
+        # there a clean trend to trade right now." Top-level, not just
+        # inside `signals`, since it's meant to be read directly by
+        # risk_manager.py to select which profit-target/stale-window
+        # table applies (see config.py's *_BY_STYLE dicts), the same way
+        # `regime` itself is read directly for the sizing multiplier.
+        "trade_style": trade_style,
         "signals": {
             "trend":      {"score": trend_raw,      "notes": trend_notes},
+            "trade_style": {"label": trade_style, "efficiency_ratio": efficiency_ratio,
+                             "notes": trade_style_notes},
             "volatility": {"score": volatility_raw, "vix": vix, "notes": volatility_notes},
             "liquidity":  {"score": liquidity_raw,  "notes": liquidity_notes},
             "credit":     {"score": credit_raw,     "notes": credit_notes},

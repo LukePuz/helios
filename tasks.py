@@ -288,6 +288,16 @@ app.conf.beat_schedule = {
         "schedule": 1800,
         "options":  {"expires": 1800},
     },
+    # Regime-adaptive profit-taking — every 30 min, same cadence as
+    # check-stops above (2026-08-29, user request; see config.py's
+    # PROFIT_TARGET_PCT_BY_STYLE and risk_manager.check_profit_targets).
+    # This is the step that makes that feature actually place live SELL
+    # orders on a schedule, not just be present-but-dormant code.
+    "check-profit-targets": {
+        "task":     "tasks.check_profit_targets",
+        "schedule": 1800,
+        "options":  {"expires": 1800},
+    },
     # SEC filings — every 10 minutes during market hours
     "poll-edgar": {
         "task":     "tasks.poll_edgar",
@@ -918,13 +928,60 @@ def run_daily_scan(self):
 def review_positions(self):
     """Scheduled reassessment of already-held positions for TRIM/EXIT/HOLD
     — see agents/crew.py's review_all_held_positions docstring for why this
-    exists (nothing else ever asked this question on a schedule)."""
+    exists (nothing else ever asked this question on a schedule).
+
+    2026-08-29 (user request): first asks risk_manager.flag_stale_positions()
+    which Accelerator/Moonshot holdings have gone nowhere for longer than
+    their regime-appropriate window, and passes those as priority_tickers
+    so a stale position gets a fresh LLM look THIS run instead of possibly
+    waiting weeks behind other holdings in the normal rotation. Flagging
+    failure doesn't block the review itself running -- falls through to
+    the unprioritized rotation, same as if nothing were stale."""
     try:
         from agents.crew import review_all_held_positions
-        review_all_held_positions(max_per_run=10)
+        stale_tickers: list[str] = []
+        try:
+            from risk_manager import RiskManager
+            rm = RiskManager(_get_client())
+            stale_tickers = [f["ticker"] for f in rm.flag_stale_positions()]
+        except Exception as e:
+            log.warning(f"review_positions: stale-position flagging failed, "
+                        f"proceeding without priority: {e}")
+        review_all_held_positions(max_per_run=10, priority_tickers=stale_tickers)
     except Exception as e:
         log.error(f"review_positions failed: {e}")
         raise self.retry(exc=e, countdown=300)
+
+
+@app.task(name="tasks.check_profit_targets", bind=True, max_retries=2)
+def check_profit_targets(self):
+    """Scheduled regime-adaptive profit-taking for Accelerator/Moonshot
+    positions (2026-08-29, user request) -- see risk_manager.
+    check_profit_targets's docstring and config.py's PROFIT_TARGET_PCT_BY_STYLE
+    for the full rationale. Unlike check_trailing_stops above, the actual
+    SELL order is placed inside risk_manager.check_profit_targets() itself
+    (there's no "detect vs execute" split to preserve here — a profit
+    target crossing isn't racing a live broker stop the way a stop-loss
+    trigger is), so this wrapper's job is just invocation, alerting, and
+    Celery retry/error handling."""
+    try:
+        import alerts
+        from risk_manager import RiskManager
+
+        client = _get_client()
+        rm = RiskManager(client)
+        sold = rm.check_profit_targets()
+        for result in sold:
+            alerts.send_trade_alert(
+                symbol=result["ticker"], side="SELL",
+                qty=int(result["shares_sold"]), price=result["new_stop"],
+                reason=(f"Profit target hit ({result['gain_pct']:.1%}, "
+                        f"style={result['trade_style']}) — partial sell, "
+                        f"remainder stop moved to breakeven"),
+            )
+    except Exception as e:
+        log.error(f"check_profit_targets failed: {e}")
+        raise self.retry(exc=e, countdown=60)
 
 
 def _schedule_backstop_retry(ticker: str, alert: dict) -> None:

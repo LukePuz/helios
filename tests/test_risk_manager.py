@@ -403,6 +403,7 @@ class TestCheckProfitTargets:
                   "profit_target_taken": False}]
         with patch("agents.market_regime.get_cached_regime",
                     return_value={"trade_style": "Trending/Expanding"}), \
+             patch("agents.market_regime.get_trade_style_for_ticker", return_value=None), \
              patch("db.get_all_position_stops", return_value=stops), \
              patch("db.mark_profit_target_taken") as mock_mark, \
              patch("ibkr.place_market_order", return_value={"order_id": 1}) as mock_order:
@@ -423,6 +424,7 @@ class TestCheckProfitTargets:
                   "profit_target_taken": False}]
         with patch("agents.market_regime.get_cached_regime",
                     return_value={"trade_style": "Trending/Expanding"}), \
+             patch("agents.market_regime.get_trade_style_for_ticker", return_value=None), \
              patch("db.get_all_position_stops", return_value=stops), \
              patch("db.mark_profit_target_taken") as mock_mark, \
              patch("ibkr.place_market_order") as mock_order:
@@ -440,6 +442,7 @@ class TestCheckProfitTargets:
                   "profit_target_taken": False}]
         with patch("agents.market_regime.get_cached_regime",
                     return_value={"trade_style": "Choppy/Distribution"}), \
+             patch("agents.market_regime.get_trade_style_for_ticker", return_value=None), \
              patch("db.get_all_position_stops", return_value=stops), \
              patch("db.mark_profit_target_taken"), \
              patch("ibkr.place_market_order", return_value={"order_id": 1}) as mock_order:
@@ -454,6 +457,7 @@ class TestCheckProfitTargets:
                   "profit_target_taken": False}]
         with patch("agents.market_regime.get_cached_regime",
                     return_value={"trade_style": "Trending/Expanding"}), \
+             patch("agents.market_regime.get_trade_style_for_ticker", return_value=None), \
              patch("db.get_all_position_stops", return_value=stops), \
              patch("ibkr.place_market_order") as mock_order:
             result = rm.check_profit_targets()
@@ -466,6 +470,7 @@ class TestCheckProfitTargets:
                   "profit_target_taken": True}]
         with patch("agents.market_regime.get_cached_regime",
                     return_value={"trade_style": "Trending/Expanding"}), \
+             patch("agents.market_regime.get_trade_style_for_ticker", return_value=None), \
              patch("db.get_all_position_stops", return_value=stops), \
              patch("ibkr.place_market_order") as mock_order:
             result = rm.check_profit_targets()
@@ -479,6 +484,7 @@ class TestCheckProfitTargets:
         stops = [{"ticker": "SNOW", "entry_price": 100.0, "thesis_bucket": "Accelerator",
                   "profit_target_taken": False}]
         with patch("agents.market_regime.get_cached_regime", return_value=None), \
+             patch("agents.market_regime.get_trade_style_for_ticker", return_value=None), \
              patch("db.get_all_position_stops", return_value=stops), \
              patch("db.mark_profit_target_taken"), \
              patch("ibkr.place_market_order", return_value={"order_id": 1}) as mock_order:
@@ -493,6 +499,7 @@ class TestCheckProfitTargets:
                   "profit_target_taken": False}]
         with patch("agents.market_regime.get_cached_regime",
                     return_value={"trade_style": "Trending/Expanding"}), \
+             patch("agents.market_regime.get_trade_style_for_ticker", return_value=None), \
              patch("db.get_all_position_stops", return_value=stops), \
              patch("db.mark_profit_target_taken") as mock_mark, \
              patch("ibkr.place_market_order", side_effect=Exception("IBKR down")):
@@ -521,6 +528,7 @@ class TestFlagStalePositions:
                   "opened_at": opened}]
         with patch("agents.market_regime.get_cached_regime",
                     return_value={"trade_style": "Choppy/Distribution"}), \
+             patch("agents.market_regime.get_trade_style_for_ticker", return_value=None), \
              patch("db.get_all_position_stops", return_value=stops):
             result = rm.flag_stale_positions()
         assert len(result) == 1
@@ -534,6 +542,7 @@ class TestFlagStalePositions:
                   "opened_at": opened}]
         with patch("agents.market_regime.get_cached_regime",
                     return_value={"trade_style": "Choppy/Distribution"}), \
+             patch("agents.market_regime.get_trade_style_for_ticker", return_value=None), \
              patch("db.get_all_position_stops", return_value=stops):
             result = rm.flag_stale_positions()
         assert result == []
@@ -546,6 +555,7 @@ class TestFlagStalePositions:
                   "opened_at": opened}]
         with patch("agents.market_regime.get_cached_regime",
                     return_value={"trade_style": "Choppy/Distribution"}), \
+             patch("agents.market_regime.get_trade_style_for_ticker", return_value=None), \
              patch("db.get_all_position_stops", return_value=stops):
             result = rm.flag_stale_positions()
         assert result == []
@@ -558,6 +568,110 @@ class TestFlagStalePositions:
                   "opened_at": opened}]
         with patch("agents.market_regime.get_cached_regime",
                     return_value={"trade_style": "Choppy/Distribution"}), \
+             patch("agents.market_regime.get_trade_style_for_ticker", return_value=None), \
              patch("db.get_all_position_stops", return_value=stops):
             result = rm.flag_stale_positions()
         assert result == []
+
+
+class TestSectorAwareTradeStyle:
+    """2026-08-29, user request: a held position should be evaluated
+    against ITS OWN sector's regime (agents.market_regime.
+    get_trade_style_for_ticker), not a single blanket whole-market read
+    -- a sector can trend while the broad market chops, or vice versa.
+    These tests guard: the per-ticker sector style actually overrides the
+    market-wide one when available, and the market-wide read is still
+    used as the fallback when sector data isn't."""
+
+    def _rm(self, positions):
+        client = _make_client(positions=positions)
+        rm = risk_manager.RiskManager.__new__(risk_manager.RiskManager)
+        rm._client = client
+        return rm
+
+    def test_sector_style_overrides_market_style_for_profit_target(self):
+        # Market-wide regime says Trending/Expanding (25% target, would
+        # NOT be hit by an 18% gain) but this ticker's own sector says
+        # Choppy/Distribution (~12.5% target, WOULD be hit) -- the sector
+        # read must win.
+        rm = self._rm([_priced_holding("UNH", qty=100.0, current_price=118.0)])
+        stops = [{"ticker": "UNH", "entry_price": 100.0, "thesis_bucket": "Accelerator",
+                  "profit_target_taken": False}]
+        with patch("agents.market_regime.get_cached_regime",
+                    return_value={"trade_style": "Trending/Expanding"}), \
+             patch("agents.market_regime.get_trade_style_for_ticker", return_value="Choppy/Distribution"), \
+             patch("db.get_all_position_stops", return_value=stops), \
+             patch("db.mark_profit_target_taken"), \
+             patch("ibkr.place_market_order", return_value={"order_id": 1}) as mock_order:
+            result = rm.check_profit_targets()
+        assert len(result) == 1
+        assert result[0]["trade_style"] == "Choppy/Distribution"
+        mock_order.assert_called_once_with("UNH", "SELL", 45.0)
+
+    def test_sector_lookup_unavailable_falls_back_to_market_style(self):
+        # get_trade_style_for_ticker returns None (ticker isn't an S&P 500
+        # constituent, or its sector hasn't been assessed yet) -- must
+        # fall back to the market-wide read, not silently skip or crash.
+        rm = self._rm([_priced_holding("SNOW", qty=100.0, current_price=130.0)])
+        stops = [{"ticker": "SNOW", "entry_price": 100.0, "thesis_bucket": "Accelerator",
+                  "profit_target_taken": False}]
+        with patch("agents.market_regime.get_cached_regime",
+                    return_value={"trade_style": "Trending/Expanding"}), \
+             patch("agents.market_regime.get_trade_style_for_ticker", return_value=None), \
+             patch("db.get_all_position_stops", return_value=stops), \
+             patch("db.mark_profit_target_taken"), \
+             patch("ibkr.place_market_order", return_value={"order_id": 1}) as mock_order:
+            result = rm.check_profit_targets()
+        assert len(result) == 1
+        assert result[0]["trade_style"] == "Trending/Expanding"
+        mock_order.assert_called_once_with("SNOW", "SELL", 25.0)
+
+    def test_two_positions_in_different_sector_regimes_get_different_targets(self):
+        # Two holdings, same gain, opposite sector regimes -- confirms the
+        # resolution happens per-ticker inside the loop, not once for the
+        # whole run.
+        rm = self._rm([
+            _priced_holding("UNH", qty=100.0, current_price=118.0),
+            _priced_holding("NVDA", qty=100.0, current_price=118.0),
+        ])
+        stops = [
+            {"ticker": "UNH", "entry_price": 100.0, "thesis_bucket": "Accelerator",
+             "profit_target_taken": False},
+            {"ticker": "NVDA", "entry_price": 100.0, "thesis_bucket": "Accelerator",
+             "profit_target_taken": False},
+        ]
+
+        def fake_sector_style(ticker):
+            return {"UNH": "Choppy/Distribution", "NVDA": "Trending/Expanding"}.get(ticker)
+
+        with patch("agents.market_regime.get_cached_regime",
+                    return_value={"trade_style": "Choppy/Distribution"}), \
+             patch("agents.market_regime.get_trade_style_for_ticker", side_effect=fake_sector_style), \
+             patch("db.get_all_position_stops", return_value=stops), \
+             patch("db.mark_profit_target_taken"), \
+             patch("ibkr.place_market_order", return_value={"order_id": 1}) as mock_order:
+            result = rm.check_profit_targets()
+
+        # UNH (Choppy, ~12.5% target) hits at 18% gain; NVDA (Trending,
+        # ~25% target) does not.
+        assert len(result) == 1
+        assert result[0]["ticker"] == "UNH"
+        mock_order.assert_called_once_with("UNH", "SELL", 45.0)
+
+    def test_sector_style_used_for_stale_window_too(self):
+        from datetime import datetime, timedelta, timezone
+        # 10 calendar days held, flat -- past Choppy/Distribution's
+        # Accelerator window (14d... wait must be >=) use a value that
+        # clears the Choppy window (14d) but not Trending's (28d), so the
+        # sector read (Choppy) is what determines whether this flags.
+        opened = datetime.now(timezone.utc) - timedelta(days=20)
+        rm = self._rm([_priced_holding("UNH", qty=100.0, current_price=101.0)])
+        stops = [{"ticker": "UNH", "entry_price": 100.0, "thesis_bucket": "Accelerator",
+                  "opened_at": opened}]
+        with patch("agents.market_regime.get_cached_regime",
+                    return_value={"trade_style": "Trending/Expanding"}), \
+             patch("agents.market_regime.get_trade_style_for_ticker", return_value="Choppy/Distribution"), \
+             patch("db.get_all_position_stops", return_value=stops):
+            result = rm.flag_stale_positions()
+        assert len(result) == 1
+        assert result[0]["trade_style"] == "Choppy/Distribution"

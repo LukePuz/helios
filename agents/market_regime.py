@@ -827,6 +827,15 @@ def assess_sector_regime(
         spy_bars = _fetch_bars("SPY", days=220)
 
     trend_raw, trend_notes = _score_trend(sector_bars)
+    # Same trade_style classification as assess_regime() (see
+    # _score_trade_style's docstring), scoped to this ETF's own bars
+    # instead of SPY's -- added 2026-08-29 so a healthcare position, say,
+    # gets evaluated against healthcare's own regime rather than the
+    # whole market's. A sector can trend while the broad market chops (or
+    # vice versa), and risk_manager.py's profit-target/staleness logic
+    # needs the RIGHT one for the specific position being evaluated, not
+    # a single blanket read for every holding regardless of sector.
+    trade_style, efficiency_ratio, trade_style_notes = _score_trade_style(sector_bars)
 
     try:
         from ingestion.macro import get_macro_snapshot
@@ -915,7 +924,8 @@ def assess_sector_regime(
         for name, (raw, notes) in scores_map.items()
     )
     reasoning = (
-        f"{sector_etf} Sector Regime: {regime} | Score: {score}/100 | Confidence: {confidence:.0f}%\n\n"
+        f"{sector_etf} Sector Regime: {regime} | Score: {score}/100 | Confidence: {confidence:.0f}%\n"
+        f"Trade style: {trade_style} (efficiency ratio {efficiency_ratio:.2f}) — {trade_style_notes}\n\n"
         f"Signal breakdown:\n{signal_lines}\n\n"
         f"Key drivers: {'; '.join(key_drivers) if key_drivers else 'None'}\n"
         f"Key risks: {'; '.join(key_risks) if key_risks else 'None'}"
@@ -929,7 +939,14 @@ def assess_sector_regime(
         "regime": regime,
         "score": score,
         "confidence": confidence,
-        "signals": {name: {"score": raw, "notes": notes} for name, (raw, notes) in scores_map.items()},
+        # Same top-level convenience field as assess_regime()'s -- read
+        # directly by risk_manager.py rather than digging into `signals`.
+        "trade_style": trade_style,
+        "signals": {
+            **{name: {"score": raw, "notes": notes} for name, (raw, notes) in scores_map.items()},
+            "trade_style": {"label": trade_style, "efficiency_ratio": efficiency_ratio,
+                             "notes": trade_style_notes},
+        },
         "key_drivers": key_drivers,
         "key_risks": key_risks,
         "reasoning": reasoning,
@@ -966,6 +983,45 @@ def get_cached_sector_regime(sector_etf: str = "XLK", regime_type: str = "sector
         log.error(f"assess_sector_regime({sector_etf}, {regime_type}) failed: {e}")
         return {"available": False, "regime": "Neutral", "score": 50.0, "confidence": 0.0,
                 "reasoning": f"Sector regime unavailable: {e}"}
+
+
+def get_trade_style_for_ticker(ticker: str) -> str | None:
+    """
+    Resolves a HELD TICKER's own sector's trade_style (2026-08-29, user
+    request) -- e.g. a healthcare position should be evaluated against
+    healthcare's actual regime, not the whole market's. A sector can be
+    trending while the broad market chops, or vice versa; risk_manager.py's
+    profit-target/staleness logic (see config.py's PROFIT_TARGET_PCT_BY_STYLE)
+    needs the RIGHT read for the specific position, not one blanket number
+    applied to every holding regardless of sector.
+
+    Resolution path: ticker -> GICS sector (ingestion.sp500_universe's
+    S&P 500 constituent map) -> sector ETF (SECTOR_ETF_MAP) -> that ETF's
+    cached "gics_sector"-type regime (assess_market_sector_map()'s sweep,
+    NOT the "sector"-type XLK/SOXX thesis tracking -- same regime_type
+    distinction assess_sector_regime's own docstring describes) ->
+    trade_style.
+
+    Returns None (not a default) if the ticker isn't a current S&P 500
+    constituent, or if that sector hasn't been assessed yet -- callers
+    should fall back to the whole-market get_cached_regime()["trade_style"]
+    in that case, same "some read beats no read" posture used everywhere
+    else in this codebase, rather than this function silently guessing.
+    """
+    try:
+        from ingestion.sp500_universe import SECTOR_ETF_MAP, get_sp500_constituents
+        constituents = get_sp500_constituents()
+        gics_sector = constituents.get(ticker, {}).get("gics_sector")
+        if not gics_sector:
+            return None
+        etf = SECTOR_ETF_MAP.get(gics_sector)
+        if not etf:
+            return None
+        packet = get_cached_sector_regime(etf, regime_type="gics_sector")
+        return packet.get("trade_style")
+    except Exception as e:
+        log.warning(f"get_trade_style_for_ticker({ticker}) failed: {e}")
+        return None
 
 
 def assess_market_sector_map() -> dict:

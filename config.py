@@ -184,11 +184,13 @@ TRAILING_STOP_DISTANCE: dict[str, tuple[float, float]] = {
 # agents.market_regime.get_cached_regime()["trade_style"] to pick which
 # column applies at decision time.
 #
-# NOT YET WIRED INTO THE SCHEDULED TASK LOOP as of 2026-08-29 -- the
-# risk_manager.py methods that consume these exist and are tested, but
-# adding them to tasks.py's beat_schedule (making this run automatically
-# against live capital) is a deliberate separate step, held pending
-# explicit confirmation given this touches real order placement.
+# WIRED INTO THE SCHEDULED TASK LOOP as of 2026-08-29 -- tasks.py's
+# check-profit-targets entry (30 min, same cadence as check-stops) calls
+# risk_manager.check_profit_targets() automatically, which places real
+# SELL orders against live capital. flag_stale_positions() is called from
+# tasks.review_positions (the existing daily 10:15am position-review
+# task), feeding stale tickers into agents.crew.review_all_held_positions's
+# priority queue rather than exiting anything itself.
 PROFIT_TARGET_PCT_BY_STYLE: dict[str, dict[str, tuple[float, float]]] = {
     "Trending/Expanding": {
         "Accelerator": (0.20, 0.30),

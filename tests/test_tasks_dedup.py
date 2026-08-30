@@ -709,3 +709,70 @@ class TestBackstopSellRetry:
 
         assert result is True
         mock_retry_task.apply_async.assert_not_called()
+
+
+class TestCheckProfitTargetsTask:
+    """2026-08-29, user request: the Celery wrapper around
+    risk_manager.check_profit_targets() -- this is the task that actually
+    makes the profit-target feature place live SELL orders on a schedule
+    (see beat_schedule's check-profit-targets entry) rather than the
+    feature being present-but-dormant code. The order placement itself
+    happens inside risk_manager (unlike check_trailing_stops, there's no
+    detect-vs-execute split here), so this task's own job is just
+    invocation and alerting -- these tests guard exactly that."""
+
+    def test_sold_positions_get_a_trade_alert(self):
+        client = MagicMock()
+        with patch("tasks._get_client", return_value=client), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("alerts.send_trade_alert") as mock_alert:
+            mock_rm_cls.return_value.check_profit_targets.return_value = [{
+                "ticker": "SNOW", "action": "PARTIAL_SELL", "shares_sold": 25.0,
+                "new_stop": 100.0, "trade_style": "Trending/Expanding", "gain_pct": 0.30,
+                "order_result": {"order_id": 1},
+            }]
+            tasks.check_profit_targets.run()
+        mock_alert.assert_called_once()
+        _, kwargs = mock_alert.call_args
+        assert kwargs["symbol"] == "SNOW"
+        assert kwargs["side"] == "SELL"
+        assert kwargs["qty"] == 25
+
+    def test_nothing_sold_sends_no_alert(self):
+        client = MagicMock()
+        with patch("tasks._get_client", return_value=client), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("alerts.send_trade_alert") as mock_alert:
+            mock_rm_cls.return_value.check_profit_targets.return_value = []
+            tasks.check_profit_targets.run()
+        mock_alert.assert_not_called()
+
+    def test_risk_manager_failure_retries_not_crashes(self):
+        with patch("tasks._get_client", side_effect=Exception("IBKR down")):
+            with pytest.raises(Exception):
+                tasks.check_profit_targets.run()
+
+
+class TestReviewPositionsStalePriority:
+    """2026-08-29, user request: review_positions now asks
+    flag_stale_positions() first and passes the result through as
+    priority_tickers -- these tests guard that the wiring actually
+    happens, and that a flagging failure doesn't block the review itself
+    from running unprioritized."""
+
+    def test_stale_tickers_are_passed_through_as_priority(self):
+        client = MagicMock()
+        with patch("tasks._get_client", return_value=client), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("agents.crew.review_all_held_positions") as mock_review:
+            mock_rm_cls.return_value.flag_stale_positions.return_value = [
+                {"ticker": "SNOW", "days_held": 20, "pct_move": 0.01},
+            ]
+            tasks.review_positions.run()
+        mock_review.assert_called_once_with(max_per_run=10, priority_tickers=["SNOW"])
+
+    def test_flagging_failure_falls_through_to_unprioritized_review(self):
+        with patch("tasks._get_client", side_effect=Exception("IBKR down")), \
+             patch("agents.crew.review_all_held_positions") as mock_review:
+            tasks.review_positions.run()
+        mock_review.assert_called_once_with(max_per_run=10, priority_tickers=[])

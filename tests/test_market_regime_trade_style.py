@@ -1,13 +1,21 @@
 """
 Unit tests for agents.market_regime._score_trade_style — the
 Trending/Expanding vs Choppy/Distribution classifier added 2026-08-29 (see
-that function's docstring for the motivating Q2->Q3 regime-shift example).
+that function's docstring for the motivating Q2->Q3 regime-shift example)
+— and get_trade_style_for_ticker, the per-ticker sector-aware resolver
+added the same day.
 
 Pure-function tests against synthetic SPY-shaped bars, hand-verified before
 asserting rather than trusting the arithmetic blind — same convention used
 throughout momentum-scanner's test suite.
 """
-from agents.market_regime import _score_trade_style, TRADE_STYLE_ER_THRESHOLD
+from unittest.mock import patch
+
+from agents.market_regime import (
+    _score_trade_style,
+    TRADE_STYLE_ER_THRESHOLD,
+    get_trade_style_for_ticker,
+)
 
 
 def _bars(closes: list[float]) -> list[dict]:
@@ -57,3 +65,25 @@ class TestScoreTradeStyle:
         closes = [100.0 + i for i in range(40)]
         _, er, _ = _score_trade_style(_bars(closes))
         assert er == round(er, 3)
+
+
+class TestGetTradeStyleForTicker:
+    def test_resolves_via_gics_sector_and_etf_map(self):
+        with patch("ingestion.sp500_universe.get_sp500_constituents",
+                    return_value={"UNH": {"gics_sector": "Health Care"}}), \
+             patch("agents.market_regime.get_cached_sector_regime",
+                    return_value={"trade_style": "Choppy/Distribution"}) as mock_sector:
+            result = get_trade_style_for_ticker("UNH")
+        assert result == "Choppy/Distribution"
+        mock_sector.assert_called_once_with("XLV", regime_type="gics_sector")
+
+    def test_non_sp500_ticker_returns_none(self):
+        with patch("ingestion.sp500_universe.get_sp500_constituents", return_value={}):
+            assert get_trade_style_for_ticker("SOME_MICROCAP") is None
+
+    def test_sector_regime_unavailable_returns_none_not_a_crash(self):
+        with patch("ingestion.sp500_universe.get_sp500_constituents",
+                    return_value={"UNH": {"gics_sector": "Health Care"}}), \
+             patch("agents.market_regime.get_cached_sector_regime",
+                    side_effect=Exception("regime fetch failed")):
+            assert get_trade_style_for_ticker("UNH") is None

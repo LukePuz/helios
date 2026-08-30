@@ -211,13 +211,24 @@ def review_held_position(ticker: str, client, positions: dict, regime: dict) -> 
     return result
 
 
-def review_all_held_positions(max_per_run: int = 10) -> list[dict]:
+def review_all_held_positions(max_per_run: int = 10, priority_tickers: list[str] | None = None) -> list[dict]:
     """
     Batch driver (tasks.review_positions) — capped per run since each review
     is a full 72B call that competes with new-candidate analysis on the same
     GPU queue. Rotates through every held position over successive runs
     (oldest-reviewed-first, tracked in system_state) rather than always
     reviewing the same few if there are more positions than max_per_run.
+
+    priority_tickers (2026-08-29, user request): tickers to place at the
+    FRONT of the rotation regardless of when they were last reviewed --
+    fed by risk_manager.flag_stale_positions() via tasks.review_positions,
+    so a position that's gone stale (old AND flat) gets a fresh LLM look
+    promptly instead of possibly waiting weeks behind other holdings in
+    the normal oldest-reviewed-first queue. Priority tickers are still
+    subject to max_per_run and still get their own last_reviewed
+    timestamp updated like any other reviewed position -- this only
+    changes ORDER, not whether a position is eligible or how many run per
+    cycle.
     """
     import json
     from datetime import datetime, timezone
@@ -234,8 +245,13 @@ def review_all_held_positions(max_per_run: int = 10) -> list[dict]:
     except Exception:
         last_reviewed = {}
 
-    tickers = sorted(positions.keys(), key=lambda t: last_reviewed.get(t, ""))[:max_per_run]
-    log.info(f"Position review: {len(tickers)} of {len(positions)} held tickers this run")
+    priority_set = set(priority_tickers or [])
+    tickers = sorted(
+        positions.keys(),
+        key=lambda t: (0 if t in priority_set else 1, last_reviewed.get(t, "")),
+    )[:max_per_run]
+    log.info(f"Position review: {len(tickers)} of {len(positions)} held tickers this run"
+             + (f" ({len(priority_set & set(tickers))} prioritized as stale)" if priority_set else ""))
 
     results = []
     now_iso = datetime.now(timezone.utc).isoformat()

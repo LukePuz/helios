@@ -392,3 +392,116 @@ class TestReviewAllHeldPositionsPriority:
             crew.review_all_held_positions(max_per_run=10)
 
         assert reviewed_order == ["NVDA", "AMD"]
+
+
+class TestBackfillCatalystTracking:
+    """2026-08-30, user request: one-time gap-closer for positions held
+    before catalyst/expected-return tracking existed. These tests guard:
+    only missing-catalyst tickers get analyzed (respecting the DB-reported
+    filter, not re-deriving it), the approval-routing side effect never
+    fires even on a pass_to_risk result (a backfill isn't a new trade
+    signal), and a failed analysis is reported as skipped rather than
+    silently dropped or crashing the run."""
+
+    def _client_with(self, tickers):
+        client = MagicMock()
+        client.get_all_positions.return_value = [
+            MagicMock(symbol=t, qty=10.0, avg_entry_price=100.0,
+                      current_price=105.0, market_value=1050.0)
+            for t in tickers
+        ]
+        return client
+
+    def test_only_missing_tickers_are_analyzed(self):
+        client = self._client_with(["AMD", "NVDA", "SNOW"])
+
+        def fake_analyze(ticker, *a, **kw):
+            return {"ticker": ticker, "action": "HOLD", "pass_to_risk": False,
+                    "catalyst": {"event": f"{ticker} catalyst", "date": "2026-11", "is_priced_in": False},
+                    "expected_return_pct": 20.0, "expected_downside_pct": -10.0,
+                    "thesis_summary": "test", "sources": [{"type": "news"}], "source_count": 1}
+
+        with patch("ibkr.IBKRClient", return_value=client), \
+             patch("agents.market_regime.get_cached_regime", return_value={}), \
+             patch("db.get_tickers_missing_catalyst_data", return_value=["SNOW"]) as mock_missing, \
+             patch("db.get_position_stop", return_value=None), \
+             patch("db.backfill_catalyst_outcome") as mock_backfill, \
+             patch("agents.crew._analyze_held_position", side_effect=fake_analyze), \
+             patch("agents.crew._route_to_approval") as mock_route:
+            results = crew.backfill_catalyst_tracking(max_per_run=10)
+
+        mock_missing.assert_called_once()
+        assert set(mock_missing.call_args[0][0]) == {"AMD", "NVDA", "SNOW"}
+        mock_backfill.assert_called_once()
+        assert mock_backfill.call_args.kwargs["ticker"] == "SNOW"
+        assert mock_backfill.call_args.kwargs["catalyst_event"] == "SNOW catalyst"
+        mock_route.assert_not_called()  # backfill must never trigger a new approval
+        assert results == [{"ticker": "SNOW", "action": "BACKFILLED",
+                             "catalyst_event": "SNOW catalyst", "source_count": 1}]
+
+    def test_pass_to_risk_result_never_routes_to_approval(self):
+        # Even if the fresh analysis WOULD normally trigger a TRIM/EXIT,
+        # a backfill pass must not act on it -- it exists to capture a
+        # snapshot, not to fire trading actions as a side effect.
+        client = self._client_with(["AMD"])
+
+        def fake_analyze(ticker, *a, **kw):
+            return {"ticker": ticker, "action": "EXIT", "pass_to_risk": True, "conviction": 8,
+                    "catalyst": {"event": "thesis broken", "date": "ongoing", "is_priced_in": True},
+                    "expected_return_pct": -30.0, "expected_downside_pct": -30.0,
+                    "thesis_summary": "test", "sources": [{"type": "news"}, {"type": "edgar_filing"}],
+                    "source_count": 2}
+
+        with patch("ibkr.IBKRClient", return_value=client), \
+             patch("agents.market_regime.get_cached_regime", return_value={}), \
+             patch("db.get_tickers_missing_catalyst_data", return_value=["AMD"]), \
+             patch("db.get_position_stop", return_value=None), \
+             patch("db.backfill_catalyst_outcome"), \
+             patch("agents.crew._analyze_held_position", side_effect=fake_analyze), \
+             patch("agents.crew._route_to_approval") as mock_route:
+            crew.backfill_catalyst_tracking(max_per_run=10)
+
+        mock_route.assert_not_called()
+
+    def test_analysis_failure_is_reported_as_skipped_not_crashed(self):
+        client = self._client_with(["AMD"])
+
+        def fake_analyze(ticker, *a, **kw):
+            return {"action": "SKIP", "ticker": ticker, "conviction": 0,
+                    "pass_to_risk": False, "reasoning": "Review failed with exception: boom"}
+
+        with patch("ibkr.IBKRClient", return_value=client), \
+             patch("agents.market_regime.get_cached_regime", return_value={}), \
+             patch("db.get_tickers_missing_catalyst_data", return_value=["AMD"]), \
+             patch("db.backfill_catalyst_outcome") as mock_backfill, \
+             patch("agents.crew._analyze_held_position", side_effect=fake_analyze):
+            results = crew.backfill_catalyst_tracking(max_per_run=10)
+
+        mock_backfill.assert_not_called()
+        assert results == [{"ticker": "AMD", "action": "SKIPPED",
+                             "reason": "Review failed with exception: boom"}]
+
+    def test_uses_position_stop_entry_data_when_available(self):
+        from datetime import datetime, timezone
+        client = self._client_with(["AMD"])
+        opened = datetime(2026, 1, 15, tzinfo=timezone.utc)
+
+        def fake_analyze(ticker, *a, **kw):
+            return {"ticker": ticker, "action": "HOLD", "pass_to_risk": False,
+                    "catalyst": {}, "expected_return_pct": None, "expected_downside_pct": None,
+                    "thesis_summary": None, "sources": [], "source_count": 0}
+
+        with patch("ibkr.IBKRClient", return_value=client), \
+             patch("agents.market_regime.get_cached_regime", return_value={}), \
+             patch("db.get_tickers_missing_catalyst_data", return_value=["AMD"]), \
+             patch("db.get_position_stop", return_value={"entry_price": 88.0, "opened_at": opened,
+                                                            "thesis_bucket": "Moonshot", "conviction": 7}), \
+             patch("db.backfill_catalyst_outcome") as mock_backfill, \
+             patch("agents.crew._analyze_held_position", side_effect=fake_analyze):
+            crew.backfill_catalyst_tracking(max_per_run=10)
+
+        kwargs = mock_backfill.call_args.kwargs
+        assert kwargs["entry_price"] == 88.0
+        assert kwargs["entry_date"] == opened
+        assert kwargs["bucket"] == "Moonshot"
+        assert kwargs["conviction"] == 7

@@ -984,6 +984,28 @@ def check_profit_targets(self):
         raise self.retry(exc=e, countdown=60)
 
 
+@app.task(name="tasks.backfill_catalyst_tracking", bind=True, max_retries=1)
+def backfill_catalyst_tracking(self, max_per_run: int = 10):
+    """On-demand, NOT scheduled (2026-08-30, user request): one-time
+    gap-closer for positions held before catalyst/expected-return
+    tracking existed -- see agents.crew.backfill_catalyst_tracking's
+    docstring. Deliberately not added to beat_schedule; going-forward
+    captures already happen automatically at real trade execution
+    (execution.py), so there's no ongoing need to run this on a
+    schedule once the current backlog is cleared. Naturally resumable:
+    call again (or let a retry fire) to continue past whatever
+    max_per_run covered this run."""
+    try:
+        from agents.crew import backfill_catalyst_tracking as _backfill
+        results = _backfill(max_per_run=max_per_run)
+        backfilled = sum(1 for r in results if r["action"] == "BACKFILLED")
+        log.info(f"Catalyst backfill: {backfilled}/{len(results)} tickers backfilled this run")
+        return results
+    except Exception as e:
+        log.error(f"backfill_catalyst_tracking failed: {e}")
+        raise self.retry(exc=e, countdown=120)
+
+
 def _schedule_backstop_retry(ticker: str, alert: dict) -> None:
     """Queue a retry_backstop_sell for a backstop attempt that placed an
     order but got no fill (most commonly: submitted after the close, so

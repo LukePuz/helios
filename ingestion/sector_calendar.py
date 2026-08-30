@@ -63,8 +63,13 @@ def refresh_sector_calendar(
 
     constituents = get_sp500_constituents()
 
-    # {(gics_sector, week_start): [(ticker, earnings_date, confirmed), ...]}
-    buckets: dict[tuple[str, date], list[tuple[str, date, bool]]] = defaultdict(list)
+    # {(gics_sector, week_start): {ticker: confirmed}} -- keyed by ticker
+    # (not a plain list) so a ticker with multiple earnings_calendar rows
+    # in the same week (a stale estimated date alongside a firmer
+    # confirmed one -- upsert_earnings_date keeps both since they're
+    # different dates under its own (ticker, earnings_date) unique key)
+    # counts once toward the cluster, not once per row.
+    buckets: dict[tuple[str, date], dict[str, bool]] = defaultdict(dict)
     for row in rows:
         ticker = row["ticker"]
         gics_sector = constituents.get(ticker, {}).get("gics_sector")
@@ -72,15 +77,18 @@ def refresh_sector_calendar(
             continue  # not an S&P constituent (our own watchlist has plenty that aren't) -- no sector to cluster into
         earnings_date = row["earnings_date"]
         wk = _week_start(earnings_date)
-        buckets[(gics_sector, wk)].append((ticker, earnings_date, row.get("confirmed", False)))
+        confirmed = row.get("confirmed", False)
+        # Prefer confirmed=True if this ticker already has an entry for
+        # this week from a different row.
+        buckets[(gics_sector, wk)][ticker] = buckets[(gics_sector, wk)].get(ticker, False) or confirmed
 
     count = 0
     for (gics_sector, wk), members in buckets.items():
         if len(members) < min_count:
             continue
         etf = SECTOR_ETF_MAP[gics_sector]
-        tickers_sorted = sorted(m[0] for m in members)
-        confirmed_share = sum(1 for m in members if m[2]) / len(members)
+        tickers_sorted = sorted(members)
+        confirmed_share = sum(1 for c in members.values() if c) / len(members)
         confidence = "confirmed" if confirmed_share >= 0.5 else "estimated"
         window_end = wk + timedelta(days=6)
         try:

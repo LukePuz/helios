@@ -77,6 +77,27 @@ class SectorCalendarTests(unittest.TestCase):
             count = refresh_sector_calendar(min_count=1)
         self.assertEqual(count, 0)
 
+    def test_same_ticker_multiple_rows_same_week_counts_once(self):
+        # Real incident (2026-08-30 live-DB seed): AVGO had two
+        # earnings_calendar rows in the same week (a stale estimated date
+        # alongside a firmer confirmed one -- different dates, so both
+        # satisfy the table's own (ticker, earnings_date) unique key) and
+        # was double-counted toward the cluster / listed twice in the note.
+        monday = _week_start(date.today() + timedelta(days=10))
+        rows = [
+            {"ticker": "AAPL", "earnings_date": monday, "confirmed": True},
+            {"ticker": "MSFT", "earnings_date": monday, "confirmed": True},
+            {"ticker": "NVDA", "earnings_date": monday + timedelta(days=1), "confirmed": True},
+            {"ticker": "NVDA", "earnings_date": monday + timedelta(days=2), "confirmed": False},
+        ]
+        with patch("db.get_earnings_in_range", return_value=rows), \
+             patch("ingestion.sp500_universe.get_sp500_constituents", return_value=self._constituents):
+            count = refresh_sector_calendar(min_count=3)
+        self.assertEqual(count, 1)
+        sector_rows = storage.query_events(scope="sector")
+        self.assertEqual(sector_rows[0]["thesis_note"].count("NVDA"), 1)
+        self.assertIn("3 Information Technology", sector_rows[0]["thesis_note"])
+
     def test_empty_earnings_range_returns_zero(self):
         with patch("db.get_earnings_in_range", return_value=[]):
             count = refresh_sector_calendar()

@@ -566,6 +566,19 @@ def execute_approved(
             chase_risk_pct_from_kijun=analyst_json.get("chase_risk_pct_from_kijun"),
             price_action=analyst_json.get("price_action"),
             price_action_structure=analyst_json.get("price_action_structure"),
+            # Catalyst/expected-return tracking (2026-08-30, user request) --
+            # promotes what used to only live in this same analyst_json blob
+            # into first-class trade_outcomes columns so it can actually be
+            # compared against what happens later, not just referenced at
+            # the moment of the original call.
+            catalyst_event=(analyst_json.get("catalyst") or {}).get("event"),
+            catalyst_date=(analyst_json.get("catalyst") or {}).get("date"),
+            catalyst_is_priced_in=(analyst_json.get("catalyst") or {}).get("is_priced_in"),
+            expected_return_pct=analyst_json.get("expected_return_pct"),
+            expected_downside_pct=analyst_json.get("expected_downside_pct"),
+            thesis_summary=analyst_json.get("thesis_summary"),
+            sources=analyst_json.get("sources"),
+            source_count=analyst_json.get("source_count"),
         )
 
         # Send trade alert — full rationale + all conviction scores + bucket,

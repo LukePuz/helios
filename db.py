@@ -454,6 +454,25 @@ _MIGRATIONS: list[tuple[int, str]] = [
     # doesn't re-sell a portion every time it runs (every 30 min once
     # wired into the schedule) once the target's already been taken once.
     (30, "ALTER TABLE position_stops ADD COLUMN IF NOT EXISTS profit_target_taken BOOLEAN DEFAULT FALSE;"),
+    # Catalyst/expected-return tracking (2026-08-30, user request): promotes
+    # what used to live only transiently in pending_approvals.analyst_json
+    # (catalyst description, expected return, cited sources) into first-class
+    # columns on trade_outcomes -- the table that actually tracks a position
+    # long-term (review_30d/60d/90d prices, outcome_pct) -- so a thesis can
+    # be checked against what it actually predicted, not just an outcome
+    # percentage with no record of what was supposed to happen or why.
+    # catalyst_materialized is deliberately nullable with no default: it's
+    # populated later by a comparison job once the catalyst_date has passed,
+    # not known at entry time.
+    (31, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS catalyst_event TEXT; "
+         "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS catalyst_date VARCHAR(20); "
+         "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS catalyst_is_priced_in BOOLEAN; "
+         "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS catalyst_materialized BOOLEAN; "
+         "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS expected_return_pct DECIMAL; "
+         "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS expected_downside_pct DECIMAL; "
+         "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS thesis_summary TEXT; "
+         "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS sources_json JSONB; "
+         "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS source_count INTEGER;"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -1848,6 +1867,14 @@ def log_trade_outcome(
     chase_risk_pct_from_kijun: float | None = None,
     price_action: int | None = None,
     price_action_structure: str | None = None,
+    catalyst_event: str | None = None,
+    catalyst_date: str | None = None,
+    catalyst_is_priced_in: bool | None = None,
+    expected_return_pct: float | None = None,
+    expected_downside_pct: float | None = None,
+    thesis_summary: str | None = None,
+    sources: list | None = None,
+    source_count: int | None = None,
 ) -> None:
     # Stamp the SPY price at entry so we can compute alpha (return vs. benchmark)
     # when the trade eventually closes.
@@ -1868,12 +1895,18 @@ def log_trade_outcome(
                 "(approval_id, trading_env, ticker, action, conviction, thesis_bucket, entry_price, "
                 " entry_benchmark_price, thesis_strength, catalyst_quality, "
                 " valuation_risk_reward, data_completeness, chase_risk, "
-                " chase_risk_pct_from_kijun, price_action, price_action_structure) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                " chase_risk_pct_from_kijun, price_action, price_action_structure, "
+                " catalyst_event, catalyst_date, catalyst_is_priced_in, "
+                " expected_return_pct, expected_downside_pct, thesis_summary, "
+                " sources_json, source_count) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (approval_id, TRADING_ENV, ticker, action, conviction, bucket, entry_price,
                  entry_benchmark_price, thesis_strength, catalyst_quality,
                  valuation_risk_reward, data_completeness, chase_risk,
-                 chase_risk_pct_from_kijun, price_action, price_action_structure),
+                 chase_risk_pct_from_kijun, price_action, price_action_structure,
+                 catalyst_event, catalyst_date, catalyst_is_priced_in,
+                 expected_return_pct, expected_downside_pct, thesis_summary,
+                 psycopg2.extras.Json(sources) if sources is not None else None, source_count),
             )
         conn.commit()
     except Exception as e:

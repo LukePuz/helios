@@ -28,10 +28,26 @@ BASE_URL = "https://api.polygon.io"
 
 from config import SYMBOLS
 
+# Endpoint path templates (ticker stripped) that have already 403'd with
+# NOT_AUTHORIZED this process's lifetime -- found 2026-09-02: the current
+# Polygon plan doesn't include real-time snapshot data ("You are not
+# entitled to this data. Please upgrade your plan"), a per-ENDPOINT plan
+# restriction, not a per-ticker or transient failure, so every single
+# get_snapshot() call across the whole day logged an identical WARNING.
+# Since it's plan-tier (not the key itself -- /v3/reference/* works fine
+# on the same key), retrying it is pointless until the plan changes; this
+# just downgrades the noise to DEBUG after the first hit per endpoint
+# template, it doesn't stop calling it (a plan upgrade should start
+# working again without a restart).
+_ENTITLEMENT_BLOCKED: set[str] = set()
+
 
 def _get(endpoint: str, params: dict | None = None) -> dict:
     if not API_KEY:
         return {}
+    # Strip the ticker (last path segment) to get a template key shared
+    # across all tickers hitting the same restricted endpoint.
+    endpoint_template = endpoint.rsplit("/", 1)[0]
     try:
         resp = requests.get(
             f"{BASE_URL}{endpoint}",
@@ -39,7 +55,27 @@ def _get(endpoint: str, params: dict | None = None) -> dict:
             timeout=10,
         )
         resp.raise_for_status()
+        _ENTITLEMENT_BLOCKED.discard(endpoint_template)  # started working again (plan upgraded)
         return resp.json()
+    except requests.exceptions.HTTPError as e:
+        is_entitlement = (
+            e.response is not None and e.response.status_code == 403
+            and "NOT_AUTHORIZED" in e.response.text
+        )
+        if is_entitlement:
+            if endpoint_template not in _ENTITLEMENT_BLOCKED:
+                _ENTITLEMENT_BLOCKED.add(endpoint_template)
+                log.warning(
+                    f"Polygon plan doesn't include {endpoint_template} data "
+                    f"(403 NOT_AUTHORIZED) — suppressing repeat warnings for "
+                    f"this endpoint until the plan changes or the process "
+                    f"restarts. Upgrade at polygon.io/pricing to restore it."
+                )
+            else:
+                log.debug(f"Polygon fetch failed ({endpoint}): {e}")
+        else:
+            log.warning(f"Polygon fetch failed ({endpoint}): {e}")
+        return {}
     except Exception as e:
         log.warning(f"Polygon fetch failed ({endpoint}): {e}")
         return {}

@@ -28,6 +28,20 @@ from config import SYMBOLS
 _SOURCE = "congressional"
 
 
+class QuiverAuthError(Exception):
+    """Raised on a 401 from Quiver Quant -- a dead/expired API key, not a
+    per-ticker/transient problem. Found 2026-09-02: poll_once() looped all
+    ~75 SYMBOLS every run hitting this same 401 on every single one (a key
+    that's dead stays dead for the whole run, never just one ticker),
+    logging 75 identical warnings and burning the whole poll cycle's time
+    budget on requests guaranteed to fail. Distinguished from a generic
+    request exception (timeout, one ticker's data genuinely unavailable,
+    etc.) so poll_once can abort the REST of this run's loop on the first
+    one instead of ignoring it 74 more times, while still retrying fresh
+    next scheduled poll (config.py's beat_schedule) rather than being
+    disabled outright -- a renewed key picks back up on its own."""
+
+
 def _is_seen(trade_id: str) -> bool:
     try:
         import db
@@ -45,7 +59,12 @@ def _mark_seen(trade_id: str) -> None:
 
 
 def _get_congressional_trades(ticker: str) -> list[dict]:
-    """Fetches recent congressional trades for a ticker."""
+    """Fetches recent congressional trades for a ticker.
+
+    Raises QuiverAuthError on a 401 (see its docstring) so the caller can
+    abort the batch instead of retrying a dead key per-ticker; any other
+    failure (timeout, one ticker's data unavailable, etc.) still returns
+    [] so the rest of the batch proceeds as before."""
     if not API_KEY:
         return []
     try:
@@ -56,6 +75,11 @@ def _get_congressional_trades(ticker: str) -> list[dict]:
         )
         resp.raise_for_status()
         return resp.json() or []
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 401:
+            raise QuiverAuthError(str(e)) from e
+        log.warning(f"Quiver Quant fetch failed for {ticker}: {e}")
+        return []
     except Exception as e:
         log.warning(f"Quiver Quant fetch failed for {ticker}: {e}")
         return []
@@ -69,7 +93,18 @@ def poll_once() -> list[dict]:
 
     new_trades = []
     for ticker in SYMBOLS:
-        trades = _get_congressional_trades(ticker)
+        try:
+            trades = _get_congressional_trades(ticker)
+        except QuiverAuthError as e:
+            log.warning(
+                f"Quiver Quant API key rejected (401) — aborting this poll's "
+                f"remaining {len(SYMBOLS) - SYMBOLS.index(ticker)} tickers "
+                f"instead of retrying a dead key on each one. Renew "
+                f"QUIVER_API_KEY in .env to restore congressional-trading "
+                f"data; the next scheduled poll will pick it up automatically "
+                f"once fixed. ({e})"
+            )
+            break
         for trade in trades[:5]:  # most recent 5 per ticker
             trade_id = f"{ticker}_{trade.get('TransactionDate','')}_{trade.get('Representative','')}"
             if _is_seen(trade_id):

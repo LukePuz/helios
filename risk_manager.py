@@ -28,6 +28,7 @@ try:
         REGIME_MULTIPLIER,
         ATR_STOP_MULTIPLIER,
         MOONSHOT_MAX_LOSS_PCT,
+        RISK_PCT_PER_TRADE,
         TRAILING_STOP_ACTIVATE,
         TRAILING_STOP_DISTANCE,
         MAX_POSITION_PCT_COMPOUNDER,
@@ -57,7 +58,8 @@ except ImportError:
     REGIME_MULTIPLIER             = {"Strong Risk-On": 1.2, "Risk-On": 1.0, "Neutral": 0.75,
                                      "Risk-Off": 0.5, "Strong Risk-Off": 0.25}
     ATR_STOP_MULTIPLIER           = {"Compounder": (2.0, 3.0), "Accelerator": (1.5, 2.0), "Moonshot": (None, None)}
-    MOONSHOT_MAX_LOSS_PCT         = 0.35
+    MOONSHOT_MAX_LOSS_PCT         = 0.20
+    RISK_PCT_PER_TRADE            = 0.02
     TRAILING_STOP_ACTIVATE        = {"Compounder": 0.30, "Accelerator": 0.20}
     TRAILING_STOP_DISTANCE        = {"Compounder": (0.15, 0.20), "Accelerator": (0.10, 0.15)}
     MAX_POSITION_PCT_COMPOUNDER   = 0.12
@@ -469,6 +471,38 @@ class RiskManager:
 
         # Stop loss
         stop_price, stop_method = self.calculate_stop(ticker, price, bucket)
+
+        # Fixed dollar-risk sizing cap (2026-09-11, user request, Minervini
+        # SEPA methodology): shares_initial above came purely from the
+        # bucket's %-of-account allocation table -- a wide-stop trade and a
+        # tight-stop trade in the same conviction band get the SAME share
+        # count, with the dollar risk simply whatever falls out of that
+        # allocation times the stop distance. This recomputes shares so a
+        # stop-out costs at most RISK_PCT_PER_TRADE of equity and takes
+        # whichever of the two share counts is SMALLER -- it only ever
+        # tightens sizing on a wide-stop trade, never loosens beyond the
+        # existing % cap. Applied after the whole-shares/cash-cap checks
+        # above (which already guarantee shares_initial >= 1) since the
+        # stop distance -- and therefore this cap -- isn't known until
+        # calculate_stop() runs.
+        if stop_price and stop_price < price:
+            risk_dollars = pv * RISK_PCT_PER_TRADE
+            risk_based_shares = int(risk_dollars / (price - stop_price))
+            if risk_based_shares < shares_initial:
+                if risk_based_shares < 1:
+                    return {"position_size_pct": 0, "dollar_amount": 0, "shares_initial": 0,
+                            "cash_blocked": False,
+                            "flags": flags + [
+                                f"Stop distance (${price - stop_price:.2f}, {stop_method}) is too wide to "
+                                f"buy even 1 share of {ticker} within the {RISK_PCT_PER_TRADE:.1%} "
+                                f"per-trade risk cap (${risk_dollars:,.2f}) — skipping"]}
+                flags.append(
+                    f"Risk-based sizing: ${price - stop_price:.2f} stop distance limits to "
+                    f"{risk_based_shares} shares (vs {shares_initial} from the {bucket} allocation "
+                    f"cap) to keep max loss at/under {RISK_PCT_PER_TRADE:.1%} of equity"
+                )
+                shares_initial = risk_based_shares
+                initial_dollar = shares_initial * price
 
         # Trailing stop params
         trail_activate = TRAILING_STOP_ACTIVATE.get(bucket)

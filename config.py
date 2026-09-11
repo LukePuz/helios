@@ -149,7 +149,14 @@ ATR_STOP_MULTIPLIER: dict[str, tuple[float, float]] = {
     "Accelerator": (1.5, 2.0),    # 1.5-2× ATR
     "Moonshot":    (None, None),   # defined max loss, not ATR-based
 }
-MOONSHOT_MAX_LOSS_PCT = 0.35   # 35% of position value for moonshot stop
+# Tightened from 0.35 to 0.20 (2026-09-11, user request) -- 35% was
+# deliberately wide to avoid whipsaw stop-outs on inherently volatile
+# names, but on a small account the dollar risk of letting a Moonshot
+# position run to a 35% loss before cutting it was judged too large
+# relative to the added whipsaw protection. Applies system-wide to every
+# Moonshot position (LUNR/QBTS/RGTI at the time of this change), not a
+# per-ticker override -- see calculate_stop()'s Moonshot branch.
+MOONSHOT_MAX_LOSS_PCT = 0.20
 
 # Trailing stop activation thresholds
 TRAILING_STOP_ACTIVATE: dict[str, float] = {

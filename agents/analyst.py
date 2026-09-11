@@ -599,6 +599,7 @@ def _stub_recommendation(candidate: dict, reason: str) -> dict:
         "expected_downside_pct": None,
         "weeks_to_catalyst": None,
         "expected_return_per_week": None,
+        "trend_template": None,
         "options_opportunity": False,
         "options_notes":   None,
         "pass_to_risk":    False,
@@ -802,6 +803,36 @@ def analyze(
             parsed["pass_to_risk"] = False
             parsed["reasoning"] = parsed.get("reasoning", "") + f" [Downgraded: {reason}]"
 
+    # Trend Template gate (2026-09-11, user request) -- Mark Minervini's
+    # 8-point Stage-2-uptrend criteria, see agents/price_action.py's
+    # compute_trend_template() docstring for the full rule set and the
+    # documented RS-percentile proxy. Scoped to Accelerator only:
+    # Minervini's methodology targets established momentum leaders, which
+    # is Accelerator's role here, not Moonshot's (pre-uptrend speculative
+    # plays would almost never pass this by design) or Compounder's
+    # (long-term thesis, not a momentum-timing entry). Same "prompt
+    # instruction alone isn't reliable enough" reasoning as the other
+    # deterministic gates above -- the LLM's own price/trend commentary
+    # isn't a substitute for computing the actual 8 criteria.
+    trend_template = None
+    if bucket == "Accelerator" and action in ("OPEN", "ADD"):
+        try:
+            from agents.price_action import compute_trend_template
+            trend_template = compute_trend_template(ticker)
+        except Exception as e:
+            log.debug(f"[{ticker}] Trend Template check failed: {e}")
+        if trend_template is not None and not trend_template["pass"]:
+            log.info(f"[{ticker}] Trend Template failed ({trend_template['reasoning']}) — downgrading to WATCH")
+            action = "WATCH"
+            parsed["pass_to_risk"] = False
+            parsed["reasoning"] = parsed.get("reasoning", "") + f" [Downgraded: Trend Template — {trend_template['reasoning']}]"
+        # trend_template is None (insufficient history) passes through
+        # un-gated rather than failing closed -- unlike the expected-
+        # return-rate gate, a genuinely new listing without 252 days of
+        # history isn't a red flag the way "no catalyst timeframe" is; it's
+        # just data the gate can't evaluate yet, and Accelerator names are
+        # by definition established enough that this should be rare.
+
     # Moonshots need conviction >= 7 for OPEN
     if bucket == "Moonshot" and action == "OPEN" and conviction < 7:
         log.info(f"[{ticker}] Moonshot conviction {conviction} < 7 — downgrading to WATCH")
@@ -879,6 +910,7 @@ def analyze(
         "expected_downside_pct": _optional_float("expected_downside_pct"),
         "weeks_to_catalyst": weeks_to_catalyst,
         "expected_return_per_week": per_week,
+        "trend_template": trend_template,
         "upside_downside_ratio": udr,
         "key_risks": parsed.get("key_risks", []),
         "sources": sources,

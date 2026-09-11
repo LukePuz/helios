@@ -235,3 +235,117 @@ def compute_price_action(ticker: str, bars: list[dict] | None = None) -> dict | 
         "volume_confirmation": volume_confirmation,
         "summary": "; ".join(summary_parts) + ".",
     }
+
+
+# ---------------------------------------------------------------------------
+# Trend Template (2026-09-11, user request)
+# ---------------------------------------------------------------------------
+# Mark Minervini's 8-point "Trend Template" for a confirmed Stage 2 uptrend,
+# from his publicly documented SEPA criteria (not this codebase's own
+# invention) -- a deterministic, ALL-8-OR-NOTHING gate, distinct from
+# compute_price_action's above SUBJECTIVE 1-5 score (structure/OBV/MA-slope
+# used as context, not a pass/fail filter). Wired into agents/analyst.py as
+# a hard gate for Accelerator OPEN/ADD, same "prompt instruction alone isn't
+# reliable enough" reasoning as the UDR/multi-source/expected-return-rate
+# gates there.
+
+TREND_TEMPLATE_RS_LOOKBACK = 252            # ~1 trading year -- both the 52-week hi/lo window and the RS-proxy return window
+TREND_TEMPLATE_MA200_SLOPE_LOOKBACK = 20    # ~1 calendar month of trading days, matches "rising for at least 1 month"
+TREND_TEMPLATE_MIN_ABOVE_52W_LOW = 0.25     # price >= 25% above the 52-week low
+TREND_TEMPLATE_MAX_BELOW_52W_HIGH = 0.25    # price within 25% of the 52-week high
+# The real 8th criterion (IBD Relative Strength ranking >= 70) is a
+# PERCENTILE across the entire market -- computing that properly means
+# ranking this ticker's trailing return against every other stock's, a
+# separate and much larger undertaking (see agents/market_regime.py's
+# SECTOR_ETF_MAP-style universe sweeps for the shape that would take).
+# This is a proxy, not a replication: trailing-year return vs SPY's same-
+# window return, requiring real outperformance -- directionally the same
+# idea (market-relative strength, not just "the stock went up"), but never
+# confused with the literal IBD percentile in the returned reasoning.
+RS_PROXY_MIN_OUTPERFORMANCE = 0.0   # must simply be beating SPY, not just close to it
+
+
+def compute_trend_template(
+    ticker: str, bars: list[dict] | None = None, spy_bars: list[dict] | None = None,
+) -> dict | None:
+    """
+    Returns {"pass": bool, "criteria": {name: bool, ...}, "reasoning": str}
+    or None if there isn't enough history yet (mirrors compute_price_action's
+    own None-on-insufficient-data convention).
+
+    `bars`/`spy_bars` can be passed in to avoid a redundant fetch; otherwise
+    fetched fresh via trading_bot's own price history cache.
+    """
+    if bars is None:
+        try:
+            import db
+            bars = db.get_price_history(ticker, days=TREND_TEMPLATE_RS_LOOKBACK + TREND_TEMPLATE_MA200_SLOPE_LOOKBACK + 10)
+        except Exception as e:
+            log.debug(f"[{ticker}] trend_template: history fetch failed: {e}")
+            return None
+    if spy_bars is None:
+        try:
+            import db
+            spy_bars = db.get_price_history("SPY", days=TREND_TEMPLATE_RS_LOOKBACK + 10)
+        except Exception as e:
+            log.debug(f"[{ticker}] trend_template: SPY history fetch failed: {e}")
+            spy_bars = None
+
+    min_bars_needed = TREND_TEMPLATE_RS_LOOKBACK + TREND_TEMPLATE_MA200_SLOPE_LOOKBACK
+    if len(bars) < min_bars_needed:
+        return None
+
+    closes = [b["close"] for b in bars]
+    price = closes[-1]
+
+    def _sma(window: int) -> list[float]:
+        return [sum(closes[max(0, i - window + 1):i + 1]) / len(closes[max(0, i - window + 1):i + 1])
+                for i in range(len(closes))]
+
+    ma50, ma150, ma200 = _sma(50), _sma(150), _sma(200)
+
+    window = closes[-TREND_TEMPLATE_RS_LOOKBACK:]
+    low_52w, high_52w = min(window), max(window)
+
+    ma200_slope_rising = (
+        len(ma200) > TREND_TEMPLATE_MA200_SLOPE_LOOKBACK
+        and ma200[-1] > ma200[-TREND_TEMPLATE_MA200_SLOPE_LOOKBACK]
+    )
+
+    pct_above_low = (price - low_52w) / low_52w if low_52w else 0.0
+    pct_below_high = (high_52w - price) / high_52w if high_52w else 1.0
+
+    rs_proxy_pass = None
+    rs_note = "SPY history unavailable -- RS proxy skipped (fails closed, see below)"
+    if spy_bars and len(spy_bars) >= TREND_TEMPLATE_RS_LOOKBACK:
+        spy_closes = [b["close"] for b in spy_bars][-TREND_TEMPLATE_RS_LOOKBACK:]
+        ticker_return = (window[-1] - window[0]) / window[0] if window[0] else 0.0
+        spy_return = (spy_closes[-1] - spy_closes[0]) / spy_closes[0] if spy_closes[0] else 0.0
+        outperformance = ticker_return - spy_return
+        rs_proxy_pass = outperformance > RS_PROXY_MIN_OUTPERFORMANCE
+        rs_note = (f"trailing-year return {ticker_return:+.1%} vs SPY {spy_return:+.1%} "
+                   f"({outperformance:+.1%} relative -- RS proxy, not the literal IBD percentile)")
+
+    criteria = {
+        "price_above_150dma_and_200dma": price > ma150[-1] and price > ma200[-1],
+        "150dma_above_200dma":           ma150[-1] > ma200[-1],
+        "200dma_rising_1_month":         ma200_slope_rising,
+        "50dma_above_150dma_and_200dma": ma50[-1] > ma150[-1] and ma50[-1] > ma200[-1],
+        "price_above_50dma":             price > ma50[-1],
+        "above_52w_low_by_25pct":        pct_above_low >= TREND_TEMPLATE_MIN_ABOVE_52W_LOW,
+        "within_25pct_of_52w_high":      pct_below_high <= TREND_TEMPLATE_MAX_BELOW_52W_HIGH,
+        # Fails closed when SPY data is unavailable rather than silently
+        # dropping to a 7-point check -- same "fail toward re-checking, not
+        # silently skipping" posture used elsewhere in this codebase.
+        "relative_strength_proxy":       bool(rs_proxy_pass),
+    }
+    all_pass = all(criteria.values())
+
+    failed = [k for k, v in criteria.items() if not v]
+    reasoning = (
+        "All 8 Trend Template criteria met -- confirmed Stage 2 uptrend."
+        if all_pass else
+        f"Failed {len(failed)}/8 Trend Template criteria: {', '.join(failed)}. {rs_note}"
+    )
+
+    return {"pass": all_pass, "criteria": criteria, "reasoning": reasoning}

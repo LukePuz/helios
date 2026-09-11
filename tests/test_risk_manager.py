@@ -56,6 +56,78 @@ class TestSizing:
         assert sizing["flags"]
 
 
+class TestRiskBasedSizing:
+    """Minervini-style fixed dollar-risk sizing cap (2026-09-11, user
+    request): shares = min(allocation-cap shares, risk$/(entry-stop)).
+    Portfolio value $100,000, conviction=8 -> band 7, bucket=Compounder
+    (0.05,0.08) -> base_pct=0.065, Risk-On mult=1.0 -> target=0.065,
+    well under the 12% hard cap -> dollar_amount=$6,500, initial (55%)
+    =$3,575 -> at price=$100, allocation-cap shares_initial=35 before any
+    risk-based adjustment. RISK_PCT_PER_TRADE=0.02 -> risk budget=$2,000
+    on a $100,000 portfolio."""
+
+    def test_wide_stop_gets_capped_below_allocation_shares(self):
+        # distance=$80 -> risk-based shares = 2000/80 = 25, less than the
+        # 35 the allocation cap alone would give -- risk cap must bind.
+        client = _make_client(portfolio_value=100_000.0)
+        with patch.object(risk_manager.RiskManager, "calculate_stop", return_value=(20.0, "mocked")), \
+             patch("risk_manager.TRADING_ENV", "paper"), \
+             patch("db.get_state", side_effect=lambda k, d=None: {"trading_halted_paper": "false",
+                                                                    "high_water_mark_paper": "100000"}.get(k, d)), \
+             patch("db.set_state"):
+            rm = risk_manager.RiskManager(client)
+            sizing = rm.size_position("NVDA", conviction=8, bucket="Compounder",
+                                      regime="Risk-On", price=100.0)
+        assert sizing["shares_initial"] == 25
+        assert any("Risk-based sizing" in f for f in sizing["flags"])
+
+    def test_tight_stop_leaves_allocation_cap_unchanged(self):
+        # distance=$5 -> risk-based shares = 2000/5 = 400, far more than
+        # the 35 from the allocation cap -- allocation cap keeps binding,
+        # no risk-based flag should appear.
+        client = _make_client(portfolio_value=100_000.0)
+        with patch.object(risk_manager.RiskManager, "calculate_stop", return_value=(95.0, "mocked")), \
+             patch("risk_manager.TRADING_ENV", "paper"), \
+             patch("db.get_state", side_effect=lambda k, d=None: {"trading_halted_paper": "false",
+                                                                    "high_water_mark_paper": "100000"}.get(k, d)), \
+             patch("db.set_state"):
+            rm = risk_manager.RiskManager(client)
+            sizing = rm.size_position("NVDA", conviction=8, bucket="Compounder",
+                                      regime="Risk-On", price=100.0)
+        assert sizing["shares_initial"] == 35
+        assert not any("Risk-based sizing" in f for f in sizing["flags"])
+
+    def test_stop_too_wide_for_even_one_share_skips_with_a_flag(self):
+        # distance=$2,001 > the full $2,000 risk budget -- risk-based
+        # shares floors to 0, must skip explicitly, not silently.
+        client = _make_client(portfolio_value=100_000.0)
+        with patch.object(risk_manager.RiskManager, "calculate_stop", return_value=(-1901.0, "mocked")), \
+             patch("risk_manager.TRADING_ENV", "paper"), \
+             patch("db.get_state", side_effect=lambda k, d=None: {"trading_halted_paper": "false",
+                                                                    "high_water_mark_paper": "100000"}.get(k, d)), \
+             patch("db.set_state"):
+            rm = risk_manager.RiskManager(client)
+            sizing = rm.size_position("NVDA", conviction=8, bucket="Compounder",
+                                      regime="Risk-On", price=100.0)
+        assert sizing["shares_initial"] == 0
+        assert any("too wide to buy even 1 share" in f for f in sizing["flags"])
+
+    def test_stop_at_or_above_entry_price_skips_risk_cap_entirely(self):
+        # A stop >= entry (data glitch or an already-favorable breakeven
+        # stop) must not divide by zero or go negative -- the risk-cap
+        # block is guarded to only run when stop_price < price.
+        client = _make_client(portfolio_value=100_000.0)
+        with patch.object(risk_manager.RiskManager, "calculate_stop", return_value=(100.0, "mocked")), \
+             patch("risk_manager.TRADING_ENV", "paper"), \
+             patch("db.get_state", side_effect=lambda k, d=None: {"trading_halted_paper": "false",
+                                                                    "high_water_mark_paper": "100000"}.get(k, d)), \
+             patch("db.set_state"):
+            rm = risk_manager.RiskManager(client)
+            sizing = rm.size_position("NVDA", conviction=8, bucket="Compounder",
+                                      regime="Risk-On", price=100.0)
+        assert sizing["shares_initial"] == 35
+
+
 class TestMicroTierBandRescaling:
     """Incident 2026-08-21: Compounder/Accelerator never got the same
     tier-rescaling Moonshot got on 2026-08-13 — their BUCKET_SIZE_TABLE

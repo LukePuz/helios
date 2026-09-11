@@ -158,6 +158,19 @@ ATR_STOP_MULTIPLIER: dict[str, tuple[float, float]] = {
 # per-ticker override -- see calculate_stop()'s Moonshot branch.
 MOONSHOT_MAX_LOSS_PCT = 0.20
 
+# Fixed dollar-risk position sizing (2026-09-11, user request, per Mark
+# Minervini's SEPA methodology): risk_manager.size_position() sizes shares
+# purely off each bucket's %-of-account allocation table (BUCKET_SIZE_TABLE)
+# -- the dollar amount at risk if the stop hits is whatever falls out of
+# that allocation times the stop distance, so two trades in the same
+# conviction band get the SAME share count regardless of how close or far
+# their stops are. This caps shares so a stop-out never costs more than
+# RISK_PCT_PER_TRADE of account equity, taking whichever of {allocation-cap
+# shares, risk-cap shares} is smaller -- it only ever tightens sizing on a
+# wide-stop trade, never loosens it beyond the existing % caps. 2% is the
+# midpoint of Minervini's publicly stated 1.25-2.5% per-trade risk range.
+RISK_PCT_PER_TRADE = 0.02
+
 # Trailing stop activation thresholds
 TRAILING_STOP_ACTIVATE: dict[str, float] = {
     "Compounder":  0.30,   # activate after 30% gain

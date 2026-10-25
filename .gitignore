@@ -29,3 +29,9 @@ CLAUDE.md
 # project workflows (e.g. /eod-review), not per-user local state.
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
+
+# AI usage log (research-log/README.md). The shared AI prompt protocol is
+# committed even though personal CLAUDE.md notes are not. Raw prompt capture
+# stays local because prompts can contain pasted command output.
+!.claude/CLAUDE.md
+research-log/raw-prompts.jsonl

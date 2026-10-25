@@ -26,6 +26,14 @@ load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env")
 log = logging.getLogger(__name__)
 
 OLLAMA_HOST  = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+# Dedicated CPU-only Ollama for the small models (deploy/systemd/ollama-cpu.service).
+# Found 2026-10-25: num_gpu=0 kept the 7B off the GPUs but not out of the main
+# server's scheduler. Its unbroken stream of screening calls (86 in 10 min
+# after an outage backlog) meant the 72B analyst never got a turn to load:
+# zero 72B loads in 6+ hours, every analysis a stub. On an idle server the
+# same 72B loads in 11s. A separate server means screening load can't block
+# the analyst at all.
+OLLAMA_CPU_HOST = os.getenv("OLLAMA_CPU_HOST", "http://localhost:11435")
 SCREENER_MODEL = os.getenv("SCREENER_MODEL", "qwen2.5:7b")
 
 from config import SYMBOLS
@@ -90,37 +98,49 @@ Respond ONLY with valid JSON, no other text:
 
 
 def _call_ollama(prompt: str) -> str | None:
-    """Calls the local Ollama 7B model. Returns raw text or None if unavailable."""
-    try:
-        resp = requests.post(
-            f"{OLLAMA_HOST}/api/generate",
-            json={
-                "model":  SCREENER_MODEL,
-                "prompt": prompt,
-                "stream": False,
-                "options": {"temperature": 0.1, "num_predict": 256, "num_gpu": 0},
-                # Screening now runs on its own queue/worker at higher
-                # concurrency than the 72B analyst (see tasks.screen_event) —
-                # both GPUs already sit at ~93% VRAM just holding the 72B
-                # model, so a concurrent GPU-bound 7B call would either fail
-                # or force the 72B further onto CPU. Forcing CPU here (same
-                # fix as chat_assistant.py) means screening never contends
-                # with the analyst for VRAM at all.
-                "keep_alive": "30m",
-            },
-            # First CPU call after a cold start can take longer than the old
-            # 30s bound (measured ~30s+ cold vs ~28s once warm) — generous
-            # enough to avoid an unnecessary keyword-fallback on every
-            # worker restart, still bounded since screening must stay fast.
-            timeout=60,
-        )
-        resp.raise_for_status()
-        return resp.json().get("response", "")
-    except requests.exceptions.ConnectionError:
-        return None  # Ollama not running yet
-    except Exception as e:
-        log.warning(f"Ollama 7B call failed: {e}")
-        return None
+    """Calls the local Ollama 7B model. Returns raw text or None if unavailable.
+
+    Tries the dedicated CPU server first. Falls back to the main server only
+    when the CPU one isn't running at all (connection refused), which is the
+    pre-2026-10-25 behavior. A timeout or error does NOT fall back, so a slow
+    CPU server can never double the latency or push load onto the 72B's
+    server."""
+    for host in (OLLAMA_CPU_HOST, OLLAMA_HOST):
+        try:
+            return _post_generate(host, prompt)
+        except requests.exceptions.ConnectionError:
+            continue  # this server isn't running; try the next
+        except Exception as e:
+            log.warning(f"Ollama 7B call failed ({host}): {e}")
+            return None
+    return None  # no Ollama running yet
+
+
+def _post_generate(host: str, prompt: str) -> str:
+    resp = requests.post(
+        f"{host}/api/generate",
+        json={
+            "model":  SCREENER_MODEL,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": 0.1, "num_predict": 256, "num_gpu": 0},
+            # Screening now runs on its own queue/worker at higher
+            # concurrency than the 72B analyst (see tasks.screen_event) —
+            # both GPUs already sit at ~93% VRAM just holding the 72B
+            # model, so a concurrent GPU-bound 7B call would either fail
+            # or force the 72B further onto CPU. Forcing CPU here (same
+            # fix as chat_assistant.py) means screening never contends
+            # with the analyst for VRAM at all.
+            "keep_alive": "30m",
+        },
+        # First CPU call after a cold start can take longer than the old
+        # 30s bound (measured ~30s+ cold vs ~28s once warm) — generous
+        # enough to avoid an unnecessary keyword-fallback on every
+        # worker restart, still bounded since screening must stay fast.
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return resp.json().get("response", "")
 
 
 def _get_tier(ticker: str) -> str:

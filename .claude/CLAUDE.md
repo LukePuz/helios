@@ -74,6 +74,9 @@ Rules for the entry:
 - Commit the work first, then write the entry with that commit's hash, then
   commit the log entry separately (`research-log: <title>`). A file can't
   contain the hash of the commit it lives in.
+- Stage `research-log/transcripts-manifest.csv` in every `research-log:`
+  commit. The session hooks append rows to it, and committing them is what
+  timestamps the hashes.
 - Never put secrets, API keys, account numbers, or balances in the log. If the
   original prompt contained one, replace it with `[REDACTED: <kind>]` and say
   so in the entry. The verbatim original stays in the hook capture.

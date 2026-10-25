@@ -66,6 +66,9 @@ Rules for the entry:
 
 - Always include the original next to the refined version, labeled as above.
   The refined text is AI-written, and the log must show who wrote what.
+- If the request text was drafted by another AI (e.g. Jarvis on the PC) and
+  Luke pasted it, don't label it "Luke (original)". Name who drafted it and
+  that Luke pasted it. Ask him if it's unclear.
 - Name AI-generated code down to the file, or the function when only part of
   a file was AI-written. That is the citation Rule 8 requires.
 - Commit the work first, then write the entry with that commit's hash, then

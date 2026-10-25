@@ -37,6 +37,7 @@ class TestSellRouting:
              patch("db.log_pending_approval", return_value=10), \
              patch("db.claim_approval_for_execution", return_value=True), \
              patch("db.get_approval_by_id", return_value={"id": 10}), \
+             patch("db.update_approval_status"), \
              patch("execution.execute_approved", return_value=True) as mock_execute, \
              patch("agents.crew._get_price", return_value=100.0), \
              patch("risk_manager.RiskManager") as mock_rm_cls, \

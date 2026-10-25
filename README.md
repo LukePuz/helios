@@ -124,7 +124,7 @@ bash setup.sh
 
 For unattended operation, see [`deploy/systemd/`](deploy/systemd/).
 
-Verification: `python test_connection.py` (broker), `python smoke_test.py` (models/data), `python -m pytest tests/` (unit tests).
+Verification: `python scripts/test_connection.py` (broker), `python scripts/smoke_test.py` (models/data), `python -m pytest tests/` (unit tests).
 
 ---
 
@@ -135,6 +135,26 @@ Since October 2026, every AI session on this repository is logged: each
 request, the AI-refined version of it, what was changed, and the commit, in
 [`research-log/`](research-log/). Entries name the files and functions the AI
 generated. The protocol is in [`.claude/CLAUDE.md`](.claude/CLAUDE.md).
+
+---
+
+## Repository layout
+
+| Path | What's there |
+|---|---|
+| `main.py`, `tasks.py` | Entry point and the Celery task schedule (ingestion, pipeline runs, monitors) |
+| `agents/` | Screener, Analyst, market regime and Markov models, candidate scanner, crew orchestration |
+| `risk_manager.py`, `execution.py`, `ibkr.py` | Position sizing and stops, order execution, broker client |
+| `context_engine.py`, `vector_store.py`, `knowledge_loader.py` | Situation briefs, ChromaDB retrieval, knowledge-base loading |
+| `ingestion/` | One module per data source (EDGAR, options flow, insider, congressional, macro, news, ...) |
+| `catalyst_service/` | Earnings, sector and macro event calendar (SQLite) |
+| `knowledge/` | Watchlist, sector theses and risk rules in markdown, loaded into prompts |
+| `db.py`, `config.py` | Postgres schema and migrations; every tunable limit |
+| `dashboard.py`, `telegram_bot.py`, `chat_assistant.py`, `standby_bot.py` | Streamlit UI, Telegram alerts and chat |
+| `deploy/` | systemd units, watchdog, log rotation for unattended operation |
+| `scripts/` | Manual checks and one-off setup (broker connection, smoke test, schema init) |
+| `tests/` | Unit tests, run in CI on every push to `main` |
+| `research-log/` | AI usage log (see below) |
 
 ---
 

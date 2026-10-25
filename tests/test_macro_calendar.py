@@ -72,7 +72,9 @@ class MacroCalendarTests(unittest.TestCase):
         with patch("ingestion.macro_calendar.date") as mock_date:
             mock_date.today.return_value = date(2026, 8, 30)
             refresh_macro_calendar()
-        events = client.upcoming_events(ticker=None, days_ahead=30)
+        with patch("catalyst_service.client.date") as mock_date:
+            mock_date.today.return_value = date(2026, 8, 30)
+            events = client.upcoming_events(ticker=None, days_ahead=30)
         fomc = [e for e in events if e["event_type"] == "fomc_meeting"]
         self.assertEqual(fomc[0]["event_date"], "2026-09-16")
 

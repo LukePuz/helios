@@ -1,7 +1,9 @@
 import sqlite3
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
+from unittest.mock import patch
 
 from catalyst_service import client
 from catalyst_service import storage
@@ -159,11 +161,12 @@ class CatalystScopeTests(unittest.TestCase):
         self.assertEqual(len(storage.query_events()), 3)
 
     def test_upcoming_events_combines_ticker_sector_and_macro(self):
-        # NVDA -> Information Technology -> XLK, per the real S&P constituent
+        # MSFT -> Information Technology -> XLK, per the real S&P constituent
         # map (ingestion.sp500_universe), so this exercises the real
-        # resolution path, not a mock.
+        # resolution path, not a mock. MSFT is also in that module's static
+        # fallback, so the test holds when Wikipedia can't be reached.
         storage.upsert_event({
-            "ticker": "NVDA", "event_date": "2026-09-10", "event_date_precision": "exact",
+            "ticker": "MSFT", "event_date": "2026-09-10", "event_date_precision": "exact",
             "event_type": "earnings", "confidence": "confirmed", "source_tier": 1, "sources": [],
         })
         storage.upsert_sector_event(
@@ -174,7 +177,10 @@ class CatalystScopeTests(unittest.TestCase):
             event_type="fomc_meeting", event_date="2026-09-16", confidence="confirmed",
             source_tier=1, sources=[],
         )
-        events = client.upcoming_events(ticker="NVDA", days_ahead=45)
+        # Freeze "today" so the fixed 2026-09 dates stay inside the window.
+        with patch("catalyst_service.client.date") as mock_date:
+            mock_date.today.return_value = date(2026, 8, 30)
+            events = client.upcoming_events(ticker="MSFT", days_ahead=45)
         scopes = [e["scope"] for e in events]
         self.assertEqual(set(scopes), {"ticker", "sector", "macro"})
         # sorted by date ascending
@@ -186,7 +192,9 @@ class CatalystScopeTests(unittest.TestCase):
             event_type="election", event_date="2026-11-03", confidence="confirmed",
             source_tier=1, sources=[],
         )
-        events = client.upcoming_events(ticker=None, days_ahead=90)
+        with patch("catalyst_service.client.date") as mock_date:
+            mock_date.today.return_value = date(2026, 8, 30)
+            events = client.upcoming_events(ticker=None, days_ahead=90)
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["scope"], "macro")
 

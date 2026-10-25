@@ -13,7 +13,7 @@ compute_weeks_to_catalyst and expected_return_per_week are pure functions
 (no live DB/Ollama required); the analyze() integration tests mock the
 LLM call end-to-end, same pattern as test_analyst_sources.py.
 """
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from agents.analyst import compute_weeks_to_catalyst, expected_return_per_week
@@ -106,12 +106,16 @@ def _response(action, expected_return_pct, catalyst_date, bucket="Accelerator"):
     })
 
 
+# analyze() measures weeks_to_catalyst from the real clock, so the
+# integration tests put the catalyst 3 weeks after today, not on a fixed date.
+_THREE_WEEKS_OUT = (datetime.now(timezone.utc) + timedelta(days=21)).strftime("%Y-%m-%d")
+
 _CANDIDATE = {"ticker": "SNOW", "role": "Accelerator", "tier": "Watch", "sector": "Software"}
 
 
 class TestExpectedReturnRateGateIntegration:
     def test_five_pct_in_three_weeks_clears_the_bar(self):
-        response = _response("OPEN", 5.0, "2026-09-20")  # ~3 weeks out from a real "now"
+        response = _response("OPEN", 5.0, _THREE_WEEKS_OUT)
         patches = _mock_analyze_deps(response)
         with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], \
              patches[6], patches[7], patches[8]:
@@ -122,7 +126,7 @@ class TestExpectedReturnRateGateIntegration:
         assert result["expected_return_per_week"] >= 1.0
 
     def test_two_pct_in_three_weeks_fails_the_bar(self):
-        response = _response("OPEN", 2.0, "2026-09-20")  # 2/3 = 0.67%/wk < 1.0
+        response = _response("OPEN", 2.0, _THREE_WEEKS_OUT)  # 2/3 = 0.67%/wk < 1.0
         patches = _mock_analyze_deps(response)
         with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], \
              patches[6], patches[7], patches[8]:

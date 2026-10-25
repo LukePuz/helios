@@ -102,7 +102,7 @@ Known limitations, stated rather than buried: the live sample is small and has l
 | Data | Postgres (Supabase), ChromaDB vector store, SQLite catalyst calendar |
 | Market data | Polygon, Alpaca data API, yfinance, FRED, SEC EDGAR, Unusual Whales, Quiver |
 | UI | Streamlit dashboard (portfolio, regime, signals, logs, manual trade) + Telegram bot |
-| Ops | systemd service, single-command launch, ~27.6k lines of Python, 29 test files, CI via GitHub Actions |
+| Ops | systemd service, single-command launch, ~28k lines of Python, 27 test files (313 tests), CI via GitHub Actions |
 
 ---
 
@@ -125,6 +125,16 @@ bash setup.sh
 For unattended operation, see [`deploy/systemd/`](deploy/systemd/).
 
 Verification: `python test_connection.py` (broker), `python smoke_test.py` (models/data), `python -m pytest tests/` (unit tests).
+
+---
+
+## AI assistance
+
+Parts of this codebase were written with AI coding assistants (Claude Code).
+Since October 2026, every AI session on this repository is logged: each
+request, the AI-refined version of it, what was changed, and the commit, in
+[`research-log/`](research-log/). Entries name the files and functions the AI
+generated. The protocol is in [`.claude/CLAUDE.md`](.claude/CLAUDE.md).
 
 ---
 

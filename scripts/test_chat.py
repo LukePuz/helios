@@ -1,6 +1,6 @@
 """
 Quick test for the group chat assistant.
-Run with: python test_chat.py
+Run with: python scripts/test_chat.py
 
 Tests:
   1. Trade intent parsing (no external deps)
@@ -11,9 +11,9 @@ import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from dotenv import load_dotenv
-load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
 
 # ---------------------------------------------------------------------------
 # 1. Trade intent parsing

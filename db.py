@@ -313,7 +313,7 @@ def _put_conn(conn) -> None:
 # so re-running init_db() (every process start) is a no-op after the first
 # time instead of re-executing every ALTER on every boot. All statements
 # remain idempotent (IF NOT EXISTS) as a second line of defense, but the
-# version table means `python setup_db.py` / init_db() logs exactly which
+# version table means `python scripts/setup_db.py` / init_db() logs exactly which
 # migrations are new versus already-applied, instead of that being invisible.
 # ---------------------------------------------------------------------------
 _MIGRATIONS: list[tuple[int, str]] = [

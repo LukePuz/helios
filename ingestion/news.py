@@ -2,8 +2,7 @@
 News ingestion — free sources only (yfinance + Google News RSS).
 
 Before this module, the codebase had NO general news ingestion at all.
-news_agent.py (kept for backward compatibility, unused by the pipeline)
-only computed a keyword sentiment score against Alpaca's news API and was
+The old news_agent.py (since removed) only computed a keyword sentiment score against Alpaca's news API and was
 never wired into the scanner, analyst, or context engine. This module
 fetches actual per-ticker headlines and feeds them through the same
 screen → analyze → route pipeline that SEC filings and options flow use,

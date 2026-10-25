@@ -1,6 +1,6 @@
 """
 Run once (or any time) to create/update all tables in Supabase.
-Usage: python setup_db.py
+Usage: python scripts/setup_db.py
 
 This used to hand-maintain its own copy of the schema (CREATE TABLE for only
 3 of the ~14 tables the app actually uses) which had drifted badly out of
@@ -13,6 +13,10 @@ versioned migrations tracked in schema_version).
 
 import logging
 import sys
+from pathlib import Path
+
+# Run from scripts/; the modules it imports live at the repo root.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(message)s")
 

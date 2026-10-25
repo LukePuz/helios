@@ -1,6 +1,6 @@
 """
 Quick broker connectivity smoke test.
-Usage: python test_connection.py
+Usage: python scripts/test_connection.py
 
 Requires TWS or IB Gateway running with API access enabled (see ibkr.py's
 module docstring for port/config details). This used to test an Alpaca
@@ -10,6 +10,10 @@ longer trades through.
 """
 
 import sys
+from pathlib import Path
+
+# Run from scripts/; the modules it imports live at the repo root.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import ibkr
 

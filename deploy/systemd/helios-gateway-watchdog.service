@@ -1,0 +1,10 @@
+[Unit]
+Description=Helios gateway-login watchdog (IBKR API port up-but-dead / stuck-2FA check)
+
+[Service]
+Type=oneshot
+User=luke-puzenski
+WorkingDirectory=/home/luke-puzenski/Desktop/trading_bot
+ExecStart=/home/luke-puzenski/Desktop/trading_bot/venv/bin/python /home/luke-puzenski/Desktop/trading_bot/deploy/watchdog.py --gateway-only
+StandardOutput=append:/home/luke-puzenski/Desktop/trading_bot/logs/watchdog.log
+StandardError=append:/home/luke-puzenski/Desktop/trading_bot/logs/watchdog.log

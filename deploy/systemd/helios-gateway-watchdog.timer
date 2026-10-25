@@ -1,0 +1,22 @@
+[Unit]
+Description=Run the Helios gateway-login watchdog every 5 min, 7 days a week
+
+[Timer]
+# Every 5 minutes, 05:00-18:55 ET, EVERY day (not just weekdays). The
+# failure this catches -- ibc-live.service active but its API port closed
+# because a weekly forced re-login's 2FA push went unapproved -- happens
+# independently of the trading stack and most often lands on a Sunday
+# (the Fri-eve..Sun-eve outage of 2026-10-16..18 is why this exists). The
+# weekday-only helios-watchdog.timer never ran during that window.
+#
+# The check itself is conditional on the gateway service being active, so
+# running it overnight/weekends is harmless -- it stays silent unless the
+# gateway is genuinely up-but-not-listening. Window stops at 18:55 since
+# helios-evening-stop suspends the machine at 19:00; WakeSystem is
+# deliberately NOT set -- don't wake the box every 5 min just to check,
+# only check when it's already awake for real work.
+OnCalendar=*-*-* 05,06,07,08,09,10,11,12,13,14,15,16,17,18:0/5 America/New_York
+Persistent=false
+
+[Install]
+WantedBy=timers.target

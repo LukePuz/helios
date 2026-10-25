@@ -15,12 +15,15 @@ Wants=network-online.target
 # case, which previously just retried every 10s forever with nobody told
 # the bot never came up for the trading day.
 OnFailure=helios-notify-failure@%n.service
-# Stop retrying after 5 failures in 10 minutes rather than forever — a
-# genuinely stuck IBKR login (2FA prompt) isn't going to resolve itself on
-# attempt #200, and hitting this limit is what puts the unit into "failed"
-# and fires OnFailure= above.
-StartLimitIntervalSec=600
-StartLimitBurst=5
+# Retry budget. Loosened 2026-10-24 after a 5-day outage: a missed 2FA tap
+# on 2026-10-19 left the live gateway logged out, this unit burned all 5
+# starts against wait-for-ibkr's 180s timeout by 05:08, went "failed", and
+# then sat dead for five days even though nothing was wrong with Helios
+# itself. The broker is no longer a startup dependency at all (see the "-"
+# on ExecStartPre below), so this budget now only covers genuine crashes of
+# main.py -- which is what OnFailure= should actually be reporting.
+StartLimitIntervalSec=1800
+StartLimitBurst=10
 # Mutual exclusion with the overnight standby listener — see
 # helios-standby.service. Ensures the two never both hold the Telegram
 # long-poll at once (Telegram 409s a second concurrent getUpdates caller),
@@ -32,13 +35,20 @@ Conflicts=helios-standby.service
 Type=simple
 User=luke-puzenski
 WorkingDirectory=/home/luke-puzenski/Desktop/trading_bot
-# Blocks startup until TWS's API port actually accepts connections — IBC's
-# headless login can take well over a minute; without this, main.py's own
-# retry logic would be racing IBC on every cold morning start.
-ExecStartPre=/home/luke-puzenski/Desktop/trading_bot/deploy/systemd/wait-for-ibkr.sh 180
+# Waits for TWS's API port so main.py isn't racing IBC's headless login on a
+# cold morning start -- but the leading "-" makes a timeout NON-FATAL
+# (2026-10-24). Previously this hard-failed, which meant a logged-out gateway
+# took down the ENTIRE system: no ingestion, no analysis, no dashboard, no
+# Telegram. Five days of filings and news were lost to one missed 2FA tap.
+# A broker outage should cost execution only. execution.execute_approved()
+# already pre-flights the connection and refuses the order (with an alert)
+# when IBKR is unreachable, so running without a broker degrades to
+# "research everything, trade nothing" rather than trading blind -- and it
+# recovers on its own the moment the gateway is back, with no restart.
+ExecStartPre=-/home/luke-puzenski/Desktop/trading_bot/deploy/systemd/wait-for-ibkr.sh 180
 ExecStart=/home/luke-puzenski/Desktop/trading_bot/venv/bin/python /home/luke-puzenski/Desktop/trading_bot/main.py
 Restart=on-failure
-RestartSec=10
+RestartSec=30
 
 StandardOutput=append:/home/luke-puzenski/Desktop/trading_bot/helios-systemd.log
 StandardError=append:/home/luke-puzenski/Desktop/trading_bot/helios-systemd.log

@@ -4,18 +4,18 @@ every stage: Screen → Analyst → Risk Manager → DB → Telegram.
 
 Forces each stage through even if it would normally be filtered out.
 Run with:
-    venv/bin/python fire_test.py
+    venv/bin/python scripts/fire_test.py
 """
 
 import logging
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
 
 from dotenv import load_dotenv
-load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
 
 # Mock IBKR client so the test doesn't conflict with the running main.py connection.
 # RiskManager only needs get_account() and get_all_positions().

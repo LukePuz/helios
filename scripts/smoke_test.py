@@ -1,7 +1,9 @@
 import sys, os
-sys.path.insert(0, ".")
+from pathlib import Path
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 from dotenv import load_dotenv
-load_dotenv(".env")
+load_dotenv(ROOT / ".env")
 
 print("--- Fix 1: vector_store import ---")
 try:

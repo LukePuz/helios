@@ -20,6 +20,10 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          # CPU-only torch first: sentence-transformers otherwise pulls the
+          # CUDA build (~3 GB of nvidia wheels), which overflows the runner's
+          # disk before the tests ever run. The tests don't use a GPU.
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements.txt
 
       - name: Run test suite

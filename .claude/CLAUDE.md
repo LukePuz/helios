@@ -41,9 +41,16 @@ still log them verbatim.
 
 ## 2. Log each request in the curated log
 
-When a request is finished, add one entry to `research-log/prompts/YYYY-MM.md`
-(the month the request started). Create the file if it doesn't exist. Use this
-format:
+The log covers work that **edits the codebase**, because that's what ISEF
+Rule 8 citation is for (Luke, 2026-10-27). Health checks, status answers, data
+collection or organization, notes, drafts and graphs don't get an entry; their
+own run reports cover them. Headless runs (the agent-bus status worker, the
+research steward) run with hooks off and no saved transcript, so the automatic
+capture skips them too.
+
+When a request that edits the codebase is finished, add one entry to
+`research-log/prompts/YYYY-MM.md` (the month the request started). Create the
+file if it doesn't exist. Use this format:
 
 ```
 ## YYYY-MM-DD HH:MM TZ: <short title>

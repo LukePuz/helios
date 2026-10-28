@@ -66,6 +66,31 @@ def _capture_original_thesis_if_new(ticker: str, approval: dict) -> None:
 # Approval-driven execution (auto-execute pipeline + Telegram Approve button)
 # ---------------------------------------------------------------------------
 
+def _remaining_after_sell(ticker: str, owned: float, filled_qty: float) -> float:
+    """Shares left after a sell, for re-placing the stop. Before this, any
+    error reading the position counted as 0 shares left, which deleted the
+    stop record while the broker stop was already cancelled: the remaining
+    shares sat unprotected with no record (professor M22, 2026-10-28).
+    Now the expected remainder (owned - filled) is the fallback, and a
+    broker read can only lower it, so a lagging portfolio read can't size
+    a stop above what is held."""
+    import ibkr
+    expected = max(round(owned - filled_qty, 4), 0.0)
+    try:
+        positions = ibkr.get_client().get_all_positions()
+    except Exception as e:
+        log.warning(f"[{ticker}] Position read after sell failed ({e}); "
+                    f"using expected remainder {expected}")
+        return expected
+    held = next((p for p in positions if p.symbol == ticker), None)
+    if held is None:
+        if expected > 0:
+            log.warning(f"[{ticker}] Broker shows no position but {expected} shares "
+                        f"expected after the sell; keeping the stop for {expected}")
+        return expected
+    return min(round(abs(float(held.qty)), 4), expected)
+
+
 def _restore_stop_after_failed_sell(ticker: str) -> None:
     """A TRIM/EXIT cancels the broker stop before its market SELL. If the
     order then fails to go in, put the stop back for what's held (limitations
@@ -599,10 +624,7 @@ def execute_approved(
                 except Exception as e:
                     log.warning(f"[{ticker}] close_trade_outcome failed: {e}")
             else:  # TRIM — re-place stop at same price for remaining quantity
-                try:
-                    remaining = round(abs(float(ibkr.get_client().get_open_position(ticker).qty)), 4)
-                except Exception:
-                    remaining = 0
+                remaining = _remaining_after_sell(ticker, owned, filled_qty)
                 stop_rec = db.get_position_stop(ticker)
                 if remaining > 0 and stop_rec:
                     try:
@@ -617,7 +639,14 @@ def execute_approved(
                             f"Place stop @ ${stop_rec['stop_price']:.2f} for {remaining} shares manually."
                         )
                 elif remaining <= 0:
+                    # A TRIM that sold the last share closes the position:
+                    # close its outcome row too, or it stays open and a later
+                    # EXIT closes it at that later price (professor C10).
                     db.delete_position_stop(ticker)
+                    try:
+                        db.close_trade_outcome(ticker, exit_price=current_price)
+                    except Exception as e:
+                        log.warning(f"[{ticker}] close_trade_outcome failed: {e}")
 
         # Log stop level and place stop order with IBKR.
         # Skipped when a bracket order already placed the stop atomically —
@@ -830,10 +859,7 @@ def execute_manual(
     stop_price = None
     if side == "SELL":
         # Keep DB stop records in sync with what remains at the broker
-        try:
-            remaining = round(abs(float(ibkr.get_client().get_open_position(ticker).qty)), 4)
-        except Exception:
-            remaining = 0
+        remaining = _remaining_after_sell(ticker, owned, filled_qty)
         if remaining <= 0:
             db.delete_position_stop(ticker)
             try:

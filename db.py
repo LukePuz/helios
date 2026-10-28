@@ -3335,6 +3335,32 @@ def get_next_earnings(ticker: str):
         _put_conn(conn)
 
 
+def get_earnings_around(tickers: list[str], days_ahead: int = 4, days_back: int = 4) -> dict:
+    """{ticker: earnings_date} for tickers with an earnings_calendar row in
+    [today - days_back, today + days_ahead], nearest date per ticker. Feeds
+    the pre/post-earnings position review (crew.review_all_held_positions).
+    4 calendar days covers T-2 and T+1 in trading days across a weekend."""
+    if not tickers:
+        return {}
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT ON (ticker) ticker, earnings_date FROM earnings_calendar "
+                "WHERE ticker = ANY(%s) "
+                "AND earnings_date BETWEEN CURRENT_DATE - %s AND CURRENT_DATE + %s "
+                "ORDER BY ticker, ABS(earnings_date - CURRENT_DATE), earnings_date",
+                (list(tickers), days_back, days_ahead),
+            )
+            return {r[0]: r[1] for r in cur.fetchall()}
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"get_earnings_around failed: {e}")
+        return {}
+    finally:
+        _put_conn(conn)
+
+
 def is_near_earnings(ticker: str, days: int = 5, strict: bool = False) -> bool | None:
     """Returns True if ticker has an earnings date within `days` calendar days.
     On a DB error returns False, or None with strict=True so the earnings

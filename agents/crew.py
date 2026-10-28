@@ -177,7 +177,35 @@ def deep_analyze(event: dict, screening: dict | None = None) -> dict:
 # worked correctly; this closes the actual gap upstream of it.
 # ---------------------------------------------------------------------------
 
-def _analyze_held_position(ticker: str, client, positions: dict, regime: dict) -> dict:
+def _earnings_review_event(ticker: str, earnings_date, today=None) -> dict:
+    """Review event for a held name that reports within a few days, or just
+    did (limitations audit 2026-10-27: no earnings playbook; held names went
+    into prints with a generic "periodic review"). States the date so the
+    model has to decide hold-through vs trim before, and react after."""
+    from datetime import date
+    days = (earnings_date - (today or date.today())).days
+    if days > 0:
+        when = f"reports earnings on {earnings_date} (in {days} calendar day{'s' if days != 1 else ''})"
+        ask = ("Decide whether to hold through the print, trim, or exit before it. "
+               "State the expected move, what result would break the thesis, and "
+               "whether the current stop and size are right for an earnings gap.")
+    elif days == 0:
+        when = f"reports earnings today ({earnings_date})"
+        ask = ("If the result is not out yet, decide whether to hold through it. If it "
+               "is out, judge whether it confirmed or broke the thesis.")
+    else:
+        when = f"reported earnings on {earnings_date} ({-days} calendar day{'s' if days != -1 else ''} ago)"
+        ask = ("Judge whether the result and the price reaction confirmed or broke the "
+               "thesis, and whether the stop and size still fit.")
+    return {
+        "ticker": ticker, "source": "portfolio_review", "type": "earnings review",
+        "title": f"Earnings position review — {ticker} {when}",
+        "text": f"{ticker} {when}. {ask}",
+    }
+
+
+def _analyze_held_position(ticker: str, client, positions: dict, regime: dict,
+                           event: dict | None = None) -> dict:
     """The brief-assembly + analyze() core shared by review_held_position
     and backfill_catalyst_tracking (2026-08-30) -- extracted so the
     backfill can get the same real catalyst/expected-return read every
@@ -188,7 +216,7 @@ def _analyze_held_position(ticker: str, client, positions: dict, regime: dict) -
     from context_engine import assemble_brief
     from knowledge_loader import get_watchlist_entry
 
-    event = {
+    event = event or {
         "ticker": ticker, "source": "portfolio_review", "type": "scheduled review",
         "title": f"Periodic position review — {ticker}", "text": "",
     }
@@ -278,12 +306,16 @@ def _capture_latest_thesis(ticker: str, result: dict) -> None:
         log.warning(f"[{ticker}] latest thesis capture failed (non-fatal to the review, but the snapshot is lost): {e}")
 
 
-def review_held_position(ticker: str, client, positions: dict, regime: dict) -> dict:
+def review_held_position(ticker: str, client, positions: dict, regime: dict,
+                         earnings_date=None) -> dict:
     """Reassess one already-held position via the same brief/analyze/route
     pipeline as the event-driven path, using a synthetic 'scheduled review'
-    event instead of a real filing/news item."""
-    log.info(f"[{ticker}] Scheduled position review")
-    result = _analyze_held_position(ticker, client, positions, regime)
+    event instead of a real filing/news item. With earnings_date, the event
+    is an earnings review (_earnings_review_event)."""
+    log.info(f"[{ticker}] Scheduled position review"
+             + (f" (earnings {earnings_date})" if earnings_date else ""))
+    event = _earnings_review_event(ticker, earnings_date) if earnings_date else None
+    result = _analyze_held_position(ticker, client, positions, regime, event=event)
     _capture_latest_thesis(ticker, result)
 
     if result.get("pass_to_risk"):
@@ -329,10 +361,18 @@ def review_all_held_positions(max_per_run: int = 10, priority_tickers: list[str]
     except Exception:
         last_reviewed = {}
 
+    # Names reporting within ~T-2..T+1 go first, every day of that window.
+    try:
+        earnings = db.get_earnings_around(list(positions.keys()))
+    except Exception as e:
+        log.warning(f"Position review: earnings lookup failed: {e}")
+        earnings = {}
+
     priority_set = set(priority_tickers or [])
     tickers = sorted(
         positions.keys(),
-        key=lambda t: (0 if t in priority_set else 1, last_reviewed.get(t, "")),
+        key=lambda t: (0 if t in earnings else 1 if t in priority_set else 2,
+                       last_reviewed.get(t, "")),
     )[:max_per_run]
     log.info(f"Position review: {len(tickers)} of {len(positions)} held tickers this run"
              + (f" ({len(priority_set & set(tickers))} prioritized as stale)" if priority_set else ""))
@@ -341,7 +381,8 @@ def review_all_held_positions(max_per_run: int = 10, priority_tickers: list[str]
     now_iso = datetime.now(timezone.utc).isoformat()
     for ticker in tickers:
         try:
-            results.append(review_held_position(ticker, client, positions, regime))
+            results.append(review_held_position(ticker, client, positions, regime,
+                                                earnings_date=earnings.get(ticker)))
         except Exception as e:
             log.error(f"[{ticker}] Position review failed: {e}")
         last_reviewed[ticker] = now_iso

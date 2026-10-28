@@ -24,3 +24,10 @@ def test_no_reason_leaves_the_column_alone():
 
 def test_migration_57_adds_the_column():
     assert any(v == 57 and "status_reason" in sql for v, sql in db._MIGRATIONS)
+
+
+def test_status_change_keeps_the_stored_telegram_id():
+    sql, _ = _sql_for()
+    assert "telegram_message_id=COALESCE(%s, telegram_message_id)" in sql
+    sql, _ = _sql_for(reason="x")
+    assert "telegram_message_id=COALESCE(%s, telegram_message_id)" in sql

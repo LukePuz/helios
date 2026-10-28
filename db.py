@@ -1234,17 +1234,19 @@ def update_approval_status(
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
+            # COALESCE: a status change without a message id keeps the stored
+            # one (it used to null it on every update; 2026-10-28).
             if reason is None:
                 # Leaves status_reason alone, so a process started before
                 # migration 57 ran can still update statuses.
                 cur.execute(
-                    "UPDATE pending_approvals SET status=%s, decided_at=NOW(), telegram_message_id=%s "
+                    "UPDATE pending_approvals SET status=%s, decided_at=NOW(), telegram_message_id=COALESCE(%s, telegram_message_id) "
                     "WHERE id=%s",
                     (status, telegram_message_id, approval_id),
                 )
             else:
                 cur.execute(
-                    "UPDATE pending_approvals SET status=%s, decided_at=NOW(), telegram_message_id=%s, "
+                    "UPDATE pending_approvals SET status=%s, decided_at=NOW(), telegram_message_id=COALESCE(%s, telegram_message_id), "
                     "status_reason=%s WHERE id=%s",
                     (status, telegram_message_id, reason, approval_id),
                 )

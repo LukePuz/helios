@@ -82,8 +82,8 @@ def screen_event_only(event: dict) -> dict:
             prov = screening.get("provenance") or {}
             db.log_signal(ticker, "SCREENED_OUT", 0.0, reason,
                           model=prov.get("model"), provenance=prov or None)
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"[{ticker}] SCREENED_OUT signal log failed: {e}")
     else:
         log.info(f"[{ticker}] Relevant (urgency={screening.get('urgency')}) — queued for deep analysis")
 
@@ -178,6 +178,17 @@ def deep_analyze(event: dict, screening: dict | None = None) -> dict:
 # handling (sized from the held position, bypassing buy gates) already
 # worked correctly; this closes the actual gap upstream of it.
 # ---------------------------------------------------------------------------
+
+def _log_route_exit(ticker: str, kind: str, result: dict, reason: str) -> None:
+    """A passed verdict that dies in routing gets a signals row, like
+    EARNINGS_BLOCKED already did (professor M30, 2026-10-28): these exits were
+    log.info only, so the final disposition of a pass wasn't observable."""
+    try:
+        import db
+        db.log_signal(ticker, kind, (result.get("conviction") or 0) / 10.0, reason[:500])
+    except Exception as e:
+        log.warning(f"[{ticker}] route-exit signal log failed: {e}")
+
 
 def _earnings_review_event(ticker: str, earnings_date, today=None) -> dict:
     """Review event for a held name that reports within a few days, or just
@@ -636,6 +647,7 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
     try:
         if db.has_active_approval(ticker):
             log.info(f"[{ticker}] Active approval already pending — skipping duplicate")
+            _log_route_exit(ticker, "ROUTE_APPROVAL_PENDING", result, "active approval already pending")
             return
     except Exception:
         pass
@@ -764,6 +776,7 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
         price = _get_price(ticker, trading_client)
         if not price:
             log.warning(f"[{ticker}] Could not determine price — skipping approval queue")
+            _log_route_exit(ticker, "ROUTE_NO_PRICE", result, "could not determine price")
             return
 
         # Size the position — stamp the price used so execution can validate freshness
@@ -849,6 +862,7 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
             if sizing.get("shares_initial", 0) <= 0:
                 flags = sizing.get("flags", [])
                 log.info(f"[{ticker}] Risk sizing returned 0 shares: {flags}")
+                _log_route_exit(ticker, "ROUTE_ZERO_SHARES", result, "; ".join(flags))
                 return
 
         # Concentration check
@@ -888,6 +902,8 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
                 if sizing["shares_initial"] <= 0:
                     log.info(f"[{ticker}] Concentration limits leave 0 shares of room — "
                              f"skipping entry (already at/over the limit)")
+                    _log_route_exit(ticker, "ROUTE_CONCENTRATION_ZERO", result,
+                                    "; ".join(sizing.get("flags", [])))
                     return
 
         # Correlation check

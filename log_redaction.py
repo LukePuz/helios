@@ -30,8 +30,15 @@ _installed = False
 
 
 def install() -> None:
+    """Also redacts formatted tracebacks and stack info, which the Formatter
+    builds outside getMessage() (professor M34: exc_info tracebacks from
+    requests errors carry the bot URL)."""
     global _installed
     if _installed:
         return
     logging.setLogRecordFactory(_RedactingRecord)
+    _format_exception = logging.Formatter.formatException
+    _format_stack = logging.Formatter.formatStack
+    logging.Formatter.formatException = lambda self, ei: redact(_format_exception(self, ei))
+    logging.Formatter.formatStack = lambda self, si: redact(_format_stack(self, si))
     _installed = True

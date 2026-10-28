@@ -121,6 +121,13 @@ _OUTPUT_TOKEN_RESERVE = _NUM_PREDICT + 300
 _PROVENANCE_STATIC: dict | None = None
 
 
+def _treatment_config() -> dict:
+    import config
+    return {k: getattr(config, k, None) for k in (
+        "EARNINGS_ENTRY_BLACKOUT_DAYS", "ALLOW_ONE_SHARE_ABOVE_ALLOCATION", "SETUP_GATES_ENABLED",
+        "ANALYST_MODEL", "SCREENER_MODEL", "MIN_EXPECTED_RETURN_PCT_PER_WEEK")}
+
+
 def _provenance(prompt: str) -> dict:
     """What produced this decision (professor C3/M7, 2026-10-27): code commit
     (with -dirty if the checkout has uncommitted tracked changes), the
@@ -137,8 +144,12 @@ def _provenance(prompt: str) -> dict:
         try:
             sha = subprocess.run(["git", "-C", repo, "rev-parse", "--short=12", "HEAD"],
                                  capture_output=True, text=True, timeout=5).stdout.strip()
-            dirty = subprocess.run(["git", "-C", repo, "status", "--porcelain", "-uno"],
-                                   capture_output=True, text=True, timeout=5).stdout.strip()
+            # Untracked .py files count too: untracked modules running live
+            # was the C2 failure mode, and -uno stamped that clean (professor
+            # C3-residual, 2026-10-28).
+            status = subprocess.run(["git", "-C", repo, "status", "--porcelain"],
+                                    capture_output=True, text=True, timeout=5).stdout.splitlines()
+            dirty = [l for l in status if not l.startswith("??") or l.rstrip().endswith(".py")]
             code_sha = (sha + ("-dirty" if dirty else "")) or None
         except Exception:
             code_sha = None
@@ -149,6 +160,9 @@ def _provenance(prompt: str) -> dict:
             digest = None
         _PROVENANCE_STATIC = {
             "code_sha": code_sha,
+            # Env-overridable treatment switches: the same code_sha can run
+            # with different values (professor C3-residual, 2026-10-28).
+            "config": _treatment_config(),
             "model": ANALYST_MODEL,
             "model_digest": digest[:12] if digest else None,
             "prompt_template_sha": hashlib.sha256(

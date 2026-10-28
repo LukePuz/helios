@@ -16,7 +16,11 @@ share counts only, no account values.
 --csv PATH appends one row per ticker (date, ticker, bucket, regime,
 conviction, buyable, reason) so verdicts in signals can be joined to whether
 the account could have bought the name that day (limitations audit 07:00,
-finding 2). The reason is a category, never an amount.
+finding 2). The reason is a category, never an amount. Each row also records
+the run time, the code commit and the price source (yfinance daily close of
+the last completed session) so it can be reproduced (professor M29). Bucket
+is the watchlist role, which is what crew sizes with (analyst overrides the
+LLM's bucket with the watchlist role). The swap path is not simulated.
 """
 from __future__ import annotations
 
@@ -166,9 +170,17 @@ def main():
         with open(args.csv, "a", newline="") as f:
             w = csv.writer(f)
             if new:
-                w.writerow(["date", "ticker", "bucket", "regime", "conviction", "buyable", "reason"])
+                w.writerow(["date", "ticker", "bucket", "regime", "conviction", "buyable", "reason",
+                            "run_at", "code_sha", "price_source"])
+            import subprocess
+            from datetime import datetime
+            repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            sha = subprocess.run(["git", "-C", repo, "rev-parse", "--short=12", "HEAD"],
+                                 capture_output=True, text=True).stdout.strip()
+            run_at = datetime.now().isoformat(timespec="seconds")
             for t, bucket, ok, reason in csv_rows:
-                w.writerow([date.today().isoformat(), t, bucket, regime, args.conviction, ok, reason])
+                w.writerow([date.today().isoformat(), t, bucket, regime, args.conviction, ok, reason,
+                            run_at, sha, "yfinance_last_daily_close"])
         print(f"appended {len(csv_rows)} rows to {args.csv}")
 
 

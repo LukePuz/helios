@@ -30,6 +30,10 @@ import re
 import subprocess
 import time
 
+import log_redaction  # noqa: E402
+
+log_redaction.install()  # bot token / account id out of this process's logs
+
 import telegram_bot as tb
 
 log = logging.getLogger(__name__)

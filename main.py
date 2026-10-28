@@ -20,6 +20,10 @@ import threading
 import time
 from pathlib import Path
 
+import log_redaction  # noqa: E402
+
+log_redaction.install()  # bot token / account id out of this process's logs
+
 
 def _setup_logging() -> None:
     from logging.handlers import RotatingFileHandler

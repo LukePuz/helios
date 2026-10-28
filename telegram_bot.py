@@ -20,6 +20,10 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import log_redaction  # noqa: E402
+
+log_redaction.install()  # bot token / account id out of this process's logs
+
 import requests
 from dotenv import load_dotenv
 

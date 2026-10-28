@@ -7,6 +7,7 @@ gates all downstream agent activity. All other agents read this before acting.
 Scoring follows knowledge/market_regime_rules.md exactly.
 """
 import logging
+import re
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -46,6 +47,14 @@ _WEIGHTS = {"trend": 1, "volatility": 2, "liquidity": 2, "credit": 2, "breadth":
 # Min/max possible weighted raw score (for normalization)
 _MAX_RAW = sum(5 * w for w in _WEIGHTS.values())   # all Very Bullish
 _MIN_RAW = sum(-5 * w for w in _WEIGHTS.values())  # all Very Bearish
+
+
+# Notes that mean an input couldn't be read and was scored Neutral. Not just
+# "unavailable": trend/volume say "Insufficient ...", flows "No ETF flow
+# data", markov "history fetch returned no data" (professor M31, 2026-10-28).
+_MISSING_INPUT = re.compile(
+    r"unavailable|insufficient|no (?:etf flow |volume )?data|returned no data|fetch failed|not available",
+    re.IGNORECASE)
 
 
 def _normalize(raw: float) -> float:
@@ -656,7 +665,7 @@ def assess_regime() -> dict:
     # 2026-10-28 05:00, finding 4). Record which ones, so a regime change can
     # be told apart from a data outage.
     missing_inputs = [name for name, (_, notes) in scores_map.items()
-                      if "unavailable" in str(notes).lower()]
+                      if _MISSING_INPUT.search(str(notes))]
     if missing_inputs:
         log.warning(f"Regime inputs unavailable (scored Neutral): {', '.join(missing_inputs)}")
     key_drivers = [

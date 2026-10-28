@@ -284,7 +284,7 @@ def screen(event: dict) -> dict:
             "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:12],
         }
     except Exception as e:
-        log.debug(f"screener provenance failed: {e}")
+        log.warning(f"screener provenance failed: {e}")
 
     log.info(
         f"Screened [{source}] {ticker}: "

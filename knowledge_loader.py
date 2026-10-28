@@ -2,6 +2,7 @@
 Knowledge base loader — parses watchlist.md and thesis files for use by agents.
 All files live in trading_bot/knowledge/.
 """
+import logging
 import os
 import re
 from functools import lru_cache
@@ -72,6 +73,13 @@ def load_watchlist() -> dict[str, dict]:
             r"^\|\s*([A-Z]{1,6})\s*\|\s*(.+?)\s*\|\s*(Compounder|Accelerator|Moonshot)\s*\|\s*(Core|Watch|Speculative)\s*\|",
             line,
         )
+        if not row_match and re.match(r"^\|\s*[A-Z]{1,6}\s*\|", line):
+            # A ticker row that doesn't parse is silently out of the universe
+            # (INTC and NLST since 06-20, role column "Watch"/"Speculative";
+            # professor M28). Say so instead.
+            logging.getLogger(__name__).warning(
+                f"watchlist.md row not parsed (role must be Compounder/Accelerator/Moonshot, "
+                f"tier Core/Watch/Speculative): {line.strip()}")
         if row_match:
             ticker, company, role, tier = row_match.groups()
             watchlist[ticker] = {

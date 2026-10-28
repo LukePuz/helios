@@ -6,6 +6,7 @@ on anything the main stack provides.
 
 Usage: notify_failure.py <failed-unit-name>
 """
+import re
 import os
 import sys
 from pathlib import Path
@@ -39,7 +40,7 @@ def main() -> None:
             timeout=10,
         )
     except Exception as e:
-        print(f"[notify_failure] Telegram send failed: {e}")
+        print(f"[notify_failure] Telegram send failed: " + re.sub(r"bot\d+:[A-Za-z0-9_-]+", "bot[REDACTED]", str(e)))
 
 
 if __name__ == "__main__":

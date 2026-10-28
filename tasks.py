@@ -16,6 +16,10 @@ from pathlib import Path
 
 from celery import Celery
 from celery.schedules import crontab
+
+import log_redaction
+
+log_redaction.install()  # bot token / account id out of every worker log
 from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")

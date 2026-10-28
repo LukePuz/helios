@@ -17,6 +17,9 @@ load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 log = logging.getLogger(__name__)
 
+import log_redaction  # noqa: E402
+log_redaction.install()
+
 _TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
 _CHAT_ID = os.getenv("TELEGRAM_CHAT_ID",   "")
 _ET      = ZoneInfo("America/New_York")

@@ -21,6 +21,7 @@ than only reporting it, which is the whole point: during the 2026-10-19 ->
 days and nothing could act on it. See the self-healing constants below for
 the flap brakes.
 """
+import re
 import os
 import socket
 import subprocess
@@ -90,7 +91,7 @@ def _send_telegram(text: str) -> None:
             timeout=10,
         )
     except Exception as e:
-        print(f"[watchdog] Telegram send failed: {e}")
+        print(f"[watchdog] Telegram send failed: " + re.sub(r"bot\d+:[A-Za-z0-9_-]+", "bot[REDACTED]", str(e)))
 
 
 def _alert_due(key: str = "watchdog_alert_at") -> bool:

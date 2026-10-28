@@ -34,9 +34,10 @@ def test_broker_lower_than_expected_wins():
         assert execution._remaining_after_sell("NVDA", 10, 3) == 5
 
 
-def test_absent_position_with_shares_expected_keeps_them():
+def test_absent_position_with_shares_expected_is_unknown():
+    # A SELL stop for shares the broker doesn't show could open a short.
     with patch("ibkr.get_client", return_value=_client([_pos("AMD", 4)])):
-        assert execution._remaining_after_sell("NVDA", 10, 3) == 7
+        assert execution._remaining_after_sell("NVDA", 10, 3) is None
 
 
 def test_sold_everything_is_zero():

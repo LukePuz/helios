@@ -66,14 +66,22 @@ def _capture_original_thesis_if_new(ticker: str, approval: dict) -> None:
 # Approval-driven execution (auto-execute pipeline + Telegram Approve button)
 # ---------------------------------------------------------------------------
 
-def _remaining_after_sell(ticker: str, owned: float, filled_qty: float) -> float:
+_POSITION_MISMATCH_ALERT = (
+    "🚨 POSITION MISMATCH — {ticker}\n"
+    "Sell filled; {expected} shares should remain but the broker shows none. "
+    "No stop placed (it could open a short); the stop record is kept. Check TWS.")
+
+
+def _remaining_after_sell(ticker: str, owned: float, filled_qty: float) -> float | None:
     """Shares left after a sell, for re-placing the stop. Before this, any
     error reading the position counted as 0 shares left, which deleted the
     stop record while the broker stop was already cancelled: the remaining
     shares sat unprotected with no record (professor M22, 2026-10-28).
     Now the expected remainder (owned - filled) is the fallback, and a
     broker read can only lower it, so a lagging portfolio read can't size
-    a stop above what is held."""
+    a stop above what is held. Returns None when the broker shows no
+    position but shares were expected: a SELL stop for shares that aren't
+    there could open a short, so the caller alerts instead of placing one."""
     import ibkr
     expected = max(round(owned - filled_qty, 4), 0.0)
     try:
@@ -85,9 +93,10 @@ def _remaining_after_sell(ticker: str, owned: float, filled_qty: float) -> float
     held = next((p for p in positions if p.symbol == ticker), None)
     if held is None:
         if expected > 0:
-            log.warning(f"[{ticker}] Broker shows no position but {expected} shares "
-                        f"expected after the sell; keeping the stop for {expected}")
-        return expected
+            log.error(f"[{ticker}] Broker shows no position but {expected} shares "
+                      f"expected after the sell; not placing a stop")
+            return None
+        return 0.0
     return min(round(abs(float(held.qty)), 4), expected)
 
 
@@ -626,7 +635,10 @@ def execute_approved(
             else:  # TRIM — re-place stop at same price for remaining quantity
                 remaining = _remaining_after_sell(ticker, owned, filled_qty)
                 stop_rec = db.get_position_stop(ticker)
-                if remaining > 0 and stop_rec:
+                if remaining is None:
+                    alert_module._send(_POSITION_MISMATCH_ALERT.format(
+                        ticker=ticker, expected=round(owned - filled_qty, 4)))
+                elif remaining > 0 and stop_rec:
                     try:
                         new_stop = tasks.manage_stop_place(ticker, remaining, stop_rec["stop_price"])
                         db.set_stop_broker_order_id(ticker, new_stop["order_id"])
@@ -860,7 +872,11 @@ def execute_manual(
     if side == "SELL":
         # Keep DB stop records in sync with what remains at the broker
         remaining = _remaining_after_sell(ticker, owned, filled_qty)
-        if remaining <= 0:
+        if remaining is None:
+            import alerts
+            alerts._send(_POSITION_MISMATCH_ALERT.format(
+                ticker=ticker, expected=round(owned - filled_qty, 4)))
+        elif remaining <= 0:
             db.delete_position_stop(ticker)
             try:
                 db.close_trade_outcome(ticker, exit_price=fill_price)

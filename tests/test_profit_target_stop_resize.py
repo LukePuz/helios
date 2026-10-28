@@ -29,7 +29,7 @@ def test_stop_is_cancelled_then_replaced_for_remaining_shares_at_breakeven():
          patch("alerts._send") as send:
         result = _rm()._partial_sell_and_resize_stop("NVDA", 100, 30, 100.0)
 
-    assert result == {"filled_qty": 30, "order_id": 7}
+    assert result == {"filled_qty": 30, "order_id": 7, "new_stop": 100.0}
     assert calls == ["cancel", "sell", ("stop", "NVDA", 70.0, 100.0)]
     set_id.assert_called_once_with("NVDA", 8)
     send.assert_not_called()
@@ -68,7 +68,7 @@ def test_alert_when_the_new_stop_cannot_be_placed():
          patch("alerts._send") as send:
         result = _rm()._partial_sell_and_resize_stop("NVDA", 100, 30, 100.0)
 
-    assert result == {"filled_qty": 30}
+    assert result == {"filled_qty": 30, "new_stop": 100.0}
     assert "UNPROTECTED" in send.call_args[0][0]
 
 

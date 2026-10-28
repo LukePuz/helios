@@ -1289,6 +1289,14 @@ class RiskManager:
                         new_stop = round(current * (1 - trail_dist), 2)
                         method_label = f"{trail_pct}% (ATR unavailable, flat-% fallback)"
 
+                    # A re-arm after a partial sale or TRIM starts the trail
+                    # from today's price; don't convert while that would sit
+                    # below the fixed stop already in place (audit 12:53 #3).
+                    if stop_px and new_stop < float(stop_px):
+                        log.info(f"[{ticker}] Trail not armed yet: ${new_stop:.2f} would be below "
+                                 f"the current stop ${float(stop_px):.2f}")
+                        continue
+
                     try:
                         import tasks
                         qty = round(abs(float(pos.qty)), 4)
@@ -1450,6 +1458,10 @@ class RiskManager:
 
         stop_rec = db.get_position_stop(ticker) or {}
         old_stop = stop_rec.get("stop_price")
+        # Never move the stop down: after a trail conversion the recorded stop
+        # can already be above breakeven (limitations audit 12:53, finding 3).
+        if old_stop is not None:
+            new_stop = max(new_stop, float(old_stop))
         try:
             tasks.manage_cancel_stop_orders_for(ticker)
         except Exception as e:
@@ -1523,7 +1535,8 @@ class RiskManager:
                     f"Profit-target sale filled but stop re-placement failed. "
                     f"Place stop @ ${new_stop:.2f} for {remaining} shares manually."
                 )
-        return order_result
+        # The stop actually used (may be above breakeven).
+        return {**order_result, "new_stop": new_stop}
 
     def check_profit_targets(self) -> list[dict]:
         """
@@ -1651,6 +1664,7 @@ class RiskManager:
                                                               decision_price=current)
             if order_result is None:
                 continue
+            new_stop = order_result.get("new_stop", new_stop)
             db.mark_profit_target_taken(ticker, new_stop)
             log.info(f"[{ticker}] Profit target hit ({gain_pct:.1%} >= {target:.1%}, "
                      f"style={trade_style}): sold {sell_qty} shares, "
@@ -1739,6 +1753,7 @@ class RiskManager:
                                                           decision_price=current)
         if order_result is None:
             return False
+        new_stop = order_result.get("new_stop", new_stop)
         db.mark_profit_target_taken(ticker, new_stop)
         if overextended and target_hit:
             reason = f"ladder target ${nearest_target:.2f} hit + Overextended valuation"

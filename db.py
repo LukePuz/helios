@@ -1429,6 +1429,25 @@ def update_trailing_stop(ticker: str, new_stop: float, trailing_high: float) -> 
         _put_conn(conn)
 
 
+def clear_trailing_active(ticker: str) -> None:
+    """The position's broker stop is a fixed STP again (see
+    tasks.manage_stop_place)."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE position_stops SET trailing_active=FALSE, updated_at=NOW() "
+                "WHERE ticker=%s AND trading_env=%s AND trailing_active",
+                (ticker, TRADING_ENV),
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"clear_trailing_active failed: {e}")
+    finally:
+        _put_conn(conn)
+
+
 def get_position_stop(ticker: str) -> dict | None:
     conn = _get_conn()
     try:
@@ -1934,7 +1953,10 @@ def mark_profit_target_taken(ticker: str, new_stop: float) -> None:
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE position_stops SET profit_target_taken=TRUE, stop_price=%s, updated_at=NOW() "
+                # Never lowers the recorded stop (a trail may already be above
+                # breakeven; limitations audit 12:53, finding 3).
+                "UPDATE position_stops SET profit_target_taken=TRUE, "
+                "stop_price=GREATEST(COALESCE(stop_price, 0), %s), updated_at=NOW() "
                 "WHERE ticker=%s AND trading_env=%s",
                 (new_stop, ticker, TRADING_ENV),
             )

@@ -168,15 +168,29 @@ def manage_stop_place(ticker: str, qty: float, stop_price: float, timeout: int =
     that happens to already be running in the orders worker (that branch is
     just a direct call, essentially free) — the point is there being exactly
     one way to do this, so a future direct ibkr.place_stop_order call can't
-    quietly reintroduce the bug."""
+    quietly reintroduce the bug.
+
+    A fixed STP replaces any native TRAIL the position had (callers cancel
+    stops first), so trailing_active is cleared: check_trailing_stops then
+    re-arms the trail on its next run if the gain still qualifies. Before
+    2026-10-28 a partial sale, TRIM or failed-sell restore left the flag TRUE
+    and the trail never came back (limitations audit 12:53, finding 3).
+    Callers that convert to a trail set it again via update_trailing_stop."""
     if _is_orders_worker():
         import ibkr
-        return ibkr.place_stop_order(ticker, qty, stop_price)
-    from celery.result import allow_join_result
-    with allow_join_result():
-        return _broker_place_stop_order.apply_async(
-            args=[ticker, qty, stop_price], queue=ORDERS_QUEUE,
-        ).get(timeout=timeout)
+        result = ibkr.place_stop_order(ticker, qty, stop_price)
+    else:
+        from celery.result import allow_join_result
+        with allow_join_result():
+            result = _broker_place_stop_order.apply_async(
+                args=[ticker, qty, stop_price], queue=ORDERS_QUEUE,
+            ).get(timeout=timeout)
+    try:
+        import db
+        db.clear_trailing_active(ticker)
+    except Exception as e:
+        log.warning(f"[{ticker}] could not clear trailing_active after a fixed stop: {e}")
+    return result
 
 
 def manage_cancel_stop_orders_for(ticker: str, timeout: int = 30) -> int:

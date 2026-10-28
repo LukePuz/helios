@@ -1557,6 +1557,40 @@ def get_position_stop(ticker: str) -> dict | None:
         _put_conn(conn)
 
 
+def get_recent_verdicts(ticker: str, hours: int = 72, limit: int = 20) -> list[dict]:
+    """Analyst verdicts on ticker in the last `hours` (this env; legacy NULL-env
+    rows count, degraded ones don't), newest first: [{timestamp, signal,
+    conviction, udr}]. udr is the model's stated upside/downside ratio from
+    signals.decision when recorded."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT timestamp, signal, confidence, "
+                "decision->'model_output'->>'upside_downside_ratio' FROM signals "
+                "WHERE symbol=%s AND signal NOT IN %s "
+                "AND (trading_env=%s OR (trading_env IS NULL AND COALESCE(reasoning, '') NOT LIKE %s)) "
+                "AND timestamp > NOW() - make_interval(hours => %s) "
+                "ORDER BY timestamp DESC LIMIT %s",
+                (ticker, _NON_ANALYST_SIGNALS, TRADING_ENV, DEGRADED_SIGNAL_PREFIX + '%', hours, limit),
+            )
+            rows = cur.fetchall()
+        out = []
+        for ts, sig, conf, udr in rows:
+            try:
+                udr = float(udr) if udr is not None else None
+            except (TypeError, ValueError):
+                udr = None
+            out.append({"timestamp": ts, "signal": sig,
+                        "conviction": round(float(conf or 0) * 10), "udr": udr})
+        return out
+    except Exception as e:
+        logging.error(f"get_recent_verdicts({ticker}) failed: {e}")
+        return []
+    finally:
+        _put_conn(conn)
+
+
 def get_position_context(ticker: str) -> dict:
     """Thesis and recent verdicts for a held ticker, for the brief's POSITION
     CONTEXT block: {original_thesis, latest_thesis, thesis_updated_at,

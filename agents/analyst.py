@@ -466,6 +466,19 @@ def count_distinct_sources(sources: list) -> int:
     })
 
 
+def _prior_verdicts(ticker: str) -> list | None:
+    """Shadow record for buy verdicts (limitations audit 2026-10-28 14:53,
+    #1b): the ticker's verdicts in the previous 72 h, so whether a buy agreed
+    with recent passes can be measured later. Logged only; nothing gates on
+    it. Read before this verdict is written, so it excludes itself."""
+    try:
+        import db
+        return [{"t": str(v["timestamp"])[:16], "signal": v["signal"],
+                 "c": v["conviction"], "udr": v["udr"]} for v in db.get_recent_verdicts(ticker)]
+    except Exception:
+        return None
+
+
 def _catalyst_check(ticker: str, parsed: dict) -> dict:
     """Shadow record of how the model's catalyst date relates to the calendar
     (limitations audit 2026-10-28 14:53, #5). Logged only; the rate gate
@@ -1170,6 +1183,7 @@ def analyze(
                 "final_pass_to_risk": bool(parsed.get("pass_to_risk", False)),
                 "gates": gates, "model_output": model_output,
                 "catalyst_check": _catalyst_check(ticker, parsed),
+                "prior_verdicts_72h": _prior_verdicts(ticker) if action in ("OPEN", "ADD") else None,
             },
             prompt=prompt,
         )

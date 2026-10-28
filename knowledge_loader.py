@@ -116,6 +116,12 @@ def get_all_tickers() -> list[str]:
     return sorted(load_watchlist().keys())
 
 
+def get_etf_tickers() -> set[str]:
+    """Watchlist tickers whose company name says ETF (e.g. DRAM, QTUM). They
+    have no analyst ratings, so pollers can skip them."""
+    return {t for t, d in load_watchlist().items() if re.search(r"\bETF\b", d["company"])}
+
+
 def get_core_tickers() -> list[str]:
     """Return only Core-tier tickers."""
     return sorted(t for t, d in load_watchlist().items() if d["tier"] == "Core")

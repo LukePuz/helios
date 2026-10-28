@@ -93,10 +93,15 @@ def _fetch_for_ticker(ticker: str) -> list[dict]:
 
 def poll_once() -> list[dict]:
     """Fetches new analyst rating changes for every watchlist ticker."""
-    from knowledge_loader import get_all_tickers
+    from knowledge_loader import get_all_tickers, get_etf_tickers
 
+    # ETFs have no analyst ratings; Yahoo answers 404 and yfinance logs an
+    # ERROR for each one on every poll (2026-10-28).
+    etfs = get_etf_tickers()
     all_items = []
     for ticker in get_all_tickers():
+        if ticker in etfs:
+            continue
         all_items.extend(_fetch_for_ticker(ticker))
         time.sleep(0.15)  # be polite to Yahoo's unofficial endpoint
     return all_items

@@ -251,6 +251,7 @@ def _capture_latest_thesis(ticker: str, result: dict) -> None:
             "valuation_tier": None,
             "key_risks": result.get("key_risks", []),
             "reasoning": result.get("reasoning"),
+            "provenance": result.get("provenance"),
         }
         db.update_latest_thesis(ticker, thesis)
 

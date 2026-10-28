@@ -55,3 +55,9 @@ def test_hold_on_unheld_ticker_becomes_watch():
 
 def test_unknown_holding_is_left_alone():
     assert _analyze("ADD", held=None)["action"] == "ADD"
+
+
+def test_result_carries_provenance():
+    prov = _analyze("OPEN", held=False)["provenance"]
+    assert set(prov) >= {"code_sha", "model", "model_digest", "prompt_template_sha", "prompt_sha"}
+    assert len(prov["prompt_sha"]) == 12

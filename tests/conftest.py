@@ -34,3 +34,13 @@ def _no_real_database(monkeypatch):
     monkeypatch.setattr(db, "_get_pool", _blocked)
     monkeypatch.setattr(db.psycopg2.pool, "ThreadedConnectionPool", _blocked)
     monkeypatch.setattr(db.psycopg2, "connect", _blocked)
+
+
+@pytest.fixture(autouse=True)
+def _static_provenance(monkeypatch):
+    """analyst._provenance shells out to git and asks Ollama for the model
+    digest once per process; tests use a fixed stub instead."""
+    from agents import analyst
+    monkeypatch.setattr(analyst, "_PROVENANCE_STATIC",
+                        {"code_sha": "test", "model": "test", "model_digest": None,
+                         "prompt_template_sha": "test"})

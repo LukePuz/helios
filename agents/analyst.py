@@ -117,6 +117,46 @@ _NUM_PREDICT = 1600  # was 1200; headroom now that action/conviction come last
 _OUTPUT_TOKEN_RESERVE = _NUM_PREDICT + 300
 
 
+_PROVENANCE_STATIC: dict | None = None
+
+
+def _provenance(prompt: str) -> dict:
+    """What produced this decision (professor C3/M7, 2026-10-27): code commit
+    (with -dirty if the checkout has uncommitted tracked changes), the
+    model's digest rather than its tag, a hash of the prompt template, and a
+    hash of the full rendered prompt. Stored with the result in
+    pending_approvals.analyst_json and the thesis snapshots, so a decision
+    can be tied to the exact code, model and prompt that made it."""
+    global _PROVENANCE_STATIC
+    if _PROVENANCE_STATIC is None:
+        import hashlib
+        import inspect
+        import subprocess
+        repo = str(Path(__file__).resolve().parent.parent)
+        try:
+            sha = subprocess.run(["git", "-C", repo, "rev-parse", "--short=12", "HEAD"],
+                                 capture_output=True, text=True, timeout=5).stdout.strip()
+            dirty = subprocess.run(["git", "-C", repo, "status", "--porcelain", "-uno"],
+                                   capture_output=True, text=True, timeout=5).stdout.strip()
+            code_sha = (sha + ("-dirty" if dirty else "")) or None
+        except Exception:
+            code_sha = None
+        try:
+            tags = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5).json().get("models", [])
+            digest = next((m.get("digest") for m in tags if m.get("name") == ANALYST_MODEL), None)
+        except Exception:
+            digest = None
+        _PROVENANCE_STATIC = {
+            "code_sha": code_sha,
+            "model": ANALYST_MODEL,
+            "model_digest": digest[:12] if digest else None,
+            "prompt_template_sha": hashlib.sha256(
+                inspect.getsource(_build_prompt).encode()).hexdigest()[:12],
+        }
+    import hashlib
+    return {**_PROVENANCE_STATIC, "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:12]}
+
+
 def _build_prompt(
     candidate: dict,
     situation_brief: str,
@@ -1052,6 +1092,7 @@ def analyze(
         "pass_to_risk": bool(parsed.get("pass_to_risk", False)),
         "reasoning": parsed.get("reasoning", ""),
         "model_used": ANALYST_MODEL,
+        "provenance": _provenance(prompt),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 

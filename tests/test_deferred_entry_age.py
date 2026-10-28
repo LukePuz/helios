@@ -25,6 +25,8 @@ def test_stale_approval_is_expired_and_reanalysed():
 
 def test_fresh_approval_still_executes():
     with patch("db.get_approval_by_id", return_value=_approval(2)), \
+         patch("db.has_newer_buy_approval", return_value=False), \
+         patch("db.get_latest_signal_for", return_value=None), \
          patch("db.update_approval_status") as status, \
          patch("execution.execute_approved", return_value=True) as execute, \
          patch("tasks.deep_analyze_event.apply_async") as analyse:

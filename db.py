@@ -1280,14 +1280,35 @@ def get_pending_approvals(status: str | None = "PENDING") -> list[dict]:
         _put_conn(conn)
 
 
+def has_newer_buy_approval(ticker: str, approval_id: int) -> bool:
+    """True if a later OPEN/ADD approval exists for ticker (pending, in flight,
+    executed or itself deferred). retry_deferred_entry drops the older one so
+    two deferred buys can't both fire at the open."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM pending_approvals "
+                "WHERE ticker=%s AND trading_env=%s AND id>%s AND action IN ('OPEN','ADD') "
+                "AND status IN ('PENDING','PROCESSING','APPROVED','FAILED') LIMIT 1",
+                (ticker, TRADING_ENV, approval_id),
+            )
+            return cur.fetchone() is not None
+    except Exception as e:
+        logging.error(f"has_newer_buy_approval failed: {e}")
+        return False
+    finally:
+        _put_conn(conn)
+
+
 def get_approval_by_id(approval_id: int) -> dict | None:
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT id, ticker, action, conviction, thesis_bucket, position_size_pct, "
-                "stop_loss_price, entry_strategy, reasoning, analyst_json, risk_json, status, expires_at "
-                "FROM pending_approvals WHERE id=%s",
+                "stop_loss_price, entry_strategy, reasoning, analyst_json, risk_json, status, expires_at, "
+                "timestamp FROM pending_approvals WHERE id=%s",
                 (approval_id,),
             )
             row = cur.fetchone()
@@ -1300,6 +1321,9 @@ def get_approval_by_id(approval_id: int) -> dict | None:
             "entry_strategy": row[7], "reasoning": row[8],
             "analyst_json": row[9], "risk_json": row[10],
             "status": row[11], "expires_at": row[12],
+            # Before 2026-10-28 this was missing, so retry_deferred_entry's
+            # 16 h age check always saw None and never fired.
+            "timestamp": row[13],
         }
     except Exception as e:
         logging.error(f"get_approval_by_id failed: {e}")

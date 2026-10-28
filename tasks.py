@@ -792,6 +792,14 @@ def retry_deferred_entry(self, approval_id: int, gap_retry_attempt: int = 1, pri
         }, None], queue=LLM_QUEUE_BULK, expires=LLM_EVENT_EXPIRES_SECONDS)
         return
 
+    # A deferred buy executes the decision as it stood at approval time, so
+    # drop it when newer information contradicts it (audit 10-28 10:53 #2).
+    reason = _deferred_buy_superseded(approval)
+    if reason:
+        db.update_approval_status(approval_id, "EXPIRED")
+        log.info(f"retry_deferred_entry: [{ticker}] approval #{approval_id} dropped: {reason}")
+        return
+
     success = execute_approved(
         approval, trigger="auto_retry",
         gap_retry_attempt=gap_retry_attempt, price_retry_attempt=price_retry_attempt,
@@ -803,6 +811,31 @@ def retry_deferred_entry(self, approval_id: int, gap_retry_attempt: int = 1, pri
 
 
 DEFERRED_ENTRY_MAX_AGE_HOURS = 16
+
+
+def _deferred_buy_superseded(approval: dict) -> str | None:
+    """Why a deferred OPEN/ADD should not execute, or None if it still stands:
+    a later approval for the same ticker exists, or a later analyst verdict
+    on the ticker is not a buy (WATCH, HOLD, TRIM, EXIT, ...)."""
+    from datetime import timezone
+    import db
+    if approval.get("action") not in ("OPEN", "ADD"):
+        return None
+    ticker = approval.get("ticker")
+    if db.has_newer_buy_approval(ticker, approval["id"]):
+        return "a newer buy approval for the same ticker exists"
+    ts = approval.get("timestamp")
+    latest = db.get_latest_signal_for(ticker)
+    if ts and latest and latest.get("timestamp") and latest.get("signal") not in ("OPEN", "ADD"):
+        lts = latest["timestamp"]
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        if lts.tzinfo is None:
+            lts = lts.replace(tzinfo=timezone.utc)
+        if lts > ts:
+            return (f"newer {latest['signal']} verdict (conviction "
+                    f"{latest.get('confidence', 0):g}) at {lts:%Y-%m-%d %H:%M} UTC")
+    return None
 
 
 def _approval_age_hours(approval: dict) -> float | None:

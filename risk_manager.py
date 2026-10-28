@@ -1416,7 +1416,8 @@ class RiskManager:
         return True
 
     def _partial_sell_and_resize_stop(self, ticker: str, qty: float, sell_qty: float,
-                                      new_stop: float) -> dict | None:
+                                      new_stop: float,
+                                      decision_price: float | None = None) -> dict | None:
         """Profit-target partial sale with the broker stop kept in step.
 
         Before 2026-10-27 both profit-target paths sold part of the position and
@@ -1466,6 +1467,21 @@ class RiskManager:
                 f"cancelled and NOT re-placed. Check the position in TWS."
             )
             return None
+
+        # Record the sale like every other fill (audit 2026-10-28 10:53 #3):
+        # before this, partial sales never reached trades or orders.
+        filled = float(order_result.get("filled_qty") or 0)
+        fill_price = order_result.get("fill_price") or decision_price or 0.0
+        try:
+            db.log_trade(symbol=ticker, side="SELL", quantity=filled, price=fill_price,
+                         reason="Profit target partial sell")
+            local_id = db.log_order(ticker=ticker, side="SELL", order_type="MARKET",
+                                    qty=sell_qty, broker_order_id=order_result.get("order_id"),
+                                    decision_price=decision_price, status="submitted")
+            if local_id and local_id > 0 and order_result.get("fill_price"):
+                db.update_order_fill(local_id, order_result["fill_price"], filled, "filled")
+        except Exception as e:
+            log.warning(f"[{ticker}] Profit-target sale logging failed: {e}")
 
         try:
             remaining = round(abs(float(ibkr.get_client().get_open_position(ticker).qty)), 4)
@@ -1607,7 +1623,8 @@ class RiskManager:
                 continue
 
             new_stop = entry  # breakeven on the remainder
-            order_result = self._partial_sell_and_resize_stop(ticker, qty, sell_qty, new_stop)
+            order_result = self._partial_sell_and_resize_stop(ticker, qty, sell_qty, new_stop,
+                                                              decision_price=current)
             if order_result is None:
                 continue
             db.mark_profit_target_taken(ticker, new_stop)
@@ -1694,7 +1711,8 @@ class RiskManager:
             return self._breakeven_without_sale(ticker, qty, entry)
 
         new_stop = entry  # breakeven on the remainder, same convention as the legacy path
-        order_result = self._partial_sell_and_resize_stop(ticker, qty, sell_qty, new_stop)
+        order_result = self._partial_sell_and_resize_stop(ticker, qty, sell_qty, new_stop,
+                                                          decision_price=current)
         if order_result is None:
             return False
         db.mark_profit_target_taken(ticker, new_stop)

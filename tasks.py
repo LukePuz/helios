@@ -1145,12 +1145,24 @@ def check_profit_targets(self):
         rm = RiskManager(client)
         sold = rm.check_profit_targets()
         for result in sold:
+            if result.get("action") == "BREAKEVEN_STOP":
+                # No shares sold (the partial rounds to 0); only the stop moved.
+                alerts._send(
+                    f"🛡️ BREAKEVEN STOP — {result['ticker']}\n"
+                    f"Profit target hit ({result['gain_pct']:.1%}, style={result['trade_style']}) "
+                    f"but the partial sale rounds to 0 shares. Stop moved to breakeven "
+                    f"${result['new_stop']:.2f}; nothing sold."
+                )
+                continue
+            # Price is the fill, not the new stop (audit 2026-10-28 10:53 #3).
+            fill = (result.get("order_result") or {}).get("fill_price")
             alerts.send_trade_alert(
                 symbol=result["ticker"], side="SELL",
-                qty=int(result["shares_sold"]), price=result["new_stop"],
+                qty=int(result["shares_sold"]), price=fill or result["new_stop"],
                 reason=(f"Profit target hit ({result['gain_pct']:.1%}, "
                         f"style={result['trade_style']}) — partial sell, "
-                        f"remainder stop moved to breakeven"),
+                        f"remainder stop moved to breakeven ${result['new_stop']:.2f}"
+                        + ("" if fill else " (fill price unavailable; price shown is the stop)")),
             )
     except Exception as e:
         log.error(f"check_profit_targets failed: {e}")

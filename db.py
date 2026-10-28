@@ -680,6 +680,9 @@ _MIGRATIONS: list[tuple[int, str]] = [
     # Rows whose catalyst fields were filled after entry by
     # backfill_catalyst_outcome (professor C6 residual, 2026-10-28).
     (54, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS catalyst_backfilled BOOLEAN DEFAULT FALSE;"),
+    # Per-verdict decision record: the model's raw action/conviction, each
+    # gate that changed it, and the full model JSON (roadmap 0e #8).
+    (55, "ALTER TABLE signals ADD COLUMN IF NOT EXISTS decision JSONB;"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -740,19 +743,22 @@ def log_trade(symbol: str, side: str, quantity: int, price: float, reason: str) 
 
 
 def log_signal(symbol: str, signal: str, confidence: float, reasoning: str,
-               model: str | None = None, provenance: dict | None = None) -> None:
+               model: str | None = None, provenance: dict | None = None,
+               decision: dict | None = None) -> None:
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO signals (symbol, signal, confidence, reasoning, trading_env, model, provenance) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                "INSERT INTO signals (symbol, signal, confidence, reasoning, trading_env, model, "
+                "provenance, decision) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
                 (symbol, signal, confidence, reasoning, TRADING_ENV, model,
-                 psycopg2.extras.Json(provenance) if provenance is not None else None),
+                 psycopg2.extras.Json(provenance) if provenance is not None else None,
+                 psycopg2.extras.Json(decision, dumps=lambda o: json.dumps(o, default=str))
+                 if decision is not None else None),
             )
         conn.commit()
     except psycopg2.errors.UndefinedColumn:
-        # Migrations 51-53 not applied yet (they run in init_db at stack
+        # Migrations 51-55 not applied yet (they run in init_db at stack
         # start); keep the verdict rather than lose it.
         conn.rollback()
         try:

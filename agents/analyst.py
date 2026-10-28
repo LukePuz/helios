@@ -759,6 +759,14 @@ def analyze(
     action     = str(parsed.get("action", "WATCH")).upper()
     conviction = max(1, min(10, int(parsed.get("conviction", 1) or 1)))
     udr        = float(parsed.get("upside_downside_ratio", 0) or 0)
+    # Decision record (roadmap 0e #8): the model's own verdict and full
+    # output before any gate, plus each gate that changed it. signals kept
+    # only the final action and 500 chars of reasoning, so a WATCH couldn't
+    # be told apart from an OPEN that a gate downgraded.
+    model_output = json.loads(json.dumps(parsed, default=str))
+    model_pass = bool(parsed.get("pass_to_risk", False))
+    model_action, model_conviction = action, conviction
+    gates: list[str] = []
 
     # The model doesn't reliably know what's held (ADD/HOLD on unheld MSFT
     # and AMZN, 10-15 and 10-26). An ADD on nothing is an OPEN and must pass
@@ -767,6 +775,7 @@ def analyze(
         coerced = "OPEN" if action == "ADD" else "WATCH"
         log.info(f"[{ticker}] {action} on a ticker not held -> {coerced}")
         parsed["reasoning"] = parsed.get("reasoning", "") + f" [{action} on an unheld ticker treated as {coerced}]"
+        gates.append(f"unheld {action} -> {coerced}")
         action = coerced
 
     # Sub-scores (1-5 each) — decompose overall conviction into components
@@ -886,6 +895,7 @@ def analyze(
     # Enforce minimum UDR for actionable recommendations
     if udr < 2.0 and action in ("OPEN", "ADD"):
         log.info(f"[{ticker}] UDR {udr:.1f} < 2.0 — downgrading to WATCH")
+        gates.append(f"udr {udr:.1f} < 2.0: {action} -> WATCH")
         action = "WATCH"
         parsed["pass_to_risk"] = False
         parsed["reasoning"] = (parsed.get("reasoning", "") +
@@ -906,6 +916,7 @@ def analyze(
     source_count = count_distinct_sources(sources)
     if source_count < 2 and action in ("OPEN", "ADD"):
         log.info(f"[{ticker}] Only {source_count} distinct source(s) cited — downgrading to WATCH")
+        gates.append(f"sources {source_count} < 2: {action} -> WATCH")
         action = "WATCH"
         parsed["pass_to_risk"] = False
         parsed["reasoning"] = (parsed.get("reasoning", "") +
@@ -929,6 +940,7 @@ def analyze(
             reason = ("no computable catalyst timeframe" if weeks_to_catalyst is None
                       else f"{per_week:.2f}%/week < {MIN_EXPECTED_RETURN_PCT_PER_WEEK}%/week minimum")
             log.info(f"[{ticker}] Expected-return rate check failed ({reason}) — downgrading to WATCH")
+            gates.append(f"return rate ({reason}): {action} -> WATCH")
             action = "WATCH"
             parsed["pass_to_risk"] = False
             parsed["reasoning"] = parsed.get("reasoning", "") + f" [Downgraded: {reason}]"
@@ -988,6 +1000,7 @@ def analyze(
             log.debug(f"[{ticker}] Trend Template check failed: {e}")
         if trend_template is not None and not trend_template["pass"]:
             log.info(f"[{ticker}] Trend Template failed ({trend_template['reasoning']}) — downgrading to WATCH")
+            gates.append(f"trend template: {action} -> WATCH")
             action = "WATCH"
             parsed["pass_to_risk"] = False
             parsed["reasoning"] = parsed.get("reasoning", "") + f" [Downgraded: Trend Template — {trend_template['reasoning']}]"
@@ -1001,6 +1014,7 @@ def analyze(
     # Moonshots need conviction >= 7 for OPEN
     if bucket == "Moonshot" and action == "OPEN" and conviction < 7:
         log.info(f"[{ticker}] Moonshot conviction {conviction} < 7 — downgrading to WATCH")
+        gates.append(f"moonshot conviction {conviction} < 7: OPEN -> WATCH")
         action = "WATCH"
         parsed["pass_to_risk"] = False
 
@@ -1015,6 +1029,7 @@ def analyze(
     regime_str = regime_packet.get("regime", "Neutral")
     if action == "OPEN" and regime_str in ("Neutral", "Risk-Off", "Strong Risk-Off") and conviction < 7:
         log.info(f"[{ticker}] {regime_str} regime — conviction {conviction} < 7 for new position — downgrading to WATCH")
+        gates.append(f"{regime_str} regime conviction {conviction} < 7: OPEN -> WATCH")
         action = "WATCH"
         parsed["pass_to_risk"] = False
 
@@ -1031,11 +1046,13 @@ def analyze(
     conviction_raw = conviction
     if fundamentals_missing and action in ("OPEN", "ADD") and conviction > 6:
         log.info(f"[{ticker}] No cached fundamentals — capping conviction {conviction} -> 6")
+        gates.append(f"no fundamentals: conviction {conviction} -> 6")
         conviction = 6
 
     # Validate pass_to_risk
     actionable = action in ("OPEN", "ADD", "TRIM", "EXIT")
     if parsed.get("pass_to_risk") and not (actionable and conviction >= 5):
+        gates.append(f"pass_to_risk dropped ({action} c{conviction})")
         parsed["pass_to_risk"] = False
 
     # Low-conviction sells (2026-10-27). The conviction >= 5 rule above meant
@@ -1046,7 +1063,10 @@ def analyze(
     # must also be <= 4, EXIT needs <= 2, and an EXIT at 3-4 becomes a TRIM.
     # UDR doesn't apply to sells.
     if action in ("TRIM", "EXIT") and conviction <= LOW_CONVICTION_SELL_MAX:
+        sell_from = action
         action, sell_passes, sell_note = _low_conviction_sell(ticker, action, conviction)
+        gates.append(f"low-conviction sell {sell_from} c{conviction} -> {action}, "
+                     f"pass={sell_passes}" + (f" ({sell_note})" if sell_note else ""))
         parsed["pass_to_risk"] = sell_passes
         if sell_note:
             parsed["reasoning"] = parsed.get("reasoning", "") + f" [{sell_note}]"
@@ -1061,9 +1081,16 @@ def analyze(
             reasoning=parsed.get("reasoning", "")[:500],
             model=ANALYST_MODEL,
             provenance=provenance,
+            decision={
+                "model_action": model_action, "model_conviction": model_conviction,
+                "model_pass_to_risk": model_pass,
+                "final_action": action, "final_conviction": conviction,
+                "final_pass_to_risk": bool(parsed.get("pass_to_risk", False)),
+                "gates": gates, "model_output": model_output,
+            },
         )
     except Exception as e:
-        log.debug(f"[{ticker}] Signal log failed: {e}")
+        log.warning(f"[{ticker}] Signal log failed: {e}")
 
     result = {
         "ticker":    ticker,

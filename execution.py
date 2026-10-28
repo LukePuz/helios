@@ -66,6 +66,44 @@ def _capture_original_thesis_if_new(ticker: str, approval: dict) -> None:
 # Approval-driven execution (auto-execute pipeline + Telegram Approve button)
 # ---------------------------------------------------------------------------
 
+def _whole_position_stop(ticker: str, new_stop: float, filled_qty: float):
+    """Stop handling when a BUY adds to a position that already has a stop.
+
+    Before 2026-10-27 an ADD overwrote entry_price with the add's fill price
+    and placed a broker stop for only the added shares, leaving the first
+    tranche on an older stop the DB no longer knew about. Now: one stop for
+    the whole position, at the higher of the old and new stop (never
+    loosened), with the broker's average cost as the entry price.
+
+    Returns (stop_price, (avg_cost, total_qty)) for an add, or
+    (new_stop, None) for a fresh position or when the broker lookup fails
+    (then the old behaviour applies: a stop for the filled shares only)."""
+    import db
+    import ibkr
+    import tasks
+    prior = db.get_position_stop(ticker)
+    if not prior or not prior.get("stop_price"):
+        return new_stop, None
+    try:
+        pos = ibkr.get_client().get_open_position(ticker)
+        total_qty = round(abs(float(pos.qty)), 4)
+        avg_cost = float(pos.avg_entry_price)
+    except Exception as e:
+        log.warning(f"[{ticker}] ADD: position lookup failed, stopping only the added shares: {e}")
+        return new_stop, None
+    if total_qty <= filled_qty:
+        return new_stop, None  # nothing was held before this fill
+    stop = max(new_stop, float(prior["stop_price"]))
+    try:
+        tasks.manage_cancel_stop_orders_for(ticker)
+    except Exception as e:
+        log.warning(f"[{ticker}] ADD: could not cancel the old stop, stopping only the added shares: {e}")
+        return new_stop, None
+    log.info(f"[{ticker}] ADD: one stop for all {total_qty} shares @ ${stop:.2f} "
+             f"(old ${float(prior['stop_price']):.2f}, new ${new_stop:.2f}); avg cost ${avg_cost:.2f}")
+    return stop, (avg_cost, total_qty)
+
+
 def execute_approved(
     approval: dict, trigger: str = "telegram",
     gap_retry_attempt: int = 1, price_retry_attempt: int = 1,
@@ -557,9 +595,13 @@ def execute_approved(
             _capture_original_thesis_if_new(ticker, approval)
             log.info(f"[{ticker}] Bracket stop recorded (orderId={bracket_result['stop_order_id']})")
         elif stop_price and side == "BUY":
+            entry_for_stops, stop_qty = current_price, filled_qty
+            stop_price, add_to_existing = _whole_position_stop(ticker, float(stop_price), filled_qty)
+            if add_to_existing:
+                entry_for_stops, stop_qty = add_to_existing
             db.upsert_position_stop(
                 ticker=ticker,
-                entry_price=current_price,
+                entry_price=entry_for_stops,
                 stop_price=float(stop_price),
                 stop_method=risk_json.get("stop_method", ""),
                 bucket=approval.get("thesis_bucket", "Accelerator"),
@@ -570,7 +612,7 @@ def execute_approved(
             stop_placed = False
             for stop_attempt in range(1, 4):
                 try:
-                    stop_result = tasks.manage_stop_place(ticker, filled_qty, float(stop_price))
+                    stop_result = tasks.manage_stop_place(ticker, stop_qty, float(stop_price))
                     db.set_stop_broker_order_id(ticker, stop_result["order_id"])
                     stop_placed = True
                     break
@@ -585,7 +627,7 @@ def execute_approved(
                     alert_module._send(
                         f"🚨 UNPROTECTED POSITION — ACTION REQUIRED\n"
                         f"<b>{ticker}</b>: entry order was filled but stop order failed after 3 attempts.\n"
-                        f"Stop target: <b>${float(stop_price):.2f}</b> for {filled_qty} shares.\n"
+                        f"Stop target: <b>${float(stop_price):.2f}</b> for {stop_qty} shares.\n"
                         f"Place stop manually in TWS immediately."
                     )
                 except Exception:

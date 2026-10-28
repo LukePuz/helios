@@ -10,6 +10,14 @@ import pytest
 import execution
 
 
+@pytest.fixture(autouse=True)
+def _no_prior_stop():
+    """BUY fills look up the existing stop to decide whether this is an ADD
+    (execution._whole_position_stop). Default: a fresh position."""
+    with patch("db.get_position_stop", return_value=None):
+        yield
+
+
 def _approval(action="TRIM", shares_initial=100, price_at_sizing=100.0, stop_loss_price=90.0):
     return {
         "id": 1,
@@ -548,3 +556,39 @@ class TestCatalystTrackingPersistence:
         assert kwargs["catalyst_event"] is None
         assert kwargs["expected_return_pct"] is None
         assert kwargs["sources"] is None
+
+
+class TestAddStopsWholePosition:
+    """2026-10-27 (audit finding 5): an ADD used to overwrite entry_price with
+    the add's fill and stop only the added shares."""
+
+    def _run(self, prior, pos_qty=15, avg=105.0, new_stop=95.0, filled=5):
+        client = MagicMock()
+        client.get_open_position.return_value = MagicMock(qty=pos_qty, avg_entry_price=avg)
+        with patch("db.get_position_stop", return_value=prior), \
+             patch("ibkr.get_client", return_value=client), \
+             patch("tasks.manage_cancel_stop_orders_for") as cancel:
+            result = execution._whole_position_stop("NVDA", new_stop, filled)
+        return result, cancel
+
+    def test_add_stops_the_whole_position_at_the_tighter_stop(self):
+        (stop, add), cancel = self._run({"stop_price": 98.0})
+        assert stop == 98.0            # old stop was higher: never loosen
+        assert add == (105.0, 15.0)    # avg cost, full quantity
+        cancel.assert_called_once_with("NVDA")
+
+    def test_add_raises_the_stop_when_the_new_one_is_higher(self):
+        (stop, _), _ = self._run({"stop_price": 90.0}, new_stop=97.0)
+        assert stop == 97.0
+
+    def test_fresh_position_is_unchanged(self):
+        (stop, add), cancel = self._run(None)
+        assert (stop, add) == (95.0, None)
+        cancel.assert_not_called()
+
+    def test_broker_lookup_failure_falls_back_to_added_shares_only(self):
+        with patch("db.get_position_stop", return_value={"stop_price": 98.0}), \
+             patch("ibkr.get_client", side_effect=RuntimeError("down")), \
+             patch("tasks.manage_cancel_stop_orders_for") as cancel:
+            assert execution._whole_position_stop("NVDA", 95.0, 5) == (95.0, None)
+        cancel.assert_not_called()

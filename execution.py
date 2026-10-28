@@ -802,6 +802,10 @@ def execute_manual(
     try:
         order_result = ibkr.place_market_order(ticker, side, qty)
     except Exception as e:
+        if side == "SELL":
+            # Same as execute_approved: the stop was cancelled above, so put
+            # it back (limitations audit 2026-10-28, finding 9).
+            _restore_stop_after_failed_sell(ticker)
         return {"success": False, "filled_qty": 0, "fill_price": None, "stop_price": None,
                 "message": f"Order submission failed: {e}"}
 
@@ -812,9 +816,13 @@ def execute_manual(
         # the broker.
         log.error(f"[{ticker}] No fill confirmed for manual {side} {qty} "
                   f"(id={order_result.get('order_id')}) — nothing recorded")
+        stop_note = (" The broker stop was cancelled before the sell and NOT re-placed "
+                     "(a late fill plus a full-size stop could short); check it."
+                     if side == "SELL" else "")
         return {"success": False, "filled_qty": 0, "fill_price": None, "stop_price": None,
                 "message": f"Order submitted (id {order_result.get('order_id')}) but no fill "
-                           f"confirmed within the wait window. Nothing recorded — check TWS."}
+                           f"confirmed within the wait window. Nothing recorded — check TWS."
+                           f"{stop_note}"}
 
     fill_price = order_result.get("fill_price") or ibkr.get_latest_price(ticker) or 0.0
     db.log_trade(symbol=ticker, side=side, quantity=filled_qty, price=fill_price, reason=reason)

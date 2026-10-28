@@ -239,6 +239,24 @@ class TestConvictionSwap:
             "initial_entry_pct": 0.55, "flags": [], "stop_loss_price": 90.0,
         }
 
+    def test_no_swap_while_market_closed(self):
+        result = _analyst_result(action="ADD", ticker="PLTR", conviction=9)
+        with patch("db.has_active_approval", return_value=False), \
+             patch("db.get_last_executed_approval", return_value=None), \
+             patch("agents.crew._get_price", return_value=100.0), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("catalyst_service.gates.catalyst_gate_check", return_value={"approved": True}), \
+             patch("execution.execute_manual") as mock_sell, \
+             patch("market_data.is_market_hours", return_value=False), \
+             patch("alerts._send"):
+            mock_rm_cls.return_value.size_position.return_value = self._cash_blocked_sizing()
+            mock_rm_cls.return_value.find_swap_candidate.return_value = {
+                "ticker": "SNOW", "conviction": 4, "qty": 10.0,
+                "market_value": 1000.0, "unrealized_pl": 150.0,
+            }
+            crew._route_to_approval(result, {"regime": "Neutral"}, MagicMock())
+        mock_sell.assert_not_called()
+
     def test_swap_found_resizes_and_proceeds(self):
         result = _analyst_result(action="ADD", ticker="PLTR", conviction=9)
         client = MagicMock()
@@ -250,6 +268,7 @@ class TestConvictionSwap:
              patch("db.log_pending_approval", return_value=-1) as mock_log_approval, \
              patch("catalyst_service.gates.catalyst_gate_check", return_value={"approved": True}), \
              patch("execution.execute_manual", return_value={"success": True}) as mock_sell, \
+             patch("market_data.is_market_hours", return_value=True), \
              patch("alerts._send") as mock_alert:
             mock_rm_cls.return_value.size_position.side_effect = [
                 self._cash_blocked_sizing(), self._funded_sizing(),

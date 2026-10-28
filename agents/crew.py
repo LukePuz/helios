@@ -742,6 +742,19 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
                     log.warning(f"[{ticker}] Swap candidate lookup failed: {e}")
                     swap = None
                 if swap:
+                    # Regular hours only (limitations audit 2026-10-28, finding
+                    # 9): analyses run from 05:00, and a pre-market swap sell is
+                    # a DAY market order that won't fill, after its stops have
+                    # already been cancelled.
+                    try:
+                        import market_data
+                        if not market_data.is_market_hours():
+                            log.info(f"[{ticker}] Swap out of {swap['ticker']} skipped: market closed")
+                            swap = None
+                    except Exception as e:
+                        log.warning(f"[{ticker}] Market-hours check failed, skipping swap: {e}")
+                        swap = None
+                if swap:
                     log.info(
                         f"[{ticker}] Cash-blocked at conviction {conviction}/10 — swapping "
                         f"out of {swap['ticker']} (conviction {swap['conviction']}/10, "

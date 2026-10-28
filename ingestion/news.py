@@ -14,6 +14,8 @@ import logging
 import re
 import time
 import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from urllib.parse import quote
 
 import requests
@@ -25,6 +27,9 @@ _SOURCE = "news"
 _TITLE_SOURCE = "news_title"   # cross-source dedup: same headline via both feeds
 GOOGLE_NEWS_RSS = "https://news.google.com/rss/search"
 HEADERS = {"User-Agent": "Mozilla/5.0 (trading-bot; +245081114+LukePuz@users.noreply.github.com)"}
+# Older items are dropped: a days-old "beats on earnings" story was being
+# analysed as a fresh trigger (limitations audit 2026-10-28, finding 6).
+MAX_ITEM_AGE = timedelta(hours=48)
 
 
 def _is_seen(item_id: str) -> bool:
@@ -40,8 +45,34 @@ def _title_key(title: str) -> str:
     link, so the identical headline from both sources gets two different
     IDs under the "news" source and was analyzed twice. This is a second,
     content-based dedup key shared across both fetchers."""
+    # Google News titles end in " - Publisher"; strip it so the same story
+    # from yfinance and Google gets the same key (audit 2026-10-28).
+    title = re.sub(r"\s+[-\u2013\u2014|]\s+[^-\u2013\u2014|]{2,40}$", "", title.strip())
     normalized = re.sub(r"\W+", "", title.lower())
     return hashlib.sha1(normalized.encode()).hexdigest()
+
+
+def _too_old(published: datetime | None) -> bool:
+    """Unknown publish time is kept; a known one older than MAX_ITEM_AGE is not."""
+    if published is None:
+        return False
+    if published.tzinfo is None:
+        published = published.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - published > MAX_ITEM_AGE
+
+
+def _parse_published(value) -> datetime | None:
+    if not value:
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+        value = str(value)
+        if re.match(r"\d{4}-\d{2}-\d{2}T", value):
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsedate_to_datetime(value)
+    except Exception:
+        return None
 
 
 def _is_seen_title(title: str) -> bool:
@@ -92,6 +123,11 @@ def _yfinance_news(ticker: str) -> list[dict]:
 
         if not title or _is_seen_title(title):
             continue
+        published = _parse_published(content.get("pubDate") or content.get("displayTime")
+                                     or item.get("providerPublishTime"))
+        if _too_old(published):
+            continue
+        pub_note = f" (published {published:%Y-%m-%d %H:%M} UTC)" if published else ""
 
         results.append({
             "source": "news",
@@ -99,7 +135,7 @@ def _yfinance_news(ticker: str) -> list[dict]:
             "title":  title,
             "url":    url,
             "image_url": _pick_thumbnail(content),
-            "text":   f"{title}\n\n{summary}".strip(),
+            "text":   f"{title}{pub_note}\n\n{summary}".strip(),
             # Not marked seen yet — tasks.poll_news marks both keys after a
             # successful dispatch, so a Celery retry can't lose the item.
             "_seen_keys": [(_SOURCE, item_id), (_TITLE_SOURCE, _title_key(title))],
@@ -127,6 +163,8 @@ def _google_news_rss(ticker: str) -> list[dict]:
         item_id = link or title
         if not title or not item_id or _is_seen(item_id) or _is_seen_title(title):
             continue
+        if _too_old(_parse_published(pub)):
+            continue
 
         results.append({
             "source": "news",
@@ -152,11 +190,20 @@ def poll_once() -> list[dict]:
     from knowledge_loader import get_all_tickers
 
     all_items = []
+    batch_keys = set()
     for ticker in get_all_tickers():
-        all_items.extend(_yfinance_news(ticker))
+        fetched = _yfinance_news(ticker)
         time.sleep(0.1)
-        all_items.extend(_google_news_rss(ticker))
+        fetched += _google_news_rss(ticker)
         time.sleep(0.3)  # be polite to Google's unofficial RSS endpoint
+        # Items are only marked seen after dispatch, so the same headline from
+        # both feeds used to pass in one poll (TSLA analysed 3x on 10-26).
+        for it in fetched:
+            key = (ticker, _title_key(it["title"]))
+            if key in batch_keys:
+                continue
+            batch_keys.add(key)
+            all_items.append(it)
     return all_items
 
 

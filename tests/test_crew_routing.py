@@ -221,6 +221,60 @@ class TestConcentrationCapping:
         mock_rm_cls.return_value.size_position.assert_called_once()
 
 
+class TestConcentrationUsesOrderWeight:
+    """Audit 10-28 #5: check_concentration used to get the remaining target
+    (position_size_pct) even when the order was bigger, e.g. one whole share
+    above target on an ADD. It now gets the larger of target and order_pct,
+    and a cap limits the shares the order actually buys."""
+
+    def _route(self, sizing, conc):
+        result = _analyst_result(action="ADD", ticker="PLTR", conviction=8)
+        with patch("db.has_active_approval", return_value=False), \
+             patch("db.get_last_executed_approval", return_value=None), \
+             patch("agents.crew._get_price", return_value=100.0), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("db.log_pending_approval", return_value=-1) as mock_log_approval, \
+             patch("catalyst_service.gates.catalyst_gate_check", return_value={"approved": True}):
+            mock_rm_cls.return_value.size_position.return_value = sizing
+            mock_rm_cls.return_value.check_concentration.return_value = conc
+            mock_rm_cls.return_value.check_correlation.return_value = {"reduce_by": 0}
+            crew._route_to_approval(result, {"regime": "Neutral"}, MagicMock())
+        return mock_rm_cls.return_value.check_concentration, mock_log_approval
+
+    def test_one_share_above_target_is_checked_at_its_real_weight(self):
+        sizing = {"shares_initial": 1, "initial_dollar": 100.0, "position_size_pct": 0.05,
+                  "order_pct": 0.20, "initial_entry_pct": 0.55, "flags": [],
+                  "stop_loss_price": 90.0}
+        conc, log_approval = self._route(sizing, {
+            "passed": False, "flags": ["AI infrastructure exposure 70% exceeds 60% limit"],
+            "ai_infrastructure_total": 0.70, "ai_infra_size_cap_pct": 0.10})
+        assert conc.call_args.args[1] == pytest.approx(0.20)
+        log_approval.assert_not_called()  # 1 share = 20% > 10% room
+
+    def test_tranche_under_the_cap_keeps_its_shares(self):
+        sizing = {"shares_initial": 5, "initial_dollar": 500.0, "position_size_pct": 0.10,
+                  "order_pct": 0.05, "initial_entry_pct": 0.55, "flags": [],
+                  "stop_loss_price": 90.0}
+        conc, log_approval = self._route(sizing, {
+            "passed": False, "flags": ["theme exposure"],
+            "ai_infrastructure_total": 0.5, "theme_size_cap_pct": 0.08})
+        assert conc.call_args.args[1] == pytest.approx(0.10)
+        kwargs = log_approval.call_args.kwargs
+        assert kwargs["risk_json"]["shares_initial"] == 5
+        assert kwargs["size_pct"] == pytest.approx(0.08)
+
+    def test_order_capped_to_room(self):
+        sizing = {"shares_initial": 10, "initial_dollar": 1000.0, "position_size_pct": 0.10,
+                  "order_pct": 0.10, "initial_entry_pct": 0.55, "flags": [],
+                  "stop_loss_price": 90.0}
+        _, log_approval = self._route(sizing, {
+            "passed": False, "flags": ["AI infra"], "ai_infrastructure_total": 0.65,
+            "ai_infra_size_cap_pct": 0.03})
+        kwargs = log_approval.call_args.kwargs
+        assert kwargs["risk_json"]["shares_initial"] == 3
+        assert kwargs["risk_json"]["initial_dollar"] == pytest.approx(300.0)
+
+
 class TestConvictionSwap:
     """2026-08-13: when sizing is blocked purely by a cash shortage (not a
     halt, not "already at target," not low conviction), _route_to_approval

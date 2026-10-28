@@ -92,14 +92,20 @@ def size_like_crew(rm, ticker, conviction, bucket, regime, price):
     sizing = rm.size_position(ticker, conviction, bucket, regime, price)
     if sizing.get("shares_initial", 0) <= 0:
         return 0, "size_position: " + "; ".join(sizing.get("flags", []))[:160]
-    conc = rm.check_concentration(ticker, sizing["position_size_pct"], bucket=bucket)
+    # Mirrors crew._route_to_approval: check the larger of target and order weight.
+    proposed = max(sizing["position_size_pct"], sizing.get("order_pct") or 0)
+    conc = rm.check_concentration(ticker, proposed, bucket=bucket)
     if not conc["passed"]:
         caps = [c for c in (conc.get("ai_infra_size_cap_pct"), conc.get("theme_size_cap_pct"),
                             conc.get("moonshot_size_cap_pct")) if c is not None]
         cap = min(caps) if caps else None
-        if cap is not None and cap < sizing["position_size_pct"]:
-            scale = cap / sizing["position_size_pct"] if sizing["position_size_pct"] > 0 else 0.0
-            shares = int(sizing["shares_initial"] * scale)
+        if cap is not None and cap < proposed:
+            order_pct = sizing.get("order_pct") or 0
+            if order_pct > 0:
+                shares = min(sizing["shares_initial"],
+                             int(sizing["shares_initial"] * cap / order_pct + 1e-9))
+            else:
+                shares = int(sizing["shares_initial"] * cap / proposed) if proposed > 0 else 0
             if shares <= 0:
                 return 0, f"concentration cap {cap:.1%} x int() -> 0 ({'; '.join(conc['flags'])[:120]})"
             return shares, f"capped by concentration to {cap:.1%}"

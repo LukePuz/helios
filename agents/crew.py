@@ -870,8 +870,11 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
                 _log_route_exit(ticker, "ROUTE_ZERO_SHARES", result, "; ".join(flags))
                 return
 
-        # Concentration check
-        conc = rm.check_concentration(ticker, sizing["position_size_pct"], bucket=bucket)
+        # Concentration check. position_size_pct is the remaining target; the
+        # order itself can be bigger (one whole share above target, e.g. on an
+        # ADD), so check whichever is larger (audit 10-28 #5).
+        proposed_pct = max(sizing["position_size_pct"], sizing.get("order_pct") or 0)
+        conc = rm.check_concentration(ticker, proposed_pct, bucket=bucket)
         if not conc["passed"]:
             log.info(f"[{ticker}] Concentration check failed: {conc['flags']}")
             sizing["flags"].extend(conc["flags"])
@@ -894,12 +897,19 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
                 conc.get("moonshot_size_cap_pct"),
             ) if c is not None]
             cap = min(caps) if caps else None
-            if cap is not None and cap < sizing["position_size_pct"]:
-                original_pct = sizing["position_size_pct"]
-                scale = (cap / original_pct) if original_pct > 0 else 0.0
-                sizing["position_size_pct"] = round(cap, 4)
-                sizing["shares_initial"] = int(sizing["shares_initial"] * scale)
-                sizing["initial_dollar"] = round(sizing["initial_dollar"] * scale, 2)
+            if cap is not None and cap < proposed_pct:
+                order_pct = sizing.get("order_pct") or 0
+                if order_pct > 0:
+                    # Cap what the order actually buys, not the target.
+                    shares = min(sizing["shares_initial"],
+                                 int(sizing["shares_initial"] * cap / order_pct + 1e-9))
+                else:
+                    shares = int(sizing["shares_initial"] * cap / proposed_pct) if proposed_pct > 0 else 0
+                old_shares = sizing["shares_initial"]
+                sizing["position_size_pct"] = round(min(sizing["position_size_pct"], cap), 4)
+                sizing["shares_initial"] = shares
+                sizing["initial_dollar"] = (round(sizing["initial_dollar"] * shares / old_shares, 2)
+                                            if old_shares else 0.0)
                 sizing["flags"].append(
                     f"Size capped to {cap:.1%} target ({sizing['shares_initial']} shares) "
                     f"to stay within concentration limits"

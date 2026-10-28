@@ -572,6 +572,9 @@ class RiskManager:
             "initial_entry_pct":   initial_pct,
             "initial_dollar":      round(initial_dollar, 2),
             "shares_initial":      shares_initial,
+            # What this order alone buys, as a share of the portfolio. Can
+            # exceed position_size_pct when one whole share is above target.
+            "order_pct":           round(shares_initial * price / pv, 4) if pv else 0,
             "stop_loss_price":     stop_price,
             "stop_method":         stop_method,
             "trailing_stop_activate_at_gain_pct": trail_activate,
@@ -732,6 +735,7 @@ class RiskManager:
             "initial_entry_pct":   1.0,   # risk-sized directly, no staged tranche
             "initial_dollar":      round(initial_dollar, 2),
             "shares_initial":      shares,
+            "order_pct":           round(initial_dollar / pv, 4) if pv else 0,
             "stop_loss_price":     stop_price,
             "stop_method":         f"Setup-gate structural stop ({bucket})",
             "trailing_stop_activate_at_gain_pct": None,  # see check_trailing_stops' ladder-ratchet path

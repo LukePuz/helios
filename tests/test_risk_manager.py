@@ -805,6 +805,11 @@ class TestOneShareAboveAllocation:
         assert sizing["shares_initial"] == 1
         assert any("buying 1 share" in f for f in sizing["flags"])
 
+    def test_order_pct_reports_the_one_share_weight(self):
+        sizing = self._size(2_500.0)
+        assert sizing["order_pct"] == pytest.approx(0.025)
+        assert sizing["order_pct"] > sizing["position_size_pct"]
+
     def test_no_share_when_one_share_exceeds_the_position_cap(self):
         assert self._size(8_000.0)["shares_initial"] == 0
 

@@ -116,7 +116,12 @@ def deep_analyze(event: dict, screening: dict | None = None) -> dict:
     try:
         from ibkr import IBKRClient
         client = IBKRClient()
-        positions = _get_positions(client)
+        positions = _get_positions(client, strict=True)
+        if positions is None:
+            log.warning(f"[{ticker}] Broker positions unavailable — skipping analysis "
+                        f"rather than analysing against an empty book")
+            return {"action": "SKIP", "ticker": ticker, "conviction": 0, "pass_to_risk": False,
+                    "reasoning": "Skipped: broker positions unavailable"}
         # Held tickers get a price via the CURRENT PORTFOLIO section; anything
         # not held previously had NO price anywhere in the brief, so the model
         # would invent one for any dollar-denominated valuation output (found
@@ -138,6 +143,8 @@ def deep_analyze(event: dict, screening: dict | None = None) -> dict:
         "tier":            wl_entry.get("tier", "Watch"),
         "sector":          wl_entry.get("sector", ""),
         "composite_score": 60,  # event-triggered, score is nominal
+        # None when the brief failed; analyze() only coerces on a known value
+        "held":            (ticker in positions) if client is not None else None,
     }
 
     # ── Analyze ────────────────────────────────────────────────────────────────
@@ -310,7 +317,10 @@ def review_all_held_positions(max_per_run: int = 10, priority_tickers: list[str]
     from agents.market_regime import get_cached_regime
 
     client = IBKRClient()
-    positions = _get_positions(client)
+    positions = _get_positions(client, strict=True)
+    if positions is None:
+        log.warning("Position review skipped: broker positions unavailable")
+        return []
     regime = get_cached_regime()
 
     try:
@@ -931,7 +941,12 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _get_positions(client) -> dict:
+def _get_positions(client, strict: bool = False) -> dict | None:
+    """Held positions by symbol. On a broker error returns {} or, with
+    strict=True, None, so callers that must not reason against a falsely
+    empty book (deep_analyze, the position review) can tell the difference.
+    On 10-19 the {} fallback had NVDA analysed as an OPEN while held and the
+    review logging "0 of 0 held tickers"."""
     try:
         positions = {}
         for p in client.get_all_positions():
@@ -945,8 +960,9 @@ def _get_positions(client) -> dict:
                 "market_value": float(p.market_value),
             }
         return positions
-    except Exception:
-        return {}
+    except Exception as e:
+        log.warning(f"Could not read broker positions: {e}")
+        return None if strict else {}
 
 
 def _get_price(ticker: str, client) -> float | None:

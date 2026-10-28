@@ -695,6 +695,15 @@ def analyze(
     conviction = max(1, min(10, int(parsed.get("conviction", 1) or 1)))
     udr        = float(parsed.get("upside_downside_ratio", 0) or 0)
 
+    # The model doesn't reliably know what's held (ADD/HOLD on unheld MSFT
+    # and AMZN, 10-15 and 10-26). An ADD on nothing is an OPEN and must pass
+    # the OPEN-only gates below; a HOLD on nothing is a WATCH. 2026-10-27.
+    if candidate.get("held") is False and action in ("ADD", "HOLD"):
+        coerced = "OPEN" if action == "ADD" else "WATCH"
+        log.info(f"[{ticker}] {action} on a ticker not held -> {coerced}")
+        parsed["reasoning"] = parsed.get("reasoning", "") + f" [{action} on an unheld ticker treated as {coerced}]"
+        action = coerced
+
     # Sub-scores (1-5 each) — decompose overall conviction into components
     # that can be individually calibrated against real outcomes later (see
     # db.get_subscore_calibration / _build_track_record_text), instead of

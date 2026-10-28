@@ -66,6 +66,37 @@ def _capture_original_thesis_if_new(ticker: str, approval: dict) -> None:
 # Approval-driven execution (auto-execute pipeline + Telegram Approve button)
 # ---------------------------------------------------------------------------
 
+def _restore_stop_after_failed_sell(ticker: str) -> None:
+    """A TRIM/EXIT cancels the broker stop before its market SELL. If the
+    order then fails to go in, put the stop back for what's held (limitations
+    audit 2026-10-27, finding 8). Before this the position was left with no
+    broker stop until someone noticed."""
+    import alerts as alert_module
+    import db
+    import ibkr
+    import tasks
+    stop_rec = db.get_position_stop(ticker)
+    if not stop_rec or not stop_rec.get("stop_price"):
+        return
+    try:
+        qty = round(abs(float(ibkr.get_client().get_open_position(ticker).qty)), 4)
+        if qty <= 0:
+            return
+        result = tasks.manage_stop_place(ticker, qty, float(stop_rec["stop_price"]))
+        db.set_stop_broker_order_id(ticker, result["order_id"])
+        log.info(f"[{ticker}] Sell failed; stop restored @ ${float(stop_rec['stop_price']):.2f} for {qty} shares")
+    except Exception as e:
+        log.error(f"[{ticker}] Sell failed and the stop could not be restored: {e}")
+        try:
+            alert_module._send(
+                f"🚨 UNPROTECTED POSITION — {ticker}\n"
+                f"A sell failed after its stop was cancelled, and the stop could not be "
+                f"restored. Place stop @ ${float(stop_rec['stop_price']):.2f} manually."
+            )
+        except Exception:
+            pass
+
+
 def _whole_position_stop(ticker: str, new_stop: float, filled_qty: float):
     """Stop handling when a BUY adds to a position that already has a stop.
 
@@ -479,7 +510,12 @@ def execute_approved(
 
         if not bracket_used:
             # Submit market order — result includes the confirmed fill price
-            order_result = ibkr.place_market_order(ticker, side, shares)
+            try:
+                order_result = ibkr.place_market_order(ticker, side, shares)
+            except Exception:
+                if side == "SELL":
+                    _restore_stop_after_failed_sell(ticker)
+                raise
             log.info(f"[{ticker}] Order submitted: {side} {shares} shares (id={order_result['order_id']})")
 
         if not bracket_used:
@@ -501,11 +537,17 @@ def execute_approved(
                 except Exception:
                     pass
                 try:
+                    stop_note = ""
+                    if side == "SELL":
+                        # Not restored automatically: the sell may still fill
+                        # late, and a full-size stop would then short.
+                        stop_note = ("\nThe broker stop was cancelled before the sell and NOT "
+                                     "re-placed. Check the position and re-place it if needed.")
                     alert_module._send(
                         f"⚠️ FILL UNCONFIRMED — <b>{ticker}</b>\n"
                         f"{side} {shares} shares submitted (order id "
                         f"{order_result.get('order_id')}) but no fill confirmed within "
-                        f"the wait window. Nothing recorded — reconcile in TWS."
+                        f"the wait window. Nothing recorded — reconcile in TWS.{stop_note}"
                     )
                 except Exception:
                     pass

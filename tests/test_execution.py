@@ -592,3 +592,28 @@ class TestAddStopsWholePosition:
              patch("tasks.manage_cancel_stop_orders_for") as cancel:
             assert execution._whole_position_stop("NVDA", 95.0, 5) == (95.0, None)
         cancel.assert_not_called()
+
+
+class TestStopRestoredAfterFailedSell:
+    """2026-10-27 (audit finding 8): a TRIM/EXIT whose order throws must not
+    leave the position without a broker stop."""
+
+    def test_stop_is_restored_for_the_held_quantity(self):
+        client = MagicMock()
+        client.get_open_position.return_value = MagicMock(qty=3)
+        with patch("db.get_position_stop", return_value={"stop_price": 90.0}), \
+             patch("db.set_stop_broker_order_id") as set_id, \
+             patch("ibkr.get_client", return_value=client), \
+             patch("tasks.manage_stop_place", return_value={"order_id": 5}) as place, \
+             patch("alerts._send") as send:
+            execution._restore_stop_after_failed_sell("NVDA")
+        place.assert_called_once_with("NVDA", 3.0, 90.0)
+        set_id.assert_called_once_with("NVDA", 5)
+        send.assert_not_called()
+
+    def test_alert_when_restore_fails(self):
+        with patch("db.get_position_stop", return_value={"stop_price": 90.0}), \
+             patch("ibkr.get_client", side_effect=RuntimeError("down")), \
+             patch("alerts._send") as send:
+            execution._restore_stop_after_failed_sell("NVDA")
+        assert "UNPROTECTED" in send.call_args[0][0]

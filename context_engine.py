@@ -87,6 +87,64 @@ def _catalyst_calendar_section(ticker: str) -> str:
         return ""
 
 
+def _price_structure_section(ticker: str, price: float | None = None) -> str:
+    """Deterministic levels the model never saw (limitations audit
+    2026-10-28 09:00, finding 2a): price structure, trend template, distance
+    from the Kijun line, ATR, base, fair value and the nearest support and
+    resistance rungs from the nightly trade ladder. These were computed only
+    after the LLM call (analyst gates) or only with SETUP_GATES_ENABLED."""
+    lines = [f"=== PRICE STRUCTURE — {ticker} ==="]
+    try:
+        from agents.price_action import compute_price_action, compute_trend_template
+        pa = compute_price_action(ticker)
+        if pa:
+            lines.append(f"Structure: {pa.get('structure')} ({pa.get('tag')}); 50-day MA "
+                         f"{pa.get('ma50_direction')}, 200-day MA {pa.get('ma200_direction')}. "
+                         f"{pa.get('summary', '')}")
+        tt = compute_trend_template(ticker)
+        if tt:
+            lines.append(f"Trend Template: {'PASS' if tt.get('pass') else 'FAIL'} — {tt.get('reasoning', '')}")
+    except Exception as e:
+        log.debug(f"[{ticker}] price action unavailable: {e}")
+    try:
+        from agents.chase_risk import compute_chase_risk
+        cr = compute_chase_risk(ticker)
+        if cr:
+            lines.append(f"Distance from Kijun (26-day midline): {cr['pct_from_kijun']:+.1f}% "
+                         f"(chase risk {cr['score']}/5, higher = less extended)")
+    except Exception as e:
+        log.debug(f"[{ticker}] chase risk unavailable: {e}")
+    try:
+        import db
+        ld = db.get_trade_ladder(ticker)
+        if ld:
+            ref = price or ld.get("current_price")
+            if ld.get("atr"):
+                lines.append(f"ATR(14): ${ld['atr']:.2f}"
+                             + (f" ({ld['atr'] / ref:.1%} of price)" if ref else ""))
+            if ld.get("base_floor") and ld.get("base_ceiling"):
+                lines.append(f"Recent base: ${ld['base_floor']:.2f} - ${ld['base_ceiling']:.2f}")
+            if ld.get("fair_value_blended"):
+                lines.append(f"Blended fair value: ${ld['fair_value_blended']:.2f} "
+                             f"(confidence {ld.get('valuation_confidence') or 'n/a'}); "
+                             f"street consensus target "
+                             + (f"${ld['street_consensus_target']:.2f}" if ld.get("street_consensus_target") else "n/a"))
+            rungs = sorted(ld.get("rungs") or [], key=lambda r: r.get("price") or 0)
+            if ref and rungs:
+                below = [r for r in rungs if r["price"] < ref][-2:]
+                above = [r for r in rungs if r["price"] >= ref][:2]
+                fmt = lambda r: f"${r['price']:.2f} ({r.get('detail') or ','.join(r.get('types', []))})"
+                if below:
+                    lines.append("Support: " + "; ".join(fmt(r) for r in reversed(below)))
+                if above:
+                    lines.append("Resistance: " + "; ".join(fmt(r) for r in above))
+            if ld.get("computed_at"):
+                lines.append(f"(levels computed {str(ld['computed_at'])[:16]})")
+    except Exception as e:
+        log.debug(f"[{ticker}] trade ladder unavailable: {e}")
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
 def _fundamentals_section(ticker: str) -> str:
     """
     Real revenue growth, margins, FCF, and valuation multiples (see
@@ -247,6 +305,10 @@ Buying Power:    ${float(account.buying_power):,.2f}""")
             log.warning(f"Options flow unavailable: {e}")
 
     # ── Fundamentals ─────────────────────────────────────────────────────────
+    price_section = _price_structure_section(ticker, current_price)
+    if price_section:
+        sections.append(price_section)
+
     fund_section = _fundamentals_section(ticker)
     if fund_section:
         sections.append(fund_section)
@@ -382,6 +444,10 @@ Buying Power:    ${float(account.buying_power):,.2f}""")
             log.warning(f"Options flow unavailable: {e}")
 
     # ── Fundamentals ─────────────────────────────────────────────────────────
+    price_section = _price_structure_section(ticker, current_price)
+    if price_section:
+        sections.append(price_section)
+
     fund_section = _fundamentals_section(ticker)
     if fund_section:
         sections.append(fund_section)

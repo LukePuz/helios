@@ -2878,6 +2878,17 @@ def close_trade_outcome(ticker: str, exit_price: float, exit_date=None) -> bool:
         _put_conn(conn)
 
 
+# Rows the test suite wrote into production before 9eb81fd (professor C9):
+# fake NVDA EXITs (approval 1, entry $100) and real NVDA rows closed at the
+# fake $100. Kept out of every outcome aggregate that feeds the analyst's
+# track record or the stats. A no-op once scripts/repair_test_artifacts.py
+# --apply has run; remove it then.
+_NOT_TEST_ARTIFACT = (
+    "NOT (action='EXIT' AND ticker='NVDA' AND COALESCE(approval_id, 0)=1 AND entry_price=100) "
+    "AND NOT (ticker='NVDA' AND COALESCE(exit_price, -1)=100)"
+)
+
+
 def get_conviction_calibration() -> list[dict]:
     """
     Realized win-rate and average alpha grouped by the conviction the analyst
@@ -2891,7 +2902,7 @@ def get_conviction_calibration() -> list[dict]:
                 "  COUNT(*) FILTER (WHERE was_correct = TRUE) AS wins, "
                 "  AVG(outcome_pct) AS avg_pct, AVG(alpha_pct) AS avg_alpha "
                 "FROM trade_outcomes "
-                "WHERE outcome_pct IS NOT NULL AND trading_env=%s "
+                f"WHERE outcome_pct IS NOT NULL AND trading_env=%s AND {_NOT_TEST_ARTIFACT} "
                 "GROUP BY conviction ORDER BY conviction DESC",
                 (TRADING_ENV,),
             )
@@ -2945,6 +2956,7 @@ def get_subscore_calibration(dimension: str) -> list[dict]:
                 f"  AVG(outcome_pct) AS avg_pct, AVG(alpha_pct) AS avg_alpha "
                 f"FROM trade_outcomes "
                 f"WHERE outcome_pct IS NOT NULL AND {dimension} IS NOT NULL AND trading_env=%s "
+                f"AND {_NOT_TEST_ARTIFACT} "
                 f"GROUP BY {dimension} ORDER BY {dimension} DESC",
                 (TRADING_ENV,),
             )
@@ -3062,7 +3074,7 @@ def get_outcomes_summary() -> dict:
                 "  COUNT(*) FILTER (WHERE was_correct = TRUE) AS wins, "
                 "  AVG(outcome_pct) AS avg_pct "
                 "FROM trade_outcomes "
-                "WHERE outcome_pct IS NOT NULL AND trading_env=%s "
+                f"WHERE outcome_pct IS NOT NULL AND trading_env=%s AND {_NOT_TEST_ARTIFACT} "
                 "GROUP BY thesis_bucket",
                 (TRADING_ENV,),
             )
@@ -3108,6 +3120,7 @@ def get_bucket_attribution() -> list[dict]:
                 WHERE o.outcome_pct IS NOT NULL
                   AND pa.risk_json ? 'initial_dollar'
                   AND o.trading_env = %s
+                  AND (NOT (o.action='EXIT' AND o.ticker='NVDA' AND COALESCE(o.approval_id, 0)=1 AND o.entry_price=100) AND NOT (o.ticker='NVDA' AND COALESCE(o.exit_price, -1)=100))
                 GROUP BY o.thesis_bucket
                 ORDER BY dollar_pnl DESC NULLS LAST
                 """,
@@ -3152,6 +3165,7 @@ def get_category_attribution() -> list[dict]:
                 WHERE o.outcome_pct IS NOT NULL
                   AND pa.risk_json ? 'initial_dollar'
                   AND o.trading_env = %s
+                  AND (NOT (o.action='EXIT' AND o.ticker='NVDA' AND COALESCE(o.approval_id, 0)=1 AND o.entry_price=100) AND NOT (o.ticker='NVDA' AND COALESCE(o.exit_price, -1)=100))
                   AND o.setup_category IS NOT NULL
                 GROUP BY o.setup_category
                 ORDER BY dollar_pnl DESC NULLS LAST

@@ -1,11 +1,19 @@
 """A fixed stop never lowers a trail-raised stop, and placing one re-arms the
 trail (limitations audit 2026-10-28 12:53, finding 3)."""
+import pytest
 from unittest.mock import MagicMock, patch
 
 import db
 import risk_manager
 import tasks
 
+
+
+@pytest.fixture(autouse=True)
+def _in_market_hours(monkeypatch):
+    # Partial sales only run in RTH since professor C15 (2026-10-28).
+    import market_data
+    monkeypatch.setattr(market_data, "is_market_hours", lambda *a, **k: True)
 
 def test_fixed_stop_clears_trailing_active():
     with patch("tasks._is_orders_worker", return_value=True), \

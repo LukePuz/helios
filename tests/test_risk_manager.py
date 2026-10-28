@@ -475,6 +475,12 @@ class TestCheckProfitTargets:
     position isn't re-sold, and a broker failure doesn't silently mark
     the target as taken anyway."""
 
+
+    @pytest.fixture(autouse=True)
+    def _in_market_hours(self, monkeypatch):
+        # Partial sales only run in RTH since professor C15 (2026-10-28).
+        import market_data
+        monkeypatch.setattr(market_data, "is_market_hours", lambda *a, **k: True)
     def _rm(self, positions):
         client = _make_client(positions=positions)
         rm = risk_manager.RiskManager.__new__(risk_manager.RiskManager)
@@ -670,6 +676,12 @@ class TestSectorAwareTradeStyle:
     market-wide one when available, and the market-wide read is still
     used as the fallback when sector data isn't."""
 
+
+    @pytest.fixture(autouse=True)
+    def _in_market_hours(self, monkeypatch):
+        # Partial sales only run in RTH since professor C15 (2026-10-28).
+        import market_data
+        monkeypatch.setattr(market_data, "is_market_hours", lambda *a, **k: True)
     def _rm(self, positions):
         client = _make_client(positions=positions)
         rm = risk_manager.RiskManager.__new__(risk_manager.RiskManager)

@@ -7,7 +7,8 @@ metadata so consumers (drift guards, stop monitors) can refuse to act on
 last-RTH prices hours after the close.
 """
 import logging
-from datetime import datetime, time as dtime, timedelta, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from ibkr import get_latest_price, get_historical_bars
 from config import SYMBOLS
@@ -18,8 +19,34 @@ log = logging.getLogger(__name__)
 STALE_AFTER_MINUTES = 20
 
 
+_ET = ZoneInfo("America/New_York")
+_RTH_OPEN = dtime(9, 30)
+_RTH_CLOSE = dtime(16, 0)
+_EARLY_CLOSE = dtime(13, 0)
+# NYSE full-day holidays and 13:00 ET early closes, 2026-2027 (published NYSE
+# calendar). Extend before 2028; is_market_hours logs a warning past the end.
+_NYSE_HOLIDAYS = {date(*d) for d in (
+    (2026, 1, 1), (2026, 1, 19), (2026, 2, 16), (2026, 4, 3), (2026, 5, 25), (2026, 6, 19),
+    (2026, 7, 3), (2026, 9, 7), (2026, 11, 26), (2026, 12, 25),
+    (2027, 1, 1), (2027, 1, 18), (2027, 2, 15), (2027, 3, 26), (2027, 5, 31), (2027, 6, 18),
+    (2027, 7, 5), (2027, 9, 6), (2027, 11, 25), (2027, 12, 24),
+)}
+_NYSE_EARLY_CLOSES = {date(*d) for d in ((2026, 11, 27), (2026, 12, 24), (2027, 11, 26))}
+_CALENDAR_LAST_YEAR = 2027
+
+
+def _session(day: date) -> tuple[dtime, dtime] | None:
+    """(open, close) in ET for a trading day, None for weekends/holidays."""
+    if day.weekday() >= 5 or day in _NYSE_HOLIDAYS:
+        return None
+    if day.year > _CALENDAR_LAST_YEAR:
+        log.warning(f"NYSE holiday calendar ends {_CALENDAR_LAST_YEAR}; extend market_data._NYSE_HOLIDAYS")
+    return (_RTH_OPEN, _EARLY_CLOSE if day in _NYSE_EARLY_CLOSES else _RTH_CLOSE)
+
+
 def is_market_hours(now_utc: datetime | None = None) -> bool:
-    """Rough US regular-trading-hours check (Mon-Fri 13:30-20:00 UTC).
+    """US regular trading hours, 09:30-16:00 America/New_York, NYSE holidays
+    and early closes excluded.
 
     Promoted from module-private 2026-07-27 so ibkr.place_market_order and
     execution.execute_approved can gate new BUY entries on it directly --
@@ -27,11 +54,16 @@ def is_market_hours(now_utc: datetime | None = None) -> bool:
     Sunday-evening auto-executed ADD submitted a DAY market order while the
     market was closed; IBKR queued it for the next session instead of
     filling or rejecting it, and the 30s fill-wait then declared the trade
-    FAILED without ever cancelling the now-orphaned, still-live order)."""
-    now = now_utc or datetime.now(timezone.utc)
-    if now.weekday() >= 5:
+    FAILED without ever cancelling the now-orphaned, still-live order).
+
+    Before 2026-10-28 this was fixed 13:30-20:00 UTC, which is only right
+    during daylight time: from 11-02 it would have called 08:30-09:30 ET
+    open and 15:00-16:00 ET closed, and it had no holidays (professor C14)."""
+    now = (now_utc or datetime.now(timezone.utc)).astimezone(_ET)
+    sess = _session(now.date())
+    if sess is None:
         return False
-    return dtime(13, 30) <= now.time() <= dtime(20, 0)
+    return sess[0] <= now.time() <= sess[1]
 
 
 # Old name kept as an alias -- this module's own get_priced_quote already
@@ -40,21 +72,24 @@ _is_market_hours = is_market_hours
 
 
 def next_market_open(now_utc: datetime | None = None) -> datetime:
-    """Next regular-session open (13:30 UTC / 9:30 ET on a weekday) at or
-    after `now`. Added 2026-07-28 alongside the move to a 5:00 AM ET wake --
+    """Next regular-session open (09:30 ET on a trading day) at or after
+    `now`, in UTC. Added 2026-07-28 alongside the move to a 5:00 AM ET wake --
     early ingestion/analysis now often finishes a new-entry recommendation
     well before the market opens, and execution.execute_approved's
     market-hours gate defers it rather than firing blind at a stale price.
     tasks.retry_deferred_entry uses this to schedule a single retry right
     at the open, instead of the recommendation just sitting FAILED until
-    something else happens to re-trigger analysis."""
-    now = now_utc or datetime.now(timezone.utc)
-    candidate = now.replace(hour=13, minute=30, second=0, microsecond=0)
-    if candidate <= now:
-        candidate += timedelta(days=1)
-    while candidate.weekday() >= 5:
-        candidate += timedelta(days=1)
-    return candidate
+    something else happens to re-trigger analysis. DST- and holiday-aware
+    since 2026-10-28 (professor C14)."""
+    now = (now_utc or datetime.now(timezone.utc)).astimezone(_ET)
+    day = now.date()
+    for _ in range(15):
+        if _session(day) is not None:
+            candidate = datetime.combine(day, _RTH_OPEN, tzinfo=_ET)
+            if candidate > now:
+                return candidate.astimezone(timezone.utc)
+        day += timedelta(days=1)
+    raise RuntimeError("no trading day in the next 15 days")
 
 
 def get_priced_quote(ticker: str) -> dict | None:

@@ -1,10 +1,18 @@
 """Profit-target partial sales must keep the broker stop in step (audit 2026-10-27
 finding 6). Before the fix the broker STP stayed at the old price for the
 original quantity after a partial sale, so it could oversell into a short."""
+import pytest
 from unittest.mock import MagicMock, patch
 
 import risk_manager
 
+
+
+@pytest.fixture(autouse=True)
+def _in_market_hours(monkeypatch):
+    # Partial sales only run in RTH since professor C15 (2026-10-28).
+    import market_data
+    monkeypatch.setattr(market_data, "is_market_hours", lambda *a, **k: True)
 
 def _rm():
     return object.__new__(risk_manager.RiskManager)

@@ -1,10 +1,18 @@
 """Profit-target partial sales are recorded in trades/orders, and the alert
 shows the fill price, not the new stop (audit 2026-10-28 10:53 #3)."""
+import pytest
 from unittest.mock import MagicMock, patch
 
 import risk_manager
 import tasks
 
+
+
+@pytest.fixture(autouse=True)
+def _in_market_hours(monkeypatch):
+    # Partial sales only run in RTH since professor C15 (2026-10-28).
+    import market_data
+    monkeypatch.setattr(market_data, "is_market_hours", lambda *a, **k: True)
 
 def _rm():
     return object.__new__(risk_manager.RiskManager)

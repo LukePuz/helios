@@ -1319,7 +1319,28 @@ class RiskManager:
                         log.error(f"[{ticker}] Native TRAIL conversion failed — falling back to "
                                  f"one-shot cancel/replace: {e}")
                         prev_high = stop_record.get("trailing_high") or entry
-                        if current > prev_high and new_stop > stop_px:
+                        if not (current > prev_high and new_stop > stop_px):
+                            # The stops were already cancelled above: put the
+                            # fixed stop back rather than leave it unprotected
+                            # (professor C16, 2026-10-28).
+                            try:
+                                import tasks
+                                qty = round(abs(float(pos.qty)), 4)
+                                result = tasks.manage_stop_place(ticker, qty, float(stop_px))
+                                db.set_stop_broker_order_id(ticker, result["order_id"])
+                                log.info(f"[{ticker}] Fixed stop restored @ ${float(stop_px):.2f} "
+                                         f"after the failed TRAIL conversion")
+                            except Exception as e2:
+                                log.error(f"[{ticker}] Stop restore after TRAIL failure failed: {e2}")
+                                alerts.append({
+                                    "ticker":        ticker,
+                                    "action":        "FIX_STOP",
+                                    "current_price": current,
+                                    "stop_price":    stop_px,
+                                    "reason":        f"TRAIL conversion failed and the ${float(stop_px):.2f} "
+                                                     f"stop could not be restored — place it manually in TWS",
+                                })
+                        elif current > prev_high and new_stop > stop_px:
                             try:
                                 import tasks
                                 tasks.manage_cancel_stop_orders_for(ticker)
@@ -1472,6 +1493,15 @@ class RiskManager:
         import db
         import ibkr
         import tasks
+
+        # Outside regular hours a market SELL is cancelled after the fill
+        # wait (ibkr.place_market_order), and the stop would already be gone:
+        # leave everything as is and let the next in-hours check take the
+        # target (professor C15, 2026-10-28).
+        import market_data
+        if not market_data.is_market_hours():
+            log.info(f"[{ticker}] Profit target reached outside regular hours: sale deferred to RTH")
+            return None
 
         stop_rec = db.get_position_stop(ticker) or {}
         old_stop = stop_rec.get("stop_price")

@@ -470,6 +470,60 @@ class TestReconcileUnconfirmedOrders:
         cancel, place, _ = self._run_sell([])
         place.assert_not_called()
 
+    def test_lookup_passes_ticker_side_and_placement_margin(self):
+        from datetime import datetime, timezone, timedelta
+        created = datetime(2026, 10, 28, 14, 0, tzinfo=timezone.utc)
+        with patch("db.get_unconfirmed_orders",
+                   return_value=[{**self._order(), "created_at": created}]), \
+             patch("ibkr.get_fill_for_order", return_value=None) as lookup:
+            tasks.reconcile_unconfirmed_orders.run()
+        lookup.assert_called_once_with(764, ticker="CRWD", side="BUY",
+                                       placed_at=created - timedelta(minutes=5))
+
+    def test_partial_late_fill_is_marked_partial(self):
+        """Professor M-4: a fill short of the order used to be marked filled."""
+        with patch("db.get_unconfirmed_orders", return_value=[self._order()]), \
+             patch("ibkr.get_fill_for_order",
+                   return_value={"filled_qty": 100.0, "fill_price": 181.0}), \
+             patch("db.log_trade") as log_trade, \
+             patch("db.update_order_fill") as update_fill, \
+             patch("db.get_approval_by_id", return_value=self._approval()), \
+             patch("tasks.manage_stop_place", return_value={"order_id": 9}) as place, \
+             patch("db.upsert_position_stop"), patch("db.set_stop_broker_order_id"), \
+             patch("db.update_approval_status"), patch("alerts._send"):
+            tasks.reconcile_unconfirmed_orders.run()
+        update_fill.assert_called_once_with(44, fill_price=181.0, filled_qty=100.0, status="partial")
+        assert log_trade.call_args.kwargs["quantity"] == 100.0
+        place.assert_called_once_with("CRWD", 100.0, 153.61)
+
+    def test_rest_of_partial_order_logs_only_new_shares(self):
+        order = {**self._order(), "filled_qty": 100.0, "fill_price": 181.0}
+        with patch("db.get_unconfirmed_orders", return_value=[order]), \
+             patch("ibkr.get_fill_for_order",
+                   return_value={"filled_qty": 144.0, "fill_price": 182.0}), \
+             patch("db.log_trade") as log_trade, \
+             patch("db.update_order_fill") as update_fill, \
+             patch("db.get_approval_by_id", return_value=self._approval()), \
+             patch("tasks.manage_stop_place", return_value={"order_id": 9}) as place, \
+             patch("db.upsert_position_stop"), patch("db.set_stop_broker_order_id"), \
+             patch("db.update_approval_status"), patch("alerts._send"):
+            tasks.reconcile_unconfirmed_orders.run()
+        kw = log_trade.call_args.kwargs
+        assert kw["quantity"] == 44.0
+        assert abs(kw["price"] - (144 * 182.0 - 100 * 181.0) / 44) < 1e-9
+        update_fill.assert_called_once_with(44, fill_price=182.0, filled_qty=144.0, status="filled")
+        place.assert_called_once_with("CRWD", 44.0, 153.61)
+
+    def test_no_new_shares_on_partial_order_does_nothing(self):
+        order = {**self._order(), "filled_qty": 100.0, "fill_price": 181.0}
+        with patch("db.get_unconfirmed_orders", return_value=[order]), \
+             patch("ibkr.get_fill_for_order",
+                   return_value={"filled_qty": 100.0, "fill_price": 181.0}), \
+             patch("db.log_trade") as log_trade, patch("alerts._send") as send:
+            tasks.reconcile_unconfirmed_orders.run()
+        log_trade.assert_not_called()
+        send.assert_not_called()
+
     def test_late_exit_closes_stop_record_and_outcome(self):
         """Professor M-3: a late full exit left position_stops behind, so
         stale-stop cleanup logged the SELL a second time."""

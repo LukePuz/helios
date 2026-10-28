@@ -2666,14 +2666,17 @@ def get_unconfirmed_orders(max_age_hours: int = 24) -> list[dict]:
     accounts (paper and live can each independently produce the same id
     for two unrelated orders), so an unscoped read here could look up a
     stale paper order's fill status against whichever broker is currently
-    connected and get a nonsensical or wrong-order match."""
+    connected and get a nonsensical or wrong-order match.
+
+    Also returns 'partial' orders (some shares reconciled, the rest may still
+    fill) with the filled_qty/fill_price already recorded (professor M-4)."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT id, ticker, side, qty, broker_order_id, decision_price, approval_id, "
-                "intent, stop_price "
-                "FROM orders WHERE status='unconfirmed' AND broker_order_id IS NOT NULL "
+                "intent, stop_price, created_at, filled_qty, fill_price "
+                "FROM orders WHERE status IN ('unconfirmed', 'partial') AND broker_order_id IS NOT NULL "
                 "AND trading_env=%s "
                 "AND created_at > NOW() - INTERVAL '%s hours' ORDER BY created_at",
                 (TRADING_ENV, max_age_hours),
@@ -2686,6 +2689,9 @@ def get_unconfirmed_orders(max_age_hours: int = 24) -> list[dict]:
                 "broker_order_id": r[4], "decision_price": float(r[5]) if r[5] is not None else None,
                 "approval_id": r[6], "intent": r[7],
                 "stop_price": float(r[8]) if r[8] is not None else None,
+                "created_at": r[9],
+                "filled_qty": float(r[10]) if r[10] is not None else 0.0,
+                "fill_price": float(r[11]) if r[11] is not None else None,
             }
             for r in rows
         ]

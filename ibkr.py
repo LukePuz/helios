@@ -632,7 +632,8 @@ def cancel_stop_orders_for(ticker: str) -> int:
     return confirmed
 
 
-def get_fill_for_order(broker_order_id: int) -> dict | None:
+def get_fill_for_order(broker_order_id: int, ticker: str | None = None,
+                       side: str | None = None, placed_at=None) -> dict | None:
     """Looks up actual executions for a specific order by id, aggregating
     partials into one (filled_qty, avg_price). Returns None if nothing has
     executed for that order (yet, or ever).
@@ -657,10 +658,22 @@ def get_fill_for_order(broker_order_id: int) -> dict | None:
     current session -- closing that gap needs either IBKR's separate Flex
     Query historical-reports API or manual reconciliation against a broker
     statement, not reqExecutions.
+
+    orderIds are per clientId and reqExecutions returns every client's
+    executions, so an id alone can match an unrelated order (professor M-4,
+    2026-10-28). Callers pass the order's ticker, side (BUY/SELL) and
+    placement time; an execution must agree on each one given.
     """
     ib = get_ib()
     execs = ib.reqExecutions()
-    matches = [e for e in execs if e.execution.orderId == broker_order_id]
+    want_side = {"BUY": "BOT", "SELL": "SLD"}.get(side) if side else None
+    matches = [
+        e for e in execs
+        if e.execution.orderId == broker_order_id
+        and (ticker is None or e.contract.symbol == ticker)
+        and (want_side is None or e.execution.side == want_side)
+        and (placed_at is None or _exec_time(e) is None or _exec_time(e) >= placed_at)
+    ]
     if not matches:
         return None
     total_qty = sum(float(e.execution.shares) for e in matches)
@@ -668,6 +681,15 @@ def get_fill_for_order(broker_order_id: int) -> dict | None:
         return None
     avg_price = sum(float(e.execution.shares) * float(e.execution.avgPrice) for e in matches) / total_qty
     return {"filled_qty": total_qty, "fill_price": avg_price}
+
+
+def _exec_time(record):
+    """Execution time as an aware datetime, or None if it can't be read."""
+    from datetime import timezone
+    t = getattr(record.execution, "time", None)
+    if t is None or not hasattr(t, "tzinfo"):
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
 
 
 def get_recent_sell_fill(ticker: str) -> dict | None:

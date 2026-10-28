@@ -159,7 +159,8 @@ class TestCancelOrderPollsForTerminalStatus:
 
 
 class _FakeExecution:
-    def __init__(self, order_id, shares, avg_price, side):
+    def __init__(self, order_id, shares, avg_price, side, time=None):
+        self.time = time
         self.orderId = order_id
         self.shares = shares
         self.avgPrice = avg_price
@@ -167,9 +168,9 @@ class _FakeExecution:
 
 
 class _FakeFillRecord:
-    def __init__(self, symbol, order_id, shares, avg_price, side):
+    def __init__(self, symbol, order_id, shares, avg_price, side, time=None):
         self.contract = MagicMock(symbol=symbol)
-        self.execution = _FakeExecution(order_id, shares, avg_price, side)
+        self.execution = _FakeExecution(order_id, shares, avg_price, side, time)
 
 
 class TestGetRecentSellFill:
@@ -320,3 +321,29 @@ class TestCancelStopOrdersForVerification:
 
         assert confirmed == 1
         fake_ib.cancelOrder.assert_called_once_with(stop_for_ticker.order)
+
+
+class TestGetFillForOrderMatching:
+    """Professor M-4: orderIds are per clientId and reqExecutions returns all
+    clients' executions, so the id alone can match an unrelated order."""
+
+    def _lookup(self, records, **kw):
+        fake_ib = MagicMock()
+        fake_ib.reqExecutions.return_value = records
+        with patch("ibkr.get_ib", return_value=fake_ib):
+            return ibkr.get_fill_for_order(764, **kw)
+
+    def test_same_id_other_ticker_or_side_is_ignored(self):
+        recs = [_FakeFillRecord("NVDA", 764, 10.0, 200.0, "BOT"),
+                _FakeFillRecord("CRWD", 764, 5.0, 180.0, "SLD"),
+                _FakeFillRecord("CRWD", 764, 144.0, 181.3, "BOT")]
+        r = self._lookup(recs, ticker="CRWD", side="BUY")
+        assert r == {"filled_qty": 144.0, "fill_price": 181.3}
+
+    def test_execution_before_the_order_was_placed_is_ignored(self):
+        from datetime import datetime, timezone, timedelta
+        placed = datetime(2026, 10, 28, 14, 0, tzinfo=timezone.utc)
+        recs = [_FakeFillRecord("CRWD", 764, 144.0, 181.3, "BOT", time=placed - timedelta(hours=1))]
+        assert self._lookup(recs, ticker="CRWD", side="BUY", placed_at=placed) is None
+        recs = [_FakeFillRecord("CRWD", 764, 144.0, 181.3, "BOT", time=placed + timedelta(seconds=40))]
+        assert self._lookup(recs, ticker="CRWD", side="BUY", placed_at=placed)["filled_qty"] == 144.0

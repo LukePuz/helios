@@ -943,6 +943,7 @@ def reconcile_unconfirmed_orders(self):
     import db
     import ibkr
     import alerts
+    from datetime import timedelta
 
     try:
         pending = db.get_unconfirmed_orders(max_age_hours=24 * 30)
@@ -953,7 +954,13 @@ def reconcile_unconfirmed_orders(self):
     for order in pending:
         ticker = order["ticker"]
         try:
-            fill = ibkr.get_fill_for_order(order["broker_order_id"])
+            # The row is written after the fill wait, so a partial can
+            # execute before created_at: allow a margin.
+            placed_at = order.get("created_at")
+            if placed_at is not None:
+                placed_at -= timedelta(minutes=5)
+            fill = ibkr.get_fill_for_order(order["broker_order_id"], ticker=ticker,
+                                           side=order["side"], placed_at=placed_at)
         except Exception as e:
             log.warning(f"[{ticker}] reconcile_unconfirmed_orders: fill lookup failed for "
                         f"order {order['broker_order_id']}: {e}")
@@ -961,10 +968,20 @@ def reconcile_unconfirmed_orders(self):
         if not fill:
             continue  # still genuinely unfilled (or cancelled/rejected) -- leave alone
 
-        fill_qty, fill_price = fill["filled_qty"], fill["fill_price"]
+        # A 'partial' order already has some shares recorded: log only the
+        # new ones, at their own average price (professor M-4).
+        total_qty, total_avg = fill["filled_qty"], fill["fill_price"]
+        prev_qty = order.get("filled_qty") or 0.0
+        fill_qty = round(total_qty - prev_qty, 4)
+        if fill_qty <= 0:
+            continue
+        fill_price = ((total_qty * total_avg - prev_qty * (order.get("fill_price") or total_avg))
+                      / fill_qty) if prev_qty else total_avg
+        complete = order.get("qty") is None or total_qty >= float(order["qty"]) - 1e-6
         log.warning(f"[{ticker}] Late fill found for order {order['broker_order_id']}: "
                     f"{order['side']} {fill_qty} @ ${fill_price:.2f} — was recorded "
-                    f"unconfirmed, reconciling now")
+                    f"unconfirmed, reconciling now"
+                    + ("" if complete else f" ({total_qty:g} of {order['qty']:g} filled)"))
 
         intent = order.get("intent")
         db.log_trade(
@@ -972,7 +989,8 @@ def reconcile_unconfirmed_orders(self):
             reason=(f"{intent + ' ' if intent else ''}Late-fill reconciled (order placed "
                     f"unconfirmed, filled after the wait window)"),
         )
-        db.update_order_fill(order["id"], fill_price=fill_price, filled_qty=fill_qty, status="filled")
+        db.update_order_fill(order["id"], fill_price=total_avg, filled_qty=total_qty,
+                             status="filled" if complete else "partial")
 
         stop_placed: bool | None = False
         approval = db.get_approval_by_id(order["approval_id"]) if order["approval_id"] else None
@@ -984,7 +1002,7 @@ def reconcile_unconfirmed_orders(self):
                     with ticker_lock(ticker):
                         stop_result = manage_stop_place(ticker, fill_qty, float(stop_price))
                     db.upsert_position_stop(
-                        ticker=ticker, entry_price=fill_price, stop_price=float(stop_price),
+                        ticker=ticker, entry_price=total_avg, stop_price=float(stop_price),
                         stop_method=risk_json.get("stop_method", ""),
                         bucket=approval.get("thesis_bucket", "Accelerator"),
                         conviction=approval.get("conviction", 5),

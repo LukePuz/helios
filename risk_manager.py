@@ -1300,6 +1300,65 @@ class RiskManager:
                                  f"order update FAILED — fix manually in TWS",
             })
 
+    def _partial_sell_and_resize_stop(self, ticker: str, qty: float, sell_qty: float,
+                                      new_stop: float) -> dict | None:
+        """Profit-target partial sale with the broker stop kept in step.
+
+        Before 2026-10-27 both profit-target paths sold part of the position and
+        only wrote the breakeven stop to the DB. The broker STP stayed at the old
+        price for the ORIGINAL quantity, so it could oversell into a short, and
+        the 30-min backstop saw the size mismatch as uncovered. Same pattern as
+        execution.py's TRIM path: cancel the stop, sell, then place a stop for
+        what's left. If the sale fails, the old stop goes back on.
+        Returns the order result, or None if the sale failed."""
+        import alerts
+        import db
+        import ibkr
+        import tasks
+
+        stop_rec = db.get_position_stop(ticker) or {}
+        old_stop = stop_rec.get("stop_price")
+        try:
+            tasks.manage_cancel_stop_orders_for(ticker)
+        except Exception as e:
+            log.error(f"[{ticker}] Profit-target: could not cancel broker stop, not selling: {e}")
+            return None
+
+        try:
+            order_result = ibkr.place_market_order(ticker, "SELL", sell_qty)
+        except Exception as e:
+            log.error(f"[{ticker}] Profit-target partial sell FAILED: {e}")
+            if old_stop:
+                try:
+                    result = tasks.manage_stop_place(ticker, round(qty, 4), float(old_stop))
+                    db.set_stop_broker_order_id(ticker, result["order_id"])
+                except Exception as e2:
+                    log.error(f"[{ticker}] Could not restore stop after failed sale: {e2}")
+                    alerts._send(
+                        f"🚨 UNPROTECTED POSITION — {ticker}\n"
+                        f"Profit-target sale failed and the stop could not be restored. "
+                        f"Place stop @ ${float(old_stop):.2f} for {round(qty, 4)} shares manually."
+                    )
+            return None
+
+        try:
+            remaining = round(abs(float(ibkr.get_client().get_open_position(ticker).qty)), 4)
+        except Exception:
+            remaining = round(qty - float(order_result.get("filled_qty") or sell_qty), 4)
+        if remaining > 0:
+            try:
+                result = tasks.manage_stop_place(ticker, remaining, new_stop)
+                db.set_stop_broker_order_id(ticker, result["order_id"])
+                log.info(f"[{ticker}] Stop re-placed @ ${new_stop:.2f} for remaining {remaining} shares")
+            except Exception as e:
+                log.error(f"[{ticker}] Failed to re-place stop after profit-target sale: {e}")
+                alerts._send(
+                    f"🚨 UNPROTECTED POSITION — {ticker}\n"
+                    f"Profit-target sale filled but stop re-placement failed. "
+                    f"Place stop @ ${new_stop:.2f} for {remaining} shares manually."
+                )
+        return order_result
+
     def check_profit_targets(self) -> list[dict]:
         """
         Regime-adaptive profit-taking for Accelerator/Moonshot positions
@@ -1417,14 +1476,10 @@ class RiskManager:
             if sell_qty <= 0:
                 continue
 
-            try:
-                import ibkr
-                order_result = ibkr.place_market_order(ticker, "SELL", sell_qty)
-            except Exception as e:
-                log.error(f"[{ticker}] Profit-target partial sell FAILED: {e}")
-                continue
-
             new_stop = entry  # breakeven on the remainder
+            order_result = self._partial_sell_and_resize_stop(ticker, qty, sell_qty, new_stop)
+            if order_result is None:
+                continue
             db.mark_profit_target_taken(ticker, new_stop)
             log.info(f"[{ticker}] Profit target hit ({gain_pct:.1%} >= {target:.1%}, "
                      f"style={trade_style}): sold {sell_qty} shares, "
@@ -1508,14 +1563,10 @@ class RiskManager:
         if sell_qty <= 0:
             return False
 
-        try:
-            import ibkr
-            order_result = ibkr.place_market_order(ticker, "SELL", sell_qty)
-        except Exception as e:
-            log.error(f"[{ticker}] Setup-gate profit-target partial sell FAILED: {e}")
-            return False
-
         new_stop = entry  # breakeven on the remainder, same convention as the legacy path
+        order_result = self._partial_sell_and_resize_stop(ticker, qty, sell_qty, new_stop)
+        if order_result is None:
+            return False
         db.mark_profit_target_taken(ticker, new_stop)
         if overextended and target_hit:
             reason = f"ladder target ${nearest_target:.2f} hit + Overextended valuation"

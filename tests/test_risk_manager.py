@@ -452,6 +452,20 @@ def _priced_holding(symbol, qty=10.0, current_price=100.0):
     return MagicMock(symbol=symbol, qty=qty, current_price=current_price)
 
 
+@pytest.fixture
+def stop_resize_mocks():
+    """Profit-target partial sales cancel and re-place the broker stop
+    (test_profit_target_stop_resize.py covers that part)."""
+    with patch("db.get_position_stop", return_value={"stop_price": 90.0}), \
+         patch("db.set_stop_broker_order_id"), \
+         patch("tasks.manage_cancel_stop_orders_for"), \
+         patch("tasks.manage_stop_place", return_value={"order_id": 2}), \
+         patch("ibkr.get_client"), \
+         patch("alerts._send"):
+        yield
+
+
+@pytest.mark.usefixtures("stop_resize_mocks")
 class TestCheckProfitTargets:
     """2026-08-29, user request: the profit-target/partial-exit piece
     missing from the original protective-only stop path -- see
@@ -646,6 +660,7 @@ class TestFlagStalePositions:
         assert result == []
 
 
+@pytest.mark.usefixtures("stop_resize_mocks")
 class TestSectorAwareTradeStyle:
     """2026-08-29, user request: a held position should be evaluated
     against ITS OWN sector's regime (agents.market_regime.

@@ -441,9 +441,9 @@ class TestReconcileUnconfirmedOrders:
         mock_stop.assert_not_called()
         assert "check TWS" in mock_alert.call_args[0][0]
 
-    def _run_sell(self, positions, stop_rec={"stop_price": 150.0}):
+    def _run_sell(self, positions, stop_rec={"stop_price": 150.0}, **order_extra):
         from unittest.mock import MagicMock
-        order = self._order(side="SELL", qty=50.0)
+        order = {**self._order(side="SELL", qty=50.0), **order_extra}
         client = MagicMock()
         client.get_all_positions.return_value = positions
         with patch("db.get_unconfirmed_orders", return_value=[order]), \
@@ -458,13 +458,44 @@ class TestReconcileUnconfirmedOrders:
              patch("tasks.manage_cancel_stop_orders_for") as cancel, \
              patch("tasks.manage_stop_place", return_value={"order_id": 9}) as place, \
              patch("db.update_approval_status"), \
+             patch("db.delete_position_stop") as delete, \
+             patch("db.close_trade_outcome") as close, \
+             patch("db.mark_profit_target_taken") as taken, \
              patch("alerts._send") as send:
             tasks.reconcile_unconfirmed_orders.run()
+        self.extra = {"delete": delete, "close": close, "taken": taken}
         return cancel, place, send
 
     def test_late_sell_that_closed_the_position_places_no_stop(self):
         cancel, place, _ = self._run_sell([])
         place.assert_not_called()
+
+    def test_late_exit_closes_stop_record_and_outcome(self):
+        """Professor M-3: a late full exit left position_stops behind, so
+        stale-stop cleanup logged the SELL a second time."""
+        self._run_sell([], intent="EXIT")
+        self.extra["delete"].assert_called_once_with("CRWD")
+        self.extra["close"].assert_called_once_with("CRWD", exit_price=175.0)
+
+    def test_late_exit_already_cleaned_up_is_not_closed_twice(self):
+        self._run_sell([], stop_rec=None, intent="EXIT")
+        self.extra["delete"].assert_not_called()
+        self.extra["close"].assert_not_called()
+
+    def test_late_profit_target_sale_marks_taken_and_uses_its_stop(self):
+        """Professor M-3: the remainder went back on the pre-sale stop and the
+        target stayed open for a second sale."""
+        from unittest.mock import MagicMock
+        _, place, _ = self._run_sell([MagicMock(symbol="CRWD", qty=20)],
+                                     intent="PROFIT_TARGET", stop_price=181.0)
+        self.extra["taken"].assert_called_once_with("CRWD", 181.0)
+        place.assert_called_once_with("CRWD", 20.0, 181.0)
+
+    def test_late_trim_keeps_recorded_stop_and_target_open(self):
+        from unittest.mock import MagicMock
+        _, place, _ = self._run_sell([MagicMock(symbol="CRWD", qty=20)], intent="TRIM")
+        self.extra["taken"].assert_not_called()
+        place.assert_called_once_with("CRWD", 20.0, 150.0)
 
     def test_late_partial_sell_reprotects_the_remainder(self):
         """Professor C12 (2026-10-28): the stop is cancelled before a partial

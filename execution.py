@@ -588,7 +588,7 @@ def execute_approved(
                         ticker=ticker, side=side, order_type="MARKET",
                         qty=shares, broker_order_id=order_result.get("order_id"),
                         decision_price=price_at_sizing, approval_id=approval["id"],
-                        status="unconfirmed",
+                        status="unconfirmed", intent=action,
                     )
                 except Exception:
                     pass

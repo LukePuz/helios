@@ -93,3 +93,4 @@ def test_unconfirmed_partial_sale_is_logged_for_reconcile():
     assert result is None
     kw = log_order.call_args.kwargs
     assert kw["status"] == "unconfirmed" and kw["broker_order_id"] == 7 and kw["side"] == "SELL"
+    assert kw["intent"] == "PROFIT_TARGET" and kw["stop_price"] is not None

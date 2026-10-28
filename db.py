@@ -695,6 +695,10 @@ _MIGRATIONS: list[tuple[int, str]] = [
     # value (limitations audit 2026-10-28 12:53, #3 follow-up).
     (58, "ALTER TABLE position_stops ADD COLUMN IF NOT EXISTS trail_amount DECIMAL, "
          "ADD COLUMN IF NOT EXISTS trail_percent DECIMAL;"),
+    # Why an order was placed (EXIT, TRIM, PROFIT_TARGET, ...), so a late SELL
+    # fill can be finished the way its own path would have (professor M-3,
+    # 2026-10-28). NULL on older rows.
+    (59, "ALTER TABLE orders ADD COLUMN IF NOT EXISTS intent TEXT;"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -2583,6 +2587,7 @@ def log_order(
     approval_id: int | None = None,
     parent_order_id: int | None = None,
     status: str = "submitted",
+    intent: str | None = None,
 ) -> int:
     """Logs a newly-placed order. Returns the local orders.id (-1 on failure)."""
     conn = _get_conn()
@@ -2592,12 +2597,12 @@ def log_order(
                 """
                 INSERT INTO orders
                     (broker_order_id, trading_env, ticker, side, order_type, qty, limit_price,
-                     stop_price, decision_price, approval_id, parent_order_id, status)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     stop_price, decision_price, approval_id, parent_order_id, status, intent)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 RETURNING id
                 """,
                 (broker_order_id, TRADING_ENV, ticker, side, order_type, qty, limit_price,
-                 stop_price, decision_price, approval_id, parent_order_id, status),
+                 stop_price, decision_price, approval_id, parent_order_id, status, intent),
             )
             order_id = cur.fetchone()[0]
         conn.commit()
@@ -2666,7 +2671,8 @@ def get_unconfirmed_orders(max_age_hours: int = 24) -> list[dict]:
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, ticker, side, qty, broker_order_id, decision_price, approval_id "
+                "SELECT id, ticker, side, qty, broker_order_id, decision_price, approval_id, "
+                "intent, stop_price "
                 "FROM orders WHERE status='unconfirmed' AND broker_order_id IS NOT NULL "
                 "AND trading_env=%s "
                 "AND created_at > NOW() - INTERVAL '%s hours' ORDER BY created_at",
@@ -2678,7 +2684,8 @@ def get_unconfirmed_orders(max_age_hours: int = 24) -> list[dict]:
                 "id": r[0], "ticker": r[1], "side": r[2],
                 "qty": float(r[3]) if r[3] is not None else None,
                 "broker_order_id": r[4], "decision_price": float(r[5]) if r[5] is not None else None,
-                "approval_id": r[6],
+                "approval_id": r[6], "intent": r[7],
+                "stop_price": float(r[8]) if r[8] is not None else None,
             }
             for r in rows
         ]

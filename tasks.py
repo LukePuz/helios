@@ -965,9 +965,11 @@ def reconcile_unconfirmed_orders(self):
                     f"{order['side']} {fill_qty} @ ${fill_price:.2f} — was recorded "
                     f"unconfirmed, reconciling now")
 
+        intent = order.get("intent")
         db.log_trade(
             symbol=ticker, side=order["side"], quantity=fill_qty, price=fill_price,
-            reason="Late-fill reconciled (order placed unconfirmed, filled after the wait window)",
+            reason=(f"{intent + ' ' if intent else ''}Late-fill reconciled (order placed "
+                    f"unconfirmed, filled after the wait window)"),
         )
         db.update_order_fill(order["id"], fill_price=fill_price, filled_qty=fill_qty, status="filled")
 
@@ -996,7 +998,7 @@ def reconcile_unconfirmed_orders(self):
             # A late SELL fill (partial sale or TRIM whose stop was cancelled
             # before the sale) leaves the rest without a stop. Re-protect it at
             # the recorded stop (professor C12, 2026-10-28).
-            stop_placed = _reprotect_after_late_sell(ticker)
+            stop_placed = _reprotect_after_late_sell(ticker, order, fill_price)
 
         alert_lines = [
             f"🔁 LATE FILL RECONCILED — <b>{ticker}</b>",
@@ -1014,12 +1016,20 @@ def reconcile_unconfirmed_orders(self):
             pass
 
 
-def _reprotect_after_late_sell(ticker: str) -> bool | None:
-    """After a late SELL fill: cancel any resting stops for ticker and place one
-    for the shares still held, at the stop price on record. Returns True if
-    placed, False if it should have been but failed, None if nothing is held."""
+def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
+                               fill_price: float | None = None) -> bool | None:
+    """After a late SELL fill, finish what the selling path would have done
+    (professor M-3, 2026-10-28):
+    - nothing left: delete the stop record and close the outcome at the fill
+      price, so stale-stop cleanup doesn't log the exit a second time;
+    - a profit-target sale: mark the target taken (no second sale) and protect
+      the rest at the stop that sale computed (breakeven or higher);
+    - otherwise: cancel resting stops and protect the rest at the stop on record.
+    Returns True if a stop was placed, False if it should have been but failed,
+    None if nothing is held."""
     import db
     import ibkr
+    order = order or {}
     try:
         pos = next((p for p in ibkr.get_client().get_all_positions() if p.symbol == ticker), None)
         remaining = round(abs(float(pos.qty)), 4) if pos else 0.0
@@ -1027,8 +1037,18 @@ def _reprotect_after_late_sell(ticker: str) -> bool | None:
         log.error(f"[{ticker}] reconcile: could not read the position after a late sell: {e}")
         return False
     if remaining <= 0:
+        if db.get_position_stop(ticker):
+            db.delete_position_stop(ticker)
+            if fill_price:
+                try:
+                    db.close_trade_outcome(ticker, exit_price=fill_price)
+                except Exception as e:
+                    log.warning(f"[{ticker}] reconcile: close_trade_outcome failed: {e}")
         return None
     stop_price = (db.get_position_stop(ticker) or {}).get("stop_price")
+    if order.get("intent") == "PROFIT_TARGET" and order.get("stop_price"):
+        stop_price = order["stop_price"]
+        db.mark_profit_target_taken(ticker, float(stop_price))
     if not stop_price:
         log.error(f"[{ticker}] reconcile: {remaining} shares left after a late sell, no stop on record")
         return False

@@ -1549,7 +1549,8 @@ class RiskManager:
             try:
                 db.log_order(ticker=ticker, side="SELL", order_type="MARKET", qty=sell_qty,
                              broker_order_id=order_result.get("order_id"),
-                             decision_price=decision_price, status="unconfirmed")
+                             decision_price=decision_price, status="unconfirmed",
+                             intent="PROFIT_TARGET", stop_price=new_stop)
             except Exception as e:
                 log.error(f"[{ticker}] Could not log the unconfirmed profit-target sale: {e}")
             alerts._send(

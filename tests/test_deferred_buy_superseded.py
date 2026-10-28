@@ -54,3 +54,54 @@ def test_sells_are_not_checked():
     with patch("db.has_newer_buy_approval") as newer:
         assert tasks._deferred_buy_superseded({"id": 1, "ticker": "X", "action": "EXIT"}) is None
     newer.assert_not_called()
+
+
+def _sized_approval(shares=5):
+    a = _approval()
+    a["risk_json"] = {"shares_initial": shares, "price_at_sizing": 100.0}
+    a["thesis_bucket"], a["conviction"] = "Accelerator", 7
+    return a
+
+
+def _run_resized(approval, shares_now):
+    with patch("db.get_approval_by_id", return_value=approval), \
+         patch("db.has_newer_buy_approval", return_value=False), \
+         patch("db.get_latest_signal_for", return_value=None), \
+         patch("tasks._deferred_buy_shares_now", return_value=shares_now), \
+         patch("db.update_approval_status") as status, \
+         patch("execution.execute_approved", return_value=True) as execute:
+        tasks.retry_deferred_entry.run(7)
+    return status, execute
+
+
+def test_buy_that_sizes_to_zero_now_is_dropped():
+    status, execute = _run_resized(_sized_approval(), 0)
+    execute.assert_not_called()
+    assert status.call_args.kwargs["reason"].startswith("re-check at execution")
+
+
+def test_buy_is_reduced_to_what_fits_now():
+    _, execute = _run_resized(_sized_approval(5), 2)
+    assert execute.call_args.args[0]["risk_json"]["shares_initial"] == 2
+
+
+def test_buy_is_never_increased():
+    _, execute = _run_resized(_sized_approval(5), 9)
+    assert execute.call_args.args[0]["risk_json"]["shares_initial"] == 5
+
+
+def test_recheck_failure_keeps_the_approved_size():
+    with patch("ibkr.get_client", side_effect=RuntimeError("no broker")):
+        assert tasks._deferred_buy_shares_now(_sized_approval()) is None
+
+
+def test_recheck_uses_sizing_and_caps():
+    from unittest.mock import MagicMock
+    rm = MagicMock()
+    rm.size_position.return_value = {"shares_initial": 4}
+    rm.shares_after_concentration.return_value = 3
+    with patch("ibkr.get_client"), \
+         patch("agents.market_regime.get_cached_regime", return_value={"regime": "Neutral"}), \
+         patch("risk_manager.RiskManager", return_value=rm):
+        assert tasks._deferred_buy_shares_now(_sized_approval()) == 3
+    assert rm.size_position.call_args.args == ("SNOW", 7, "Accelerator", "Neutral", 100.0)

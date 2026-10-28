@@ -816,6 +816,22 @@ def retry_deferred_entry(self, approval_id: int, gap_retry_attempt: int = 1, pri
         log.info(f"retry_deferred_entry: [{ticker}] approval #{approval_id} dropped: {reason}")
         return
 
+    # Re-size against the account as it is now: positions, cash and caps may
+    # have changed since approval (audit 10-28 10:53 #2 residual).
+    shares_now = _deferred_buy_shares_now(approval)
+    if shares_now is not None:
+        approved = int((approval.get("risk_json") or {}).get("shares_initial") or 0)
+        if shares_now <= 0:
+            db.update_approval_status(approval_id, "EXPIRED",
+                                      reason="re-check at execution: sizes to 0 shares now")
+            log.info(f"retry_deferred_entry: [{ticker}] approval #{approval_id} dropped: "
+                     f"sizes to 0 shares at execution")
+            return
+        if shares_now < approved:
+            log.info(f"retry_deferred_entry: [{ticker}] approval #{approval_id} reduced "
+                     f"{approved} -> {shares_now} shares at execution")
+            approval = {**approval, "risk_json": {**approval["risk_json"], "shares_initial": shares_now}}
+
     success = execute_approved(
         approval, trigger="auto_retry",
         gap_retry_attempt=gap_retry_attempt, price_retry_attempt=price_retry_attempt,
@@ -827,6 +843,32 @@ def retry_deferred_entry(self, approval_id: int, gap_retry_attempt: int = 1, pri
 
 
 DEFERRED_ENTRY_MAX_AGE_HOURS = 16
+
+
+def _deferred_buy_shares_now(approval: dict) -> int | None:
+    """Shares a deferred OPEN/ADD would get if sized now (sizing + concentration
+    caps on the live account, at the price it was approved at). None when it
+    isn't a buy or the re-check itself fails (then the approved size stands)."""
+    if approval.get("action") not in ("OPEN", "ADD"):
+        return None
+    risk_json = approval.get("risk_json") or {}
+    price = risk_json.get("price_at_sizing")
+    if not price:
+        return None
+    try:
+        import ibkr
+        from agents.market_regime import get_cached_regime
+        from risk_manager import RiskManager
+        regime = (get_cached_regime() or {}).get("regime", "Neutral")
+        bucket = approval.get("thesis_bucket") or "Accelerator"
+        rm = RiskManager(ibkr.get_client())
+        sizing = rm.size_position(approval["ticker"], int(approval.get("conviction") or 5),
+                                  bucket, regime, float(price))
+        return rm.shares_after_concentration(approval["ticker"], sizing, bucket)
+    except Exception as e:
+        log.warning(f"retry_deferred_entry: [{approval.get('ticker')}] re-size failed, "
+                    f"keeping the approved size: {e}")
+        return None
 
 
 def _deferred_buy_superseded(approval: dict) -> str | None:

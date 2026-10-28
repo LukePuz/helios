@@ -1111,6 +1111,24 @@ class RiskManager:
         candidates.sort(key=lambda c: (c["unrealized_pl"], c["conviction"]))
         return candidates[0]
 
+    def shares_after_concentration(self, ticker: str, sizing: dict, bucket: str) -> int:
+        """shares_initial after the concentration caps, checked at the larger
+        of target and order weight (same rule as crew._route_to_approval)."""
+        shares = int(sizing.get("shares_initial", 0) or 0)
+        if shares <= 0:
+            return 0
+        proposed = max(sizing.get("position_size_pct") or 0, sizing.get("order_pct") or 0)
+        conc = self.check_concentration(ticker, proposed, bucket=bucket)
+        if conc.get("passed", False):
+            return shares
+        caps = [c for c in (conc.get("ai_infra_size_cap_pct"), conc.get("theme_size_cap_pct"),
+                            conc.get("moonshot_size_cap_pct")) if c is not None]
+        cap = min(caps) if caps else None
+        if cap is None or cap >= proposed:
+            return shares
+        base = (sizing.get("order_pct") or 0) or proposed
+        return min(shares, int(shares * cap / base + 1e-9)) if base > 0 else 0
+
     def would_size_after_swap(self, ticker: str, conviction: int, bucket: str,
                               regime: str, price: float, swap: dict) -> int:
         """Shares the new buy would get if `swap` were sold first: sizing run
@@ -1147,22 +1165,9 @@ class RiskManager:
         try:
             sim = RiskManager(_View(), start_value=self.start_value)
             sizing = sim.size_position(ticker, conviction, bucket, regime, price)
-            shares = int(sizing.get("shares_initial", 0))
-            if shares <= 0:
-                return 0
             # Same concentration cap crew applies after sizing (professor M36):
             # a swap whose buy the caps cut to 0 must not sell the holding.
-            proposed = max(sizing.get("position_size_pct") or 0, sizing.get("order_pct") or 0)
-            conc = sim.check_concentration(ticker, proposed, bucket=bucket)
-            if not conc.get("passed", False):
-                caps = [c for c in (conc.get("ai_infra_size_cap_pct"), conc.get("theme_size_cap_pct"),
-                                    conc.get("moonshot_size_cap_pct")) if c is not None]
-                cap = min(caps) if caps else None
-                if cap is not None and cap < proposed:
-                    order_pct = sizing.get("order_pct") or 0
-                    base = order_pct if order_pct > 0 else proposed
-                    shares = min(shares, int(shares * cap / base + 1e-9)) if base > 0 else 0
-            return shares
+            return sim.shares_after_concentration(ticker, sizing, bucket)
         except Exception as e:
             log.warning(f"[{ticker}] swap pre-check sizing failed: {e}")
             return 0

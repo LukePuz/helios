@@ -739,8 +739,9 @@ def retry_deferred_entry(self, approval_id: int, gap_retry_attempt: int = 1, pri
     so every retry chain is bounded to a fixed window after the open rather
     than deferring indefinitely.
 
-    Deliberately does NOT re-run the 72B analysis — reuses
-    execute_approved's own price-drift, gap-confirmation, and price-
+    Approvals older than DEFERRED_ENTRY_MAX_AGE_HOURS are expired and sent
+    back through a fresh 72B analysis instead (2026-10-27). Younger ones do
+    NOT re-run the analysis — they reuse execute_approved's own price-drift, gap-confirmation, and price-
     freshness guards as the safety check against firing a now-stale
     decision. If the market is somehow still closed when this fires
     (holiday, clock skew), or the gap/price still hasn't resolved,
@@ -764,6 +765,23 @@ def retry_deferred_entry(self, approval_id: int, gap_retry_attempt: int = 1, pri
         return
 
     ticker = approval.get("ticker", "?")
+
+    # Stale decisions get re-analysed instead of executed (2026-10-27,
+    # limitations audit finding 13). A Friday-evening approval used to fill at
+    # Monday's open on 60-hour-old reasoning, guarded only by price drift.
+    age_h = _approval_age_hours(approval)
+    if age_h is not None and age_h > DEFERRED_ENTRY_MAX_AGE_HOURS:
+        db.update_approval_status(approval_id, "EXPIRED")
+        log.info(f"retry_deferred_entry: [{ticker}] approval #{approval_id} is {age_h:.0f}h old "
+                 f"(> {DEFERRED_ENTRY_MAX_AGE_HOURS}h) — expired, queued a fresh analysis")
+        deep_analyze_event.apply_async(args=[{
+            "ticker": ticker, "source": "stale_entry_recheck", "type": "re-analysis",
+            "title": f"Re-check of a {approval.get('action', 'BUY')} approved {age_h:.0f}h ago "
+                     f"that never executed",
+            "text": "",
+        }, None], queue=LLM_QUEUE_BULK, expires=LLM_EVENT_EXPIRES_SECONDS)
+        return
+
     success = execute_approved(
         approval, trigger="auto_retry",
         gap_retry_attempt=gap_retry_attempt, price_retry_attempt=price_retry_attempt,
@@ -772,6 +790,19 @@ def retry_deferred_entry(self, approval_id: int, gap_retry_attempt: int = 1, pri
     log.info(f"retry_deferred_entry: [{ticker}] approval #{approval_id} "
              f"{'executed' if success else 'still failed'} on retry "
              f"(gap_attempt={gap_retry_attempt}, price_attempt={price_retry_attempt})")
+
+
+DEFERRED_ENTRY_MAX_AGE_HOURS = 16
+
+
+def _approval_age_hours(approval: dict) -> float | None:
+    from datetime import datetime, timezone
+    ts = approval.get("timestamp")
+    if not isinstance(ts, datetime):
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - ts).total_seconds() / 3600
 
 
 @app.task(name="tasks.reconcile_unconfirmed_orders", bind=True, max_retries=2)

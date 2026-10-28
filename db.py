@@ -903,8 +903,11 @@ def get_latest_signal_for(ticker: str) -> dict | None:
             cur.execute(
                 "SELECT signal, confidence, timestamp FROM signals "
                 "WHERE symbol=%s AND signal NOT IN %s "
+                # Paper verdicts must not drive live decisions (professor M35).
+                # NULL = rows from before migration 51.
+                "AND (trading_env=%s OR trading_env IS NULL) "
                 "ORDER BY timestamp DESC LIMIT 1",
-                (ticker, _NON_ANALYST_SIGNALS),
+                (ticker, _NON_ANALYST_SIGNALS, TRADING_ENV),
             )
             row = cur.fetchone()
             if not row:
@@ -1469,8 +1472,9 @@ def get_position_context(ticker: str) -> dict:
             row = cur.fetchone()
             cur.execute(
                 "SELECT timestamp, signal, confidence FROM signals "
-                "WHERE symbol=%s AND signal NOT IN %s ORDER BY timestamp DESC LIMIT 3",
-                (ticker, _NON_ANALYST_SIGNALS),
+                "WHERE symbol=%s AND signal NOT IN %s "
+                "AND (trading_env=%s OR trading_env IS NULL) ORDER BY timestamp DESC LIMIT 3",
+                (ticker, _NON_ANALYST_SIGNALS, TRADING_ENV),
             )
             verdicts = cur.fetchall()
         out = {"recent_verdicts": [{"timestamp": v[0], "signal": v[1],

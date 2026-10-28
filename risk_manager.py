@@ -1461,6 +1461,14 @@ class RiskManager:
             # Not restored automatically: a late fill plus a full-size stop
             # could short. Not marked taken, so the target can fire again.
             log.error(f"[{ticker}] Profit-target sale not confirmed filled: {order_result}")
+            # Logged unconfirmed so reconcile_unconfirmed_orders sees a late
+            # fill and re-protects the rest (professor C12, 2026-10-28).
+            try:
+                db.log_order(ticker=ticker, side="SELL", order_type="MARKET", qty=sell_qty,
+                             broker_order_id=order_result.get("order_id"),
+                             decision_price=decision_price, status="unconfirmed")
+            except Exception as e:
+                log.error(f"[{ticker}] Could not log the unconfirmed profit-target sale: {e}")
             alerts._send(
                 f"⚠️ PROFIT-TARGET SALE UNCONFIRMED — {ticker}\n"
                 f"SELL {sell_qty} submitted but no fill confirmed. The broker stop was "

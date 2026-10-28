@@ -441,22 +441,46 @@ class TestReconcileUnconfirmedOrders:
         mock_stop.assert_not_called()
         assert "check TWS" in mock_alert.call_args[0][0]
 
-    def test_sell_side_late_fill_does_not_attempt_a_stop(self):
-        """A late-filled SELL (e.g. a TRIM/EXIT) must never trigger stop
-        placement -- stops are a BUY-side concern."""
+    def _run_sell(self, positions, stop_rec={"stop_price": 150.0}):
+        from unittest.mock import MagicMock
         order = self._order(side="SELL", qty=50.0)
+        client = MagicMock()
+        client.get_all_positions.return_value = positions
         with patch("db.get_unconfirmed_orders", return_value=[order]), \
              patch("ibkr.get_fill_for_order",
                    return_value={"filled_qty": 50.0, "fill_price": 175.0}), \
              patch("db.log_trade"), \
              patch("db.update_order_fill"), \
              patch("db.get_approval_by_id", return_value=self._approval()), \
-             patch("ibkr.place_stop_order") as mock_stop, \
+             patch("ibkr.get_client", return_value=client), \
+             patch("db.get_position_stop", return_value=stop_rec), \
+             patch("db.set_stop_broker_order_id"), \
+             patch("tasks.manage_cancel_stop_orders_for") as cancel, \
+             patch("tasks.manage_stop_place", return_value={"order_id": 9}) as place, \
              patch("db.update_approval_status"), \
-             patch("alerts._send"):
+             patch("alerts._send") as send:
             tasks.reconcile_unconfirmed_orders.run()
+        return cancel, place, send
 
-        mock_stop.assert_not_called()
+    def test_late_sell_that_closed_the_position_places_no_stop(self):
+        cancel, place, _ = self._run_sell([])
+        place.assert_not_called()
+
+    def test_late_partial_sell_reprotects_the_remainder(self):
+        """Professor C12 (2026-10-28): the stop is cancelled before a partial
+        sale, so a late fill used to leave the rest with no stop."""
+        from unittest.mock import MagicMock
+        cancel, place, send = self._run_sell([MagicMock(symbol=self._order()["ticker"], qty=20)])
+        cancel.assert_called_once()
+        place.assert_called_once_with(self._order()["ticker"], 20.0, 150.0)
+        assert "Protective stop placed." in send.call_args.args[0]
+
+    def test_late_partial_sell_without_a_stop_record_warns(self):
+        from unittest.mock import MagicMock
+        _, place, send = self._run_sell([MagicMock(symbol=self._order()["ticker"], qty=20)],
+                                        stop_rec=None)
+        place.assert_not_called()
+        assert "check TWS" in send.call_args.args[0]
 
 
 class TestBrokerVisibilityTimeout:

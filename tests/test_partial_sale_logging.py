@@ -71,3 +71,17 @@ def test_breakeven_only_sends_no_trade_alert():
         "trade_style": "swing", "gain_pct": 0.2}])
     trade_alert.assert_not_called()
     assert "BREAKEVEN STOP" in send.call_args.args[0]
+
+
+def test_unconfirmed_partial_sale_is_logged_for_reconcile():
+    """Professor C12: an unconfirmed sale must reach orders as 'unconfirmed' so
+    reconcile_unconfirmed_orders can catch a late fill."""
+    with patch("db.get_position_stop", return_value={"stop_price": 90.0}), \
+         patch("tasks.manage_cancel_stop_orders_for"), \
+         patch("ibkr.place_market_order", return_value={"filled_qty": 0, "order_id": 7}), \
+         patch("alerts._send"), \
+         patch("db.log_order", return_value=12) as log_order:
+        result = _rm()._partial_sell_and_resize_stop("NVDA", 100, 30, 100.0, decision_price=126.0)
+    assert result is None
+    kw = log_order.call_args.kwargs
+    assert kw["status"] == "unconfirmed" and kw["broker_order_id"] == 7 and kw["side"] == "SELL"

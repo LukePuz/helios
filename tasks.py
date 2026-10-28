@@ -915,7 +915,7 @@ def reconcile_unconfirmed_orders(self):
         )
         db.update_order_fill(order["id"], fill_price=fill_price, filled_qty=fill_qty, status="filled")
 
-        stop_placed = False
+        stop_placed: bool | None = False
         approval = db.get_approval_by_id(order["approval_id"]) if order["approval_id"] else None
         if order["side"] == "BUY" and approval:
             risk_json = approval.get("risk_json") or {}
@@ -936,13 +936,18 @@ def reconcile_unconfirmed_orders(self):
                     log.error(f"[{ticker}] reconcile_unconfirmed_orders: stop placement failed: {e}")
             if approval.get("status") == "FAILED":
                 db.update_approval_status(order["approval_id"], "APPROVED")
+        elif order["side"] == "SELL":
+            # A late SELL fill (partial sale or TRIM whose stop was cancelled
+            # before the sale) leaves the rest without a stop. Re-protect it at
+            # the recorded stop (professor C12, 2026-10-28).
+            stop_placed = _reprotect_after_late_sell(ticker)
 
         alert_lines = [
             f"🔁 LATE FILL RECONCILED — <b>{ticker}</b>",
             f"{order['side']} {fill_qty:g} shares @ ${fill_price:.2f} — this order was marked "
             f"unconfirmed but had actually filled at the broker.",
         ]
-        if order["side"] == "BUY":
+        if order["side"] == "BUY" or stop_placed is not None:
             alert_lines.append(
                 "Protective stop placed." if stop_placed else
                 "⚠️ Could not place a protective stop automatically — check TWS."
@@ -951,6 +956,35 @@ def reconcile_unconfirmed_orders(self):
             alerts._send("\n".join(alert_lines))
         except Exception:
             pass
+
+
+def _reprotect_after_late_sell(ticker: str) -> bool | None:
+    """After a late SELL fill: cancel any resting stops for ticker and place one
+    for the shares still held, at the stop price on record. Returns True if
+    placed, False if it should have been but failed, None if nothing is held."""
+    import db
+    import ibkr
+    try:
+        pos = next((p for p in ibkr.get_client().get_all_positions() if p.symbol == ticker), None)
+        remaining = round(abs(float(pos.qty)), 4) if pos else 0.0
+    except Exception as e:
+        log.error(f"[{ticker}] reconcile: could not read the position after a late sell: {e}")
+        return False
+    if remaining <= 0:
+        return None
+    stop_price = (db.get_position_stop(ticker) or {}).get("stop_price")
+    if not stop_price:
+        log.error(f"[{ticker}] reconcile: {remaining} shares left after a late sell, no stop on record")
+        return False
+    try:
+        manage_cancel_stop_orders_for(ticker)
+        result = manage_stop_place(ticker, remaining, float(stop_price))
+        db.set_stop_broker_order_id(ticker, result["order_id"])
+        log.info(f"[{ticker}] reconcile: stop @ ${float(stop_price):.2f} placed for {remaining} shares")
+        return True
+    except Exception as e:
+        log.error(f"[{ticker}] reconcile: stop placement after a late sell failed: {e}")
+        return False
 
 
 # ── New tasks: regime + scanner + stop monitor ────────────────────────────────

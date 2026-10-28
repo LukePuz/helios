@@ -269,7 +269,7 @@ Then output ONLY valid JSON in exactly this format (no markdown, no explanation 
 }}
 
 Rules:
-- Set pass_to_risk to true ONLY if action is OPEN, ADD, TRIM, or EXIT AND conviction >= 5 AND upside_downside_ratio >= 2.0
+- Set pass_to_risk to true ONLY if action is OPEN or ADD AND conviction >= 5 AND upside_downside_ratio >= 2.0. For TRIM or EXIT, conviction is your conviction in the thesis (a low number means it is weakening or broken); the system decides pass_to_risk for low-conviction sells itself
 - For Moonshot tickers: conviction >= 7 required to recommend OPEN; never exceed 2% position
 - Score conviction on the evidence alone, regardless of regime — regime-based selectivity is applied downstream by position sizing, not by inflating or suppressing your stated score
 {'- Your stated conviction has a track record above — calibrate against it, not against how confident you feel' if track_record else ''}
@@ -476,6 +476,31 @@ def _extract_json(raw: str) -> dict | None:
 # ---------------------------------------------------------------------------
 # Stub for unavailable model
 # ---------------------------------------------------------------------------
+
+LOW_CONVICTION_SELL_MAX = 4   # TRIM passes at or below this, if confirmed
+EXIT_CONVICTION_MAX = 2       # EXIT (sell everything) only at or below this
+
+
+def _low_conviction_sell(ticker: str, action: str, conviction: int) -> tuple[str, bool, str]:
+    """Decide a TRIM/EXIT at conviction <= 4. Returns (action, pass_to_risk, note).
+    Needs the previous analyst verdict on this ticker to be <= 4 too, so one
+    noisy reading can't sell; db.get_latest_signal_for skips routing rows and
+    runs before this analysis is logged."""
+    try:
+        import db
+        prev = db.get_latest_signal_for(ticker)
+    except Exception as e:
+        log.warning(f"[{ticker}] low-conviction sell: previous verdict lookup failed: {e}")
+        prev = None
+    prev_conv = round(prev["confidence"] * 10) if prev else None
+    if prev_conv is None or prev_conv > LOW_CONVICTION_SELL_MAX:
+        return action, False, (f"Low-conviction {action} held for confirmation: previous "
+                               f"verdict conviction {prev_conv}, needs <= {LOW_CONVICTION_SELL_MAX}")
+    if action == "EXIT" and conviction > EXIT_CONVICTION_MAX:
+        return "TRIM", True, (f"EXIT at conviction {conviction} reduced to TRIM "
+                              f"(EXIT needs <= {EXIT_CONVICTION_MAX}); previous verdict {prev_conv}")
+    return action, True, f"Low-conviction {action} confirmed: previous verdict conviction {prev_conv}"
+
 
 def _stub_recommendation(candidate: dict, reason: str) -> dict:
     ticker = candidate.get("ticker", "UNKNOWN")
@@ -938,6 +963,19 @@ def analyze(
     actionable = action in ("OPEN", "ADD", "TRIM", "EXIT")
     if parsed.get("pass_to_risk") and not (actionable and conviction >= 5):
         parsed["pass_to_risk"] = False
+
+    # Low-conviction sells (2026-10-27). The conviction >= 5 rule above meant
+    # a TRIM/EXIT with a weakening or broken thesis (conviction 1-4) could
+    # never pass: from Aug 13 to Oct 27 all 6 TRIMs were dropped (QBTS at
+    # c3-c4 five times, then it hit its stop). Sells now pass on a confirmed
+    # low reading, conservatively: the previous analyst verdict on the ticker
+    # must also be <= 4, EXIT needs <= 2, and an EXIT at 3-4 becomes a TRIM.
+    # UDR doesn't apply to sells.
+    if action in ("TRIM", "EXIT") and conviction <= LOW_CONVICTION_SELL_MAX:
+        action, sell_passes, sell_note = _low_conviction_sell(ticker, action, conviction)
+        parsed["pass_to_risk"] = sell_passes
+        if sell_note:
+            parsed["reasoning"] = parsed.get("reasoning", "") + f" [{sell_note}]"
 
     try:
         import db

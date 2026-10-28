@@ -81,3 +81,11 @@ class TestAnalyzeWiring:
     def test_open_rules_unchanged(self):
         result = _analyze("OPEN", 4, _prev(4), llm_pass=True)
         assert result["pass_to_risk"] is False
+
+
+def test_stale_confirming_verdict_does_not_count():
+    from datetime import datetime, timedelta, timezone
+    old = {"signal": "TRIM", "confidence": 0.3,
+           "timestamp": datetime.now(timezone.utc) - timedelta(days=20)}
+    with patch("db.get_latest_signal_for", return_value=old):
+        assert _low_conviction_sell("QBTS", "TRIM", 3)[:2] == ("TRIM", False)

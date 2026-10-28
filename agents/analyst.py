@@ -483,6 +483,17 @@ def _extract_json(raw: str) -> dict | None:
 
 LOW_CONVICTION_SELL_MAX = 4   # TRIM passes at or below this, if confirmed
 EXIT_CONVICTION_MAX = 2       # EXIT (sell everything) only at or below this
+LOW_CONVICTION_CONFIRM_MAX_AGE_DAYS = 7  # confirming verdict must be this recent
+
+
+def _signal_age_days(signal: dict) -> float:
+    from datetime import datetime, timezone
+    ts = signal.get("timestamp")
+    if not isinstance(ts, datetime):
+        return 0.0  # unknown age: don't block on it
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - ts).total_seconds() / 86400
 
 
 def _low_conviction_sell(ticker: str, action: str, conviction: int) -> tuple[str, bool, str]:
@@ -496,6 +507,9 @@ def _low_conviction_sell(ticker: str, action: str, conviction: int) -> tuple[str
     except Exception as e:
         log.warning(f"[{ticker}] low-conviction sell: previous verdict lookup failed: {e}")
         prev = None
+    if prev and _signal_age_days(prev) > LOW_CONVICTION_CONFIRM_MAX_AGE_DAYS:
+        return action, False, (f"Low-conviction {action} held for confirmation: previous "
+                               f"verdict is older than {LOW_CONVICTION_CONFIRM_MAX_AGE_DAYS} days")
     prev_conv = round(prev["confidence"] * 10) if prev else None
     if prev_conv is None or prev_conv > LOW_CONVICTION_SELL_MAX:
         return action, False, (f"Low-conviction {action} held for confirmation: previous "

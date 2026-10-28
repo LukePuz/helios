@@ -121,6 +121,40 @@ _OUTPUT_TOKEN_RESERVE = _NUM_PREDICT + 300
 _PROVENANCE_STATIC: dict | None = None
 
 
+def _git_code_sha() -> dict:
+    """Commit identity of the checkout, read once at import so it names the
+    code this process loaded, not whatever is checked out when the first
+    analysis runs (professor 0k, 2026-10-28).
+
+    code_sha: last commit that touched anything outside research-log/ (from
+    2026-10-28; before, it was HEAD, usually the research-log commit after
+    the code commit). head_sha: HEAD. Both get -dirty if the checkout has
+    uncommitted tracked changes outside research-log/ or untracked .py files (untracked modules
+    running live was the C2 failure mode; professor C3-residual)."""
+    import subprocess
+    repo = str(Path(__file__).resolve().parent.parent)
+
+    def git(*args):
+        return subprocess.run(["git", "-C", repo, *args],
+                              capture_output=True, text=True, timeout=5).stdout
+    try:
+        head = git("rev-parse", "--short=12", "HEAD").strip()
+        code = git("log", "-1", "--format=%h", "--abbrev=12", "--", ".",
+                   ":(exclude)research-log").strip()
+        # Not stripped: porcelain's leading space is part of the XY column.
+        status = git("status", "--porcelain").splitlines()
+        dirty = "-dirty" if [l for l in status
+                             if not l[3:].startswith("research-log/")
+                             and (not l.startswith("??") or l.rstrip().endswith(".py"))] else ""
+        return {"code_sha": (code + dirty) if code else None,
+                "head_sha": (head + dirty) if head else None}
+    except Exception:
+        return {"code_sha": None, "head_sha": None}
+
+
+_CODE_SHA = _git_code_sha()
+
+
 def _treatment_config() -> dict:
     import config
     return {k: getattr(config, k, None) for k in (
@@ -139,27 +173,14 @@ def _provenance(prompt: str) -> dict:
     if _PROVENANCE_STATIC is None:
         import hashlib
         import inspect
-        import subprocess
-        repo = str(Path(__file__).resolve().parent.parent)
-        try:
-            sha = subprocess.run(["git", "-C", repo, "rev-parse", "--short=12", "HEAD"],
-                                 capture_output=True, text=True, timeout=5).stdout.strip()
-            # Untracked .py files count too: untracked modules running live
-            # was the C2 failure mode, and -uno stamped that clean (professor
-            # C3-residual, 2026-10-28).
-            status = subprocess.run(["git", "-C", repo, "status", "--porcelain"],
-                                    capture_output=True, text=True, timeout=5).stdout.splitlines()
-            dirty = [l for l in status if not l.startswith("??") or l.rstrip().endswith(".py")]
-            code_sha = (sha + ("-dirty" if dirty else "")) or None
-        except Exception:
-            code_sha = None
         try:
             tags = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5).json().get("models", [])
             digest = next((m.get("digest") for m in tags if m.get("name") == ANALYST_MODEL), None)
         except Exception:
             digest = None
         _PROVENANCE_STATIC = {
-            "code_sha": code_sha,
+            "code_sha": _CODE_SHA["code_sha"],
+            "head_sha": _CODE_SHA["head_sha"],
             # Env-overridable treatment switches: the same code_sha can run
             # with different values (professor C3-residual, 2026-10-28).
             "config": _treatment_config(),

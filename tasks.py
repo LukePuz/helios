@@ -472,6 +472,12 @@ app.conf.beat_schedule = {
         "options":  {"expires": 36 * 3600},
     },
     # News (yfinance + Google News RSS) — every 15 minutes
+    # IPO watch (Luke, 2026-10-28): is a pending company listed yet?
+    "ipo-watch": {
+        "task":     "tasks.check_ipo_watch",
+        "schedule": crontab(hour=8, minute=20, day_of_week="mon-fri"),
+        "options":  {"queue": INGESTION_QUEUE, "expires": 6 * 3600},
+    },
     "poll-news": {
         "task":     "tasks.poll_news",
         "schedule": 900,
@@ -993,6 +999,52 @@ def run_daily_scan(self):
     except Exception as e:
         log.error(f"run_daily_scan failed: {e}")
         raise self.retry(exc=e, countdown=300)
+
+
+_US_EXCHANGES = {"NYQ", "NMS", "NGM", "NCM", "NYS", "ASE", "NAS", "NYSE", "NASDAQ"}
+
+
+def _find_us_listing(company: str) -> dict | None:
+    """A US-listed common stock whose name starts with `company`, or None.
+    The yfinance search also returns ETFs, tokenized stocks and funds named
+    after the company (checked for Anthropic on 2026-10-28), so only
+    quoteType EQUITY on a major US exchange counts."""
+    import yfinance as yf
+    for q in yf.Search(company, max_results=10).quotes:
+        name = (q.get("longname") or q.get("shortname") or "").strip()
+        if (q.get("quoteType") == "EQUITY" and q.get("exchange") in _US_EXCHANGES
+                and name.lower().startswith(company.lower())):
+            return {"symbol": q.get("symbol"), "exchange": q.get("exchange"), "name": name}
+    return None
+
+
+@app.task(name="tasks.check_ipo_watch", bind=True, max_retries=1)
+def check_ipo_watch(self):
+    """Daily: has any IPO-watch company (knowledge/watchlist.md) listed? One
+    Telegram alert per company when it has; the lead then activates it on
+    the watchlist and logs that (Luke, 2026-10-28: Anthropic)."""
+    import db
+    from knowledge_loader import load_ipo_watch
+    for entry in load_ipo_watch():
+        company = entry["company"]
+        key = f"ipo_watch_listed_{company.lower()}"
+        if db.get_state(key):
+            continue
+        try:
+            listing = _find_us_listing(company)
+        except Exception as e:
+            log.warning(f"check_ipo_watch: search for {company} failed: {e}")
+            continue
+        if not listing:
+            log.info(f"check_ipo_watch: {company} not listed yet")
+            continue
+        db.set_state(key, listing["symbol"])
+        log.warning(f"check_ipo_watch: {company} appears listed as {listing['symbol']} "
+                    f"({listing['exchange']}, {listing['name']})")
+        import alerts
+        alerts._send(f"📈 <b>IPO watch</b>: {company} appears listed as "
+                     f"<b>{listing['symbol']}</b> ({listing['exchange']}). Not tradeable "
+                     f"until it is activated on the watchlist.")
 
 
 def _scan_summary(regime: dict, candidates: list[dict]) -> str:

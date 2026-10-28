@@ -74,8 +74,10 @@ def check_breakout_gate(ticker: str, ladder: dict | None = None, bars: list[dict
         return _gate_result("Breakout", False, False, {}, reasoning="No trade ladder computed yet")
 
     market, sector = _resolve_regimes(ticker)
+    from config import EARNINGS_ENTRY_BLACKOUT_DAYS
     try:
-        no_blackout = not db.is_near_earnings(ticker, days=5)
+        no_blackout = (not db.is_near_earnings(ticker, days=EARNINGS_ENTRY_BLACKOUT_DAYS)
+                       if EARNINGS_ENTRY_BLACKOUT_DAYS else True)
     except Exception:
         no_blackout = True
 

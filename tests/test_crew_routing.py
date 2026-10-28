@@ -547,7 +547,8 @@ def test_stub_result_is_not_captured_as_a_thesis():
 
 def test_open_is_blocked_inside_the_earnings_blackout():
     result = _analyst_result(action="OPEN", ticker="MSFT", conviction=8)
-    with patch("db.is_near_earnings", return_value=True), \
+    with patch("config.EARNINGS_ENTRY_BLACKOUT_DAYS", 5), \
+         patch("db.is_near_earnings", return_value=True), \
          patch("db.get_next_earnings", return_value="2026-10-28"), \
          patch("db.has_active_approval", return_value=False), \
          patch("db.get_last_executed_approval", return_value=None), \
@@ -562,7 +563,8 @@ def test_open_is_blocked_inside_the_earnings_blackout():
 
 def test_open_is_blocked_when_the_earnings_calendar_cannot_be_read():
     result = _analyst_result(action="OPEN", ticker="MSFT", conviction=8)
-    with patch("db.is_near_earnings", return_value=None), \
+    with patch("config.EARNINGS_ENTRY_BLACKOUT_DAYS", 5), \
+         patch("db.is_near_earnings", return_value=None), \
          patch("db.has_active_approval", return_value=False), \
          patch("db.get_last_executed_approval", return_value=None), \
          patch("db.log_signal") as log_signal, \
@@ -572,3 +574,22 @@ def test_open_is_blocked_when_the_earnings_calendar_cannot_be_read():
         crew._route_to_approval(result, {"regime": "Neutral"}, MagicMock())
     mock_rm_cls.return_value.size_position.assert_not_called()
     assert "unreadable" in log_signal.call_args[0][3]
+
+
+def test_no_earnings_blackout_by_default():
+    """Luke 2026-10-28: trading near earnings is allowed; the analyst decides."""
+    import config
+    assert config.EARNINGS_ENTRY_BLACKOUT_DAYS == 0
+    result = _analyst_result(action="OPEN", ticker="MSFT", conviction=8)
+    with patch("db.is_near_earnings", return_value=True) as near, \
+         patch("db.has_active_approval", return_value=False), \
+         patch("db.get_last_executed_approval", return_value=None), \
+         patch("db.log_signal") as log_signal, \
+         patch("agents.crew._get_price", return_value=100.0), \
+         patch("catalyst_service.gates.catalyst_gate_check", return_value={"approved": True}), \
+         patch("risk_manager.RiskManager") as mock_rm_cls:
+        mock_rm_cls.return_value.size_position.return_value = {"shares_initial": 0, "flags": []}
+        crew._route_to_approval(result, {"regime": "Neutral"}, MagicMock())
+    near.assert_not_called()
+    mock_rm_cls.return_value.size_position.assert_called_once()
+    assert all(c[0][1] != "EARNINGS_BLOCKED" for c in log_signal.call_args_list)

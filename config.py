@@ -323,7 +323,12 @@ STALE_PRICE_RETRY_MINUTES = 3
 TRIM_FRACTION = 0.33   # analyst TRIM sells this fraction of the held position
 
 # No new OPEN/ADD within this many calendar days before earnings (0 = off).
-EARNINGS_ENTRY_BLACKOUT_DAYS = int(os.getenv("EARNINGS_ENTRY_BLACKOUT_DAYS", "5"))
+# Off since 2026-10-28 by Luke's decision: "don't forbid trading near earnings,
+# the bot should be able to buy and sell based on what it thinks the earnings
+# will look like." Earnings dates still reach the analyst (catalyst calendar,
+# earnings review); normal caps and stops apply. Also governs the scanner's
+# earnings skip/catalyst cap and the setup gates' no-blackout criterion.
+EARNINGS_ENTRY_BLACKOUT_DAYS = int(os.getenv("EARNINGS_ENTRY_BLACKOUT_DAYS", "0"))
 
 # When the first tranche buys less than 1 share, buy exactly 1 if that share
 # fits the hard per-position cap and the cash-reserve cap (risk_manager.size_position).

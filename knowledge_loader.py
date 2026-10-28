@@ -85,6 +85,24 @@ def load_watchlist() -> dict[str, dict]:
     return watchlist
 
 
+def load_ipo_watch() -> list[dict]:
+    """Pending IPO-watch entries from watchlist.md's "IPO Watch" section:
+    [{"company", "status", "added"}]. Not part of load_watchlist(), so they
+    can't be scanned, analysed or traded until listed (Luke, 2026-10-28)."""
+    text = _read("watchlist.md")
+    m = re.search(r"^## IPO Watch.*?(?=^## |\Z)", text, flags=re.M | re.S)
+    if not m:
+        return []
+    entries = []
+    for line in m.group().splitlines():
+        if not line.lstrip().startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) >= 3 and cells[0] not in ("Company", "") and not set(cells[0]) <= set("-"):
+            entries.append({"company": cells[0], "status": cells[1], "added": cells[2]})
+    return entries
+
+
 def get_all_tickers() -> list[str]:
     """Return every ticker in the watchlist (sorted)."""
     return sorted(load_watchlist().keys())

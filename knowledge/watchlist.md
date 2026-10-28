@@ -246,6 +246,22 @@ Treatment:
 
 ---
 
+## IPO Watch (not tradeable until listed)
+
+Private companies Luke wants tracked from their listing day. The ticker
+parser above only reads `| TICKER | Company | Role | Tier |` rows, so these
+never reach the scanner, analyst or orders. tasks.check_ipo_watch searches
+daily for a US-listed equity under the company name and sends one Telegram
+alert when it finds one; the entry is then moved into a section table above
+with a ticker, role and tier, and the activation is logged in the research
+log.
+
+| Company | Status | Added |
+|---|---|---|
+| Anthropic | pending listing | 2026-10-28, Luke ("I believe it is going to IPO soon") |
+
+---
+
 ## Watchlist Management Rules
 
 1. Every ticker must map to a thesis file. If no thesis file exists, create one before adding to the watchlist.

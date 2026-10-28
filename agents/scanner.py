@@ -429,12 +429,15 @@ def run_scan(regime_packet: dict | None = None) -> dict:
             disqualified.append({"ticker": ticker, "reason": "No price data available", "composite_score": 0})
             continue
 
-        # Earnings blackout — skip if earnings within 5 days, cap catalyst if within 10
+        # Earnings blackout — skip if earnings within the blackout window, cap
+        # catalyst if within 2x it. Both off when EARNINGS_ENTRY_BLACKOUT_DAYS
+        # is 0 (Luke, 2026-10-28).
+        from config import EARNINGS_ENTRY_BLACKOUT_DAYS as _BLACKOUT
         try:
             import db as _db
-            if _db.is_near_earnings(ticker, days=5):
-                log.info(f"[{ticker}] Skipped — earnings within 5 days")
-                disqualified.append({"ticker": ticker, "reason": "Earnings within 5 days (blackout)", "composite_score": 0})
+            if _BLACKOUT and _db.is_near_earnings(ticker, days=_BLACKOUT):
+                log.info(f"[{ticker}] Skipped — earnings within {_BLACKOUT} days")
+                disqualified.append({"ticker": ticker, "reason": f"Earnings within {_BLACKOUT} days (blackout)", "composite_score": 0})
                 continue
         except Exception:
             pass
@@ -447,7 +450,7 @@ def run_scan(regime_packet: dict | None = None) -> dict:
         # Cap catalyst score if earnings within 10 days (timing risk)
         try:
             import db as _db
-            if _db.is_near_earnings(ticker, days=10):
+            if _BLACKOUT and _db.is_near_earnings(ticker, days=2 * _BLACKOUT):
                 if cat_score > 15:
                     cat_score = 15
                     cat_notes += " [earnings risk: within 10 days]"

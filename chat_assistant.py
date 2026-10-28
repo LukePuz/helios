@@ -83,8 +83,11 @@ def parse_trade_intent(text: str) -> Optional[dict]:
       sell 2.5 shares of AMD
     """
     clean = re.sub(r"!urgent", "", text, flags=re.IGNORECASE).strip()
-    m = _TRADE_PATTERN.search(clean)
-    if not m:
+    # The whole message must be the command. search() used to match anywhere,
+    # so "dont sell PLTR yet" or "should I sell AMD?" became SELL orders
+    # (limitations audit 2026-10-28 16:53, #5).
+    m = _TRADE_PATTERN.match(clean)
+    if not m or clean[m.end():].strip(" .!"):
         return None
 
     side_raw, qty_before, ticker, qty_after = m.groups()

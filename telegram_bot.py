@@ -320,6 +320,13 @@ def _execute_chat_order(
             _reply(chat_id, "🛑 <b>Blocked</b> — portfolio drawdown halt is active. No new buys.", reply_to)
             return
 
+        if side == "SELL" and qty is None:
+            # Was sized by the BUY sizer and clamped to what's owned, so on a
+            # 1-share position it sold everything (audit 2026-10-28 16:53, #5).
+            _reply(chat_id, f"⚠️ Say how many shares to sell, e.g. <code>!urgent sell 1 {ticker}</code>. "
+                            f"Nothing was sold.", reply_to)
+            return
+
         bucket = "Accelerator"
         if qty is None:
             price = ibkr.get_latest_price(ticker)
@@ -374,7 +381,9 @@ def _handle_mention(update: dict, is_urgent: bool) -> None:
         return
 
     # Allowlist check — uses numeric user IDs (find yours via @userinfobot)
-    if _ALLOWED_USER_IDS and user_id not in _ALLOWED_USER_IDS:
+    # Fails closed like the callback path: an empty allowlist used to let
+    # anyone through (limitations audit 2026-10-28 16:53, #5).
+    if not _ALLOWED_USER_IDS or user_id not in _ALLOWED_USER_IDS:
         log.warning(f"[chat] Blocked @mention from user_id={user_id} ({display}) — not in TELEGRAM_ALLOWED_USER_IDS")
         return
 

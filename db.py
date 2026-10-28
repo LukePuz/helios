@@ -732,6 +732,40 @@ def init_db() -> None:
         _put_conn(conn)
 
 
+# Failed verdict/trade writes (professor M40, 2026-10-28). They used to be
+# swallowed at ERROR level, which drops rows from the study's record. Now the
+# full record goes to a local JSONL spill (never the rendered prompt: it holds
+# portfolio values) and an alert goes out at most once an hour per writer.
+DEGRADED_SIGNAL_PREFIX = "[degraded-log] "
+_SPILL_PATH = Path(__file__).parent / "logs" / "db_write_spill.jsonl"
+_LAST_WRITE_ALERT: dict[str, float] = {}
+
+
+def _spill(writer: str, record: dict, error: str) -> None:
+    try:
+        _SPILL_PATH.parent.mkdir(exist_ok=True)
+        with open(_SPILL_PATH, "a") as f:
+            f.write(json.dumps({"at": datetime.now(timezone.utc).isoformat(), "writer": writer,
+                                "error": error[:300], "record": record}, default=str) + "\n")
+    except Exception as e:
+        logging.error(f"{writer}: spill failed too: {e}")
+
+
+def _record_write_failure(writer: str, exc: Exception, record: dict) -> None:
+    logging.error(f"{writer} failed: {exc}")
+    _spill(writer, record, str(exc))
+    now = _time.time()
+    if now - _LAST_WRITE_ALERT.get(writer, 0) < 3600:
+        return
+    _LAST_WRITE_ALERT[writer] = now
+    try:
+        import alerts
+        alerts._send(f"⚠️ DB WRITE FAILED — {writer}\n{str(exc)[:200]}\n"
+                     f"Rows are being saved to logs/{_SPILL_PATH.name}; check Postgres.")
+    except Exception:
+        pass
+
+
 def log_trade(symbol: str, side: str, quantity: int, price: float, reason: str) -> None:
     conn = _get_conn()
     try:
@@ -744,7 +778,8 @@ def log_trade(symbol: str, side: str, quantity: int, price: float, reason: str) 
         conn.commit()
     except Exception as e:
         conn.rollback()
-        logging.error(f"log_trade failed: {e}")
+        _record_write_failure("log_trade", e, {"symbol": symbol, "side": side, "quantity": quantity,
+                                               "price": price, "reason": reason})
     finally:
         _put_conn(conn)
 
@@ -766,22 +801,47 @@ def log_signal(symbol: str, signal: str, confidence: float, reasoning: str,
             )
         conn.commit()
     except psycopg2.errors.UndefinedColumn:
-        # Migrations 51-56 not applied yet (they run in init_db at stack
-        # start); keep the verdict rather than lose it.
+        # Migrations 55-56 (or older) not applied yet; they run in init_db at
+        # stack start. Keep the verdict: first with env/model/provenance
+        # (51-53), else the bare row marked as degraded so it can't pass for
+        # a legacy row (professor C11/M40). Both are also spilled in full.
         conn.rollback()
+        rec = {"symbol": symbol, "signal": signal, "confidence": confidence, "reasoning": reasoning,
+               "trading_env": TRADING_ENV, "model": model, "provenance": provenance,
+               "decision": decision}
+        _spill("log_signal", rec, "missing columns")
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO signals (symbol, signal, confidence, reasoning) VALUES (%s,%s,%s,%s)",
-                    (symbol, signal, confidence, reasoning),
+                    "INSERT INTO signals (symbol, signal, confidence, reasoning, trading_env, model, "
+                    "provenance) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                    (symbol, signal, confidence, reasoning, TRADING_ENV, model,
+                     psycopg2.extras.Json(provenance) if provenance is not None else None),
                 )
             conn.commit()
+            logging.warning(f"log_signal: {symbol} stored without decision/prompt (migrations pending)")
+        except psycopg2.errors.UndefinedColumn:
+            conn.rollback()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO signals (symbol, signal, confidence, reasoning) VALUES (%s,%s,%s,%s)",
+                        (symbol, signal, confidence, DEGRADED_SIGNAL_PREFIX + (reasoning or "")),
+                    )
+                conn.commit()
+                logging.warning(f"log_signal: {symbol} stored as a degraded row (migrations pending)")
+            except Exception as e:
+                conn.rollback()
+                _record_write_failure("log_signal", e, rec)
         except Exception as e:
             conn.rollback()
-            logging.error(f"log_signal failed: {e}")
+            _record_write_failure("log_signal", e, rec)
     except Exception as e:
         conn.rollback()
-        logging.error(f"log_signal failed: {e}")
+        _record_write_failure("log_signal", e, {
+            "symbol": symbol, "signal": signal, "confidence": confidence, "reasoning": reasoning,
+            "trading_env": TRADING_ENV, "model": model, "provenance": provenance,
+            "decision": decision})
     finally:
         _put_conn(conn)
 
@@ -905,9 +965,9 @@ def get_latest_signal_for(ticker: str) -> dict | None:
                 "WHERE symbol=%s AND signal NOT IN %s "
                 # Paper verdicts must not drive live decisions (professor M35).
                 # NULL = rows from before migration 51.
-                "AND (trading_env=%s OR trading_env IS NULL) "
+                "AND (trading_env=%s OR (trading_env IS NULL AND COALESCE(reasoning, '') NOT LIKE %s)) "
                 "ORDER BY timestamp DESC LIMIT 1",
-                (ticker, _NON_ANALYST_SIGNALS, TRADING_ENV),
+                (ticker, _NON_ANALYST_SIGNALS, TRADING_ENV, DEGRADED_SIGNAL_PREFIX + '%'),
             )
             row = cur.fetchone()
             if not row:
@@ -1492,8 +1552,8 @@ def get_position_context(ticker: str) -> dict:
             cur.execute(
                 "SELECT timestamp, signal, confidence FROM signals "
                 "WHERE symbol=%s AND signal NOT IN %s "
-                "AND (trading_env=%s OR trading_env IS NULL) ORDER BY timestamp DESC LIMIT 3",
-                (ticker, _NON_ANALYST_SIGNALS, TRADING_ENV),
+                "AND (trading_env=%s OR (trading_env IS NULL AND COALESCE(reasoning, '') NOT LIKE %s)) ORDER BY timestamp DESC LIMIT 3",
+                (ticker, _NON_ANALYST_SIGNALS, TRADING_ENV, DEGRADED_SIGNAL_PREFIX + '%'),
             )
             verdicts = cur.fetchall()
         out = {"recent_verdicts": [{"timestamp": v[0], "signal": v[1],

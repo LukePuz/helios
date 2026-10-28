@@ -82,3 +82,41 @@ def test_unconfirmed_fill_is_not_treated_as_a_sale():
     assert result is None
     place.assert_not_called()
     assert "UNCONFIRMED" in send.call_args[0][0]
+
+
+def test_small_position_moves_stop_to_breakeven_without_selling():
+    """Audit 2026-10-28 07:00 finding 3: 1 share x 25% rounds to 0, so the
+    breakeven move must happen without a sale."""
+    calls = []
+    with patch("db.get_position_stop", return_value={"stop_price": 90.0}), \
+         patch("db.set_stop_broker_order_id"), \
+         patch("db.mark_profit_target_taken") as taken, \
+         patch("tasks.manage_cancel_stop_orders_for", side_effect=lambda t: calls.append("cancel")), \
+         patch("tasks.manage_stop_place", side_effect=lambda *a: calls.append(("stop",) + a) or {"order_id": 5}), \
+         patch("ibkr.place_market_order") as sell:
+        assert _rm()._breakeven_without_sale("NVDA", 1, 100.0) is True
+    sell.assert_not_called()
+    assert calls == ["cancel", ("stop", "NVDA", 1, 100.0)]
+    taken.assert_called_once_with("NVDA", 100.0)
+
+
+def test_breakeven_move_skipped_when_stop_already_higher():
+    with patch("db.get_position_stop", return_value={"stop_price": 105.0}), \
+         patch("db.mark_profit_target_taken") as taken, \
+         patch("tasks.manage_cancel_stop_orders_for") as cancel:
+        assert _rm()._breakeven_without_sale("NVDA", 1, 100.0) is True
+    cancel.assert_not_called()
+    taken.assert_called_once_with("NVDA", 105.0)
+
+
+def test_failed_breakeven_stop_restores_old_stop_and_keeps_target_open():
+    with patch("db.get_position_stop", return_value={"stop_price": 90.0}), \
+         patch("db.set_stop_broker_order_id"), \
+         patch("db.mark_profit_target_taken") as taken, \
+         patch("tasks.manage_cancel_stop_orders_for"), \
+         patch("tasks.manage_stop_place", side_effect=[RuntimeError("down"), {"order_id": 6}]) as place, \
+         patch("alerts._send") as send:
+        assert _rm()._breakeven_without_sale("NVDA", 2, 100.0) is False
+    assert place.call_args_list[-1][0] == ("NVDA", 2, 90.0)
+    taken.assert_not_called()
+    send.assert_not_called()

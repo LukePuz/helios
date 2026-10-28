@@ -1320,6 +1320,54 @@ class RiskManager:
                                  f"order update FAILED — fix manually in TWS",
             })
 
+    def _breakeven_without_sale(self, ticker: str, qty: float, new_stop: float) -> bool:
+        """Profit target hit on a position too small to sell part of (1-3
+        shares x 25-45% rounds to 0). Before 2026-10-28 that just continued,
+        and the breakeven stop move lived inside the partial sale, so it never
+        happened: a 1-share position could rise past target, round-trip and
+        stop out at a loss (limitations audit 07:00, finding 3). Now the stop
+        moves to breakeven for the whole position and the target is marked
+        taken. Cancel first, then place; if the new stop fails, the old one
+        goes back on. Returns True when the target is marked taken."""
+        import alerts
+        import db
+        import tasks
+
+        stop_rec = db.get_position_stop(ticker) or {}
+        old_stop = stop_rec.get("stop_price")
+        if old_stop is not None and float(old_stop) >= new_stop:
+            db.mark_profit_target_taken(ticker, float(old_stop))
+            return True
+        try:
+            tasks.manage_cancel_stop_orders_for(ticker)
+        except Exception as e:
+            log.error(f"[{ticker}] Breakeven move: could not cancel broker stop: {e}")
+            return False
+        try:
+            result = tasks.manage_stop_place(ticker, round(qty, 4), new_stop)
+        except Exception as e:
+            log.error(f"[{ticker}] Breakeven stop placement failed: {e}")
+            restored = False
+            if old_stop:
+                try:
+                    result = tasks.manage_stop_place(ticker, round(qty, 4), float(old_stop))
+                    db.set_stop_broker_order_id(ticker, result["order_id"])
+                    restored = True
+                except Exception as e2:
+                    log.error(f"[{ticker}] Could not restore stop: {e2}")
+            if not restored:
+                alerts._send(
+                    f"🚨 UNPROTECTED POSITION — {ticker}\n"
+                    f"Breakeven stop move failed and the old stop could not be restored. "
+                    f"Place a stop for {round(qty, 4)} shares manually."
+                )
+            return False
+        db.set_stop_broker_order_id(ticker, result["order_id"])
+        db.mark_profit_target_taken(ticker, new_stop)
+        log.info(f"[{ticker}] Profit target hit on {qty:g} shares (too few to sell part): "
+                 f"stop moved to breakeven ${new_stop:.2f}, no sale")
+        return True
+
     def _partial_sell_and_resize_stop(self, ticker: str, qty: float, sell_qty: float,
                                       new_stop: float) -> dict | None:
         """Profit-target partial sale with the broker stop kept in step.
@@ -1505,8 +1553,10 @@ class RiskManager:
             qty = abs(float(pos.qty))
             sell_qty = int(qty * partial_pct)  # whole shares; IBKR rejects fractional orders
             if sell_qty <= 0:
-                log.debug(f"[{ticker}] Profit target hit but {qty:g} shares x {partial_pct:.0%} "
-                          f"is under one share — no partial sale")
+                if self._breakeven_without_sale(ticker, qty, entry):
+                    results.append({"ticker": ticker, "action": "BREAKEVEN_STOP", "shares_sold": 0,
+                                    "new_stop": entry, "trade_style": trade_style,
+                                    "gain_pct": gain_pct})
                 continue
 
             new_stop = entry  # breakeven on the remainder
@@ -1594,7 +1644,7 @@ class RiskManager:
         qty = abs(float(pos.qty))
         sell_qty = int(qty * partial_pct)  # whole shares; IBKR rejects fractional orders
         if sell_qty <= 0:
-            return False
+            return self._breakeven_without_sale(ticker, qty, entry)
 
         new_stop = entry  # breakeven on the remainder, same convention as the legacy path
         order_result = self._partial_sell_and_resize_stop(ticker, qty, sell_qty, new_stop)

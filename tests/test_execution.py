@@ -448,6 +448,33 @@ class TestGapConfirmationGuard:
         mock_retry_task.apply_async.assert_not_called()
         assert "Gap Unconfirmed" in mock_alert.call_args[0][0]
 
+    def _gap_raises(self, attempt):
+        approval = _approval(action="ADD", price_at_sizing=108.0)
+        with patch("ibkr.get_ib"), \
+             patch("ibkr.get_client"), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("ibkr.place_market_order") as mock_order, \
+             patch("market_data.get_priced_quote", return_value=self._fresh_quote()), \
+             patch("market_data.check_gap_confirmation", side_effect=RuntimeError("no bars")), \
+             patch("market_data.is_market_hours", return_value=True), \
+             patch("tasks.retry_deferred_entry") as mock_retry_task, \
+             patch("alerts._send") as mock_alert:
+            mock_rm_cls.return_value.is_halted.return_value = False
+            result = execution.execute_approved(approval, gap_retry_attempt=attempt)
+        assert result is False
+        mock_order.assert_not_called()
+        return mock_retry_task, mock_alert
+
+    def test_buy_defers_when_gap_check_errors(self):
+        """Audit 2026-10-28 14:53 #8: used to proceed with the BUY unchecked."""
+        retry, _ = self._gap_raises(1)
+        assert retry.apply_async.call_args.kwargs["args"][1] == 2
+
+    def test_buy_skips_when_gap_check_keeps_erroring(self):
+        retry, alert = self._gap_raises(3)
+        retry.apply_async.assert_not_called()
+        assert "Gap Check Failed" in alert.call_args[0][0]
+
     def test_sell_never_calls_gap_confirmation(self):
         approval = _approval(action="EXIT", shares_initial=100)
         position = MagicMock(qty=100.0)

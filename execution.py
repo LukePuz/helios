@@ -506,7 +506,29 @@ def execute_approved(
                     return False
                 # "confirmed" or "no_gap" -- proceed normally.
             except Exception as e:
-                log.warning(f"[{ticker}] Gap-confirmation check failed, proceeding: {e}")
+                # Fails closed like the stale-price check above (limitations
+                # audit 2026-10-28 14:53, #8): retry later, then skip.
+                from config import GAP_CONFIRMATION_MAX_RETRIES, GAP_CONFIRMATION_RETRY_MINUTES
+                if gap_retry_attempt < GAP_CONFIRMATION_MAX_RETRIES:
+                    from datetime import datetime, timedelta, timezone
+                    eta = datetime.now(timezone.utc) + timedelta(minutes=GAP_CONFIRMATION_RETRY_MINUTES)
+                    log.warning(f"[{ticker}] Gap-confirmation check failed ({e}); "
+                                f"re-checking at {eta.isoformat()}")
+                    try:
+                        from tasks import retry_deferred_entry
+                        retry_deferred_entry.apply_async(
+                            args=[approval["id"], gap_retry_attempt + 1], eta=eta, queue="ops",
+                        )
+                    except Exception as e2:
+                        log.error(f"[{ticker}] Could not schedule gap re-check: {e2}")
+                    return False
+                log.error(f"[{ticker}] Gap-confirmation check failed again ({e}); skipping {action}")
+                alert_module._send(
+                    f"⚠️ ORDER SKIPPED — Gap Check Failed\n"
+                    f"<b>{ticker}</b>: the opening-gap check could not run ({str(e)[:120]}). "
+                    f"Skipping this entry rather than buy unchecked."
+                )
+                return False
 
         if side == "SELL":
             # Cancel the existing broker stop only now that the sell is

@@ -271,6 +271,21 @@ def screen(event: dict) -> dict:
             log.warning("7B model returned invalid JSON — using fallback.")
             result = _keyword_fallback(event, tier=tier)
 
+    # Provenance for the SCREENED_OUT signal row (SEF run 7, 2026-10-28):
+    # those rows had no model or code version, so screener rejections couldn't
+    # be tied to what made them.
+    try:
+        import hashlib
+        from agents.analyst import _provenance as _analyst_provenance
+        result["provenance"] = {
+            "code_sha": _analyst_provenance("")["code_sha"],
+            "model": result.get("model_used") or "keyword_fallback",
+            "prompt_template_sha": hashlib.sha256(_SCREENER_PROMPT.encode()).hexdigest()[:12],
+            "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:12],
+        }
+    except Exception as e:
+        log.debug(f"screener provenance failed: {e}")
+
     log.info(
         f"Screened [{source}] {ticker}: "
         f"relevant={result['relevant']} urgency={result['urgency']} "

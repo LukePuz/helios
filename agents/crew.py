@@ -79,7 +79,9 @@ def screen_event_only(event: dict) -> dict:
         log.info(f"[{ticker}] Screened out: {reason}")
         try:
             import db
-            db.log_signal(ticker, "SCREENED_OUT", 0.0, reason)
+            prov = screening.get("provenance") or {}
+            db.log_signal(ticker, "SCREENED_OUT", 0.0, reason,
+                          model=prov.get("model"), provenance=prov or None)
         except Exception:
             pass
     else:

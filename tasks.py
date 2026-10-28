@@ -1891,6 +1891,9 @@ def alert_catalyst_conflicts(self):
         raise self.retry(exc=e, countdown=300)
 
 
+IMPLAUSIBLE_READS_BEFORE_HWM_RESET = 3
+
+
 @app.task(name="tasks.check_portfolio_drawdown", bind=True, max_retries=2)
 def check_portfolio_drawdown(self):
     """
@@ -1912,6 +1915,7 @@ def check_portfolio_drawdown(self):
         halted_key = f"trading_halted_{TRADING_ENV}"
         reason_key = f"halt_reason_{TRADING_ENV}"
         breach_key = f"drawdown_breach_count_{TRADING_ENV}"
+        implausible_key = f"drawdown_implausible_count_{TRADING_ENV}"
 
         client = _get_client()
         pv     = float(client.get_account().portfolio_value)
@@ -1929,7 +1933,30 @@ def check_portfolio_drawdown(self):
             log.warning(f"Implausible portfolio value ${pv:,.2f} (HWM ${hwm:,.2f}) — "
                        f"skipping drawdown check, not updating HWM")
             db.set_state(breach_key, "0")
+            # A persistent "implausible" read is a stale baseline, not noise:
+            # the halt fires at MAX_DRAWDOWN_PCT long before a real 50% loss.
+            # From 2026-10-11 the live HWM was the paper default ($1M), so this
+            # branch skipped every check and the circuit breaker was off
+            # (limitations audit 2026-10-28). After 3 consecutive reads (90
+            # min), reset the HWM to the current value and say so.
+            implausible = int(db.get_state(implausible_key, "0") or 0) + 1 if pv > 0 else 0
+            db.set_state(implausible_key, str(implausible))
+            if implausible >= IMPLAUSIBLE_READS_BEFORE_HWM_RESET:
+                db.set_state(hwm_key, str(pv))
+                db.set_state(implausible_key, "0")
+                log.critical(f"HWM {hwm_key} reset from ${hwm:,.2f} to ${pv:,.2f} after "
+                             f"{implausible} consecutive implausible reads")
+                try:
+                    alerts._send(
+                        f"⚠️ Drawdown baseline reset ({TRADING_ENV})\n"
+                        f"The high-water mark was more than twice the account value on "
+                        f"{implausible} checks in a row, so the drawdown halt was being skipped. "
+                        f"Baseline reset to the current value; the halt is active again."
+                    )
+                except Exception:
+                    pass
             return
+        db.set_state(implausible_key, "0")
 
         if pv > hwm:
             db.set_state(hwm_key, str(pv))

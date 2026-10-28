@@ -835,6 +835,10 @@ def get_chat_history(user_id: str, limit: int = 12, max_age_hours: float = 4) ->
         _put_conn(conn)
 
 
+# Signal types crew.py logs for routing decisions, not analyst verdicts.
+_NON_ANALYST_SIGNALS = ("SCREENED_OUT", "CATALYST_BLOCKED", "COOLDOWN_SKIPPED", "SELL_NO_POSITION")
+
+
 def get_latest_signal_for(ticker: str) -> dict | None:
     """Most recent analysis result for a ticker, regardless of verdict —
     every call to agents.analyst.analyze() logs here (see analyst.py's
@@ -844,14 +848,20 @@ def get_latest_signal_for(ticker: str) -> dict | None:
     its entry and whenever position_stops.conviction next gets touched
     (only on a fresh ADD) — used by RiskManager.find_swap_candidate to
     judge whether a held position still deserves its size, not just what
-    conviction it was entered at."""
+    conviction it was entered at.
+
+    Skips the routing rows crew.py writes to the same table (SCREENED_OUT and
+    CATALYST_BLOCKED at 0.0, COOLDOWN_SKIPPED, SELL_NO_POSITION). Before
+    2026-10-27 one screened-out headline made a healthy holding read as
+    conviction 0, which passes the swap test."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT signal, confidence, timestamp FROM signals "
-                "WHERE symbol=%s ORDER BY timestamp DESC LIMIT 1",
-                (ticker,),
+                "WHERE symbol=%s AND signal NOT IN %s "
+                "ORDER BY timestamp DESC LIMIT 1",
+                (ticker, _NON_ANALYST_SIGNALS),
             )
             row = cur.fetchone()
             if not row:

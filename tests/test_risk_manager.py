@@ -762,3 +762,20 @@ class TestSectorAwareTradeStyle:
             result = rm.flag_stale_positions()
         assert len(result) == 1
         assert result[0]["trade_style"] == "Choppy/Distribution"
+
+
+def test_latest_signal_query_skips_routing_rows():
+    """Audit 2026-10-27 finding 9: a SCREENED_OUT row (confidence 0.0) must not
+    count as the held position's conviction in the swap check."""
+    import db
+    cur = MagicMock()
+    cur.fetchone.return_value = ("HOLD", 0.7, None)
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
+        result = db.get_latest_signal_for("NVDA")
+
+    sql, params = cur.execute.call_args[0]
+    assert "signal NOT IN %s" in sql
+    assert "SCREENED_OUT" in params[1] and "CATALYST_BLOCKED" in params[1]
+    assert result["confidence"] == 0.7

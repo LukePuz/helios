@@ -228,6 +228,27 @@ def _keyword_fallback(event: dict, tier: str = "Watch") -> dict:
     }
 
 
+
+_DIGEST_CACHE: dict = {}
+
+
+def _screener_digest() -> str | None:
+    """Digest of SCREENER_MODEL on the Ollama that serves it (CPU host first,
+    same order as _call_ollama), cached per process. SCREENED_OUT rows had
+    no digest (SEF run 8)."""
+    if "d" not in _DIGEST_CACHE:
+        digest = None
+        for host in (OLLAMA_CPU_HOST, OLLAMA_HOST):
+            try:
+                tags = requests.get(f"{host}/api/tags", timeout=5).json().get("models", [])
+                digest = next((m.get("digest") for m in tags if m.get("name") == SCREENER_MODEL), None)
+            except Exception:
+                continue
+            if digest:
+                break
+        _DIGEST_CACHE["d"] = digest[:12] if digest else None
+    return _DIGEST_CACHE["d"]
+
 def screen(event: dict) -> dict:
     """
     Main entry point. Returns screening result dict.
@@ -280,6 +301,7 @@ def screen(event: dict) -> dict:
         result["provenance"] = {
             "code_sha": _analyst_provenance("")["code_sha"],
             "model": result.get("model_used") or "keyword_fallback",
+            "model_digest": _screener_digest() if result.get("model_used") else None,
             "prompt_template_sha": hashlib.sha256(_SCREENER_PROMPT.encode()).hexdigest()[:12],
             "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:12],
         }

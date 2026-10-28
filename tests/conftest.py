@@ -41,6 +41,8 @@ def _static_provenance(monkeypatch):
     """analyst._provenance shells out to git and asks Ollama for the model
     digest once per process; tests use a fixed stub instead."""
     from agents import analyst
+    from agents import screener
+    monkeypatch.setattr(screener, "_DIGEST_CACHE", {"d": "testdigest"})
     monkeypatch.setattr(analyst, "_PROVENANCE_STATIC",
                         {"code_sha": "test", "model": "test", "model_digest": None,
                          "prompt_template_sha": "test"})

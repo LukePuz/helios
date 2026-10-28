@@ -46,6 +46,10 @@ try:
         PARTIAL_SELL_PCT_BY_STYLE,
         STALE_WINDOW_DAYS_BY_STYLE,
         STALE_MOVE_THRESHOLD_PCT,
+        SETUP_GATES_ENABLED,
+        CATEGORY_RISK_PCT_PER_TRADE,
+        CATEGORY_SOFT_CEILING_PCT,
+        PORTFOLIO_HEAT_CAP_PCT,
     )
 except ImportError:
     TRADING_ENV                   = "paper"
@@ -81,6 +85,10 @@ except ImportError:
         "Choppy/Distribution": {"Accelerator": 14, "Moonshot": 10},
     }
     STALE_MOVE_THRESHOLD_PCT      = 0.05
+    SETUP_GATES_ENABLED           = False
+    CATEGORY_RISK_PCT_PER_TRADE   = {"Breakout": 0.015, "Catalyst": 0.010, "Continuation": 0.010}
+    CATEGORY_SOFT_CEILING_PCT     = {"Breakout": (0.06, 0.08), "Catalyst": (0.04, 0.06), "Continuation": (0.03, 0.05)}
+    PORTFOLIO_HEAT_CAP_PCT        = 0.07
 
     def get_active_limits(balance: float) -> dict:
         return {"tier": "standard", "max_concurrent_positions": None,
@@ -334,6 +342,22 @@ class RiskManager:
                     "flags": [f"Conviction {conviction} below the {limits['tier']}-tier minimum "
                               f"({limits['min_conviction_to_queue']}) — skipping"]}
 
+        # Swing-trading cutover, Phase 4/5 (2026-10-11): when SETUP_GATES_
+        # ENABLED and a live setup-gate classification + trade ladder exist
+        # for this ticker, risk-first sizing off the gate's structural stop
+        # REPLACES the legacy %-of-account allocation-table method below
+        # entirely for this call. Returns None (not a sizing dict) when
+        # there's no live category/ladder data for this ticker (e.g. a
+        # legacy position still carrying an old bucket, or the gates
+        # haven't classified it) -- same "insufficient data -> fall back"
+        # convention compute_trend_template already uses elsewhere in this
+        # codebase, so the pre-cutover method directly below is always the
+        # fallback, never bypassed outright.
+        if SETUP_GATES_ENABLED:
+            new_path = self._size_position_setup_gates(ticker, conviction, bucket, regime, price, pv)
+            if new_path is not None:
+                return new_path
+
         band  = _conviction_band(conviction)
         sizes = BUCKET_SIZE_TABLE.get(bucket, BUCKET_SIZE_TABLE["Accelerator"])
         lo, hi = sizes.get(band, (0.01, 0.02))
@@ -537,6 +561,169 @@ class RiskManager:
         }
 
     # ------------------------------------------------------------------
+    # Swing-trading cutover, Phase 4/5 (2026-10-11): setup-gate sizing path
+    # ------------------------------------------------------------------
+
+    def _size_position_setup_gates(
+        self, ticker: str, conviction: int, bucket: str, regime: str, price: float, pv: float,
+    ) -> dict | None:
+        """
+        SETUP_GATES_ENABLED sizing path, called from size_position() above.
+        Risk-first: get the gate's own structural stop_price FIRST (from
+        agents.setup_gates.classify_setup, which reads agents.trade_ladder's
+        nightly rungs), THEN derive risk_dollars = equity x
+        CATEGORY_RISK_PCT_PER_TRADE[category] x REGIME_MULTIPLIER[regime],
+        THEN shares = risk_dollars / (entry - stop) -- the reverse order
+        from the legacy path, which sizes off a %-of-account table first and
+        only derives dollar risk as a side effect. CATEGORY_SOFT_CEILING_PCT
+        is then applied as a pure TRIM (never raises shares), same posture
+        as the cash-reserve and portfolio-heat caps below.
+
+        Returns None (never a zero-share dict) when there's no live
+        category+ladder match for this ticker -- the caller must fall back
+        to the legacy allocation-table method in that case. Every actual
+        "can't size this" outcome below (stop too wide, at/above ceiling,
+        cash-blocked, heat-blocked) returns a real 0-share sizing dict
+        instead, matching the legacy path's own convention so callers
+        (agents/crew.py's swap-candidate logic, alerts) see a consistent
+        shape either way.
+        """
+        if bucket not in CATEGORY_RISK_PCT_PER_TRADE:
+            return None
+        try:
+            import db
+            from agents.setup_gates import classify_setup
+        except Exception as e:
+            log.warning(f"[{ticker}] setup-gate sizing unavailable ({e}) — falling back to legacy sizing")
+            return None
+
+        ladder = db.get_trade_ladder(ticker)
+        if not ladder:
+            return None
+
+        try:
+            best, _all_gates = classify_setup(ticker)
+        except Exception as e:
+            log.warning(f"[{ticker}] classify_setup failed ({e}) — falling back to legacy sizing")
+            return None
+
+        if not best or best.get("category") != bucket or best.get("stop_price") is None:
+            return None
+
+        stop_price = float(best["stop_price"])
+        if not price or price <= 0 or stop_price >= price:
+            # A structurally invalid stop (at/above entry) can't be risk-sized
+            # at all — fall back rather than divide by zero/negative.
+            log.warning(f"[{ticker}] setup-gate stop ${stop_price:.2f} is not below "
+                        f"price ${price:.2f} — falling back to legacy sizing")
+            return None
+
+        risk_pct     = CATEGORY_RISK_PCT_PER_TRADE[bucket]
+        mult         = REGIME_MULTIPLIER.get(regime, 0.75)
+        risk_dollars = pv * risk_pct * mult
+        shares       = int(risk_dollars / (price - stop_price))
+
+        flags: list[str] = []
+        if shares < 1:
+            return {"position_size_pct": 0, "dollar_amount": 0, "shares_initial": 0,
+                    "cash_blocked": False, "heat_blocked": False,
+                    "flags": [f"Stop distance (${price - stop_price:.2f}, structural/{bucket}) is too "
+                              f"wide to buy even 1 share of {ticker} within the {risk_pct:.1%} "
+                              f"per-trade risk cap (${risk_dollars:,.2f}) — skipping"]}
+
+        # Soft ceiling — trims, never raises (see config.CATEGORY_SOFT_CEILING_PCT).
+        held     = self.current_position_value(ticker)
+        _lo, ceiling_hi = CATEGORY_SOFT_CEILING_PCT.get(bucket, (None, None))
+        if ceiling_hi is not None:
+            ceiling_dollar = max(0.0, pv * ceiling_hi - held)
+            ceiling_shares = int(ceiling_dollar / price) if price else 0
+            if ceiling_shares < shares:
+                flags.append(f"Soft ceiling ({ceiling_hi:.0%} of portfolio) trims {shares} -> {ceiling_shares} shares")
+                shares = ceiling_shares
+        if shares < 1:
+            return {"position_size_pct": 0, "dollar_amount": 0, "shares_initial": 0,
+                    "cash_blocked": False, "heat_blocked": False,
+                    "flags": flags + [f"{ticker} already at/above the {bucket} soft ceiling — skipping"]}
+
+        # Cash-reserve cap — identical convention to the legacy path.
+        cash_reserve  = self.cash()
+        cash_cap      = max(cash_reserve, 0) * MAX_TRADE_PCT_OF_CASH_RESERVE
+        initial_dollar = shares * price
+        cash_capped   = initial_dollar > cash_cap
+        if cash_capped:
+            shares = int(cash_cap / price) if price else 0
+            initial_dollar = shares * price
+            flags.append(f"Capped at {MAX_TRADE_PCT_OF_CASH_RESERVE:.0%} of cash reserve "
+                         f"(${cash_reserve:,.0f} available)")
+        cash_blocked = False
+        if shares < 1:
+            cash_blocked = cash_reserve <= 0 or cash_capped
+            if cash_blocked:
+                self._alert_cash_blocked(cash_reserve)
+            return {"position_size_pct": 0, "dollar_amount": 0, "shares_initial": 0,
+                    "cash_blocked": cash_blocked, "heat_blocked": False,
+                    "flags": flags + [f"Allocation ${initial_dollar:,.2f} buys less than 1 share "
+                              f"of {ticker} at ${price:,.2f} — skipping"]}
+
+        # Portfolio heat cap (config.PORTFOLIO_HEAT_CAP_PCT) — partial-sizes
+        # down to fit the remaining budget, the same "scale down, don't
+        # hard-block" posture the cash-reserve cap above already uses, not
+        # a hard block. See db.get_portfolio_heat_pct's docstring for the
+        # exact dollar-risk-to-CURRENT-stop definition.
+        heat_blocked = False
+        try:
+            positions_map = {p.symbol: {"qty": float(p.qty)} for p in self._client.get_all_positions()}
+            heat = db.get_portfolio_heat_pct(pv, positions_map)
+            current_heat_pct = heat.get("heat_pct", 0.0)
+        except Exception as e:
+            log.warning(f"[{ticker}] portfolio heat lookup failed ({e}) — treating current heat as 0")
+            current_heat_pct = 0.0
+
+        heat_cap = PORTFOLIO_HEAT_CAP_PCT * mult
+        new_trade_risk_pct = (shares * (price - stop_price)) / pv if pv else 0.0
+        if current_heat_pct + new_trade_risk_pct > heat_cap:
+            remaining_budget_dollars = max(0.0, heat_cap - current_heat_pct) * pv
+            heat_capped_shares = int(remaining_budget_dollars / (price - stop_price))
+            if heat_capped_shares < shares:
+                flags.append(
+                    f"Portfolio heat cap ({heat_cap:.1%} of equity, {current_heat_pct:.1%} already used) "
+                    f"trims {shares} -> {heat_capped_shares} shares"
+                )
+                shares = heat_capped_shares
+                initial_dollar = shares * price
+            if shares < 1:
+                heat_blocked = True
+                return {"position_size_pct": 0, "dollar_amount": 0, "shares_initial": 0,
+                        "cash_blocked": False, "heat_blocked": True,
+                        "flags": flags + [f"Portfolio heat already at/above the {heat_cap:.1%} cap "
+                                  f"({current_heat_pct:.1%} used) — skipping"]}
+
+        max_loss = shares * (price - stop_price)
+        if mult < 1.0:
+            flags.append(f"Regime multiplier {mult}x applied ({regime})")
+
+        return {
+            "ticker":              ticker,
+            "position_size_pct":   round(initial_dollar / pv, 4) if pv else 0,
+            "dollar_amount":       round(initial_dollar, 2),
+            "initial_entry_pct":   1.0,   # risk-sized directly, no staged tranche
+            "initial_dollar":      round(initial_dollar, 2),
+            "shares_initial":      shares,
+            "stop_loss_price":     stop_price,
+            "stop_method":         f"Setup-gate structural stop ({bucket})",
+            "trailing_stop_activate_at_gain_pct": None,  # see check_trailing_stops' ladder-ratchet path
+            "trailing_stop_distance_pct": None,
+            "max_loss_if_stopped": round(max_loss, 2),
+            "regime_multiplier":   mult,
+            "bucket":              bucket,
+            "conviction":          conviction,
+            "cash_blocked":        cash_blocked,
+            "heat_blocked":        heat_blocked,
+            "target_prices":       best.get("target_prices", []),
+            "flags":               flags,
+        }
+
+    # ------------------------------------------------------------------
     # ATR-based stop calculation
     # ------------------------------------------------------------------
 
@@ -550,6 +737,24 @@ class RiskManager:
         """
         Returns (stop_price, method_description).
         """
+        # Swing-trading cutover, Phase 4/5 (2026-10-11): when SETUP_GATES_
+        # ENABLED and a live gate classification with a real stop_price
+        # exists for this ticker under this exact category, use it directly
+        # instead of the ATR-multiple calc below. Falls back to the
+        # existing ATR logic otherwise (bad classify_setup call, no live
+        # match, or no stop_price on the match) -- same "insufficient data
+        # -> fall back" convention compute_trend_template already uses
+        # elsewhere in this codebase.
+        if SETUP_GATES_ENABLED and bucket in CATEGORY_RISK_PCT_PER_TRADE:
+            try:
+                from agents.setup_gates import classify_setup
+                best, _all_gates = classify_setup(ticker)
+            except Exception as e:
+                log.warning(f"[{ticker}] setup-gate stop lookup failed ({e}) — falling back to ATR stop")
+                best = None
+            if best and best.get("category") == bucket and best.get("stop_price") is not None:
+                return float(best["stop_price"]), f"Setup-gate structural stop ({bucket})"
+
         if bucket == "Moonshot":
             stop = round(entry_price * (1 - MOONSHOT_MAX_LOSS_PCT), 2)
             return stop, f"Moonshot hard stop: {MOONSHOT_MAX_LOSS_PCT:.0%} max loss from entry"
@@ -953,6 +1158,16 @@ class RiskManager:
                 })
                 continue
 
+            # Swing-trading cutover, Phase 4/5 (2026-10-11): when SETUP_
+            # GATES_ENABLED, a position carrying a live setup category uses
+            # the ladder-rung ratchet below INSTEAD OF the fixed ATR-
+            # multiple trail-activation logic that follows — skip it
+            # entirely for this ticker rather than letting both paths touch
+            # the same stop in the same run.
+            if SETUP_GATES_ENABLED and bucket in CATEGORY_RISK_PCT_PER_TRADE:
+                self._ratchet_ladder_stop(ticker, pos, current, stop_px, alerts)
+                continue
+
             # Check if trailing stop should be activated
             entry    = stop_record.get("entry_price", current)
             gain_pct = (current - entry) / entry if entry else 0
@@ -1039,6 +1254,52 @@ class RiskManager:
 
         return alerts
 
+    def _ratchet_ladder_stop(self, ticker: str, pos: object, current: float,
+                              stop_px: float, alerts: list[dict]) -> None:
+        """
+        SETUP_GATES_ENABLED trailing-stop path (2026-10-11): ratchets the
+        stop to the highest ladder rung (agents.trade_ladder's nightly
+        rungs, confluence_score >= 1 -- i.e. every real rung, single-type
+        levels included, not just multi-confluence clusters) strictly
+        below the current price, refreshed from whatever the ladder's
+        latest nightly build computed -- instead of a fixed ATR-multiple
+        trail distance. Ratchet-only: never moves the stop down, same
+        guarantee the legacy ATR-trail path above already provides (a new
+        candidate rung below the existing stop is simply ignored).
+        """
+        import db
+        ladder = db.get_trade_ladder(ticker)
+        if not ladder:
+            return
+        candidates = [
+            r["price"] for r in (ladder.get("rungs") or [])
+            if r.get("confluence_score", 0) >= 1 and r["price"] < current
+        ]
+        if not candidates:
+            return
+        new_stop = max(candidates)
+        if new_stop <= stop_px:
+            return  # not an improvement -- never move down
+
+        try:
+            import tasks
+            qty = round(abs(float(pos.qty)), 4)
+            tasks.manage_cancel_stop_orders_for(ticker)
+            result = tasks.manage_stop_place(ticker, qty, new_stop)
+            db.set_stop_broker_order_id(ticker, result["order_id"])
+            db.update_trailing_stop(ticker, new_stop, current)
+            log.info(f"[{ticker}] Ladder trailing stop ratcheted ${stop_px:.2f} -> ${new_stop:.2f}")
+        except Exception as e:
+            log.error(f"[{ticker}] Ladder trailing stop ratchet FAILED: {e}")
+            alerts.append({
+                "ticker":        ticker,
+                "action":        "FIX_STOP",
+                "current_price": current,
+                "stop_price":    new_stop,
+                "reason":        f"Ladder trailing stop should be ${new_stop:.2f} but broker "
+                                 f"order update FAILED — fix manually in TWS",
+            })
+
     def check_profit_targets(self) -> list[dict]:
         """
         Regime-adaptive profit-taking for Accelerator/Moonshot positions
@@ -1115,19 +1376,37 @@ class RiskManager:
             if stop_record.get("profit_target_taken"):
                 continue
 
+            # Moved up from below the old bucket-table lookup (unchanged
+            # computation, just earlier) so the SETUP_GATES_ENABLED branch
+            # immediately below can use pos/entry/current/gain_pct too —
+            # behaviorally identical for every legacy bucket, which simply
+            # falls through to the unchanged code further down.
+            pos = positions.get(ticker)
+            entry = stop_record.get("entry_price")
+            if not pos or not entry:
+                continue
+            current = float(pos.current_price)
+            gain_pct = (current - entry) / entry
+
+            # Swing-trading cutover, Phase 4/5 (2026-10-11): a position
+            # carrying a live setup category reads its scale-out schedule
+            # from the gate/ladder instead of the flat PROFIT_TARGET_PCT_
+            # BY_STYLE table — handled entirely, never falls through to the
+            # legacy table-driven logic below.
+            if SETUP_GATES_ENABLED and bucket in CATEGORY_RISK_PCT_PER_TRADE:
+                trade_style = _trade_style_for(ticker)
+                partial_pct = PARTIAL_SELL_PCT_BY_STYLE[trade_style]
+                self._check_profit_target_setup_gates(
+                    ticker, bucket, entry, current, gain_pct, partial_pct, trade_style, results
+                )
+                continue
+
             trade_style = _trade_style_for(ticker)
             targets_by_bucket = PROFIT_TARGET_PCT_BY_STYLE[trade_style]
             if bucket not in targets_by_bucket:
                 continue  # Compounder, or any bucket not in this framework
             partial_pct = PARTIAL_SELL_PCT_BY_STYLE[trade_style]
 
-            pos = positions.get(ticker)
-            entry = stop_record.get("entry_price")
-            if not pos or not entry:
-                continue
-
-            current = float(pos.current_price)
-            gain_pct = (current - entry) / entry
             target_lo, target_hi = targets_by_bucket[bucket]
             target = (target_lo + target_hi) / 2
             if gain_pct < target:
@@ -1157,6 +1436,101 @@ class RiskManager:
             })
 
         return results
+
+    def _check_profit_target_setup_gates(
+        self, ticker: str, bucket: str, entry: float, current: float, gain_pct: float,
+        partial_pct: float, trade_style: str, results: list[dict],
+    ) -> bool:
+        """
+        SETUP_GATES_ENABLED profit-taking path (2026-10-11): the scale-out
+        schedule comes from the live setup-gate's own target_prices
+        (agents/setup_gates.py's classify_setup, which projects them off
+        agents.trade_ladder's rungs at classification time) instead of the
+        flat PROFIT_TARGET_PCT_BY_STYLE %-of-gain table. Falls back to the
+        nearest ladder rungs above entry if the ticker's live category no
+        longer matches this position's stored bucket (e.g. the setup has
+        since stopped qualifying) rather than skipping target-taking
+        outright.
+
+        Layers the EXISTING valuation-tier override on top UNCONDITIONALLY:
+        an "Overextended" fair-value read (agents/valuation.py, via the
+        same ladder) forces a partial sell even if price hasn't reached a
+        ladder target yet -- same override tasks.py's digest code already
+        surfaces for held positions, just now acted on here instead of
+        only displayed.
+
+        This method issues the SAME kind of real partial-sell market order
+        the pre-existing (pre-cutover) check_profit_targets loop already
+        places for Accelerator/Moonshot above -- it is NOT a new class of
+        live-order behavior, just a different trigger (ladder target /
+        valuation tier instead of the flat %-of-gain table) reached only
+        when SETUP_GATES_ENABLED is explicitly set True. Never reached in
+        this task's deliverable, which ships with that flag False.
+
+        Returns True if a sell was actually executed this run.
+        """
+        import db
+
+        ladder = db.get_trade_ladder(ticker)
+        valuation_tier = ladder.get("valuation_tier") if ladder else None
+        overextended = valuation_tier == "Overextended"
+
+        best = None
+        try:
+            from agents.setup_gates import classify_setup
+            best, _all_gates = classify_setup(ticker)
+        except Exception as e:
+            log.debug(f"[{ticker}] profit-target classify_setup failed: {e}")
+
+        target_prices = (best.get("target_prices") or []) if (best and best.get("category") == bucket) else []
+        if not target_prices and ladder:
+            target_prices = sorted(
+                r["price"] for r in (ladder.get("rungs") or []) if r["price"] > entry
+            )[:3]
+
+        nearest_target = min(target_prices) if target_prices else None
+        target_hit = nearest_target is not None and current >= nearest_target
+
+        if not (target_hit or overextended):
+            return False
+
+        try:
+            positions = {p.symbol: p for p in self._client.get_all_positions()}
+        except Exception as e:
+            log.warning(f"[{ticker}] setup-gate profit-target: could not fetch positions: {e}")
+            return False
+        pos = positions.get(ticker)
+        if not pos:
+            return False
+
+        qty = abs(float(pos.qty))
+        sell_qty = round(qty * partial_pct, 4)
+        if sell_qty <= 0:
+            return False
+
+        try:
+            import ibkr
+            order_result = ibkr.place_market_order(ticker, "SELL", sell_qty)
+        except Exception as e:
+            log.error(f"[{ticker}] Setup-gate profit-target partial sell FAILED: {e}")
+            return False
+
+        new_stop = entry  # breakeven on the remainder, same convention as the legacy path
+        db.mark_profit_target_taken(ticker, new_stop)
+        if overextended and target_hit:
+            reason = f"ladder target ${nearest_target:.2f} hit + Overextended valuation"
+        elif overextended:
+            reason = "Overextended valuation override"
+        else:
+            reason = f"ladder target ${nearest_target:.2f} hit"
+        log.info(f"[{ticker}] Setup-gate profit target ({reason}, gain {gain_pct:.1%}): "
+                 f"sold {sell_qty} shares, remainder stop -> breakeven ${new_stop:.2f}")
+        results.append({
+            "ticker": ticker, "action": "PARTIAL_SELL", "shares_sold": sell_qty,
+            "new_stop": new_stop, "trade_style": trade_style, "gain_pct": gain_pct,
+            "setup_category": bucket, "reason": reason, "order_result": order_result,
+        })
+        return True
 
     def flag_stale_positions(self) -> list[dict]:
         """

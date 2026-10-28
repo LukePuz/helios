@@ -457,6 +457,75 @@ import os as _os
 USE_BRACKET_ORDERS = _os.getenv("USE_BRACKET_ORDERS", "false").lower() == "true"
 
 # ---------------------------------------------------------------------------
+# Swing-trading cutover, Phase 4/5 (2026-10-11) -- setup-gate sizing/stops
+# ---------------------------------------------------------------------------
+# Master switch for the swing-trading redesign's sizing/stop/category
+# authority. Everything built across the prior phases (agents/setup_gates.py's
+# classify_setup, agents/trade_ladder.py's nightly rungs, agents/valuation.py's
+# fair-value ensemble) has run in SHADOW MODE only so far -- logged alongside
+# the existing Compounder/Accelerator/Moonshot system (agents/scanner.py's
+# setup_gates_detail), never consulted for a real sizing/stop decision. This
+# flag is the only thing that flips that: when False (the only state this
+# has ever shipped in, and the required default/fallback), risk_manager.
+# size_position/calculate_stop/check_trailing_stops/check_profit_targets and
+# agents/analyst.py's bucket lookup are byte-for-byte identical to
+# pre-cutover behavior -- every new branch gated on this flag is additive and
+# reversible, same on/off convention as USE_BRACKET_ORDERS above.
+#
+# Known from 2+ weeks of live shadow data: the three gates are strict BY
+# DESIGN and qualified on ~0% of the 75-ticker watchlist for multiple
+# consecutive days in choppy market conditions. Setting this True is a
+# deliberate decision to accept "no new entries for a while" in some
+# regimes, not a bug to fix first -- see the final report from this phase
+# for the full pre-flip checklist (this sizing math has zero live track
+# record as of this writing).
+SETUP_GATES_ENABLED = os.getenv("SETUP_GATES_ENABLED", "false").lower() == "true"
+
+# Risk-per-trade-of-equity by LIVE setup category (Breakout/Catalyst/
+# Continuation) -- the SETUP_GATES_ENABLED equivalent of RISK_PCT_PER_TRADE
+# above, which stays exactly as-is and keeps governing Compounder/
+# Accelerator/Moonshot sizing when the flag is off. Breakout gets the
+# largest allocation: it's the most-corroborated of the three (a confirmed
+# Stage 2 trend + a genuine multi-contraction base + a real volume-
+# confirmed trigger, vs. Catalyst's two-source corroboration or
+# Continuation's single pullback-and-resume read). All three sit inside
+# Minervini's own stated 1.25-2.5% per-trade risk range, same source
+# RISK_PCT_PER_TRADE's 2% midpoint was drawn from.
+CATEGORY_RISK_PCT_PER_TRADE: dict[str, float] = {
+    "Breakout":     0.015,
+    "Catalyst":     0.010,
+    "Continuation": 0.010,
+}
+
+# Soft %-of-portfolio ceiling by category -- (min, max) band, SETUP_GATES_
+# ENABLED's equivalent of BUCKET_SIZE_TABLE's hard caps. "Soft" is load-
+# bearing: risk_manager's new sizing path computes shares from
+# risk_dollars / stop_distance FIRST (risk-first sizing, the design this
+# whole phase is built around) and this ceiling only ever TRIMS the
+# resulting share count -- it never pulls shares UP toward the band the
+# way BUCKET_SIZE_TABLE's existing bands drive legacy sizing toward their
+# midpoint. Relative ordering mirrors CATEGORY_RISK_PCT_PER_TRADE above.
+CATEGORY_SOFT_CEILING_PCT: dict[str, tuple[float, float]] = {
+    "Breakout":     (0.06, 0.08),
+    "Catalyst":     (0.04, 0.06),
+    "Continuation": (0.03, 0.05),
+}
+
+# Total open risk across every position -- db.get_portfolio_heat_pct's
+# dollar-risk-to-CURRENT-stop definition, so a position already trailed to
+# breakeven or better contributes zero heat -- as a % of equity. Scoped to
+# the SETUP_GATES_ENABLED path only: the legacy bucket system has no
+# portfolio-wide risk budget today, only per-position caps, and retrofitting
+# one onto it is out of scope for this phase. risk_manager's new sizing path
+# checks this before finalizing share count: if current_heat +
+# this_trade's_own_risk would exceed PORTFOLIO_HEAT_CAP_PCT x
+# REGIME_MULTIPLIER[regime] (tighter in cautious regimes, same multiplier
+# every other sizing step already uses), the new trade is scaled DOWN to
+# fit the remaining budget -- mirroring how the existing cash-reserve cap
+# partial-sizes a trade instead of hard-blocking it outright.
+PORTFOLIO_HEAT_CAP_PCT = 0.07
+
+# ---------------------------------------------------------------------------
 # Ollama model config
 # ---------------------------------------------------------------------------
 import os

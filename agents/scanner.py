@@ -477,6 +477,37 @@ def run_scan(regime_packet: dict | None = None) -> dict:
             "sector":               entry.get("sector"),
         }
 
+        # Shadow-mode setup classification (2026-09-13) -- logged
+        # alongside the existing composite-score system for comparison,
+        # does NOT gate pass_to_analyst or replace `role` above. See
+        # agents/setup_gates.py's module docstring: this is Phase 2 of
+        # the swing-trading redesign, running in parallel with the live
+        # system so real-world firing rates can be compared before any
+        # cutover (agents/analyst.py's SETUP_GATES_ENABLED flag, not yet
+        # built) is considered.
+        try:
+            from agents.setup_gates import classify_setup
+            best_setup, all_setup_gates = classify_setup(ticker)
+            candidate["setup_category"] = best_setup["category"] if best_setup else None
+            candidate["setup_triggered"] = bool(best_setup and best_setup["triggered"])
+            candidate["setup_gates_shadow"] = {
+                cat: {
+                    "qualifies": g["qualifies"], "triggered": g["triggered"],
+                    "criteria": g["criteria"], "reasoning": g["reasoning"],
+                }
+                for cat, g in all_setup_gates.items()
+            }
+        except Exception as e:
+            # WARNING, not debug (2026-09-17, found investigating why
+            # scanner_candidates showed 0/75 rows with setup_category
+            # populated across two full days despite the persistence fix
+            # working correctly in isolation -- this exception handler's
+            # debug-level log was hiding a systematic failure completely.
+            log.warning(f"[{ticker}] shadow setup classification failed: {e}")
+            candidate["setup_category"] = None
+            candidate["setup_triggered"] = False
+            candidate["setup_gates_shadow"] = {}
+
         if priority == "PASS":
             disqualified.append({
                 "ticker": ticker,
@@ -501,6 +532,9 @@ def run_scan(regime_packet: dict | None = None) -> dict:
                 catalyst_detail=cat_notes,
                 passed_to_analyst=priority in ("HIGH", "MEDIUM"),
                 regime_at_scan=regime,
+                setup_category=candidate.get("setup_category"),
+                setup_triggered=candidate.get("setup_triggered"),
+                setup_gates_detail=candidate.get("setup_gates_shadow"),
             )
         except Exception as e:
             log.debug(f"Scanner DB log failed for {ticker}: {e}")

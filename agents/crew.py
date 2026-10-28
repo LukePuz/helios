@@ -207,12 +207,70 @@ def _analyze_held_position(ticker: str, client, positions: dict, regime: dict) -
         }
 
 
+def _capture_latest_thesis(ticker: str, result: dict) -> None:
+    """Persists the FULL analyst result from a scheduled review, every
+    cycle, regardless of action -- fixes the gap found 2026-09-13
+    reconstructing Helios's Friday QBTS review for the user: a plain HOLD
+    verdict's full reasoning was previously lost, only a 176-char
+    activity_feed line survived (analyst.analyze already truncates to
+    500 chars for db.log_signal, and only OPEN/ADD/TRIM/EXIT that pass
+    the conviction/UDR gate ever reach pending_approvals.analyst_json).
+    Failures are logged, never raised -- losing a thesis snapshot must
+    never block the review itself."""
+    try:
+        import db
+        from datetime import datetime, timezone
+        weeks_to_catalyst = result.get("weeks_to_catalyst")
+        thesis = {
+            "as_of": datetime.now(timezone.utc).isoformat(),
+            "setup_category": None,  # not yet classified live -- setup_gates.py runs in shadow mode
+            "action": result.get("action"),
+            "conviction": result.get("conviction"),
+            "thesis_summary": result.get("thesis_summary"),
+            "gate_criteria": None,
+            "catalyst": result.get("catalyst"),
+            "catalyst_status": "pending",
+            "expected_return_pct": result.get("expected_return_pct"),
+            "expected_downside_pct": result.get("expected_downside_pct"),
+            "weeks_to_catalyst": weeks_to_catalyst,
+            "no_near_term_catalyst": db.compute_no_near_term_catalyst(result.get("catalyst"), weeks_to_catalyst),
+            "catalyst_stale": result.get("catalyst_stale", False),
+            "valuation_tier": None,
+            "key_risks": result.get("key_risks", []),
+            "reasoning": result.get("reasoning"),
+        }
+        db.update_latest_thesis(ticker, thesis)
+
+        # #4 (2026-09-15, user request): a legacy position matching ZERO
+        # live setup categories AND carrying no genuine near-term catalyst
+        # is exactly the profile the swing-trading redesign says shouldn't
+        # sit unexamined -- surfaced as a visible activity_feed alert here
+        # (never a silent log line), NOT an auto-trim. See
+        # agents.setup_gates.check_legacy_position_health's docstring.
+        try:
+            from agents.setup_gates import check_legacy_position_health
+            check_legacy_position_health(ticker, thesis)
+        except Exception as e:
+            log.debug(f"[{ticker}] legacy position health check failed: {e}")
+    except Exception as e:
+        # WARNING, not debug (2026-09-17, found investigating a silent
+        # failure): a lost thesis snapshot is non-fatal to the review
+        # itself but IS real data loss for the drift-tracking system --
+        # a 2026-09-15 off-schedule dispatch via tasks.review_positions.
+        # delay() (no explicit queue routing) landed on the busy shared
+        # worker queue, likely hit DB pool contention against concurrently
+        # running reconcile-stops/check-profit-targets/portfolio-snapshot,
+        # and failed here completely invisibly at debug level.
+        log.warning(f"[{ticker}] latest thesis capture failed (non-fatal to the review, but the snapshot is lost): {e}")
+
+
 def review_held_position(ticker: str, client, positions: dict, regime: dict) -> dict:
     """Reassess one already-held position via the same brief/analyze/route
     pipeline as the event-driven path, using a synthetic 'scheduled review'
     event instead of a real filing/news item."""
     log.info(f"[{ticker}] Scheduled position review")
     result = _analyze_held_position(ticker, client, positions, regime)
+    _capture_latest_thesis(ticker, result)
 
     if result.get("pass_to_risk"):
         _route_to_approval(result, regime, client)
@@ -634,7 +692,15 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
             # RiskManager.find_swap_candidate's docstring for the exact,
             # deliberately conservative eligibility rule (never forced;
             # returns None and changes nothing if no position qualifies).
-            if sizing.get("cash_blocked"):
+            #
+            # Swing-trading cutover, Phase 4/5 (2026-10-11): also fires on
+            # heat_blocked (SETUP_GATES_ENABLED's portfolio-heat cap, see
+            # risk_manager._size_position_setup_gates) -- same "out of room,
+            # worth checking for a rotation candidate" situation cash_blocked
+            # already covers, just a different reason sizing came back at 0
+            # shares. heat_blocked is never True unless SETUP_GATES_ENABLED,
+            # so this is a no-op when the flag is off.
+            if sizing.get("cash_blocked") or sizing.get("heat_blocked"):
                 try:
                     swap = rm.find_swap_candidate(ticker, conviction)
                 except Exception as e:

@@ -26,6 +26,7 @@ import os
 import socket
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -170,6 +171,32 @@ def _service_is_active(service: str) -> bool:
     except Exception as e:
         print(f"[watchdog] systemctl is-active {service} failed: {e}")
         return False
+
+
+_TRANSITIONAL_STATES = {"activating", "deactivating", "reloading"}
+# Touched by whoever restarts Helios on purpose (deploys); while it is fresh
+# the watchdog neither alerts nor self-heals (2026-10-28: the 16:05 deploy
+# restart was caught mid-stop, alerted Luke and triggered a second restart).
+_PLANNED_RESTART_MARKER = Path(__file__).resolve().parent.parent / "logs" / ".planned_restart"
+_PLANNED_RESTART_GRACE_S = 600
+
+
+def _service_state(service: str) -> str:
+    try:
+        out = subprocess.run(["systemctl", "is-active", service],
+                             capture_output=True, text=True, timeout=5)
+        return out.stdout.strip() or "unknown"
+    except Exception as e:
+        print(f"[watchdog] systemctl is-active {service} failed: {e}")
+        return "unknown"
+
+
+def _planned_restart_in_progress() -> bool:
+    try:
+        age = time.time() - _PLANNED_RESTART_MARKER.stat().st_mtime
+    except OSError:
+        return False
+    return age < _PLANNED_RESTART_GRACE_S
 
 
 def _gateway_service_name() -> str:
@@ -402,7 +429,13 @@ def main() -> None:
     # effect; helios-watchdog.service passes it, nothing else does.
     heal = "--heal" in sys.argv[1:]
 
-    service_down = not _service_is_active(_HELIOS_SERVICE)
+    state = _service_state(_HELIOS_SERVICE)
+    if state in _TRANSITIONAL_STATES or _planned_restart_in_progress():
+        print(f"[watchdog] skipped: {_HELIOS_SERVICE} is {state}"
+              f"{' (planned restart)' if _planned_restart_in_progress() else ''}")
+        return
+
+    service_down = state != "active"
     proc_problems = _check_processes()
     problems = ([f"{_HELIOS_SERVICE} is not active"] if service_down else []) \
         + proc_problems + _check_snapshot_freshness()

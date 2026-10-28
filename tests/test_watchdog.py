@@ -65,3 +65,46 @@ class TestIbkrPortReachable:
     def test_returns_false_on_timeout(self):
         with patch("socket.create_connection", side_effect=TimeoutError()):
             assert watchdog._ibkr_port_reachable() is False
+
+
+class TestPlannedRestart:
+    """2026-10-28: the 16:05 deploy restart was caught mid-stop; the watchdog
+    alerted Luke and self-healed (a second restart). Transitional states and a
+    fresh planned-restart marker now skip the run."""
+
+    def _main(self, state, marker_fresh=False, tmp_path=None, monkeypatch=None):
+        from unittest.mock import patch
+        import time as _t
+        marker = tmp_path / ".planned_restart"
+        if marker_fresh:
+            marker.write_text("")
+        monkeypatch.setattr(watchdog, "_PLANNED_RESTART_MARKER", marker)
+        monkeypatch.setattr(watchdog.sys, "argv", ["watchdog.py", "--heal"])
+        with patch.object(watchdog, "_service_state", return_value=state), \
+             patch.object(watchdog, "_check_processes", return_value=[]) as procs, \
+             patch.object(watchdog, "_check_snapshot_freshness", return_value=[]), \
+             patch.object(watchdog, "_attempt_heal", return_value=[]) as heal, \
+             patch.object(watchdog, "_emit") as emit:
+            watchdog.main()
+        return procs, heal, emit
+
+    def test_deactivating_is_skipped(self, tmp_path, monkeypatch):
+        procs, heal, emit = self._main("deactivating", tmp_path=tmp_path, monkeypatch=monkeypatch)
+        heal.assert_not_called(); emit.assert_not_called()
+
+    def test_fresh_marker_skips_even_when_inactive(self, tmp_path, monkeypatch):
+        _, heal, emit = self._main("inactive", True, tmp_path, monkeypatch)
+        heal.assert_not_called(); emit.assert_not_called()
+
+    def test_inactive_without_marker_still_heals(self, tmp_path, monkeypatch):
+        _, heal, emit = self._main("inactive", False, tmp_path, monkeypatch)
+        heal.assert_called_once(); emit.assert_called_once()
+
+    def test_stale_marker_is_ignored(self, tmp_path, monkeypatch):
+        import os, time as _t
+        marker = tmp_path / ".planned_restart"
+        marker.write_text("")
+        old = _t.time() - 3600
+        os.utime(marker, (old, old))
+        monkeypatch.setattr(watchdog, "_PLANNED_RESTART_MARKER", marker)
+        assert watchdog._planned_restart_in_progress() is False

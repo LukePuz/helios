@@ -823,3 +823,34 @@ class TestOneShareAboveAllocation:
     def test_risk_cap_still_applies_to_the_one_share(self):
         # $2,500 stop distance on one share > 2% of $100k
         assert self._size(2_600.0, stop_offset=2_500.0)["shares_initial"] == 0
+
+
+class TestSwapPreCheck:
+    """Audit 2026-10-28 09:00 #9: don't sell a holding for a buy that still sizes to 0."""
+
+    def _rm(self, cash):
+        client = _make_client(portfolio_value=100_000.0, cash=cash)
+        client.get_all_positions.return_value = [MagicMock(symbol="OLD", qty=10, market_value=20_000.0)]
+        with patch("db.get_state", return_value=None), patch("db.set_state"):
+            return risk_manager.RiskManager(client)
+
+    def test_freed_cash_counts(self):
+        rm = self._rm(cash=0.0)
+        seen = {}
+
+        def fake_size(self_, *a):
+            seen["cash"] = self_.cash()
+            seen["positions"] = [p.symbol for p in self_._client.get_all_positions()]
+            return {"shares_initial": 3}
+        with patch.object(risk_manager.RiskManager, "size_position", fake_size), \
+             patch("db.get_state", return_value=None), patch("db.set_state"):
+            n = rm.would_size_after_swap("NEW", 7, "Accelerator", "Neutral", 100.0,
+                                         {"ticker": "OLD", "market_value": 20_000.0})
+        assert n == 3 and seen["cash"] == 20_000.0 and seen["positions"] == []
+
+    def test_zero_when_buy_still_sizes_to_zero(self):
+        rm = self._rm(cash=0.0)
+        with patch.object(risk_manager.RiskManager, "size_position", return_value={"shares_initial": 0}), \
+             patch("db.get_state", return_value=None), patch("db.set_state"):
+            assert rm.would_size_after_swap("NEW", 7, "Accelerator", "Neutral", 5_000.0,
+                                            {"ticker": "OLD", "market_value": 100.0}) == 0

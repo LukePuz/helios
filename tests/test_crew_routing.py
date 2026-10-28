@@ -250,6 +250,27 @@ class TestConvictionSwap:
              patch("market_data.is_market_hours", return_value=False), \
              patch("alerts._send"):
             mock_rm_cls.return_value.size_position.return_value = self._cash_blocked_sizing()
+            mock_rm_cls.return_value.would_size_after_swap.return_value = 1
+            mock_rm_cls.return_value.find_swap_candidate.return_value = {
+                "ticker": "SNOW", "conviction": 4, "qty": 10.0,
+                "market_value": 1000.0, "unrealized_pl": 150.0,
+            }
+            crew._route_to_approval(result, {"regime": "Neutral"}, MagicMock())
+        mock_sell.assert_not_called()
+
+    def test_no_swap_when_the_buy_would_still_size_to_zero(self):
+        """Audit 2026-10-28 09:00 #9: don't sell a holding for nothing."""
+        result = _analyst_result(action="ADD", ticker="PLTR", conviction=9)
+        with patch("db.has_active_approval", return_value=False), \
+             patch("db.get_last_executed_approval", return_value=None), \
+             patch("db.log_signal"), \
+             patch("agents.crew._get_price", return_value=100.0), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("catalyst_service.gates.catalyst_gate_check", return_value={"approved": True}), \
+             patch("execution.execute_manual") as mock_sell, \
+             patch("market_data.is_market_hours", return_value=True):
+            mock_rm_cls.return_value.size_position.return_value = self._cash_blocked_sizing()
+            mock_rm_cls.return_value.would_size_after_swap.return_value = 0
             mock_rm_cls.return_value.find_swap_candidate.return_value = {
                 "ticker": "SNOW", "conviction": 4, "qty": 10.0,
                 "market_value": 1000.0, "unrealized_pl": 150.0,
@@ -273,6 +294,7 @@ class TestConvictionSwap:
             mock_rm_cls.return_value.size_position.side_effect = [
                 self._cash_blocked_sizing(), self._funded_sizing(),
             ]
+            mock_rm_cls.return_value.would_size_after_swap.return_value = 1
             mock_rm_cls.return_value.find_swap_candidate.return_value = {
                 "ticker": "SNOW", "conviction": 4, "qty": 10.0,
                 "market_value": 1000.0, "unrealized_pl": 150.0,
@@ -349,6 +371,7 @@ class TestConvictionSwap:
                    return_value={"success": False, "message": "no fill"}), \
              patch("alerts._send") as mock_alert:
             mock_rm_cls.return_value.size_position.return_value = self._cash_blocked_sizing()
+            mock_rm_cls.return_value.would_size_after_swap.return_value = 1
             mock_rm_cls.return_value.find_swap_candidate.return_value = {
                 "ticker": "SNOW", "conviction": 4, "qty": 10.0,
                 "market_value": 1000.0, "unrealized_pl": 150.0,

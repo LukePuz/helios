@@ -1107,6 +1107,46 @@ class RiskManager:
         candidates.sort(key=lambda c: (c["unrealized_pl"], c["conviction"]))
         return candidates[0]
 
+    def would_size_after_swap(self, ticker: str, conviction: int, bucket: str,
+                              regime: str, price: float, swap: dict) -> int:
+        """Shares the new buy would get if `swap` were sold first: sizing run
+        against the account with the swap's market value added to cash and
+        its position removed. crew used to sell first and re-size after, so a
+        buy that still sized to 0 left the holding sold and nothing bought
+        (limitations audit 2026-10-28 09:00, finding 9). Returns 0 on error."""
+        from types import SimpleNamespace
+        real = self._client
+        try:
+            acct = real.get_account()
+            freed = float(swap.get("market_value") or 0)
+            view_acct = SimpleNamespace(portfolio_value=float(acct.portfolio_value),
+                                        cash=float(acct.cash) + freed,
+                                        buying_power=float(acct.buying_power) + freed)
+            remaining = [p for p in real.get_all_positions() if p.symbol != swap.get("ticker")]
+        except Exception as e:
+            log.warning(f"[{ticker}] swap pre-check could not read the account: {e}")
+            return 0
+
+        class _View:
+            def get_account(self):
+                return view_acct
+
+            def get_all_positions(self):
+                return remaining
+
+            def get_open_position(self, symbol):
+                for p in remaining:
+                    if p.symbol == symbol:
+                        return p
+                raise Exception(f"No open position in {symbol}")
+
+        try:
+            sim = RiskManager(_View(), start_value=self.start_value)
+            return int(sim.size_position(ticker, conviction, bucket, regime, price).get("shares_initial", 0))
+        except Exception as e:
+            log.warning(f"[{ticker}] swap pre-check sizing failed: {e}")
+            return 0
+
     # ------------------------------------------------------------------
     # Backward-compatible methods (used by remaining code)
     # ------------------------------------------------------------------

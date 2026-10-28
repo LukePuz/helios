@@ -805,6 +805,11 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
                 except Exception as e:
                     log.warning(f"[{ticker}] Swap candidate lookup failed: {e}")
                     swap = None
+                if swap and rm.would_size_after_swap(ticker, conviction, bucket, regime_str,
+                                                     price, swap) <= 0:
+                    log.info(f"[{ticker}] Swap out of {swap['ticker']} skipped: the buy would "
+                             f"still size to 0 shares after the sale")
+                    swap = None
                 if swap:
                     # Regular hours only (limitations audit 2026-10-28, finding
                     # 9): analyses run from 05:00, and a pre-market swap sell is

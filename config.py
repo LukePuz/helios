@@ -333,6 +333,11 @@ EARNINGS_ENTRY_BLACKOUT_DAYS = int(os.getenv("EARNINGS_ENTRY_BLACKOUT_DAYS", "0"
 # When the first tranche buys less than 1 share, buy exactly 1 if that share
 # fits the hard per-position cap and the cash-reserve cap (risk_manager.size_position).
 ALLOW_ONE_SHARE_ABOVE_ALLOCATION = os.getenv("ALLOW_ONE_SHARE_ABOVE_ALLOCATION", "true").lower() == "true"
+# Brief sections that change what the analyst sees (professor M37-M39, Q35).
+# Off until Luke decides whether the model should see its own past verdicts
+# and the gate inputs before the call (2026-10-28).
+BRIEF_PRICE_STRUCTURE = os.getenv("BRIEF_PRICE_STRUCTURE", "false").lower() == "true"
+BRIEF_POSITION_CONTEXT = os.getenv("BRIEF_POSITION_CONTEXT", "false").lower() == "true"
 # When a monitored stop level is breached and NO protective stop exists at
 # the broker, execute a market sell of the full position instead of only
 # alerting. Only ever reduces exposure; set False to fall back to alert-only.

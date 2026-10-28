@@ -1,9 +1,25 @@
+import pytest
 """POSITION CONTEXT block for held tickers (stop, thesis, recent verdicts)."""
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import context_engine
 
+
+
+@pytest.fixture(autouse=True)
+def _section_on(monkeypatch):
+    # The section is off by default until Luke decides (Q35).
+    import config
+    monkeypatch.setattr(config, "BRIEF_POSITION_CONTEXT", True)
+
+
+def test_section_is_off_by_default_flag(monkeypatch):
+    import config
+    import context_engine
+    monkeypatch.setattr(config, "BRIEF_POSITION_CONTEXT", False)
+    fn = context_engine._position_context_section
+    assert fn("NVDA", 100.0) == ""
 
 def test_held_ticker_shows_stop_thesis_and_verdicts():
     stop = {"entry_price": 100.0, "stop_price": 90.0, "stop_method": "2.5x ATR",

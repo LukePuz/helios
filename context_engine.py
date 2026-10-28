@@ -92,7 +92,11 @@ def _position_context_section(ticker: str, price: float | None = None) -> str:
     thesis at entry and the latest one, and the last three verdicts. The brief
     showed only qty/entry/price/P&L, so a review (and the earnings review,
     which asks whether the stop and size fit) couldn't see the stop or what
-    it decided before (limitations audits 2026-10-27/28)."""
+    it decided before (limitations audits 2026-10-27/28).
+    Off unless config.BRIEF_POSITION_CONTEXT (Luke's call, Q35)."""
+    import config
+    if not config.BRIEF_POSITION_CONTEXT:
+        return ""
     try:
         import db
         stop = db.get_position_stop(ticker)
@@ -139,7 +143,11 @@ def _price_structure_section(ticker: str, price: float | None = None) -> str:
     2026-10-28 09:00, finding 2a): price structure, trend template, distance
     from the Kijun line, ATR, base, fair value and the nearest support and
     resistance rungs from the nightly trade ladder. These were computed only
-    after the LLM call (analyst gates) or only with SETUP_GATES_ENABLED."""
+    after the LLM call (analyst gates) or only with SETUP_GATES_ENABLED.
+    Off unless config.BRIEF_PRICE_STRUCTURE (Luke's call, Q35)."""
+    import config
+    if not config.BRIEF_PRICE_STRUCTURE:
+        return ""
     lines = [f"=== PRICE STRUCTURE — {ticker} ==="]
     try:
         from agents.price_action import compute_price_action, compute_trend_template

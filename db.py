@@ -1415,6 +1415,40 @@ def get_position_stop(ticker: str) -> dict | None:
         _put_conn(conn)
 
 
+def get_position_context(ticker: str) -> dict:
+    """Thesis and recent verdicts for a held ticker, for the brief's POSITION
+    CONTEXT block: {original_thesis, latest_thesis, thesis_updated_at,
+    profit_target_taken, recent_verdicts: [{timestamp, signal, conviction}]}.
+    Empty dict on error."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT original_thesis, latest_thesis, thesis_updated_at, profit_target_taken "
+                "FROM position_stops WHERE ticker=%s AND trading_env=%s",
+                (ticker, TRADING_ENV),
+            )
+            row = cur.fetchone()
+            cur.execute(
+                "SELECT timestamp, signal, confidence FROM signals "
+                "WHERE symbol=%s AND signal NOT IN %s ORDER BY timestamp DESC LIMIT 3",
+                (ticker, _NON_ANALYST_SIGNALS),
+            )
+            verdicts = cur.fetchall()
+        out = {"recent_verdicts": [{"timestamp": v[0], "signal": v[1],
+                                    "conviction": round(float(v[2] or 0) * 10)} for v in verdicts]}
+        if row:
+            out.update(original_thesis=row[0], latest_thesis=row[1], thesis_updated_at=row[2],
+                       profit_target_taken=row[3])
+        return out
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"get_position_context failed: {e}")
+        return {}
+    finally:
+        _put_conn(conn)
+
+
 def delete_position_stop(ticker: str) -> None:
     conn = _get_conn()
     try:

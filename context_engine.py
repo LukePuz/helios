@@ -87,6 +87,53 @@ def _catalyst_calendar_section(ticker: str) -> str:
         return ""
 
 
+def _position_context_section(ticker: str, price: float | None = None) -> str:
+    """For a held ticker: entry, stop, days held, profit-target state, the
+    thesis at entry and the latest one, and the last three verdicts. The brief
+    showed only qty/entry/price/P&L, so a review (and the earnings review,
+    which asks whether the stop and size fit) couldn't see the stop or what
+    it decided before (limitations audits 2026-10-27/28)."""
+    try:
+        import db
+        stop = db.get_position_stop(ticker)
+        if not stop:
+            return ""
+        ctx = db.get_position_context(ticker)
+    except Exception as e:
+        log.debug(f"[{ticker}] position context unavailable: {e}")
+        return ""
+    from datetime import datetime, timezone
+    lines = [f"=== POSITION CONTEXT — {ticker} (held) ==="]
+    entry, sp = stop.get("entry_price"), stop.get("stop_price")
+    line = f"Entry ${entry:.2f}; protective stop ${sp:.2f}"
+    if price and sp:
+        line += f" ({(sp - price) / price:+.1%} from current price)"
+    if stop.get("stop_method"):
+        line += f" [{stop['stop_method']}]"
+    lines.append(line)
+    if stop.get("opened_at"):
+        days = (datetime.now(timezone.utc) - stop["opened_at"]).days
+        lines.append(f"Held {days} days; bucket {stop.get('thesis_bucket') or 'n/a'}; "
+                     f"conviction at entry {stop.get('conviction') or 'n/a'}; "
+                     f"trailing stop {'active' if stop.get('trailing_active') else 'not active'}; "
+                     f"profit target {'already taken' if ctx.get('profit_target_taken') else 'not taken'}")
+
+    def _thesis(t):
+        if not isinstance(t, dict):
+            return None
+        return t.get("thesis_summary") or t.get("summary") or t.get("reasoning")
+
+    if _thesis(ctx.get("original_thesis")):
+        lines.append(f"Thesis at entry: {_thesis(ctx['original_thesis'])[:300]}")
+    if _thesis(ctx.get("latest_thesis")):
+        lines.append(f"Latest thesis ({str(ctx.get('thesis_updated_at') or '')[:10]}): "
+                     f"{_thesis(ctx['latest_thesis'])[:300]}")
+    if ctx.get("recent_verdicts"):
+        lines.append("Recent verdicts: " + "; ".join(
+            f"{str(v['timestamp'])[:10]} {v['signal']} c{v['conviction']}" for v in ctx["recent_verdicts"]))
+    return "\n".join(lines)
+
+
 def _price_structure_section(ticker: str, price: float | None = None) -> str:
     """Deterministic levels the model never saw (limitations audit
     2026-10-28 09:00, finding 2a): price structure, trend template, distance
@@ -305,6 +352,10 @@ Buying Power:    ${float(account.buying_power):,.2f}""")
             log.warning(f"Options flow unavailable: {e}")
 
     # ── Fundamentals ─────────────────────────────────────────────────────────
+    position_section = _position_context_section(ticker, current_price)
+    if position_section:
+        sections.append(position_section)
+
     price_section = _price_structure_section(ticker, current_price)
     if price_section:
         sections.append(price_section)
@@ -444,6 +495,10 @@ Buying Power:    ${float(account.buying_power):,.2f}""")
             log.warning(f"Options flow unavailable: {e}")
 
     # ── Fundamentals ─────────────────────────────────────────────────────────
+    position_section = _position_context_section(ticker, current_price)
+    if position_section:
+        sections.append(position_section)
+
     price_section = _price_structure_section(ticker, current_price)
     if price_section:
         sections.append(price_section)

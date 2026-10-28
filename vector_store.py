@@ -99,7 +99,14 @@ def _get_embedder() -> SentenceTransformer:
         # 400s timeout and falling back to stub recommendations for hours.
         # MiniLM is tiny; CPU inference costs milliseconds, not the
         # multi-minute difference GPU contention was causing Ollama.
-        _embedder = SentenceTransformer(_EMBED_MODEL, device="cpu")
+        # Local cache first: every worker process used to fetch metadata from
+        # the HF Hub unauthenticated, so a Hub outage or rate limit became a
+        # memory/embedding failure (limitations audit 12:53, #8).
+        try:
+            _embedder = SentenceTransformer(_EMBED_MODEL, device="cpu", local_files_only=True)
+        except Exception as e:
+            log.warning(f"Embedding model not in local cache ({e}); downloading from the Hub")
+            _embedder = SentenceTransformer(_EMBED_MODEL, device="cpu")
         log.info("Embedding model ready (CPU).")
     return _embedder
 

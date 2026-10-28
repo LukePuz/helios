@@ -484,8 +484,11 @@ class RiskManager:
         # and the cash-reserve cap; the single-share cap above and the
         # per-trade risk cap below still apply. Decided by the lead session
         # after Luke delegated the call (Jarvis, bus #36).
+        # Held value counts toward the cap: on an ADD, checking the new share
+        # alone let the position reach target + one share, up to about twice
+        # the hard cap (limitations audit 2026-10-28 09:00, finding 5).
         if (shares_initial < 1 and ALLOW_ONE_SHARE_ABOVE_ALLOCATION
-                and price <= pv * hard_cap and price <= cash_cap):
+                and held + price <= pv * hard_cap and price <= cash_cap):
             flags.append(
                 f"Allocation ${initial_dollar:,.2f} is under 1 share; buying 1 share "
                 f"(${price:,.2f} = {price / pv:.1%} of portfolio, within the "

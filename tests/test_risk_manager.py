@@ -812,6 +812,14 @@ class TestOneShareAboveAllocation:
         # 20% of $10k cash = $2,000 < one $2,500 share
         assert self._size(2_500.0, cash=10_000.0)["shares_initial"] == 0
 
+    def test_held_value_counts_toward_the_cap_on_an_add(self):
+        # Audit 2026-10-28 09:00 #5: $1,000 held + one $6,500 share = $7,500 > the
+        # $7,000 hard cap, though the share alone fits.
+        with patch.object(risk_manager.RiskManager, "current_position_value", return_value=1_000.0):
+            assert self._size(6_500.0)["shares_initial"] == 0
+        with patch.object(risk_manager.RiskManager, "current_position_value", return_value=0.0):
+            assert self._size(6_500.0)["shares_initial"] == 1
+
     def test_risk_cap_still_applies_to_the_one_share(self):
         # $2,500 stop distance on one share > 2% of $100k
         assert self._size(2_600.0, stop_offset=2_500.0)["shares_initial"] == 0

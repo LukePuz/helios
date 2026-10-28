@@ -33,3 +33,15 @@ def test_buyable():
     rm = _rm({"shares_initial": 2, "position_size_pct": 0.15, "flags": []}, {"passed": True})
     shares, why = dr.size_like_crew(rm, "SOFI", 7, "Accelerator", "Neutral", 16.0)
     assert shares == 2 and dr._reason_category(shares, why) == "ok"
+
+
+def test_refuses_csv_when_setup_gates_are_on(monkeypatch, tmp_path):
+    import sys
+    import pytest
+    import config
+    monkeypatch.setattr(config, "SETUP_GATES_ENABLED", True)
+    monkeypatch.setattr(sys, "argv", ["sizing_dryrun.py", "--csv", str(tmp_path / "x.csv")])
+    with pytest.raises(SystemExit) as e:
+        dr.main()
+    assert "SETUP_GATES_ENABLED" in str(e.value)
+    assert not (tmp_path / "x.csv").exists()

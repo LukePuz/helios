@@ -118,6 +118,13 @@ def main():
     import db
     import risk_manager
     from knowledge_loader import load_watchlist
+    import config
+    if config.SETUP_GATES_ENABLED and args.csv:
+        # With gates on, crew sizes on classify_setup's category, not the
+        # watchlist role this mirror uses, so rows would disagree with crew
+        # (professor M29 caveat). Refuse rather than write wrong rows.
+        sys.exit("SETUP_GATES_ENABLED is on: the dry run does not mirror gate-category sizing; "
+                 "not writing CSV rows")
 
     conn = db._get_conn()
     try:

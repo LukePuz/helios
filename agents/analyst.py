@@ -113,7 +113,8 @@ def _estimate_tokens(text: str) -> int:
 
 # Reserved for the model's own output (num_predict) plus a safety margin so
 # the budget check doesn't cut it razor-thin.
-_OUTPUT_TOKEN_RESERVE = 1200 + 300
+_NUM_PREDICT = 1600  # was 1200; headroom now that action/conviction come last
+_OUTPUT_TOKEN_RESERVE = _NUM_PREDICT + 300
 
 
 def _build_prompt(
@@ -225,17 +226,15 @@ four copies of the same overall confidence.
   valuation_risk_reward (1-5): 1 = poor risk/reward even if the thesis plays out exactly; 5 = exceptional asymmetry. Should track your upside_downside_ratio, not contradict it.
   data_completeness (1-5): 1 = little concrete evidence in the brief or fundamentals, mostly inference; 5 = comprehensive, fresh, well-sourced data backing the call.
 
-Then output ONLY valid JSON in exactly this format (no markdown, no explanation outside the JSON):
+Then output ONLY valid JSON in exactly this format (no markdown, no explanation outside the JSON).
+Fill the fields in the order shown: the evidence, scenarios, valuation, risks and
+reasoning come first, and your scores and action come last, decided from what you
+wrote above them:
 
 {{
-  "action": "OPEN or ADD or HOLD or TRIM or EXIT or WATCH or PASS",
-  "conviction": <integer 1-10 per the scale above>,
-  "thesis_strength": <integer 1-5>,
-  "catalyst_quality": <integer 1-5>,
-  "valuation_risk_reward": <integer 1-5>,
-  "data_completeness": <integer 1-5>,
-  "thesis_bucket": "Compounder or Accelerator or Moonshot",
-  "thesis_summary": "One sentence why this position exists.",
+  "sources": [
+    {{"type": "news or edgar_filing or options_flow or insider_trade or congressional_trade or analyst_rating or fundamentals_data or price_action or arxiv_paper or other", "detail": "The specific fact this source contributes -- not a repeat of the catalyst description"}}
+  ],
   "expectation_gap": {{
     "bull_case": "What needs to happen for upside",
     "current_price_implies": "What growth/outcome is already priced in",
@@ -257,15 +256,20 @@ Then output ONLY valid JSON in exactly this format (no markdown, no explanation 
   }},
   "expected_return_pct": <float -- your single-number bull-case % upside from the Current Price to bull_case_target, e.g. 25.0 for +25%. Same figure as catalyst.expected_upside_if_positive / valuation.bull_case_target, just as one clean number instead of a range string, so it can be tracked against the actual outcome later.>,
   "expected_downside_pct": <float -- same idea for the downside_scenario, as a negative number, e.g. -15.0>,
-  "sources": [
-    {{"type": "news or edgar_filing or options_flow or insider_trade or congressional_trade or analyst_rating or fundamentals_data or price_action or arxiv_paper or other", "detail": "The specific fact this source contributes -- not a repeat of the catalyst description"}}
-  ],
   "upside_downside_ratio": <your computed ratio: bull-case upside percent divided by downside percent>,
   "key_risks": ["Risk 1", "Risk 2", "Risk 3"],
+  "reasoning": "2-3 sentence narrative explaining the recommendation, citing specific numbers and their source per the rule below.",
+  "thesis_bucket": "Compounder or Accelerator or Moonshot",
+  "thesis_summary": "One sentence why this position exists.",
+  "thesis_strength": <integer 1-5>,
+  "catalyst_quality": <integer 1-5>,
+  "valuation_risk_reward": <integer 1-5>,
+  "data_completeness": <integer 1-5>,
+  "conviction": <integer 1-10 per the scale above>,
+  "action": "OPEN or ADD or HOLD or TRIM or EXIT or WATCH or PASS",
   "options_opportunity": false,
   "options_notes": "Brief note or null",
-  "pass_to_risk": true,
-  "reasoning": "2-3 sentence narrative explaining the recommendation, citing specific numbers and their source per the rule below."
+  "pass_to_risk": true
 }}
 
 Rules:
@@ -322,7 +326,7 @@ def _call_ollama(prompt: str, num_ctx: int = _NUM_CTX) -> str | None:
         "stream":  False,
         "options": {
             "temperature":    0.2,
-            "num_predict":    1200,
+            "num_predict":    _NUM_PREDICT,
             "num_ctx":        num_ctx,
             "repeat_penalty": 1.1,
         },

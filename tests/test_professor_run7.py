@@ -43,3 +43,33 @@ def test_failed_trail_conversion_restores_the_fixed_stop():
 def test_failed_restore_raises_fix_stop():
     _, alerts = _failed_conversion(RuntimeError("broker down"))
     assert [a for a in alerts if a["action"] == "FIX_STOP"]
+
+
+def test_update_trailing_stop_writes_the_flag():
+    import db
+    conn = MagicMock()
+    cur = conn.cursor.return_value.__enter__.return_value
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
+        db.update_trailing_stop("NVDA", 110.0, 120.0, native_trail=False)
+    sql, params = cur.execute.call_args.args
+    assert "trailing_active=%s" in sql and params[2] is False
+
+
+def test_partial_sale_never_places_a_stop_above_the_price(monkeypatch):
+    import market_data
+    monkeypatch.setattr(market_data, "is_market_hours", lambda *a, **k: True)
+    client = MagicMock()
+    client.get_open_position.return_value = MagicMock(qty=70)
+    # recorded stop 130 (stale fixed-STP record) is above the 126 trigger price
+    with patch("db.get_position_stop", return_value={"stop_price": 130.0}), \
+         patch("db.set_stop_broker_order_id"), \
+         patch("tasks.manage_cancel_stop_orders_for"), \
+         patch("ibkr.place_market_order", return_value={"filled_qty": 30, "order_id": 7}), \
+         patch("ibkr.get_client", return_value=client), \
+         patch("tasks.manage_stop_place", return_value={"order_id": 8}) as place, \
+         patch("db.log_trade"), patch("db.log_order", return_value=1), patch("db.update_order_fill"), \
+         patch("alerts._send"):
+        result = object.__new__(risk_manager.RiskManager)._partial_sell_and_resize_stop(
+            "NVDA", 100, 30, 100.0, decision_price=126.0)
+    place.assert_called_once_with("NVDA", 70.0, 100.0)
+    assert result["new_stop"] == 100.0

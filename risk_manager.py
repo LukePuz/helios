@@ -1347,7 +1347,7 @@ class RiskManager:
                                 qty = round(abs(float(pos.qty)), 4)
                                 result = tasks.manage_stop_place(ticker, qty, new_stop)
                                 db.set_stop_broker_order_id(ticker, result["order_id"])
-                                db.update_trailing_stop(ticker, new_stop, current)
+                                db.update_trailing_stop(ticker, new_stop, current, native_trail=False)
                                 log.info(f"[{ticker}] Broker stop moved to ${new_stop:.2f} (fallback path)")
                             except Exception as e2:
                                 log.error(f"[{ticker}] Fallback stop move also failed: {e2}")
@@ -1416,7 +1416,7 @@ class RiskManager:
             tasks.manage_cancel_stop_orders_for(ticker)
             result = tasks.manage_stop_place(ticker, qty, new_stop)
             db.set_stop_broker_order_id(ticker, result["order_id"])
-            db.update_trailing_stop(ticker, new_stop, current)
+            db.update_trailing_stop(ticker, new_stop, current, native_trail=False)
             log.info(f"[{ticker}] Ladder trailing stop ratcheted ${stop_px:.2f} -> ${new_stop:.2f}")
         except Exception as e:
             log.error(f"[{ticker}] Ladder trailing stop ratchet FAILED: {e}")
@@ -1505,10 +1505,18 @@ class RiskManager:
 
         stop_rec = db.get_position_stop(ticker) or {}
         old_stop = stop_rec.get("stop_price")
+        breakeven = new_stop
         # Never move the stop down: after a trail conversion the recorded stop
         # can already be above breakeven (limitations audit 12:53, finding 3).
         if old_stop is not None:
             new_stop = max(new_stop, float(old_stop))
+        # A SELL STP at or above the market fills at once. Use the highest
+        # candidate below the price that triggered the target (professor M-1).
+        if decision_price and new_stop >= decision_price:
+            below = [c for c in (breakeven, float(old_stop) if old_stop is not None else None)
+                     if c is not None and c < decision_price]
+            new_stop = max(below) if below else breakeven
+            log.warning(f"[{ticker}] Recorded stop is at/above the price; using ${new_stop:.2f}")
         try:
             tasks.manage_cancel_stop_orders_for(ticker)
         except Exception as e:

@@ -1479,14 +1479,18 @@ def upsert_position_stop(
         _put_conn(conn)
 
 
-def update_trailing_stop(ticker: str, new_stop: float, trailing_high: float) -> None:
+def update_trailing_stop(ticker: str, new_stop: float, trailing_high: float,
+                         native_trail: bool = True) -> None:
+    """native_trail=False for a fixed STP moved up by code (fallback, ladder
+    ratchet): the flag then says the broker holds no TRAIL, so nothing treats
+    the recorded stop as a live trail (professor run 7, M-1)."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE position_stops SET stop_price=%s, trailing_high=%s, "
-                "trailing_active=TRUE, updated_at=NOW() WHERE ticker=%s AND trading_env=%s",
-                (new_stop, trailing_high, ticker, TRADING_ENV),
+                "trailing_active=%s, updated_at=NOW() WHERE ticker=%s AND trading_env=%s",
+                (new_stop, trailing_high, native_trail, ticker, TRADING_ENV),
             )
         conn.commit()
     except Exception as e:

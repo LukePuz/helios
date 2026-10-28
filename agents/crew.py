@@ -690,10 +690,18 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
         # gap, and the default path had no earnings rule at all. Decided by
         # the lead session under Luke's delegation (Jarvis, bus #36).
         from config import EARNINGS_ENTRY_BLACKOUT_DAYS
-        if EARNINGS_ENTRY_BLACKOUT_DAYS and db.is_near_earnings(ticker, EARNINGS_ENTRY_BLACKOUT_DAYS):
-            next_er = db.get_next_earnings(ticker)
-            reason = (f"earnings {next_er} within {EARNINGS_ENTRY_BLACKOUT_DAYS} days — "
-                      f"no new {action} until after the report")
+        try:
+            near = (db.is_near_earnings(ticker, EARNINGS_ENTRY_BLACKOUT_DAYS, strict=True)
+                    if EARNINGS_ENTRY_BLACKOUT_DAYS else False)
+        except Exception:
+            near = None  # can't check: fail closed
+        if near is not False:
+            if near is None:
+                reason = f"earnings calendar unreadable — no new {action} until it can be checked"
+            else:
+                next_er = db.get_next_earnings(ticker)
+                reason = (f"earnings {next_er} within {EARNINGS_ENTRY_BLACKOUT_DAYS} days — "
+                          f"no new {action} until after the report")
             log.info(f"[{ticker}] Entry blocked: {reason}")
             if _feed_emit:
                 _feed_emit("risk", ticker, f"Blocked — {reason}", "info")

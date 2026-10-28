@@ -558,3 +558,17 @@ def test_open_is_blocked_inside_the_earnings_blackout():
         crew._route_to_approval(result, {"regime": "Neutral"}, MagicMock())
     mock_rm_cls.return_value.size_position.assert_not_called()
     assert log_signal.call_args[0][1] == "EARNINGS_BLOCKED"
+
+
+def test_open_is_blocked_when_the_earnings_calendar_cannot_be_read():
+    result = _analyst_result(action="OPEN", ticker="MSFT", conviction=8)
+    with patch("db.is_near_earnings", return_value=None), \
+         patch("db.has_active_approval", return_value=False), \
+         patch("db.get_last_executed_approval", return_value=None), \
+         patch("db.log_signal") as log_signal, \
+         patch("agents.crew._get_price", return_value=100.0), \
+         patch("catalyst_service.gates.catalyst_gate_check", return_value={"approved": True}), \
+         patch("risk_manager.RiskManager") as mock_rm_cls:
+        crew._route_to_approval(result, {"regime": "Neutral"}, MagicMock())
+    mock_rm_cls.return_value.size_position.assert_not_called()
+    assert "unreadable" in log_signal.call_args[0][3]

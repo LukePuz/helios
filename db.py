@@ -3335,8 +3335,10 @@ def get_next_earnings(ticker: str):
         _put_conn(conn)
 
 
-def is_near_earnings(ticker: str, days: int = 5) -> bool:
-    """Returns True if ticker has an earnings date within `days` calendar days."""
+def is_near_earnings(ticker: str, days: int = 5, strict: bool = False) -> bool | None:
+    """Returns True if ticker has an earnings date within `days` calendar days.
+    On a DB error returns False, or None with strict=True so the earnings
+    blackout can fail closed (limitations audit 2026-10-28, finding 11)."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
@@ -3349,7 +3351,7 @@ def is_near_earnings(ticker: str, days: int = 5) -> bool:
             return cur.fetchone() is not None
     except Exception as e:
         logging.error(f"is_near_earnings failed: {e}")
-        return False
+        return None if strict else False
     finally:
         _put_conn(conn)
 

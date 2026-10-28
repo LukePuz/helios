@@ -466,6 +466,37 @@ def count_distinct_sources(sources: list) -> int:
     })
 
 
+def _catalyst_check(ticker: str, parsed: dict) -> dict:
+    """Shadow record of how the model's catalyst date relates to the calendar
+    (limitations audit 2026-10-28 14:53, #5). Logged only; the rate gate
+    is unchanged. past_or_today: the date floors to 1 day in
+    compute_weeks_to_catalyst, the most favourable rate. month_only: "YYYY-MM",
+    read as the 15th."""
+    cat = parsed.get("catalyst") or {}
+    raw = str(cat.get("date") or "").strip()
+    out = {"model_date": raw or None, "past_or_today": None,
+           "month_only": bool(re.fullmatch(r"\d{4}-\d{2}", raw)),
+           "calendar_next_earnings": None, "days_model_vs_calendar": None}
+    try:
+        d = None
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+            d = datetime.strptime(raw, "%Y-%m-%d").date()
+        elif out["month_only"]:
+            d = datetime.strptime(raw + "-15", "%Y-%m-%d").date()
+        today = datetime.now(timezone.utc).date()
+        if d is not None:
+            out["past_or_today"] = d <= today
+        import db
+        nxt = db.get_next_earnings(ticker)
+        if nxt is not None:
+            out["calendar_next_earnings"] = str(nxt)
+            if d is not None:
+                out["days_model_vs_calendar"] = (d - nxt).days
+    except Exception as e:
+        out["error"] = str(e)[:120]
+    return out
+
+
 def compute_weeks_to_catalyst(catalyst_date: str | None, as_of: datetime | None = None) -> float | None:
     """Pure helper for the minimum-expected-return-rate gate (2026-08-30,
     user request). Parses the model's catalyst.date field, trying the
@@ -1138,6 +1169,7 @@ def analyze(
                 "final_action": action, "final_conviction": conviction,
                 "final_pass_to_risk": bool(parsed.get("pass_to_risk", False)),
                 "gates": gates, "model_output": model_output,
+                "catalyst_check": _catalyst_check(ticker, parsed),
             },
             prompt=prompt,
         )

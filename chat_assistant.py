@@ -436,16 +436,26 @@ def _call_ollama_chat(messages: list[dict], tools: list[dict] | None = None) -> 
     if tools:
         payload["tools"] = tools
 
-    try:
-        resp = requests.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=90)
-        resp.raise_for_status()
-        return resp.json().get("message")
-    except requests.exceptions.Timeout:
-        log.error("Ollama chat timed out")
-        return None
-    except Exception as e:
-        log.error(f"Ollama chat failed: {e}")
-        return None
+    # Dedicated CPU-only server first (deploy/systemd/ollama-cpu.service), so
+    # chat can't queue behind or block the 72B analyst on the main server; see
+    # agents/screener.py OLLAMA_CPU_HOST for the 2026-10-25 finding. Falls back
+    # to the main server only when the CPU one isn't running at all.
+    cpu_host = os.getenv("OLLAMA_CPU_HOST", "http://localhost:11435")
+    for host in (cpu_host, OLLAMA_HOST):
+        try:
+            resp = requests.post(f"{host}/api/chat", json=payload, timeout=90)
+            resp.raise_for_status()
+            return resp.json().get("message")
+        except requests.exceptions.ConnectionError:
+            continue  # this server isn't running; try the next
+        except requests.exceptions.Timeout:
+            log.error(f"Ollama chat timed out ({host})")
+            return None
+        except Exception as e:
+            log.error(f"Ollama chat failed ({host}): {e}")
+            return None
+    log.error("Ollama chat failed: no Ollama server reachable")
+    return None
 
 
 # ---------------------------------------------------------------------------

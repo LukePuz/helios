@@ -25,9 +25,10 @@ load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env")
 log = logging.getLogger(__name__)
 
 try:
-    from config import MIN_EXPECTED_RETURN_PCT_PER_WEEK
+    from config import MIN_EXPECTED_RETURN_PCT_PER_WEEK, SETUP_GATES_ENABLED
 except ImportError:
     MIN_EXPECTED_RETURN_PCT_PER_WEEK = 1.0
+    SETUP_GATES_ENABLED = False
 
 OLLAMA_HOST   = os.getenv("OLLAMA_HOST",    "http://localhost:11434")
 ANALYST_MODEL = os.getenv("ANALYST_MODEL",  "qwen2.5:72b")
@@ -743,16 +744,45 @@ def analyze(
     # silently accepting that let a weak/misconfigured model quietly loosen
     # risk limits. The LLM's suggestion is kept for audit but never used for
     # sizing; update the watchlist by hand if a reclassification is deliberate.
+    #
+    # Swing-trading cutover, Phase 4/5 (2026-10-11): when SETUP_GATES_ENABLED,
+    # agents.setup_gates.classify_setup(ticker)'s LIVE classification (Breakout/
+    # Catalyst/Continuation, or None if nothing currently matches) becomes the
+    # sizing/stop authority for this ticker INSTEAD OF the static watchlist
+    # role, per the design: the three setup categories are dynamic per-moment
+    # classifications, not a static per-ticker label the way the old buckets
+    # were. knowledge/watchlist.md's "role" column is untouched and used as
+    # the fallback when nothing currently qualifies (e.g. a legacy position
+    # the gates haven't classified, or a genuinely quiet period — the gates
+    # ran at ~0% qualification across the watchlist for multiple consecutive
+    # days in choppy shadow-mode conditions, which is expected). When the
+    # flag is False, none of this runs and behavior is unchanged.
     watchlist_role = candidate.get("role", "Accelerator")
     llm_bucket     = parsed.get("thesis_bucket", watchlist_role)
-    bucket_mismatch = llm_bucket != watchlist_role
-    if bucket_mismatch:
-        log.warning(
-            f"[{ticker}] Analyst suggested bucket '{llm_bucket}' but watchlist role "
-            f"is '{watchlist_role}' — using the watchlist role for sizing. Update "
-            f"knowledge/watchlist.md if this reclassification should stick."
-        )
-    bucket = watchlist_role
+    live_setup_best = None
+    live_setup_gates = {}
+    if SETUP_GATES_ENABLED:
+        try:
+            from agents.setup_gates import classify_setup
+            live_setup_best, live_setup_gates = classify_setup(ticker)
+        except Exception as e:
+            log.warning(f"[{ticker}] classify_setup failed ({e}) — falling back to watchlist role")
+        bucket = live_setup_best["category"] if live_setup_best else watchlist_role
+        bucket_mismatch = llm_bucket != bucket
+        if bucket_mismatch:
+            log.info(
+                f"[{ticker}] Analyst suggested bucket '{llm_bucket}'; live setup "
+                f"classification is '{bucket}' — using the live classification for sizing."
+            )
+    else:
+        bucket_mismatch = llm_bucket != watchlist_role
+        if bucket_mismatch:
+            log.warning(
+                f"[{ticker}] Analyst suggested bucket '{llm_bucket}' but watchlist role "
+                f"is '{watchlist_role}' — using the watchlist role for sizing. Update "
+                f"knowledge/watchlist.md if this reclassification should stick."
+            )
+        bucket = watchlist_role
 
     # Enforce minimum UDR for actionable recommendations
     if udr < 2.0 and action in ("OPEN", "ADD"):
@@ -791,6 +821,7 @@ def analyze(
     # own rubric already treating vague/ongoing timing as weak (1/5).
     weeks_to_catalyst = None
     per_week = None
+    catalyst_stale = False
     if bucket in ("Accelerator", "Moonshot") and action in ("OPEN", "ADD"):
         catalyst_date = (parsed.get("catalyst") or {}).get("date")
         weeks_to_catalyst = compute_weeks_to_catalyst(catalyst_date)
@@ -802,6 +833,29 @@ def analyze(
             action = "WATCH"
             parsed["pass_to_risk"] = False
             parsed["reasoning"] = parsed.get("reasoning", "") + f" [Downgraded: {reason}]"
+    elif bucket in ("Accelerator", "Moonshot") and action == "HOLD":
+        # 2026-09-15, user request: found reviewing 4 real held positions
+        # that this whole discipline silently stopped applying the day
+        # after entry -- a HOLD review never recomputed it, so a position
+        # could coast indefinitely on a catalyst that had gone stale
+        # ("ongoing" milestones, no date) without the same 1%/week bar a
+        # fresh entry has to clear ever being re-checked. Deliberately
+        # informational only here, NOT a downgrade -- WATCH/EXIT has no
+        # meaning for an already-held position the way it does for a
+        # fresh candidate, and auto-converting a HOLD into a TRIM that
+        # could auto-execute is a live-order behavior change, not a
+        # visibility fix. catalyst_stale is surfaced in the result for
+        # thesis-drift tracking (db.compute_thesis_drift) and reporting
+        # to actually force human attention instead.
+        catalyst_date = (parsed.get("catalyst") or {}).get("date")
+        weeks_to_catalyst = compute_weeks_to_catalyst(catalyst_date)
+        per_week = expected_return_per_week(_optional_float("expected_return_pct"), weeks_to_catalyst)
+        if per_week is None or per_week < MIN_EXPECTED_RETURN_PCT_PER_WEEK:
+            catalyst_stale = True
+            reason = ("no computable catalyst timeframe" if weeks_to_catalyst is None
+                      else f"{per_week:.2f}%/week < {MIN_EXPECTED_RETURN_PCT_PER_WEEK}%/week minimum")
+            log.info(f"[{ticker}] HOLD carries a stale catalyst ({reason}) — flagged, not auto-downgraded")
+            parsed["reasoning"] = parsed.get("reasoning", "") + f" [STALE CATALYST ON HOLD: {reason}]"
 
     # Trend Template gate (2026-09-11, user request) -- Mark Minervini's
     # 8-point Stage-2-uptrend criteria, see agents/price_action.py's
@@ -814,6 +868,18 @@ def analyze(
     # instruction alone isn't reliable enough" reasoning as the other
     # deterministic gates above -- the LLM's own price/trend commentary
     # isn't a substitute for computing the actual 8 criteria.
+    # Swing-trading cutover, Phase 4/5 (2026-10-11): this gate is scoped to
+    # `bucket == "Accelerator"` below, which already means it's naturally
+    # SKIPPED whenever SETUP_GATES_ENABLED gave this ticker a live Breakout/
+    # Catalyst/Continuation match -- `bucket` is literally that category
+    # name in that case (set above), not "Accelerator". No extra condition
+    # needed: agents.setup_gates already ran compute_trend_template
+    # internally (via agents.trade_ladder's nightly trend_stage field) for
+    # any Breakout/Continuation match, so recomputing it here would be
+    # redundant. The fallback case (live_setup_best is None -> bucket falls
+    # back to the watchlist role) means the gates DIDN'T classify this
+    # ticker, so this inline check is still the only place Trend Template
+    # runs for it.
     trend_template = None
     if bucket == "Accelerator" and action in ("OPEN", "ADD"):
         try:
@@ -910,6 +976,7 @@ def analyze(
         "expected_downside_pct": _optional_float("expected_downside_pct"),
         "weeks_to_catalyst": weeks_to_catalyst,
         "expected_return_per_week": per_week,
+        "catalyst_stale": catalyst_stale,
         "trend_template": trend_template,
         "upside_downside_ratio": udr,
         "key_risks": parsed.get("key_risks", []),

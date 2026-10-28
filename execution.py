@@ -19,6 +19,49 @@ import logging
 log = logging.getLogger(__name__)
 
 
+def _capture_original_thesis_if_new(ticker: str, approval: dict) -> None:
+    """Writes original_thesis once, at genuine first entry -- never
+    overwritten by a later ADD to the same position (db.get_thesis
+    returning something means it's already set). Fixes the gap found
+    2026-09-13: a HOLD verdict's full analyst reasoning was previously
+    lost after a scheduled review, only a 176-char activity_feed line
+    survived; this is the entry-side half of that fix (the review-side
+    half is agents/crew.py's review_held_position). Failures are logged,
+    never raised -- losing a thesis snapshot must never block a real
+    fill from completing."""
+    try:
+        import db
+        from datetime import datetime, timezone
+        if db.get_thesis(ticker):
+            return
+        analyst_json = approval.get("analyst_json") or {}
+        thesis = {
+            "as_of": datetime.now(timezone.utc).isoformat(),
+            "setup_category": None,  # not yet classified live -- setup_gates.py runs in shadow mode
+            "action": approval.get("action"),
+            "conviction": approval.get("conviction"),
+            "thesis_summary": analyst_json.get("thesis_summary"),
+            "gate_criteria": None,
+            "catalyst": analyst_json.get("catalyst"),
+            "catalyst_status": "pending",
+            "expected_return_pct": analyst_json.get("expected_return_pct"),
+            "expected_downside_pct": analyst_json.get("expected_downside_pct"),
+            "weeks_to_catalyst": analyst_json.get("weeks_to_catalyst"),
+            "no_near_term_catalyst": db.compute_no_near_term_catalyst(
+                analyst_json.get("catalyst"), analyst_json.get("weeks_to_catalyst")),
+            "valuation_tier": None,
+            "key_risks": analyst_json.get("key_risks", []),
+            "reasoning": analyst_json.get("reasoning"),
+        }
+        db.set_original_thesis(ticker, thesis)
+    except Exception as e:
+        # WARNING, not debug -- same reasoning as agents/crew.py's
+        # _capture_latest_thesis (2026-09-17): losing this snapshot is
+        # real data loss for the drift-tracking system, not something
+        # that should require a debug-level grep to discover after the fact.
+        log.warning(f"[{ticker}] original thesis capture failed (non-fatal to the fill, but the snapshot is lost): {e}")
+
+
 # ---------------------------------------------------------------------------
 # Approval-driven execution (auto-execute pipeline + Telegram Approve button)
 # ---------------------------------------------------------------------------
@@ -511,6 +554,7 @@ def execute_approved(
                 trail_distance_pct=risk_json.get("trailing_stop_distance_pct"),
             )
             db.set_stop_broker_order_id(ticker, bracket_result["stop_order_id"])
+            _capture_original_thesis_if_new(ticker, approval)
             log.info(f"[{ticker}] Bracket stop recorded (orderId={bracket_result['stop_order_id']})")
         elif stop_price and side == "BUY":
             db.upsert_position_stop(
@@ -522,6 +566,7 @@ def execute_approved(
                 conviction=approval.get("conviction", 5),
                 trail_distance_pct=risk_json.get("trailing_stop_distance_pct"),
             )
+            _capture_original_thesis_if_new(ticker, approval)
             stop_placed = False
             for stop_attempt in range(1, 4):
                 try:

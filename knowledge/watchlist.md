@@ -1,5 +1,22 @@
 # Watchlist
 
+> **Portfolio Role is the flag-off fallback.** Every ticker below still
+> carries a Compounder / Accelerator / Moonshot role, and that role stays
+> the sizing/stop authority as long as `config.SETUP_GATES_ENABLED` is
+> False (the default). Once that flag is set True, it becomes INERT for
+> any ticker that `agents/setup_gates.py`'s `classify_setup()` currently
+> matches to a live setup category (Breakout / Catalyst / Continuation,
+> read nightly off `agents/trade_ladder.py`'s rungs) — that dynamic,
+> day-to-day classification takes over as the sizing/stop authority
+> instead. Role is still used as the fallback when the gates don't
+> currently match anything for a ticker (a legacy position, or a genuinely
+> quiet period — the gates are strict by design and can run near 0%
+> qualification across the whole watchlist for days at a time). Do NOT
+> rewrite the Portfolio Role column with Breakout/Catalyst/Continuation
+> labels — that would misrepresent the design: the three setup categories
+> are live, per-moment classifications, not a static per-ticker label the
+> way role is. (2026-10-11, swing-trading cutover Phase 4/5.)
+
 ## Purpose
 
 The watchlist is the system's active universe of tracked ideas.

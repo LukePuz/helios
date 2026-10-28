@@ -490,6 +490,15 @@ app.conf.beat_schedule = {
         "schedule": crontab(hour=16, minute=45, day_of_week="mon-fri"),
         "options":  {"queue": INGESTION_QUEUE, "expires": 2 * 3600},
     },
+    # Trade ladder refresh — 5:15 PM ET, after BOTH refresh-price-history
+    # (16:45) and refresh-fundamentals (17:00) so it reads same-day-fresh
+    # bars and multiples. Ops queue, no LLM involved -- must finish before
+    # the 19:00 stack-down like its two inputs above.
+    "refresh-trade-ladder": {
+        "task":     "tasks.refresh_trade_ladder",
+        "schedule": crontab(hour=17, minute=15, day_of_week="mon-fri"),
+        "options":  {"queue": INGESTION_QUEUE, "expires": 2 * 3600},
+    },
     # S&P 500 universe price history — weekly, Saturday 9:00 AM. Same
     # down-all-weekend caveat as prune-vector-store/prune-seen-items above:
     # actually runs via Monday 05:00 catch-up (~44h later), which is fine —
@@ -498,6 +507,15 @@ app.conf.beat_schedule = {
     "refresh-sp500-history": {
         "task":     "tasks.refresh_sp500_history",
         "schedule": crontab(hour=9, minute=0, day_of_week="sat"),
+        "options":  {"queue": INGESTION_QUEUE, "expires": 48 * 3600},
+    },
+    # Broadened Comps peer universe — Saturday 9:30 AM, after
+    # refresh-sp500-history so this reads the same-week price data.
+    # Same down-all-weekend caveat as its sibling above (Monday 05:00
+    # catch-up).
+    "refresh-sp500-fundamentals": {
+        "task":     "tasks.refresh_sp500_fundamentals",
+        "schedule": crontab(hour=9, minute=30, day_of_week="sat"),
         "options":  {"queue": INGESTION_QUEUE, "expires": 48 * 3600},
     },
     # Ingestion health check — hourly
@@ -1487,6 +1505,26 @@ def refresh_price_history(self):
         raise self.retry(exc=e, countdown=300)
 
 
+@app.task(name="tasks.refresh_trade_ladder", bind=True, max_retries=2)
+def refresh_trade_ladder(self):
+    """Nightly per-ticker trade ladder (2026-09-13, swing-trading redesign)
+    -- technical rungs (swings/MAs/base/volume-nodes/gaps) + valuation
+    layer (fair value, tier). Scheduled after refresh-price-history and
+    refresh-fundamentals so it reads same-day-fresh bars and multiples,
+    not yesterday's. Write-only: this stage doesn't gate or size anything
+    itself, see agents/setup_gates.py (SETUP_GATES_ENABLED) for the
+    consumer side."""
+    try:
+        from agents.trade_ladder import refresh_all_ladders
+        count = refresh_all_ladders()
+        log.info(f"Trade ladder refreshed: {count} tickers updated")
+        _heartbeat_ok("trade_ladder", count)
+    except Exception as e:
+        log.error(f"refresh_trade_ladder failed: {e}")
+        _heartbeat_fail("trade_ladder", str(e))
+        raise self.retry(exc=e, countdown=300)
+
+
 @app.task(name="tasks.refresh_sp500_history", bind=True, max_retries=2)
 def refresh_sp500_history(self):
     """Weekly refresh of the price_history cache for the full S&P 500
@@ -1503,6 +1541,26 @@ def refresh_sp500_history(self):
     except Exception as e:
         log.error(f"refresh_sp500_history failed: {e}")
         _heartbeat_fail("sp500_history", str(e))
+        raise self.retry(exc=e, countdown=600)
+
+
+@app.task(name="tasks.refresh_sp500_fundamentals", bind=True, max_retries=2)
+def refresh_sp500_fundamentals(self):
+    """Weekly refresh of the sp500_fundamentals table (2026-09-13,
+    broadened Comps) -- ~500 sequential yfinance calls, same cadence
+    reasoning as refresh_sp500_history above: peer multiples are a slow-
+    moving background signal, not worth the extra ingestion cost nightly.
+    Feeds agents.valuation.compute_comps_fair_value's broadened
+    industry-based peer search via ingestion.fundamentals.
+    get_industry_peer_median."""
+    try:
+        from ingestion.fundamentals import refresh_sp500_fundamentals as _refresh
+        count = _refresh()
+        log.info(f"S&P 500 fundamentals refreshed: {count} tickers updated")
+        _heartbeat_ok("sp500_fundamentals", count)
+    except Exception as e:
+        log.error(f"refresh_sp500_fundamentals failed: {e}")
+        _heartbeat_fail("sp500_fundamentals", str(e))
         raise self.retry(exc=e, countdown=600)
 
 
@@ -1580,7 +1638,7 @@ def send_daily_digest(self):
     try:
         import db
         import alerts
-        from datetime import date, timedelta
+        from datetime import date, timedelta, datetime, timezone
 
         client  = _get_client()
         account = client.get_account()
@@ -1614,8 +1672,41 @@ def send_daily_digest(self):
             if stop_rec and current:
                 d = (current - stop_rec["stop_price"]) / current
                 dist = f", stop {d:+.1%} away"
+
+            # 2026-09-17, user request: entry price, days held, %gain, and
+            # current trade thesis alongside what was already here (share
+            # count, P&L, stop distance) -- makes the digest answer "why
+            # am I holding this and how has it done" without a separate
+            # lookup, using the thesis-tracking system already in place
+            # (db.get_thesis) rather than duplicating that data.
+            entry_line = ""
+            thesis_line = ""
+            if stop_rec:
+                entry_price = stop_rec.get("entry_price")
+                opened_at = stop_rec.get("opened_at")
+                if entry_price and current:
+                    gain_pct = (current - entry_price) / entry_price
+                    days_held = (datetime.now(timezone.utc) - opened_at).days if opened_at else None
+                    days_str = f", {days_held}d held" if days_held is not None else ""
+                    entry_line = f", entry ${entry_price:,.2f}{days_str}, {gain_pct:+.1%}"
+
+                try:
+                    thesis = db.get_thesis(p.symbol)
+                    if thesis:
+                        latest = thesis.get("latest") or thesis.get("original") or {}
+                        summary = (latest.get("thesis_summary") or "").strip()
+                        if summary:
+                            # Keep short -- this runs per position in an
+                            # already-long digest, not the place for the
+                            # full multi-sentence reasoning.
+                            if len(summary) > 140:
+                                summary = summary[:137] + "..."
+                            thesis_line = f"\n    💭 {summary}"
+                except Exception as e:
+                    log.debug(f"[{p.symbol}] thesis lookup failed for digest: {e}")
+
             positions_text.append(
-                f"{p.symbol}: {p.qty:.0f}sh, P&amp;L ${float(p.unrealized_pl):+,.0f}{dist}"
+                f"{p.symbol}: {p.qty:.0f}sh{entry_line}, P&amp;L ${float(p.unrealized_pl):+,.0f}{dist}{thesis_line}"
             )
 
         catalysts_text = []

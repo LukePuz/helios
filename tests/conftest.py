@@ -16,3 +16,21 @@ def _default_to_orders_worker_context(monkeypatch):
     already targets. Tests that specifically exercise the routing logic
     itself (tests/test_order_routing.py) override this locally per-test."""
     monkeypatch.setenv("IB_CLIENT_ID", "30")
+
+
+@pytest.fixture(autouse=True)
+def _no_real_database(monkeypatch):
+    """db.py loads .env at import, so in the live checkout an unpatched db.*
+    call reaches the production database. test_sell_not_blocked_when_market_closed
+    did exactly that from 08-04 to 10-19: 42 fake NVDA EXIT rows at $100 in
+    trade_outcomes, and real NVDA rows closed at $100. Any test that needs
+    the DB must mock the db function it calls."""
+    import db
+
+    def _blocked(*args, **kwargs):
+        raise RuntimeError("tests must not touch the real database; mock the db.* call")
+
+    monkeypatch.setattr(db, "_pool", None)
+    monkeypatch.setattr(db, "_get_pool", _blocked)
+    monkeypatch.setattr(db.psycopg2.pool, "ThreadedConnectionPool", _blocked)
+    monkeypatch.setattr(db.psycopg2, "connect", _blocked)

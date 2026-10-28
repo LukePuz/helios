@@ -483,6 +483,193 @@ _MIGRATIONS: list[tuple[int, str]] = [
     # against what rate was actually predicted, not just the raw pct.
     (32, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS weeks_to_catalyst DECIMAL; "
          "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS expected_return_per_week DECIMAL;"),
+
+    # ------------------------------------------------------------------
+    # Swing-trading strategy redesign (2026-09-13, user request): replaces
+    # the long-term conviction buckets (Compounder/Accelerator/Moonshot)
+    # with setup-defined swing categories (Breakout/Catalyst/Continuation),
+    # backed by a per-ticker technical+valuation trade ladder and original/
+    # latest thesis tracking. setup_category is added ALONGSIDE the
+    # existing thesis_bucket column rather than replacing it in place --
+    # thesis_bucket stays populated during the transition (shadow mode,
+    # see agents/setup_gates.py) so nothing reading it breaks until the
+    # SETUP_GATES_ENABLED cutover is actually flipped.
+    # ------------------------------------------------------------------
+    (33, """
+        CREATE TABLE IF NOT EXISTS trade_ladder (
+            ticker              VARCHAR(10) PRIMARY KEY,
+            computed_at         TIMESTAMPTZ DEFAULT NOW(),
+            current_price       DECIMAL,
+            atr                 DECIMAL,
+            trend_stage         VARCHAR(20),
+            base_detected       BOOLEAN,
+            base_ceiling        DECIMAL,
+            base_floor          DECIMAL,
+            base_contractions   INTEGER,
+            base_volume_dryup   BOOLEAN,
+            gap_catalyst_active BOOLEAN,
+            gap_day_high        DECIMAL,
+            gap_day_low         DECIMAL,
+            peer_implied_fair_value DECIMAL,
+            street_consensus_target DECIMAL,
+            fair_value_blended      DECIMAL,
+            valuation_pct_of_fair   DECIMAL,
+            valuation_tier          VARCHAR(20),
+            valuation_outlier       BOOLEAN DEFAULT FALSE,
+            rungs               JSONB
+        );
+    """),
+    (34, "ALTER TABLE position_stops ADD COLUMN IF NOT EXISTS setup_category VARCHAR(20); "
+         "ALTER TABLE position_stops ADD COLUMN IF NOT EXISTS valuation_tier_at_entry VARCHAR(20); "
+         "ALTER TABLE position_stops ADD COLUMN IF NOT EXISTS original_thesis JSONB; "
+         "ALTER TABLE position_stops ADD COLUMN IF NOT EXISTS latest_thesis JSONB; "
+         "ALTER TABLE position_stops ADD COLUMN IF NOT EXISTS thesis_updated_at TIMESTAMPTZ;"),
+    (35, "ALTER TABLE pending_approvals ADD COLUMN IF NOT EXISTS setup_category VARCHAR(20); "
+         "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS setup_category VARCHAR(20); "
+         "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS valuation_tier_at_entry VARCHAR(20);"),
+    (36, """
+        CREATE TABLE IF NOT EXISTS thesis_history (
+            id           SERIAL PRIMARY KEY,
+            ticker       VARCHAR(10),
+            trading_env  VARCHAR(10) NOT NULL DEFAULT 'paper',
+            recorded_at  TIMESTAMPTZ DEFAULT NOW(),
+            thesis_json  JSONB
+        );
+    """),
+    (37, "CREATE INDEX IF NOT EXISTS idx_thesis_history_ticker_recorded ON thesis_history (ticker, recorded_at DESC);"),
+    # sharesOutstanding/targetMeanPrice already flow through yfinance's
+    # .info dict (targetMeanPrice already lands in fundamentals.raw_json
+    # today but nothing reads it) -- explicit columns make both queryable
+    # without unpacking JSON, needed for the peer-implied fair-value calc
+    # (agents/trade_ladder.py) and the Street-consensus anchor.
+    (38, "ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS shares_outstanding DECIMAL; "
+         "ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS target_mean_price DECIMAL;"),
+
+    # Multi-pronged fundamentals-based valuation ensemble (2026-09-13, user
+    # request) -- Street consensus alone was found to skew 60% of the
+    # watchlist into "Deep Value" (sell-side targets are structurally
+    # optimistic almost everywhere), so it's demoted to a displayed
+    # reference range and replaced as the primary valuation driver by four
+    # independent fundamentals-based methods (DCF, comps, Rule-of-40
+    # multiple, PEG). These new fundamentals columns feed those calcs.
+    (39, "ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS free_cash_flow DECIMAL; "
+         "ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS net_cash DECIMAL; "
+         "ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS beta DECIMAL; "
+         "ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS earnings_growth DECIMAL; "
+         "ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS forward_eps DECIMAL; "
+         "ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS target_low_price DECIMAL; "
+         "ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS target_high_price DECIMAL;"),
+    (40, "ALTER TABLE trade_ladder ADD COLUMN IF NOT EXISTS dcf_fair_value DECIMAL; "
+         "ALTER TABLE trade_ladder ADD COLUMN IF NOT EXISTS comps_fair_value DECIMAL; "
+         "ALTER TABLE trade_ladder ADD COLUMN IF NOT EXISTS rule40_fair_value DECIMAL; "
+         "ALTER TABLE trade_ladder ADD COLUMN IF NOT EXISTS peg_fair_value DECIMAL; "
+         "ALTER TABLE trade_ladder ADD COLUMN IF NOT EXISTS valuation_methods_used JSONB; "
+         "ALTER TABLE trade_ladder ADD COLUMN IF NOT EXISTS valuation_confidence VARCHAR(10); "
+         "ALTER TABLE trade_ladder ADD COLUMN IF NOT EXISTS street_target_low DECIMAL; "
+         "ALTER TABLE trade_ladder ADD COLUMN IF NOT EXISTS street_target_high DECIMAL;"),
+
+    # Reverse DCF / "Expectations Investing" (2026-09-13, user request) --
+    # PEG and Rule-of-40 demoted out of the blended fair_value_blended
+    # median (they're growth-quality CONTEXT, same tier as Street
+    # consensus, not price-target inputs) and replaced as a primary
+    # decision input by this: instead of assuming a growth rate to get a
+    # price, hold price fixed and solve for the growth rate the market is
+    # implicitly requiring -- then compare that ask against the ticker's
+    # own actual growth. A genuinely different axis (plausibility, not
+    # price), so it's NOT part of the dollar-value median either -- see
+    # agents/valuation.py's compute_reverse_dcf docstring.
+    (41, "ALTER TABLE trade_ladder ADD COLUMN IF NOT EXISTS implied_growth_rate DECIMAL; "
+         "ALTER TABLE trade_ladder ADD COLUMN IF NOT EXISTS growth_gap_vs_actual DECIMAL; "
+         "ALTER TABLE trade_ladder ADD COLUMN IF NOT EXISTS growth_assumption_flag VARCHAR(20);"),
+
+    # Residual Income (Ohlson model) + Justified Multiple (2026-09-13, user
+    # request) -- both CFA-standard, price-producing methods, added to
+    # reach a 4-method blend (DCF, Comps, Residual Income, Justified
+    # Multiple) after DCF+Comps alone proved too thin (median of 2 = plain
+    # average, letting DCF's hypergrowth-undervaluation bias dominate).
+    # book_value_per_share/return_on_equity/net_profit_margin are what
+    # both new methods need; not previously promoted out of raw_json.
+    (42, "ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS book_value_per_share DECIMAL; "
+         "ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS return_on_equity DECIMAL; "
+         "ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS net_profit_margin DECIMAL;"),
+    (43, "ALTER TABLE trade_ladder ADD COLUMN IF NOT EXISTS residual_income_fair_value DECIMAL; "
+         "ALTER TABLE trade_ladder ADD COLUMN IF NOT EXISTS justified_multiple_fair_value DECIMAL;"),
+
+    # Fundamentals history (2026-09-13, user request: "approaches that use
+    # more of the company's own pricing history and past results"). The
+    # `fundamentals` table has only ever stored the LATEST snapshot per
+    # ticker (nightly upsert overwrites it) -- no method here can compare
+    # a company against its OWN historical multiple/margin trajectory
+    # without a real time series, which doesn't exist yet and can't be
+    # backfilled. This starts logging one nightly snapshot per ticker
+    # going forward (append-only, same pattern as thesis_history) so a
+    # genuine "reversion to own historical average multiple" method
+    # becomes possible once enough real history accumulates -- it produces
+    # nothing useful today, same "can't backfill what wasn't recorded"
+    # situation as thesis_history's own backfill-from-approvals earlier.
+    (44, """
+        CREATE TABLE IF NOT EXISTS fundamentals_history (
+            id                  SERIAL PRIMARY KEY,
+            ticker              VARCHAR(10) NOT NULL,
+            recorded_at         TIMESTAMPTZ DEFAULT NOW(),
+            price_to_sales      DECIMAL,
+            ev_to_ebitda        DECIMAL,
+            forward_pe          DECIMAL,
+            revenue_growth_yoy  DECIMAL,
+            fcf_margin          DECIMAL,
+            net_profit_margin   DECIMAL,
+            return_on_equity    DECIMAL
+        );
+    """),
+    (45, "CREATE INDEX IF NOT EXISTS idx_fundamentals_history_ticker_recorded ON fundamentals_history (ticker, recorded_at DESC);"),
+
+    # Broadened Comps universe (2026-09-13) -- the original sector-scoped
+    # peer median was drawn only from the ~75-ticker watchlist, which
+    # produced fragile/thin peer groups (LUNR's 3-name "Space Data
+    # Centers" group spanning a 43x multiple range) and left most of the
+    # watchlist at "Insufficient Data." yfinance's own sector/industry
+    # classification works for ANY ticker (not just S&P 500 members --
+    # confirmed 2026-09-13: RGTI/QBTS/LUNR all have real industry labels
+    # despite being too small for index membership), so `industry` is
+    # added to `fundamentals` for the watchlist, and a companion
+    # sp500_fundamentals table gives a genuinely large peer pool (~500
+    # names) to draw from, both grouped by the SAME field.
+    (46, "ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS sector VARCHAR(50); "
+         "ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS industry VARCHAR(100);"),
+    (47, """
+        CREATE TABLE IF NOT EXISTS sp500_fundamentals (
+            ticker              VARCHAR(10) PRIMARY KEY,
+            updated_at          TIMESTAMPTZ DEFAULT NOW(),
+            sector              VARCHAR(50),
+            industry            VARCHAR(100),
+            price_to_sales      DECIMAL,
+            ev_to_ebitda        DECIMAL,
+            revenue_growth_yoy  DECIMAL,
+            gross_margin        DECIMAL,
+            fcf_margin          DECIMAL
+        );
+    """),
+    (48, "CREATE INDEX IF NOT EXISTS idx_sp500_fundamentals_industry ON sp500_fundamentals (industry);"),
+
+    # Fixes a real gap found 2026-09-15: agents/scanner.py's shadow setup-
+    # gate classification (agents/setup_gates.py, wired in 2026-09-13) was
+    # only ever added to the in-memory candidate dict, never persisted --
+    # "what did the new Breakout/Catalyst/Continuation system say during
+    # today's actual scan" was unanswerable after the fact, even though
+    # the classification itself ran. These two columns close that gap
+    # going forward (can't backfill what wasn't recorded, same situation
+    # as thesis_history's own backfill-from-approvals).
+    (49, "ALTER TABLE scanner_candidates ADD COLUMN IF NOT EXISTS setup_category VARCHAR(20); "
+         "ALTER TABLE scanner_candidates ADD COLUMN IF NOT EXISTS setup_triggered BOOLEAN;"),
+
+    # 2026-09-17, user request: migration 49 only ever persisted the BEST-
+    # match category and whether it triggered -- the full per-gate
+    # criteria breakdown (which of the ~4-6 checks each of Breakout/
+    # Catalyst/Continuation passed or failed) was computed every run but
+    # never stored, so "nothing qualified" and "here's exactly how close
+    # it got" were indistinguishable after the fact. This closes that --
+    # can't backfill the two days already run before this column existed.
+    (50, "ALTER TABLE scanner_candidates ADD COLUMN IF NOT EXISTS setup_gates_detail JSONB;"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -1198,7 +1385,7 @@ def get_all_position_stops() -> list[dict]:
             cur.execute(
                 "SELECT ticker, entry_price, stop_price, stop_method, trailing_active, "
                 "trailing_high, trail_distance_pct, thesis_bucket, conviction, broker_order_id, "
-                "opened_at, profit_target_taken "
+                "opened_at, profit_target_taken, setup_category, valuation_tier_at_entry "
                 "FROM position_stops WHERE trading_env=%s ORDER BY ticker",
                 (TRADING_ENV,),
             )
@@ -1212,6 +1399,7 @@ def get_all_position_stops() -> list[dict]:
                 "thesis_bucket": r[7], "conviction": r[8],
                 "broker_order_id": int(r[9]) if r[9] else None,
                 "opened_at": r[10], "profit_target_taken": bool(r[11]),
+                "setup_category": r[12], "valuation_tier_at_entry": r[13],
             }
             for r in rows
         ]
@@ -1234,6 +1422,363 @@ def get_open_position_symbols() -> set[str]:
         return set()
     finally:
         _put_conn(conn)
+
+
+def set_setup_category(ticker: str, setup_category: str, valuation_tier: str | None = None) -> None:
+    """Stamps the live setup-gate classification onto an open position, alongside
+    the legacy thesis_bucket (kept populated during the SETUP_GATES_ENABLED
+    shadow period -- see agents/setup_gates.py module docstring)."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE position_stops SET setup_category=%s, valuation_tier_at_entry=%s "
+                "WHERE ticker=%s AND trading_env=%s",
+                (setup_category, valuation_tier, ticker, TRADING_ENV),
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"[{ticker}] set_setup_category failed: {e}")
+    finally:
+        _put_conn(conn)
+
+
+# ---------------------------------------------------------------------------
+# Trade ladder (2026-09-13, swing-trading redesign) -- one row per ticker,
+# latest snapshot only. See agents/trade_ladder.py for how `rungs` and the
+# valuation fields are computed.
+# ---------------------------------------------------------------------------
+
+def upsert_trade_ladder(ticker: str, ladder: dict) -> None:
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO trade_ladder (
+                    ticker, computed_at, current_price, atr, trend_stage,
+                    base_detected, base_ceiling, base_floor, base_contractions, base_volume_dryup,
+                    gap_catalyst_active, gap_day_high, gap_day_low,
+                    peer_implied_fair_value, street_consensus_target, fair_value_blended,
+                    valuation_pct_of_fair, valuation_tier, valuation_outlier, rungs,
+                    dcf_fair_value, comps_fair_value, rule40_fair_value, peg_fair_value,
+                    valuation_methods_used, valuation_confidence, street_target_low, street_target_high,
+                    implied_growth_rate, growth_gap_vs_actual, growth_assumption_flag,
+                    residual_income_fair_value, justified_multiple_fair_value
+                ) VALUES (%s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                          %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (ticker) DO UPDATE SET
+                    computed_at = NOW(),
+                    current_price = EXCLUDED.current_price,
+                    atr = EXCLUDED.atr,
+                    trend_stage = EXCLUDED.trend_stage,
+                    base_detected = EXCLUDED.base_detected,
+                    base_ceiling = EXCLUDED.base_ceiling,
+                    base_floor = EXCLUDED.base_floor,
+                    base_contractions = EXCLUDED.base_contractions,
+                    base_volume_dryup = EXCLUDED.base_volume_dryup,
+                    gap_catalyst_active = EXCLUDED.gap_catalyst_active,
+                    gap_day_high = EXCLUDED.gap_day_high,
+                    gap_day_low = EXCLUDED.gap_day_low,
+                    peer_implied_fair_value = EXCLUDED.peer_implied_fair_value,
+                    street_consensus_target = EXCLUDED.street_consensus_target,
+                    fair_value_blended = EXCLUDED.fair_value_blended,
+                    valuation_pct_of_fair = EXCLUDED.valuation_pct_of_fair,
+                    valuation_tier = EXCLUDED.valuation_tier,
+                    valuation_outlier = EXCLUDED.valuation_outlier,
+                    rungs = EXCLUDED.rungs,
+                    dcf_fair_value = EXCLUDED.dcf_fair_value,
+                    comps_fair_value = EXCLUDED.comps_fair_value,
+                    rule40_fair_value = EXCLUDED.rule40_fair_value,
+                    peg_fair_value = EXCLUDED.peg_fair_value,
+                    valuation_methods_used = EXCLUDED.valuation_methods_used,
+                    valuation_confidence = EXCLUDED.valuation_confidence,
+                    street_target_low = EXCLUDED.street_target_low,
+                    street_target_high = EXCLUDED.street_target_high,
+                    implied_growth_rate = EXCLUDED.implied_growth_rate,
+                    growth_gap_vs_actual = EXCLUDED.growth_gap_vs_actual,
+                    growth_assumption_flag = EXCLUDED.growth_assumption_flag,
+                    residual_income_fair_value = EXCLUDED.residual_income_fair_value,
+                    justified_multiple_fair_value = EXCLUDED.justified_multiple_fair_value
+                """,
+                (
+                    ticker, ladder.get("current_price"), ladder.get("atr"), ladder.get("trend_stage"),
+                    ladder.get("base_detected"), ladder.get("base_ceiling"), ladder.get("base_floor"),
+                    ladder.get("base_contractions"), ladder.get("base_volume_dryup"),
+                    ladder.get("gap_catalyst_active"), ladder.get("gap_day_high"), ladder.get("gap_day_low"),
+                    ladder.get("peer_implied_fair_value"), ladder.get("street_consensus_target"),
+                    ladder.get("fair_value_blended"), ladder.get("valuation_pct_of_fair"),
+                    ladder.get("valuation_tier"), ladder.get("valuation_outlier", False),
+                    psycopg2.extras.Json(ladder.get("rungs", [])),
+                    ladder.get("dcf_fair_value"), ladder.get("comps_fair_value"),
+                    ladder.get("rule40_fair_value"), ladder.get("peg_fair_value"),
+                    psycopg2.extras.Json(ladder.get("valuation_methods_used", [])),
+                    ladder.get("valuation_confidence"),
+                    ladder.get("street_target_low"), ladder.get("street_target_high"),
+                    ladder.get("implied_growth_rate"), ladder.get("growth_gap_vs_actual"),
+                    ladder.get("growth_assumption_flag"),
+                    ladder.get("residual_income_fair_value"), ladder.get("justified_multiple_fair_value"),
+                ),
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"[{ticker}] upsert_trade_ladder failed: {e}")
+    finally:
+        _put_conn(conn)
+
+
+_TRADE_LADDER_DECIMAL_FIELDS = (
+    "current_price", "atr", "base_ceiling", "base_floor", "gap_day_high", "gap_day_low",
+    "peer_implied_fair_value", "street_consensus_target", "fair_value_blended",
+    "valuation_pct_of_fair", "dcf_fair_value", "comps_fair_value", "rule40_fair_value",
+    "peg_fair_value", "street_target_low", "street_target_high", "implied_growth_rate",
+    "growth_gap_vs_actual", "residual_income_fair_value", "justified_multiple_fair_value",
+)
+
+
+def _normalize_trade_ladder(row: dict) -> dict:
+    """psycopg2's RealDictCursor returns DECIMAL columns as decimal.Decimal,
+    not float -- found 2026-09-13 wiring agents/setup_gates.py: `ladder.
+    get("atr") * 0.5` raised TypeError (Decimal * float unsupported)
+    despite the same column reading fine as a value. Every OTHER accessor
+    in this file explicitly casts to float; this one didn't because it
+    reads via `SELECT *` for schema flexibility. Cast here once instead
+    of at every call site. `rungs` (JSONB) is unaffected -- JSON numbers
+    round-trip as native float/int, not Decimal."""
+    for field in _TRADE_LADDER_DECIMAL_FIELDS:
+        if row.get(field) is not None:
+            row[field] = float(row[field])
+    return row
+
+
+def get_trade_ladder(ticker: str) -> dict | None:
+    conn = _get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM trade_ladder WHERE ticker=%s", (ticker,))
+            row = cur.fetchone()
+        return _normalize_trade_ladder(dict(row)) if row else None
+    except Exception as e:
+        logging.error(f"[{ticker}] get_trade_ladder failed: {e}")
+        return None
+    finally:
+        _put_conn(conn)
+
+
+def get_all_trade_ladders() -> list[dict]:
+    conn = _get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM trade_ladder ORDER BY ticker")
+            return [_normalize_trade_ladder(dict(r)) for r in cur.fetchall()]
+    except Exception as e:
+        logging.error(f"get_all_trade_ladders failed: {e}")
+        return []
+    finally:
+        _put_conn(conn)
+
+
+# ---------------------------------------------------------------------------
+# Thesis tracking (2026-09-13) -- original_thesis is written once at entry
+# (execution.py's fill-confirmation path), latest_thesis is overwritten on
+# EVERY scheduled position review regardless of action (fixing the prior
+# gap where a plain HOLD verdict's full reasoning was lost, only a 176-char
+# activity_feed line survived). thesis_history keeps every snapshot, not
+# just the latest, for drift analysis over a position's whole life.
+# ---------------------------------------------------------------------------
+
+def set_original_thesis(ticker: str, thesis: dict) -> None:
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE position_stops SET original_thesis=%s, latest_thesis=%s, thesis_updated_at=NOW() "
+                "WHERE ticker=%s AND trading_env=%s",
+                (psycopg2.extras.Json(thesis), psycopg2.extras.Json(thesis), ticker, TRADING_ENV),
+            )
+        conn.commit()
+        log_thesis_history(ticker, thesis)
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"[{ticker}] set_original_thesis failed: {e}")
+    finally:
+        _put_conn(conn)
+
+
+def update_latest_thesis(ticker: str, thesis: dict) -> None:
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE position_stops SET latest_thesis=%s, thesis_updated_at=NOW() "
+                "WHERE ticker=%s AND trading_env=%s",
+                (psycopg2.extras.Json(thesis), ticker, TRADING_ENV),
+            )
+        conn.commit()
+        log_thesis_history(ticker, thesis)
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"[{ticker}] update_latest_thesis failed: {e}")
+    finally:
+        _put_conn(conn)
+
+
+def get_thesis(ticker: str) -> dict | None:
+    """Returns {"original": {...}, "latest": {...}, "updated_at": ...}, or
+    None only if NEITHER exists yet. Found 2026-09-13 wiring
+    review_held_position's latest_thesis capture: a scheduled review can
+    legitimately run before an original was ever recorded (a position
+    opened before thesis tracking existed, or one whose entry-side
+    capture failed) -- checking only original_thesis for None treated a
+    real, successfully-captured latest_thesis as if nothing were there at
+    all. Callers should treat a None "original" as "no baseline to diff
+    against" (db.compute_thesis_drift already can't run without one),
+    not as the whole thesis being absent."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT original_thesis, latest_thesis, thesis_updated_at FROM position_stops "
+                "WHERE ticker=%s AND trading_env=%s",
+                (ticker, TRADING_ENV),
+            )
+            row = cur.fetchone()
+        if not row or (row[0] is None and row[1] is None):
+            return None
+        return {"original": row[0], "latest": row[1], "updated_at": row[2]}
+    except Exception as e:
+        logging.error(f"[{ticker}] get_thesis failed: {e}")
+        return None
+    finally:
+        _put_conn(conn)
+
+
+def log_thesis_history(ticker: str, thesis: dict) -> None:
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO thesis_history (ticker, trading_env, thesis_json) VALUES (%s, %s, %s)",
+                (ticker, TRADING_ENV, psycopg2.extras.Json(thesis)),
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"[{ticker}] log_thesis_history failed: {e}")
+    finally:
+        _put_conn(conn)
+
+
+def get_thesis_history(ticker: str, limit: int = 30) -> list[dict]:
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT recorded_at, thesis_json FROM thesis_history "
+                "WHERE ticker=%s AND trading_env=%s ORDER BY recorded_at DESC LIMIT %s",
+                (ticker, TRADING_ENV, limit),
+            )
+            return [{"recorded_at": r[0], "thesis": r[1]} for r in cur.fetchall()]
+    except Exception as e:
+        logging.error(f"[{ticker}] get_thesis_history failed: {e}")
+        return []
+    finally:
+        _put_conn(conn)
+
+
+# Keyword heuristic (2026-09-15, user request) -- a broad macro event
+# (FOMC, CPI, jobs report) is not a company-specific catalyst even when
+# it's the most proximate dated event in a situation brief; found reading
+# 4 real held positions that LUNR and NVDA's latest thesis both listed
+# "FOMC meeting" as THE catalyst, which says nothing about either
+# company's own thesis actually playing out. Deliberately a simple
+# substring check, not NLP -- transparent and auditable over a fancier
+# classifier for a binary "is this actually about the company" signal.
+_MACRO_CATALYST_KEYWORDS = (
+    "fomc", "cpi", "federal reserve", "fed meeting", "jobs report",
+    "nonfarm payroll", "nfp", "pce", "gdp report", "rate decision",
+)
+
+
+def compute_no_near_term_catalyst(catalyst: dict | None, weeks_to_catalyst: float | None) -> bool:
+    """True if a position has no genuine, dated, COMPANY-SPECIFIC catalyst
+    to justify continued holding -- either no computable timeframe at all
+    (weeks_to_catalyst is None), or the stated catalyst is actually a
+    broad macro event masquerading as one. Used by thesis capture (agents/
+    crew.py, execution.py) to make this a first-class, queryable flag
+    instead of something only visible by reading the reasoning prose."""
+    if weeks_to_catalyst is None:
+        return True
+    event = ((catalyst or {}).get("event") or "").lower()
+    return any(kw in event for kw in _MACRO_CATALYST_KEYWORDS)
+
+
+def compute_thesis_drift(original: dict, latest: dict) -> dict:
+    """Pure, deterministic diff between a position's original and latest
+    thesis snapshot -- no LLM call, same 'compute the hard number in code'
+    convention as chase_risk/price_action. `material_change` is the alert
+    throttle: most daily reviews won't trip it, so send_thesis_update_alert
+    doesn't turn into daily noise."""
+    orig_conviction = original.get("conviction")
+    latest_conviction = latest.get("conviction")
+    conviction_delta = (
+        latest_conviction - orig_conviction
+        if orig_conviction is not None and latest_conviction is not None else None
+    )
+
+    catalyst_status = latest.get("catalyst_status", "pending")
+    catalyst_overdue = False
+    try:
+        from agents.analyst import compute_weeks_to_catalyst
+        weeks = compute_weeks_to_catalyst((original.get("catalyst") or {}).get("date"))
+        # weeks_to_catalyst is computed relative to "now" -- a negative
+        # result would mean the date's already passed, but the helper
+        # floors at 1 day out, so overdue is instead detected by comparing
+        # the ORIGINAL weeks-out figure against how much wall-clock time
+        # has elapsed since the thesis was first recorded.
+        orig_weeks = original.get("weeks_to_catalyst")
+        as_of = original.get("as_of")
+        if orig_weeks is not None and as_of:
+            from datetime import datetime, timezone
+            recorded = datetime.fromisoformat(as_of.replace("Z", "+00:00"))
+            elapsed_weeks = (datetime.now(timezone.utc) - recorded).total_seconds() / (7 * 86400)
+            catalyst_overdue = elapsed_weeks > orig_weeks and catalyst_status == "pending"
+    except Exception:
+        pass
+
+    new_risks = list(set(latest.get("key_risks") or []) - set(original.get("key_risks") or []))
+
+    # Found 2026-09-15 reviewing 4 real held positions: QBTS's ORIGINAL
+    # thesis was anchored on a specific, named, dated catalyst (a Nasdaq
+    # Verafin partnership); its LATEST thesis had quietly replaced that
+    # with vague "ongoing" technical milestones -- a real degradation
+    # conviction_delta alone doesn't necessarily catch (QBTS's own
+    # conviction only dropped 7->5, "material" by the >=2 rule already,
+    # but a position could lose its whole dated catalyst while conviction
+    # drops by just 1). Distinct from "no_near_term_catalyst persisting" --
+    # that would fire every single review forever and defeat the alert
+    # throttle; this only fires on an actual CHANGE from having one.
+    orig_no_catalyst = original.get("no_near_term_catalyst")
+    latest_no_catalyst = latest.get("no_near_term_catalyst")
+    catalyst_degraded = bool(orig_no_catalyst is False and latest_no_catalyst is True)
+
+    material_change = bool(
+        (conviction_delta is not None and abs(conviction_delta) >= 2)
+        or catalyst_status in ("invalidated", "confirmed_negative")
+        or (latest.get("action") not in (None, "OPEN", "ADD", "HOLD") and original.get("action") in ("OPEN", "ADD"))
+        or catalyst_degraded
+    )
+
+    return {
+        "conviction_delta": conviction_delta,
+        "catalyst_status": catalyst_status,
+        "catalyst_overdue": catalyst_overdue,
+        "new_risks": new_risks,
+        "catalyst_degraded": catalyst_degraded,
+        "material_change": material_change,
+    }
 
 
 def set_stop_broker_order_id(ticker: str, broker_order_id: int | None) -> None:
@@ -1486,8 +2031,11 @@ def upsert_fundamentals(ticker: str, metrics: dict) -> None:
                 """
                 INSERT INTO fundamentals
                     (ticker, updated_at, revenue_growth_yoy, gross_margin, fcf_margin,
-                     price_to_sales, ev_to_ebitda, forward_pe, market_cap, raw_json)
-                VALUES (%s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s)
+                     price_to_sales, ev_to_ebitda, forward_pe, market_cap, raw_json,
+                     shares_outstanding, target_mean_price, free_cash_flow, net_cash,
+                     beta, earnings_growth, forward_eps, target_low_price, target_high_price,
+                     book_value_per_share, return_on_equity, net_profit_margin, sector, industry)
+                VALUES (%s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (ticker) DO UPDATE SET
                     updated_at         = NOW(),
                     revenue_growth_yoy = EXCLUDED.revenue_growth_yoy,
@@ -1497,7 +2045,21 @@ def upsert_fundamentals(ticker: str, metrics: dict) -> None:
                     ev_to_ebitda       = EXCLUDED.ev_to_ebitda,
                     forward_pe         = EXCLUDED.forward_pe,
                     market_cap         = EXCLUDED.market_cap,
-                    raw_json           = EXCLUDED.raw_json
+                    raw_json           = EXCLUDED.raw_json,
+                    shares_outstanding = EXCLUDED.shares_outstanding,
+                    target_mean_price  = EXCLUDED.target_mean_price,
+                    free_cash_flow     = EXCLUDED.free_cash_flow,
+                    net_cash           = EXCLUDED.net_cash,
+                    beta               = EXCLUDED.beta,
+                    earnings_growth    = EXCLUDED.earnings_growth,
+                    forward_eps        = EXCLUDED.forward_eps,
+                    target_low_price   = EXCLUDED.target_low_price,
+                    target_high_price  = EXCLUDED.target_high_price,
+                    book_value_per_share = EXCLUDED.book_value_per_share,
+                    return_on_equity     = EXCLUDED.return_on_equity,
+                    net_profit_margin    = EXCLUDED.net_profit_margin,
+                    sector               = EXCLUDED.sector,
+                    industry             = EXCLUDED.industry
                 """,
                 (
                     ticker,
@@ -1509,6 +2071,20 @@ def upsert_fundamentals(ticker: str, metrics: dict) -> None:
                     metrics.get("forward_pe"),
                     metrics.get("market_cap"),
                     json.dumps(metrics.get("raw", {})),
+                    metrics.get("shares_outstanding"),
+                    metrics.get("target_mean_price"),
+                    metrics.get("free_cash_flow"),
+                    metrics.get("net_cash"),
+                    metrics.get("beta"),
+                    metrics.get("earnings_growth"),
+                    metrics.get("forward_eps"),
+                    metrics.get("target_low_price"),
+                    metrics.get("target_high_price"),
+                    metrics.get("book_value_per_share"),
+                    metrics.get("return_on_equity"),
+                    metrics.get("net_profit_margin"),
+                    metrics.get("sector"),
+                    metrics.get("industry"),
                 ),
             )
         conn.commit()
@@ -1519,13 +2095,60 @@ def upsert_fundamentals(ticker: str, metrics: dict) -> None:
         _put_conn(conn)
 
 
+def log_fundamentals_history(ticker: str, metrics: dict) -> None:
+    """Append-only nightly snapshot -- see migration 44's comment. Called
+    alongside upsert_fundamentals (which only keeps the latest row) so a
+    real time series starts accumulating now; failures here are logged,
+    not raised, since losing one night's history snapshot should never
+    block the (more important) latest-snapshot upsert."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO fundamentals_history "
+                "(ticker, price_to_sales, ev_to_ebitda, forward_pe, revenue_growth_yoy, "
+                "fcf_margin, net_profit_margin, return_on_equity) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    ticker, metrics.get("price_to_sales"), metrics.get("ev_to_ebitda"),
+                    metrics.get("forward_pe"), metrics.get("revenue_growth_yoy"),
+                    metrics.get("fcf_margin"), metrics.get("net_profit_margin"),
+                    metrics.get("return_on_equity"),
+                ),
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"log_fundamentals_history({ticker}) failed: {e}")
+    finally:
+        _put_conn(conn)
+
+
+def get_fundamentals_history(ticker: str, limit: int = 400) -> list[dict]:
+    conn = _get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM fundamentals_history WHERE ticker=%s ORDER BY recorded_at DESC LIMIT %s",
+                (ticker, limit),
+            )
+            return [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        logging.error(f"get_fundamentals_history({ticker}) failed: {e}")
+        return []
+    finally:
+        _put_conn(conn)
+
+
 def get_fundamentals(ticker: str) -> dict | None:
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT ticker, updated_at, revenue_growth_yoy, gross_margin, fcf_margin, "
-                "price_to_sales, ev_to_ebitda, forward_pe, market_cap "
+                "price_to_sales, ev_to_ebitda, forward_pe, market_cap, "
+                "shares_outstanding, target_mean_price, free_cash_flow, net_cash, "
+                "beta, earnings_growth, forward_eps, target_low_price, target_high_price, "
+                "book_value_per_share, return_on_equity, net_profit_margin, sector, industry "
                 "FROM fundamentals WHERE ticker=%s",
                 (ticker,),
             )
@@ -1541,6 +2164,20 @@ def get_fundamentals(ticker: str) -> dict | None:
             "ev_to_ebitda":       float(row[6]) if row[6] is not None else None,
             "forward_pe":         float(row[7]) if row[7] is not None else None,
             "market_cap":         float(row[8]) if row[8] is not None else None,
+            "shares_outstanding": float(row[9]) if row[9] is not None else None,
+            "target_mean_price":  float(row[10]) if row[10] is not None else None,
+            "free_cash_flow":     float(row[11]) if row[11] is not None else None,
+            "net_cash":           float(row[12]) if row[12] is not None else None,
+            "beta":               float(row[13]) if row[13] is not None else None,
+            "earnings_growth":    float(row[14]) if row[14] is not None else None,
+            "forward_eps":        float(row[15]) if row[15] is not None else None,
+            "target_low_price":   float(row[16]) if row[16] is not None else None,
+            "target_high_price":  float(row[17]) if row[17] is not None else None,
+            "book_value_per_share": float(row[18]) if row[18] is not None else None,
+            "return_on_equity":     float(row[19]) if row[19] is not None else None,
+            "net_profit_margin":    float(row[20]) if row[20] is not None else None,
+            "sector":               row[21],
+            "industry":             row[22],
         }
     except Exception as e:
         logging.error(f"get_fundamentals({ticker}) failed: {e}")
@@ -1831,7 +2468,11 @@ def get_fundamentals_all() -> list[dict]:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT ticker, revenue_growth_yoy, gross_margin, fcf_margin, "
-                "price_to_sales, ev_to_ebitda, forward_pe, market_cap FROM fundamentals"
+                "price_to_sales, ev_to_ebitda, forward_pe, market_cap, "
+                "shares_outstanding, target_mean_price, free_cash_flow, net_cash, "
+                "beta, earnings_growth, forward_eps, target_low_price, target_high_price, "
+                "book_value_per_share, return_on_equity, net_profit_margin, sector, industry "
+                "FROM fundamentals"
             )
             rows = cur.fetchall()
         return [
@@ -1844,11 +2485,107 @@ def get_fundamentals_all() -> list[dict]:
                 "ev_to_ebitda":       float(r[5]) if r[5] is not None else None,
                 "forward_pe":         float(r[6]) if r[6] is not None else None,
                 "market_cap":         float(r[7]) if r[7] is not None else None,
+                "shares_outstanding": float(r[8]) if r[8] is not None else None,
+                "target_mean_price":  float(r[9]) if r[9] is not None else None,
+                "free_cash_flow":     float(r[10]) if r[10] is not None else None,
+                "net_cash":           float(r[11]) if r[11] is not None else None,
+                "beta":               float(r[12]) if r[12] is not None else None,
+                "earnings_growth":    float(r[13]) if r[13] is not None else None,
+                "forward_eps":        float(r[14]) if r[14] is not None else None,
+                "target_low_price":   float(r[15]) if r[15] is not None else None,
+                "target_high_price":  float(r[16]) if r[16] is not None else None,
+                "book_value_per_share": float(r[17]) if r[17] is not None else None,
+                "return_on_equity":     float(r[18]) if r[18] is not None else None,
+                "net_profit_margin":    float(r[19]) if r[19] is not None else None,
+                "sector":               r[20],
+                "industry":             r[21],
             }
             for r in rows
         ]
     except Exception as e:
         logging.error(f"get_fundamentals_all failed: {e}")
+        return []
+    finally:
+        _put_conn(conn)
+
+
+def upsert_sp500_fundamentals(ticker: str, metrics: dict) -> None:
+    """Lightweight companion to upsert_fundamentals -- only the fields the
+    broadened Comps peer search needs (see ingestion.fundamentals.
+    refresh_sp500_fundamentals), not the full valuation-ensemble depth
+    the watchlist's own fundamentals table carries."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO sp500_fundamentals
+                    (ticker, updated_at, sector, industry, price_to_sales,
+                     ev_to_ebitda, revenue_growth_yoy, gross_margin, fcf_margin)
+                VALUES (%s, NOW(), %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (ticker) DO UPDATE SET
+                    updated_at         = NOW(),
+                    sector             = EXCLUDED.sector,
+                    industry           = EXCLUDED.industry,
+                    price_to_sales     = EXCLUDED.price_to_sales,
+                    ev_to_ebitda       = EXCLUDED.ev_to_ebitda,
+                    revenue_growth_yoy = EXCLUDED.revenue_growth_yoy,
+                    gross_margin       = EXCLUDED.gross_margin,
+                    fcf_margin         = EXCLUDED.fcf_margin
+                """,
+                (
+                    ticker, metrics.get("sector"), metrics.get("industry"),
+                    metrics.get("price_to_sales"), metrics.get("ev_to_ebitda"),
+                    metrics.get("revenue_growth_yoy"), metrics.get("gross_margin"),
+                    metrics.get("fcf_margin"),
+                ),
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"upsert_sp500_fundamentals({ticker}) failed: {e}")
+    finally:
+        _put_conn(conn)
+
+
+_SP500_FUNDAMENTALS_DECIMAL_FIELDS = (
+    "price_to_sales", "ev_to_ebitda", "revenue_growth_yoy", "gross_margin", "fcf_margin",
+)
+
+
+def _normalize_sp500_fundamentals(row: dict) -> dict:
+    """Same Decimal-vs-float fix as _normalize_trade_ladder -- found
+    2026-09-13 in the same session: get_industry_peer_median mixes these
+    rows with get_fundamentals_all's (already float-cast) rows in one
+    sorted list, and Decimal/float arithmetic between them raises
+    TypeError even though both print identically."""
+    for field in _SP500_FUNDAMENTALS_DECIMAL_FIELDS:
+        if row.get(field) is not None:
+            row[field] = float(row[field])
+    return row
+
+
+def get_sp500_fundamentals_all() -> list[dict]:
+    conn = _get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM sp500_fundamentals")
+            return [_normalize_sp500_fundamentals(dict(r)) for r in cur.fetchall()]
+    except Exception as e:
+        logging.error(f"get_sp500_fundamentals_all failed: {e}")
+        return []
+    finally:
+        _put_conn(conn)
+
+
+def get_sp500_fundamentals_by_industry(industry: str) -> list[dict]:
+    conn = _get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM sp500_fundamentals WHERE industry=%s", (industry,))
+            return [_normalize_sp500_fundamentals(dict(r)) for r in cur.fetchall()]
+    except Exception as e:
+        logging.error(f"get_sp500_fundamentals_by_industry({industry}) failed: {e}")
         return []
     finally:
         _put_conn(conn)
@@ -2370,6 +3107,115 @@ def get_bucket_attribution() -> list[dict]:
         _put_conn(conn)
 
 
+def get_category_attribution() -> list[dict]:
+    """Same approximation as get_bucket_attribution, grouped by the new
+    setup_category (Breakout/Catalyst/Continuation) instead of the legacy
+    thesis_bucket -- this is the number that actually tells you whether the
+    setup-category reframe (2026-09-13) is working, once enough trades have
+    closed under it to be meaningful."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    o.setup_category,
+                    COUNT(*) AS closed_trades,
+                    SUM(CASE WHEN o.was_correct THEN 1 ELSE 0 END) AS wins,
+                    AVG(o.alpha_pct) AS avg_alpha_pct,
+                    SUM((pa.risk_json->>'initial_dollar')::DECIMAL * o.outcome_pct) AS dollar_pnl,
+                    SUM((pa.risk_json->>'initial_dollar')::DECIMAL) AS dollar_deployed
+                FROM trade_outcomes o
+                JOIN pending_approvals pa ON pa.id = o.approval_id
+                WHERE o.outcome_pct IS NOT NULL
+                  AND pa.risk_json ? 'initial_dollar'
+                  AND o.trading_env = %s
+                  AND o.setup_category IS NOT NULL
+                GROUP BY o.setup_category
+                ORDER BY dollar_pnl DESC NULLS LAST
+                """,
+                (TRADING_ENV,),
+            )
+            rows = cur.fetchall()
+        return [
+            {
+                "setup_category": r[0], "closed_trades": r[1], "wins": r[2],
+                "win_rate": round(r[2] / r[1], 3) if r[1] else None,
+                "avg_alpha_pct": float(r[3]) if r[3] is not None else None,
+                "dollar_pnl": round(float(r[4]), 2) if r[4] is not None else 0.0,
+                "dollar_deployed": round(float(r[5]), 2) if r[5] is not None else 0.0,
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        logging.error(f"get_category_attribution failed: {e}")
+        return []
+    finally:
+        _put_conn(conn)
+
+
+def get_portfolio_heat() -> dict:
+    """Total remaining dollar risk across every open position, as a % of
+    equity -- NOT position count, NOT capital deployed. A position whose
+    trailing stop has moved to/above breakeven contributes zero heat (it
+    can no longer lose money, only give back profit), so this differs
+    materially from a simple 'positions held' count. Single source of
+    truth for the dashboard/digest/Telegram, which must never each
+    independently recompute this and risk showing three different numbers.
+    Equity is passed in by the caller (risk_manager already knows it from
+    the broker) rather than fetched here, keeping this a pure DB+math
+    function with no broker dependency of its own.
+    """
+    stops = get_all_position_stops()
+    by_category: dict[str, float] = {}
+    total_heat_dollars = 0.0
+    for s in stops:
+        entry, stop = s.get("entry_price"), s.get("stop_price")
+        if entry is None or stop is None:
+            continue
+        # qty isn't stored on position_stops -- caller must multiply by
+        # live share count if per-position dollar heat (not just the
+        # per-share risk) is needed; get_portfolio_heat_pct(equity, positions)
+        # below does that using broker-supplied quantities.
+        per_share_risk = max(0.0, float(entry) - float(stop))
+        cat = s.get("setup_category") or s.get("thesis_bucket") or "Unclassified"
+        by_category[cat] = by_category.get(cat, 0.0) + per_share_risk
+    return {"per_share_risk_by_category": by_category, "stops": stops}
+
+
+def get_portfolio_heat_pct(equity: float, positions: dict[str, dict]) -> dict:
+    """
+    positions: {ticker: {"qty": float, ...}} from the broker (ibkr.py's
+    get_all_positions), joined here against position_stops' entry/stop to
+    get real dollar heat per position, not just per-share.
+    Returns {"heat_pct": float, "heat_dollars": float,
+             "by_category": {category: heat_dollars}, "positions": [...]}.
+    """
+    stops = get_all_position_stops()
+    by_category: dict[str, float] = {}
+    detail = []
+    total = 0.0
+    for s in stops:
+        ticker = s["ticker"]
+        pos = positions.get(ticker)
+        entry, stop = s.get("entry_price"), s.get("stop_price")
+        if not pos or entry is None or stop is None:
+            continue
+        qty = abs(float(pos.get("qty", 0)))
+        per_share_risk = max(0.0, float(entry) - float(stop))
+        dollar_risk = per_share_risk * qty
+        cat = s.get("setup_category") or s.get("thesis_bucket") or "Unclassified"
+        by_category[cat] = by_category.get(cat, 0.0) + dollar_risk
+        total += dollar_risk
+        detail.append({"ticker": ticker, "category": cat, "heat_dollars": round(dollar_risk, 2)})
+    return {
+        "heat_pct": round(total / equity, 4) if equity else 0.0,
+        "heat_dollars": round(total, 2),
+        "by_category": {k: round(v, 2) for k, v in by_category.items()},
+        "positions": detail,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Earnings calendar
 # ---------------------------------------------------------------------------
@@ -2473,6 +3319,9 @@ def log_scanner_candidate(
     catalyst_detail: str,
     passed_to_analyst: bool,
     regime_at_scan: str,
+    setup_category: str | None = None,
+    setup_triggered: bool | None = None,
+    setup_gates_detail: dict | None = None,
 ) -> None:
     conn = _get_conn()
     try:
@@ -2481,12 +3330,13 @@ def log_scanner_candidate(
                 "INSERT INTO scanner_candidates "
                 "(ticker, scan_type, composite_score, technical_score, momentum_score, "
                 "catalyst_score, thesis_alignment_score, priority, catalyst_detail, "
-                "passed_to_analyst, regime_at_scan) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                "passed_to_analyst, regime_at_scan, setup_category, setup_triggered, setup_gates_detail) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (
                     ticker, scan_type, composite_score, technical_score, momentum_score,
                     catalyst_score, thesis_alignment_score, priority, catalyst_detail,
-                    passed_to_analyst, regime_at_scan,
+                    passed_to_analyst, regime_at_scan, setup_category, setup_triggered,
+                    psycopg2.extras.Json(setup_gates_detail) if setup_gates_detail is not None else None,
                 ),
             )
         conn.commit()

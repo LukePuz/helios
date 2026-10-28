@@ -210,6 +210,7 @@ class TestMarketHoursGate:
              patch("market_data.get_priced_quote", return_value=None), \
              patch("market_data.is_market_hours", return_value=False), \
              patch("db.log_trade"), patch("db.log_order"), patch("db.delete_position_stop"), \
+             patch("db.log_trade_outcome"), patch("db.close_trade_outcome"), \
              patch("alerts._send"):
             mock_client.return_value.get_open_position.return_value = MagicMock(qty=100)
             mock_order.return_value = {"order_id": 56, "fill_price": 100.0, "filled_qty": 100.0}

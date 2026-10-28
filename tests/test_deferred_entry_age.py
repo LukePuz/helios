@@ -18,7 +18,7 @@ def test_stale_approval_is_expired_and_reanalysed():
          patch("tasks.deep_analyze_event.apply_async") as analyse:
         tasks.retry_deferred_entry.run(7)
     execute.assert_not_called()
-    status.assert_called_once_with(7, "EXPIRED")
+    assert status.call_args.args == (7, "EXPIRED") and "60h old" in status.call_args.kwargs["reason"]
     event = analyse.call_args.kwargs["args"][0]
     assert event["ticker"] == "SNOW" and event["source"] == "stale_entry_recheck"
 

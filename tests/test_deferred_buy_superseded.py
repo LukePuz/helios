@@ -24,7 +24,7 @@ def _run(approval, newer_approval=False, latest=None):
 def test_newer_buy_approval_drops_the_older_one():
     status, execute = _run(_approval(), newer_approval=True)
     execute.assert_not_called()
-    status.assert_called_once_with(7, "EXPIRED")
+    assert status.call_args.args == (7, "EXPIRED") and status.call_args.kwargs["reason"].startswith("superseded: ")
 
 
 def test_newer_contrary_verdict_drops_the_buy():
@@ -32,7 +32,7 @@ def test_newer_contrary_verdict_drops_the_buy():
               "timestamp": datetime.now(timezone.utc) - timedelta(hours=1)}
     status, execute = _run(_approval("ADD"), latest=latest)
     execute.assert_not_called()
-    status.assert_called_once_with(7, "EXPIRED")
+    assert status.call_args.args == (7, "EXPIRED") and status.call_args.kwargs["reason"].startswith("superseded: ")
 
 
 def test_older_contrary_verdict_does_not_drop_it():

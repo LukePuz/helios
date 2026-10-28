@@ -781,7 +781,9 @@ def retry_deferred_entry(self, approval_id: int, gap_retry_attempt: int = 1, pri
     # Monday's open on 60-hour-old reasoning, guarded only by price drift.
     age_h = _approval_age_hours(approval)
     if age_h is not None and age_h > DEFERRED_ENTRY_MAX_AGE_HOURS:
-        db.update_approval_status(approval_id, "EXPIRED")
+        db.update_approval_status(approval_id, "EXPIRED",
+                                  reason=f"deferred entry {age_h:.0f}h old "
+                                         f"(> {DEFERRED_ENTRY_MAX_AGE_HOURS}h), re-analysed")
         log.info(f"retry_deferred_entry: [{ticker}] approval #{approval_id} is {age_h:.0f}h old "
                  f"(> {DEFERRED_ENTRY_MAX_AGE_HOURS}h) — expired, queued a fresh analysis")
         deep_analyze_event.apply_async(args=[{
@@ -796,7 +798,7 @@ def retry_deferred_entry(self, approval_id: int, gap_retry_attempt: int = 1, pri
     # drop it when newer information contradicts it (audit 10-28 10:53 #2).
     reason = _deferred_buy_superseded(approval)
     if reason:
-        db.update_approval_status(approval_id, "EXPIRED")
+        db.update_approval_status(approval_id, "EXPIRED", reason=f"superseded: {reason}")
         log.info(f"retry_deferred_entry: [{ticker}] approval #{approval_id} dropped: {reason}")
         return
 

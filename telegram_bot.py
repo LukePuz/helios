@@ -214,7 +214,7 @@ def _handle_callback(update: dict) -> None:
         # Check expiry before executing
         expires_at = approval.get("expires_at")
         if expires_at and datetime.now(timezone.utc) > expires_at:
-            db.update_approval_status(approval_id, "EXPIRED")
+            db.update_approval_status(approval_id, "EXPIRED", reason="past expires_at (tap)")
             _answer_callback(cq_id, "This recommendation has expired (>6 hours old).")
             if msg_id:
                 ticker_exp = approval.get("ticker", "")

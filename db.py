@@ -687,6 +687,9 @@ _MIGRATIONS: list[tuple[int, str]] = [
     # can be replayed. Kept out of `decision` because the brief contains
     # portfolio values: research exports must not copy this column.
     (56, "ALTER TABLE signals ADD COLUMN IF NOT EXISTS prompt TEXT;"),
+    # Why an approval ended in its status (SEF ask, 2026-10-28): EXPIRED has
+    # several causes (age, superseded, past expires_at). NULL before migration.
+    (57, "ALTER TABLE pending_approvals ADD COLUMN IF NOT EXISTS status_reason TEXT;"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -1158,15 +1161,25 @@ def update_approval_status(
     approval_id: int,
     status: str,
     telegram_message_id: int | None = None,
+    reason: str | None = None,
 ) -> None:
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE pending_approvals SET status=%s, decided_at=NOW(), telegram_message_id=%s "
-                "WHERE id=%s",
-                (status, telegram_message_id, approval_id),
-            )
+            if reason is None:
+                # Leaves status_reason alone, so a process started before
+                # migration 57 ran can still update statuses.
+                cur.execute(
+                    "UPDATE pending_approvals SET status=%s, decided_at=NOW(), telegram_message_id=%s "
+                    "WHERE id=%s",
+                    (status, telegram_message_id, approval_id),
+                )
+            else:
+                cur.execute(
+                    "UPDATE pending_approvals SET status=%s, decided_at=NOW(), telegram_message_id=%s, "
+                    "status_reason=%s WHERE id=%s",
+                    (status, telegram_message_id, reason, approval_id),
+                )
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -1338,7 +1351,8 @@ def expire_stale_approvals() -> int:
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE pending_approvals SET status='EXPIRED', decided_at=NOW() "
+                "UPDATE pending_approvals SET status='EXPIRED', decided_at=NOW(), "
+                "status_reason='past expires_at' "
                 "WHERE status='PENDING' AND expires_at IS NOT NULL AND expires_at < NOW()"
             )
             count = cur.rowcount

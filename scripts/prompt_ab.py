@@ -66,8 +66,10 @@ def main():
     conn = db._get_conn()
     try:
         with conn.cursor() as cur:
+            # Same environment only (professor C13, 2026-10-28).
             cur.execute("SELECT symbol, prompt FROM signals WHERE prompt IS NOT NULL "
-                        "ORDER BY timestamp DESC LIMIT %s", (args.n,))
+                        "AND trading_env=%s ORDER BY timestamp DESC LIMIT %s",
+                        (db.TRADING_ENV, args.n))
             rows = cur.fetchall()
     finally:
         db._put_conn(conn)

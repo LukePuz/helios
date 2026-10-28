@@ -176,16 +176,15 @@ class _HTMLTextExtractor(HTMLParser):
         return re.sub(r"[ \t]+", " ", "\n".join(self._chunks))
 
 
-def _find_primary_filing_doc(index_url: str) -> str | None:
+def _filing_documents(index_url: str) -> list[tuple[str, str]]:
     """
-    Given a filing's -index.htm page, finds the primary document (the
-    actual 8-K/10-Q/10-K body, not the index page itself — that used to be
-    what got fetched and truncated to 3000 chars downstream, so the LLM
-    mostly saw index-page nav/header boilerplate instead of filing content).
+    Given a filing's -index.htm page, returns [(doc_type, url)] for the .htm
+    documents in SEC's "Document Format Files" table, primary document first
+    (Seq=1). Fetching the index page itself used to be what got truncated to
+    3000 chars downstream, so the LLM mostly saw nav boilerplate.
 
-    SEC's "Document Format Files" table lists the primary document first
-    (Seq=1); its href is often prefixed with "/ix?doc=" (the inline-XBRL
-    viewer route, an HTML wrapper around the same document) — the actual
+    The primary href is often prefixed with "/ix?doc=" (the inline-XBRL
+    viewer route, an HTML wrapper around the same document) -- the actual
     document lives at that same path with the prefix stripped, same pattern
     as insider.py's xslF345Xnn/ viewer-path handling for Form 4 XML.
     """
@@ -194,41 +193,90 @@ def _find_primary_filing_doc(index_url: str) -> str | None:
         resp.raise_for_status()
     except Exception as e:
         log.debug(f"Could not fetch filing index {index_url}: {e}")
-        return None
+        return []
 
     table_match = re.search(r'tableFile.*?</table>', resp.text, flags=re.IGNORECASE | re.DOTALL)
     if not table_match:
-        return None
-    hrefs = re.findall(r'href="([^"]+\.htm[^"]*)"', table_match.group(), flags=re.IGNORECASE)
-    if not hrefs:
-        return None
+        return []
+    docs = []
+    for row in re.findall(r"<tr.*?</tr>", table_match.group(), flags=re.IGNORECASE | re.DOTALL):
+        href = re.search(r'href="([^"]+\.htm[^"]*)"', row, flags=re.IGNORECASE)
+        if not href:
+            continue
+        cells = [re.sub(r"<[^>]+>", "", c).replace("&nbsp;", " ").strip()
+                 for c in re.findall(r"<td[^>]*>(.*?)</td>", row, flags=re.IGNORECASE | re.DOTALL)]
+        doc_type = cells[3] if len(cells) >= 4 else ""
+        url = re.sub(r"^/ix\?doc=", "", href.group(1))
+        docs.append((doc_type, url if url.startswith("http") else f"{EDGAR_DOC}{url}"))
+    return docs
 
-    href = re.sub(r"^/ix\?doc=", "", hrefs[0])
-    return href if href.startswith("http") else f"{EDGAR_DOC}{href}"
 
-
-def _fetch_filing_text(filing_url: str) -> str:
-    """Downloads and cleans the actual text of a filing from SEC EDGAR.
-    filing_url is the -index.htm page from the atom feed; this resolves it
-    to the primary document and strips HTML to prose."""
-    primary_doc = _find_primary_filing_doc(filing_url)
-    if not primary_doc:
-        log.debug(f"No primary document found for {filing_url}")
-        return ""
+def _html_to_text(url: str) -> str:
     try:
-        resp = requests.get(primary_doc, headers=HEADERS, timeout=15)
+        resp = requests.get(url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
     except Exception as e:
-        log.warning(f"Failed to fetch filing text from {primary_doc}: {e}")
+        log.warning(f"Failed to fetch filing text from {url}: {e}")
         return ""
-
     parser = _HTMLTextExtractor()
     try:
         parser.feed(resp.text)
     except Exception as e:
-        log.debug(f"HTML parse failed for {primary_doc}, using raw text: {e}")
+        log.debug(f"HTML parse failed for {url}, using raw text: {e}")
         return resp.text[:50_000]
-    return parser.text()[:50_000]  # cap at 50k chars to stay within model context
+    return parser.text()
+
+
+# 8-K item numbers worth naming in the excerpt header. The screener sees only
+# the first 500 chars, so the header has to say what kind of event this is.
+_8K_ITEMS = {
+    "1.01": "material agreement", "1.02": "agreement terminated",
+    "2.01": "acquisition or disposition", "2.02": "results of operations",
+    "2.03": "new financial obligation", "2.05": "exit or restructuring costs",
+    "2.06": "impairment", "3.01": "delisting notice", "4.02": "non-reliance on financials",
+    "5.02": "officer or director change", "7.01": "Reg FD disclosure",
+    "8.01": "other events", "9.01": "exhibits",
+}
+
+
+def _skip_cover(text: str, form: str) -> str:
+    """Drops the SEC cover page (registrant name, address, check boxes),
+    which used to fill the screener's 500 chars and the analyst's excerpt:
+    on 10-27 every 8-K and 10-Q was screened out as "no specific new factual
+    information" (limitations audit 2026-10-28 05:00, finding 2)."""
+    if form.upper().startswith("8-K"):
+        m = re.search(r"Item\s+\d\.\d{2}", text)
+        return text[m.start():] if m else text
+    if form.upper() in ("10-Q", "10-K"):
+        # The first hit is the table of contents; the second is the section.
+        hits = [m.start() for m in re.finditer(r"Management.s Discussion and Analysis", text, re.IGNORECASE)]
+        return text[hits[1]:] if len(hits) >= 2 else text
+    return text
+
+
+def _fetch_filing_text(filing_url: str, form: str = "") -> str:
+    """Downloads and cleans a filing from SEC EDGAR. filing_url is the
+    -index.htm page from the atom feed. For an 8-K the text starts with the
+    item numbers and the EX-99 exhibits (the press release is where the news
+    is; the 8-K body often just says "see Exhibit 99.1"), then the body with
+    the cover page removed."""
+    docs = _filing_documents(filing_url)
+    if not docs:
+        log.debug(f"No primary document found for {filing_url}")
+        return ""
+    body = _skip_cover(_html_to_text(docs[0][1]), form)
+    parts = []
+    if form.upper().startswith("8-K"):
+        items = sorted(set(re.findall(r"Item\s+(\d\.\d{2})", body)))
+        if items:
+            parts.append("8-K items: " + ", ".join(
+                f"{i} ({_8K_ITEMS[i]})" if i in _8K_ITEMS else i for i in items))
+        for doc_type, url in [d for d in docs[1:] if d[0].upper().startswith("EX-99")][:2]:
+            exhibit = _html_to_text(url)
+            if exhibit:
+                parts.append(f"{doc_type}:\n{exhibit[:20_000]}")
+    parts.append(("Filing body:\n" if parts else "") + body)
+    return "\n\n".join(parts)[:50_000]  # cap at 50k chars to stay within model context
 
 
 def _get_recent_filings(ticker: str, cik: str, form: str) -> list[dict]:
@@ -280,12 +328,16 @@ def _get_recent_filings(ticker: str, cik: str, form: str) -> list[dict]:
             # failure would otherwise see this filing as already-seen and
             # silently drop it forever. tasks.poll_edgar marks it seen only
             # after successfully dispatching it (see _seen_key/_SOURCE).
-            text = _fetch_filing_text(url) if url else ""
+            text = _fetch_filing_text(url, form) if url else ""
 
             filings.append({
                 "ticker":    ticker,
                 "cik":       cik,
                 "form":      form,
+                # Without a source the screener logged "?", the brief said
+                # "Triggering Event: UNKNOWN" and memory filed it as news.
+                "source":    "sec_form4" if form == "4" else "sec_filing",
+                "type":      f"Form {form}" if form == "4" else form,
                 "title":     title,
                 "url":       url,
                 "timestamp": updated,

@@ -36,6 +36,7 @@ ANALYST_MODEL = os.getenv("ANALYST_MODEL",  "qwen2.5:72b")
 # qwen2.5 3b/7b/72b all support this context length natively — raised from
 # the previous 8192, which risked silent truncation once briefs got large.
 _NUM_CTX = 32768
+_BRIEF_MAX_CHARS = 24_000  # ~6k tokens; the token-budget guard handles the rest
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +186,13 @@ def _build_prompt(
     # trims further if the assembled prompt still doesn't fit.
     thesis_excerpt      = thesis_text[:6000]
     philosophy_excerpt  = philosophy_text[:2000]
-    brief_text          = situation_brief[:8000] if situation_brief else "No additional context available."
+    # Was a silent 8,000-char cut that dropped the brief's later sections
+    # (fundamentals, memory) before the token guard below ever ran (limitations
+    # audit 2026-10-27, finding 12). The guard trims by priority and logs it.
+    if situation_brief and len(situation_brief) > _BRIEF_MAX_CHARS:
+        log.warning(f"[{ticker}] Situation brief {len(situation_brief):,} chars, cut to {_BRIEF_MAX_CHARS:,}")
+    brief_text          = situation_brief[:_BRIEF_MAX_CHARS] if situation_brief else "No additional context available."
+    log.info(f"[{ticker}] Situation brief: {len(situation_brief or ''):,} chars")
     track_record        = _build_track_record_text()
 
     def _render() -> str:

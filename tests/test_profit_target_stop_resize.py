@@ -70,3 +70,15 @@ def test_alert_when_the_new_stop_cannot_be_placed():
 
     assert result == {"filled_qty": 30}
     assert "UNPROTECTED" in send.call_args[0][0]
+
+
+def test_unconfirmed_fill_is_not_treated_as_a_sale():
+    with patch("db.get_position_stop", return_value={"stop_price": 90.0}), \
+         patch("tasks.manage_cancel_stop_orders_for"), \
+         patch("ibkr.place_market_order", return_value={"order_id": 7, "filled_qty": 0}), \
+         patch("tasks.manage_stop_place") as place, \
+         patch("alerts._send") as send:
+        result = _rm()._partial_sell_and_resize_stop("NVDA", 100, 30, 100.0)
+    assert result is None
+    place.assert_not_called()
+    assert "UNCONFIRMED" in send.call_args[0][0]

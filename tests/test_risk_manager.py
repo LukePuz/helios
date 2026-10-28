@@ -492,7 +492,7 @@ class TestCheckProfitTargets:
              patch("agents.market_regime.get_trade_style_for_ticker", return_value=None), \
              patch("db.get_all_position_stops", return_value=stops), \
              patch("db.mark_profit_target_taken") as mock_mark, \
-             patch("ibkr.place_market_order", return_value={"order_id": 1}) as mock_order:
+             patch("ibkr.place_market_order", return_value={"order_id": 1, "filled_qty": 1}) as mock_order:
             result = rm.check_profit_targets()
 
         assert len(result) == 1
@@ -531,7 +531,7 @@ class TestCheckProfitTargets:
              patch("agents.market_regime.get_trade_style_for_ticker", return_value=None), \
              patch("db.get_all_position_stops", return_value=stops), \
              patch("db.mark_profit_target_taken"), \
-             patch("ibkr.place_market_order", return_value={"order_id": 1}) as mock_order:
+             patch("ibkr.place_market_order", return_value={"order_id": 1, "filled_qty": 1}) as mock_order:
             result = rm.check_profit_targets()
         assert len(result) == 1
         # Choppy/Distribution partial-sell fraction is 0.45 -> 45 shares
@@ -573,7 +573,7 @@ class TestCheckProfitTargets:
              patch("agents.market_regime.get_trade_style_for_ticker", return_value=None), \
              patch("db.get_all_position_stops", return_value=stops), \
              patch("db.mark_profit_target_taken"), \
-             patch("ibkr.place_market_order", return_value={"order_id": 1}) as mock_order:
+             patch("ibkr.place_market_order", return_value={"order_id": 1, "filled_qty": 1}) as mock_order:
             result = rm.check_profit_targets()
         # 18% gain clears Choppy/Distribution's ~12.5% Accelerator target
         assert len(result) == 1
@@ -689,7 +689,7 @@ class TestSectorAwareTradeStyle:
              patch("agents.market_regime.get_trade_style_for_ticker", return_value="Choppy/Distribution"), \
              patch("db.get_all_position_stops", return_value=stops), \
              patch("db.mark_profit_target_taken"), \
-             patch("ibkr.place_market_order", return_value={"order_id": 1}) as mock_order:
+             patch("ibkr.place_market_order", return_value={"order_id": 1, "filled_qty": 1}) as mock_order:
             result = rm.check_profit_targets()
         assert len(result) == 1
         assert result[0]["trade_style"] == "Choppy/Distribution"
@@ -707,7 +707,7 @@ class TestSectorAwareTradeStyle:
              patch("agents.market_regime.get_trade_style_for_ticker", return_value=None), \
              patch("db.get_all_position_stops", return_value=stops), \
              patch("db.mark_profit_target_taken"), \
-             patch("ibkr.place_market_order", return_value={"order_id": 1}) as mock_order:
+             patch("ibkr.place_market_order", return_value={"order_id": 1, "filled_qty": 1}) as mock_order:
             result = rm.check_profit_targets()
         assert len(result) == 1
         assert result[0]["trade_style"] == "Trending/Expanding"
@@ -736,7 +736,7 @@ class TestSectorAwareTradeStyle:
              patch("agents.market_regime.get_trade_style_for_ticker", side_effect=fake_sector_style), \
              patch("db.get_all_position_stops", return_value=stops), \
              patch("db.mark_profit_target_taken"), \
-             patch("ibkr.place_market_order", return_value={"order_id": 1}) as mock_order:
+             patch("ibkr.place_market_order", return_value={"order_id": 1, "filled_qty": 1}) as mock_order:
             result = rm.check_profit_targets()
 
         # UNH (Choppy, ~12.5% target) hits at 18% gain; NVDA (Trending,

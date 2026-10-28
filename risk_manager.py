@@ -1361,6 +1361,17 @@ class RiskManager:
                     )
             return None
 
+        if float(order_result.get("filled_qty") or 0) <= 0:
+            # Not restored automatically: a late fill plus a full-size stop
+            # could short. Not marked taken, so the target can fire again.
+            log.error(f"[{ticker}] Profit-target sale not confirmed filled: {order_result}")
+            alerts._send(
+                f"⚠️ PROFIT-TARGET SALE UNCONFIRMED — {ticker}\n"
+                f"SELL {sell_qty} submitted but no fill confirmed. The broker stop was "
+                f"cancelled and NOT re-placed. Check the position in TWS."
+            )
+            return None
+
         try:
             remaining = round(abs(float(ibkr.get_client().get_open_position(ticker).qty)), 4)
         except Exception:
@@ -1492,8 +1503,10 @@ class RiskManager:
                 continue
 
             qty = abs(float(pos.qty))
-            sell_qty = round(qty * partial_pct, 4)
+            sell_qty = int(qty * partial_pct)  # whole shares; IBKR rejects fractional orders
             if sell_qty <= 0:
+                log.debug(f"[{ticker}] Profit target hit but {qty:g} shares x {partial_pct:.0%} "
+                          f"is under one share — no partial sale")
                 continue
 
             new_stop = entry  # breakeven on the remainder
@@ -1579,7 +1592,7 @@ class RiskManager:
             return False
 
         qty = abs(float(pos.qty))
-        sell_qty = round(qty * partial_pct, 4)
+        sell_qty = int(qty * partial_pct)  # whole shares; IBKR rejects fractional orders
         if sell_qty <= 0:
             return False
 

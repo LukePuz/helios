@@ -35,6 +35,7 @@ def _analyze(udr, regime="Risk-On"):
         analyze({"ticker": "MSFT", "role": "Compounder", "tier": "Core", "sector": "Software",
                  "held": False}, situation_brief="brief",
                 regime_packet={"regime": regime, "score": 70, "reasoning": ""})
+    assert "brief" in (log_signal.call_args.kwargs["prompt"] or "")
     return log_signal.call_args.kwargs["decision"]
 
 

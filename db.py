@@ -683,6 +683,10 @@ _MIGRATIONS: list[tuple[int, str]] = [
     # Per-verdict decision record: the model's raw action/conviction, each
     # gate that changed it, and the full model JSON (roadmap 0e #8).
     (55, "ALTER TABLE signals ADD COLUMN IF NOT EXISTS decision JSONB;"),
+    # Full rendered analyst prompt per verdict (professor M7), so a decision
+    # can be replayed. Kept out of `decision` because the brief contains
+    # portfolio values: research exports must not copy this column.
+    (56, "ALTER TABLE signals ADD COLUMN IF NOT EXISTS prompt TEXT;"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -744,21 +748,22 @@ def log_trade(symbol: str, side: str, quantity: int, price: float, reason: str) 
 
 def log_signal(symbol: str, signal: str, confidence: float, reasoning: str,
                model: str | None = None, provenance: dict | None = None,
-               decision: dict | None = None) -> None:
+               decision: dict | None = None, prompt: str | None = None) -> None:
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO signals (symbol, signal, confidence, reasoning, trading_env, model, "
-                "provenance, decision) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                "provenance, decision, prompt) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (symbol, signal, confidence, reasoning, TRADING_ENV, model,
                  psycopg2.extras.Json(provenance) if provenance is not None else None,
                  psycopg2.extras.Json(decision, dumps=lambda o: json.dumps(o, default=str))
-                 if decision is not None else None),
+                 if decision is not None else None,
+                 prompt),
             )
         conn.commit()
     except psycopg2.errors.UndefinedColumn:
-        # Migrations 51-55 not applied yet (they run in init_db at stack
+        # Migrations 51-56 not applied yet (they run in init_db at stack
         # start); keep the verdict rather than lose it.
         conn.rollback()
         try:

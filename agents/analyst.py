@@ -1102,6 +1102,7 @@ def analyze(
                 "final_pass_to_risk": bool(parsed.get("pass_to_risk", False)),
                 "gates": gates, "model_output": model_output,
             },
+            prompt=prompt,
         )
     except Exception as e:
         log.warning(f"[{ticker}] Signal log failed: {e}")

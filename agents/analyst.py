@@ -1044,6 +1044,7 @@ def analyze(
         if sell_note:
             parsed["reasoning"] = parsed.get("reasoning", "") + f" [{sell_note}]"
 
+    provenance = _provenance(prompt)
     try:
         import db
         db.log_signal(
@@ -1051,6 +1052,8 @@ def analyze(
             signal=action,
             confidence=conviction / 10.0,
             reasoning=parsed.get("reasoning", "")[:500],
+            model=ANALYST_MODEL,
+            provenance=provenance,
         )
     except Exception as e:
         log.debug(f"[{ticker}] Signal log failed: {e}")
@@ -1092,7 +1095,7 @@ def analyze(
         "pass_to_risk": bool(parsed.get("pass_to_risk", False)),
         "reasoning": parsed.get("reasoning", ""),
         "model_used": ANALYST_MODEL,
-        "provenance": _provenance(prompt),
+        "provenance": provenance,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 

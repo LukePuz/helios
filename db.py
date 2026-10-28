@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import psycopg2
+import psycopg2.errors
 import psycopg2.extras
 import psycopg2.pool
 from dotenv import load_dotenv
@@ -670,6 +671,15 @@ _MIGRATIONS: list[tuple[int, str]] = [
     # it got" were indistinguishable after the fact. This closes that --
     # can't backfill the two days already run before this column existed.
     (50, "ALTER TABLE scanner_candidates ADD COLUMN IF NOT EXISTS setup_gates_detail JSONB;"),
+    # signals is the only record of every analyst verdict (WATCH/HOLD and
+    # rejected calls never reach pending_approvals), but it had no account,
+    # model or provenance (professor M19, 2026-10-28). Old rows stay NULL.
+    (51, "ALTER TABLE signals ADD COLUMN IF NOT EXISTS trading_env VARCHAR(10);"),
+    (52, "ALTER TABLE signals ADD COLUMN IF NOT EXISTS model VARCHAR(80);"),
+    (53, "ALTER TABLE signals ADD COLUMN IF NOT EXISTS provenance JSONB;"),
+    # Rows whose catalyst fields were filled after entry by
+    # backfill_catalyst_outcome (professor C6 residual, 2026-10-28).
+    (54, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS catalyst_backfilled BOOLEAN DEFAULT FALSE;"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -729,15 +739,32 @@ def log_trade(symbol: str, side: str, quantity: int, price: float, reason: str) 
         _put_conn(conn)
 
 
-def log_signal(symbol: str, signal: str, confidence: float, reasoning: str) -> None:
+def log_signal(symbol: str, signal: str, confidence: float, reasoning: str,
+               model: str | None = None, provenance: dict | None = None) -> None:
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO signals (symbol, signal, confidence, reasoning) VALUES (%s,%s,%s,%s)",
-                (symbol, signal, confidence, reasoning),
+                "INSERT INTO signals (symbol, signal, confidence, reasoning, trading_env, model, provenance) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                (symbol, signal, confidence, reasoning, TRADING_ENV, model,
+                 psycopg2.extras.Json(provenance) if provenance is not None else None),
             )
         conn.commit()
+    except psycopg2.errors.UndefinedColumn:
+        # Migrations 51-53 not applied yet (they run in init_db at stack
+        # start); keep the verdict rather than lose it.
+        conn.rollback()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO signals (symbol, signal, confidence, reasoning) VALUES (%s,%s,%s,%s)",
+                    (symbol, signal, confidence, reasoning),
+                )
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"log_signal failed: {e}")
     except Exception as e:
         conn.rollback()
         logging.error(f"log_signal failed: {e}")
@@ -2760,7 +2787,7 @@ def backfill_catalyst_outcome(
                     "UPDATE trade_outcomes SET catalyst_event=%s, catalyst_date=%s, "
                     "catalyst_is_priced_in=%s, expected_return_pct=%s, expected_downside_pct=%s, "
                     "thesis_summary=%s, sources_json=%s, source_count=%s, "
-                    "weeks_to_catalyst=%s, expected_return_per_week=%s, "
+                    "weeks_to_catalyst=%s, expected_return_per_week=%s, catalyst_backfilled=TRUE, "
                     "notes=CONCAT_WS('; ', notes, %s) "
                     "WHERE id=%s AND catalyst_event IS NULL AND expected_return_pct IS NULL "
                     "AND thesis_summary IS NULL",

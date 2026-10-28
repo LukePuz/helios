@@ -659,3 +659,16 @@ def test_backfill_never_overwrites_an_entry_time_snapshot():
                                      False, 10.0, -5.0, "thesis", [], 0)
     sql = cur.execute.call_args_list[-1][0][0]
     assert "catalyst_event IS NULL" in sql and "notes=CONCAT_WS" in sql
+
+
+def test_log_signal_writes_env_model_and_provenance():
+    """Professor M19: signals carries trading_env, model and provenance."""
+    import db
+    cur = MagicMock()
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
+        db.log_signal("NVDA", "HOLD", 0.5, "r", model="m", provenance={"code_sha": "x"})
+    sql, params = cur.execute.call_args[0]
+    assert "trading_env, model, provenance" in sql
+    assert params[4] == db.TRADING_ENV and params[5] == "m"

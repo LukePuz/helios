@@ -47,3 +47,33 @@ def _static_provenance(monkeypatch):
     monkeypatch.setattr(analyst, "_PROVENANCE_STATIC",
                         {"code_sha": "test", "model": "test", "model_digest": None,
                          "prompt_template_sha": "test"})
+
+
+class _FakeLock:
+    """In-process stand-in for a redis-py Lock: tests never touch the live
+    Redis, where a test ticker's lock could block the running bot."""
+    held: set = set()
+
+    def __init__(self, name, **_):
+        self.name = name
+
+    def acquire(self):
+        if self.name in _FakeLock.held:
+            return False
+        _FakeLock.held.add(self.name)
+        return True
+
+    def release(self):
+        _FakeLock.held.discard(self.name)
+
+
+class _FakeRedis:
+    def lock(self, name, **kw):
+        return _FakeLock(name, **kw)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_redis(monkeypatch):
+    import stop_lock
+    _FakeLock.held = set()
+    monkeypatch.setattr(stop_lock, "_redis", lambda: _FakeRedis())

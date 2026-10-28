@@ -18,6 +18,7 @@ from celery import Celery
 from celery.schedules import crontab
 
 import log_redaction
+from stop_lock import locked_by_ticker, ticker_lock
 
 log_redaction.install()  # bot token / account id out of every worker log
 from dotenv import load_dotenv
@@ -980,7 +981,8 @@ def reconcile_unconfirmed_orders(self):
             stop_price = approval.get("stop_loss_price") or risk_json.get("stop_loss_price")
             if stop_price:
                 try:
-                    stop_result = manage_stop_place(ticker, fill_qty, float(stop_price))
+                    with ticker_lock(ticker):
+                        stop_result = manage_stop_place(ticker, fill_qty, float(stop_price))
                     db.upsert_position_stop(
                         ticker=ticker, entry_price=fill_price, stop_price=float(stop_price),
                         stop_method=risk_json.get("stop_method", ""),
@@ -1016,6 +1018,7 @@ def reconcile_unconfirmed_orders(self):
             pass
 
 
+@locked_by_ticker(lambda ticker, *a, **k: ticker, on_busy=False)
 def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
                                fill_price: float | None = None) -> bool | None:
     """After a late SELL fill, finish what the selling path would have done
@@ -1321,6 +1324,7 @@ def _schedule_backstop_retry(ticker: str, alert: dict) -> None:
         log.error(f"[{ticker}] Could not schedule backstop-sell retry: {e}")
 
 
+@locked_by_ticker(lambda ticker, *a, **k: ticker, on_busy=False)
 def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) -> bool:
     """Market-sell the full position when its stop level is breached and no
     protective stop exists at the broker. This monitor is the last line of

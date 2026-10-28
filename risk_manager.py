@@ -11,6 +11,8 @@ Maintains backward-compatible interface for any modules still calling
 shares_affordable() and check_sell_allowed().
 """
 import logging
+
+from stop_lock import TickerBusy, locked_by_ticker, ticker_lock
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1303,62 +1305,68 @@ class RiskManager:
                         continue
 
                     try:
-                        import tasks
-                        qty = round(abs(float(pos.qty)), 4)
-                        tasks.manage_cancel_stop_orders_for(ticker)
-                        if trail_amount is not None:
-                            result = tasks.manage_place_trailing_stop(ticker, qty, trail_amount=trail_amount)
-                        else:
-                            result = tasks.manage_place_trailing_stop(ticker, qty, trail_percent=trail_pct)
-                        db.set_stop_broker_order_id(ticker, result["order_id"])
-                        db.update_trailing_stop(ticker, new_stop, current)
-                        db.set_trail_params(ticker, trail_amount, trail_pct)
-                        log.info(f"[{ticker}] Converted to native TRAIL stop ({method_label}), "
-                                f"orderId={result['order_id']}")
-                    except Exception as e:
-                        log.error(f"[{ticker}] Native TRAIL conversion failed — falling back to "
-                                 f"one-shot cancel/replace: {e}")
-                        prev_high = stop_record.get("trailing_high") or entry
-                        if not (current > prev_high and new_stop > stop_px):
-                            # The stops were already cancelled above: put the
-                            # fixed stop back rather than leave it unprotected
-                            # (professor C16, 2026-10-28).
+                        # One stop change per ticker at a time (stop_lock).
+                        with ticker_lock(ticker):
                             try:
                                 import tasks
                                 qty = round(abs(float(pos.qty)), 4)
-                                result = tasks.manage_stop_place(ticker, qty, float(stop_px))
-                                db.set_stop_broker_order_id(ticker, result["order_id"])
-                                log.info(f"[{ticker}] Fixed stop restored @ ${float(stop_px):.2f} "
-                                         f"after the failed TRAIL conversion")
-                            except Exception as e2:
-                                log.error(f"[{ticker}] Stop restore after TRAIL failure failed: {e2}")
-                                alerts.append({
-                                    "ticker":        ticker,
-                                    "action":        "FIX_STOP",
-                                    "current_price": current,
-                                    "stop_price":    stop_px,
-                                    "reason":        f"TRAIL conversion failed and the ${float(stop_px):.2f} "
-                                                     f"stop could not be restored — place it manually in TWS",
-                                })
-                        elif current > prev_high and new_stop > stop_px:
-                            try:
-                                import tasks
                                 tasks.manage_cancel_stop_orders_for(ticker)
-                                qty = round(abs(float(pos.qty)), 4)
-                                result = tasks.manage_stop_place(ticker, qty, new_stop)
+                                if trail_amount is not None:
+                                    result = tasks.manage_place_trailing_stop(ticker, qty, trail_amount=trail_amount)
+                                else:
+                                    result = tasks.manage_place_trailing_stop(ticker, qty, trail_percent=trail_pct)
                                 db.set_stop_broker_order_id(ticker, result["order_id"])
-                                db.update_trailing_stop(ticker, new_stop, current, native_trail=False)
-                                log.info(f"[{ticker}] Broker stop moved to ${new_stop:.2f} (fallback path)")
-                            except Exception as e2:
-                                log.error(f"[{ticker}] Fallback stop move also failed: {e2}")
-                                alerts.append({
-                                    "ticker":        ticker,
-                                    "action":        "FIX_STOP",
-                                    "current_price": current,
-                                    "stop_price":    new_stop,
-                                    "reason":        f"Trailing stop should be ${new_stop:.2f} but "
-                                                     f"broker order update FAILED — fix manually in TWS",
-                                })
+                                db.update_trailing_stop(ticker, new_stop, current)
+                                db.set_trail_params(ticker, trail_amount, trail_pct)
+                                log.info(f"[{ticker}] Converted to native TRAIL stop ({method_label}), "
+                                        f"orderId={result['order_id']}")
+                            except Exception as e:
+                                log.error(f"[{ticker}] Native TRAIL conversion failed — falling back to "
+                                         f"one-shot cancel/replace: {e}")
+                                prev_high = stop_record.get("trailing_high") or entry
+                                if not (current > prev_high and new_stop > stop_px):
+                                    # The stops were already cancelled above: put the
+                                    # fixed stop back rather than leave it unprotected
+                                    # (professor C16, 2026-10-28).
+                                    try:
+                                        import tasks
+                                        qty = round(abs(float(pos.qty)), 4)
+                                        result = tasks.manage_stop_place(ticker, qty, float(stop_px))
+                                        db.set_stop_broker_order_id(ticker, result["order_id"])
+                                        log.info(f"[{ticker}] Fixed stop restored @ ${float(stop_px):.2f} "
+                                                 f"after the failed TRAIL conversion")
+                                    except Exception as e2:
+                                        log.error(f"[{ticker}] Stop restore after TRAIL failure failed: {e2}")
+                                        alerts.append({
+                                            "ticker":        ticker,
+                                            "action":        "FIX_STOP",
+                                            "current_price": current,
+                                            "stop_price":    stop_px,
+                                            "reason":        f"TRAIL conversion failed and the ${float(stop_px):.2f} "
+                                                             f"stop could not be restored — place it manually in TWS",
+                                        })
+                                elif current > prev_high and new_stop > stop_px:
+                                    try:
+                                        import tasks
+                                        tasks.manage_cancel_stop_orders_for(ticker)
+                                        qty = round(abs(float(pos.qty)), 4)
+                                        result = tasks.manage_stop_place(ticker, qty, new_stop)
+                                        db.set_stop_broker_order_id(ticker, result["order_id"])
+                                        db.update_trailing_stop(ticker, new_stop, current, native_trail=False)
+                                        log.info(f"[{ticker}] Broker stop moved to ${new_stop:.2f} (fallback path)")
+                                    except Exception as e2:
+                                        log.error(f"[{ticker}] Fallback stop move also failed: {e2}")
+                                        alerts.append({
+                                            "ticker":        ticker,
+                                            "action":        "FIX_STOP",
+                                            "current_price": current,
+                                            "stop_price":    new_stop,
+                                            "reason":        f"Trailing stop should be ${new_stop:.2f} but "
+                                                             f"broker order update FAILED — fix manually in TWS",
+                                        })
+                    except TickerBusy:
+                        log.warning(f"[{ticker}] TRAIL conversion skipped this run: "
+                                    f"another stop change holds the ticker")
                 else:
                     # Already converted to a native TRAIL order — the broker
                     # is ratcheting it automatically. Just track the new high
@@ -1383,6 +1391,7 @@ class RiskManager:
 
         return alerts
 
+    @locked_by_ticker(lambda self, ticker, *a, **k: ticker)
     def _ratchet_ladder_stop(self, ticker: str, pos: object, current: float,
                               stop_px: float, alerts: list[dict]) -> None:
         """
@@ -1429,6 +1438,7 @@ class RiskManager:
                                  f"order update FAILED — fix manually in TWS",
             })
 
+    @locked_by_ticker(lambda self, ticker, *a, **k: ticker, on_busy=False)
     def _breakeven_without_sale(self, ticker: str, qty: float, new_stop: float) -> bool:
         """Profit target hit on a position too small to sell part of (1-3
         shares x 25-45% rounds to 0). Before 2026-10-28 that just continued,
@@ -1477,6 +1487,7 @@ class RiskManager:
                  f"stop moved to breakeven ${new_stop:.2f}, no sale")
         return True
 
+    @locked_by_ticker(lambda self, ticker, *a, **k: ticker)
     def _partial_sell_and_resize_stop(self, ticker: str, qty: float, sell_qty: float,
                                       new_stop: float,
                                       decision_price: float | None = None) -> dict | None:

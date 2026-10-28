@@ -16,6 +16,8 @@ path now backs all four call sites, so a fix here fixes it everywhere.
 """
 import logging
 
+from stop_lock import locked_by_ticker
+
 log = logging.getLogger(__name__)
 
 
@@ -169,6 +171,9 @@ def _whole_position_stop(ticker: str, new_stop: float, filled_qty: float):
     return stop, (avg_cost, total_qty)
 
 
+# The whole execution holds the ticker's stop lock: a SELL cancels the stop,
+# sells and re-places it; a BUY places the first stop (stop_lock).
+@locked_by_ticker(lambda approval, *a, **k: approval["ticker"], on_busy=False)
 def execute_approved(
     approval: dict, trigger: str = "telegram",
     gap_retry_attempt: int = 1, price_retry_attempt: int = 1,
@@ -809,6 +814,9 @@ def execute_approved(
 # Manual / !urgent execution (dashboard form, chat !urgent command)
 # ---------------------------------------------------------------------------
 
+@locked_by_ticker(lambda ticker, *a, **k: ticker, on_busy={
+    "success": False, "filled_qty": 0.0, "fill_price": 0.0, "stop_price": None,
+    "message": "Another stop change is in progress for this ticker; try again shortly."})
 def execute_manual(
     ticker: str,
     side: str,

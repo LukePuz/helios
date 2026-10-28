@@ -22,6 +22,29 @@ BENCHMARK_TICKERS = ["SPY", "QQQ"]
 
 
 def _fetch_bars(ticker: str, period: str = "1y") -> list[dict]:
+    """Daily bars from yfinance. An empty result ("possibly delisted") is
+    usually a transient Yahoo failure, so it's retried with backoff; for the
+    benchmarks, Alpaca is the fallback. SPY failed this way on 10-15, 10-26
+    and 10-27 (2026), and SPY is the alpha benchmark."""
+    bars = []
+    for attempt in range(3):
+        bars = _fetch_bars_yf(ticker, period)
+        if bars:
+            return bars
+        if attempt < 2:
+            time.sleep(2 * (attempt + 1))
+    if ticker in BENCHMARK_TICKERS:
+        try:
+            from agents.market_regime import _fetch_bars as _alpaca_bars
+            bars = _alpaca_bars(ticker, days=260)
+            if bars:
+                log.warning(f"[{ticker}] yfinance returned no bars; used Alpaca ({len(bars)} bars)")
+        except Exception as e:
+            log.warning(f"[{ticker}] Alpaca fallback failed: {e}")
+    return bars
+
+
+def _fetch_bars_yf(ticker: str, period: str) -> list[dict]:
     try:
         hist = yf.Ticker(ticker).history(period=period, interval="1d")
     except Exception as e:

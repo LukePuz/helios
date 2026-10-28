@@ -10,6 +10,7 @@ def test_screen_result_has_provenance():
         result = screener.screen({"ticker": "NVDA", "source": "news", "title": "t", "text": "x"})
     prov = result["provenance"]
     assert prov["model"] == screener.SCREENER_MODEL and prov["code_sha"] == "test"
+    assert prov["head_sha"] == "testhead"  # SEF run 12: was missing on screener rows
     assert prov["model_digest"] == "testdigest"
     assert len(prov["prompt_template_sha"]) == 12 and len(prov["prompt_sha"]) == 12
 

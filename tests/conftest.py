@@ -43,6 +43,7 @@ def _static_provenance(monkeypatch):
     from agents import analyst
     from agents import screener
     monkeypatch.setattr(screener, "_DIGEST_CACHE", {"d": "testdigest"})
+    monkeypatch.setattr(analyst, "_CODE_SHA", {"code_sha": "test", "head_sha": "testhead"})
     monkeypatch.setattr(analyst, "_PROVENANCE_STATIC",
                         {"code_sha": "test", "model": "test", "model_digest": None,
                          "prompt_template_sha": "test"})

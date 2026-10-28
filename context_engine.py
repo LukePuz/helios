@@ -256,8 +256,11 @@ Buying Power:    ${float(account.buying_power):,.2f}""")
         import vector_store
         query = f"{ticker} {event.get('title', '')} {event.get('text', '')[:200]}"
 
-        # Search for relevant history across all collections
-        history = vector_store.search_all_collections(query, n_results=4)
+        # Search for relevant history across all collections. Skip the
+        # event's own doc (same id crew.screen_event stored it under).
+        own_id = event.get("url") or event.get("title")
+        history = vector_store.search_all_collections(
+            query, n_results=4, exclude_ids={own_id} if own_id else None)
         if history:
             mem_lines = ["=== RELEVANT HISTORICAL CONTEXT (from memory) ==="]
             for h in history:

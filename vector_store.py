@@ -113,6 +113,20 @@ def _get_collection(name: str) -> chromadb.Collection:
     return _collections[name]
 
 
+def _with_fresh_retry(name: str, fn):
+    """Runs fn(collection), retrying once with a fresh handle. The health
+    check (tasks.check_vector_store_health) rebuilds a corrupted collection
+    from another process, which leaves this process's cached handle pointing
+    at the deleted collection: every search then failed with "Collection ...
+    does not exist" until the 19:00 restart (50 times on 10-15 and 10-26)."""
+    try:
+        return fn(_get_collection(name))
+    except Exception as e:
+        log.info(f"vector_store: '{name}' handle failed ({e}); reopening")
+        _collections.pop(name, None)
+        return fn(_get_collection(name))
+
+
 def embed(text: str) -> list[float]:
     """
     Converts text to embedding vector.
@@ -155,13 +169,12 @@ def store(
     meta = {k: str(v) if not isinstance(v, (str, int, float, bool)) else v
             for k, v in meta.items()}
     with _write_lock():
-        col = _get_collection(collection)
-        col.upsert(
+        _with_fresh_retry(collection, lambda col: col.upsert(
             ids=[doc_id],
             embeddings=[embedding],
             documents=[text[:8192]],
             metadatas=[meta],
-        )
+        ))
 
 
 def search(
@@ -170,6 +183,7 @@ def search(
     n_results: int = 5,
     where: dict | None = None,
     query_embedding: list[float] | None = None,
+    exclude_ids: set[str] | None = None,
 ) -> list[dict]:
     """
     Semantic search — returns the most relevant documents for a query.
@@ -178,28 +192,38 @@ def search(
     Pass query_embedding to reuse an already-computed embedding (see
     search_all_collections, which used to embed the identical query string
     once per collection — 7 CPU embeddings for one logical search).
-    """
-    col = _get_collection(collection)
-    count = col.count()
-    if count == 0:
-        return []
 
-    n_results = min(n_results, count)
+    exclude_ids drops those doc ids from the results. The triggering event is
+    stored just before its analysis (crew.screen_event), so without this it
+    comes back as its own top "historical context" hit.
+    """
+    exclude_ids = exclude_ids or set()
     if query_embedding is None:
         query_embedding = embed(query)
 
-    kwargs: dict[str, Any] = {
-        "query_embeddings": [query_embedding],
-        "n_results": n_results,
-        "include": ["documents", "metadatas", "distances"],
-    }
-    if where:
-        kwargs["where"] = where
+    def _query(col):
+        count = col.count()
+        if count == 0:
+            return None
+        kwargs: dict[str, Any] = {
+            "query_embeddings": [query_embedding],
+            "n_results": min(n_results + len(exclude_ids), count),
+            "include": ["documents", "metadatas", "distances"],
+        }
+        if where:
+            kwargs["where"] = where
+        return col.query(**kwargs)
 
-    results = col.query(**kwargs)
+    results = _with_fresh_retry(collection, _query)
+    if results is None:
+        return []
 
     docs = []
     for i, doc in enumerate(results["documents"][0]):
+        if results["ids"][0][i] in exclude_ids:
+            continue
+        if len(docs) >= n_results:
+            break
         docs.append({
             "text":     doc,
             "metadata": results["metadatas"][0][i],
@@ -208,17 +232,25 @@ def search(
     return docs
 
 
-def search_all_collections(query: str, n_results: int = 3) -> list[dict]:
+def search_all_collections(query: str, n_results: int = 3,
+                           exclude_ids: set[str] | None = None) -> list[dict]:
     """
     Searches every collection and returns the top results across all of them.
     Used for broad context assembly when the event type isn't known.
+    A collection that fails is skipped, so one bad collection doesn't empty
+    the whole memory section of the brief.
     """
     # Embed the query once, not once per collection (this used to run 7
     # identical CPU embeddings of the same query string per call).
     query_embedding = embed(query)
     all_results = []
     for collection in COLLECTIONS:
-        results = search(collection, query, n_results=n_results, query_embedding=query_embedding)
+        try:
+            results = search(collection, query, n_results=n_results,
+                             query_embedding=query_embedding, exclude_ids=exclude_ids)
+        except Exception as e:
+            log.warning(f"vector_store: search in '{collection}' failed: {e}")
+            continue
         for r in results:
             r["collection"] = collection
         all_results.extend(results)

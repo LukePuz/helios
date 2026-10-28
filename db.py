@@ -2735,8 +2735,9 @@ def backfill_catalyst_outcome(
     """Writes a fresh catalyst/expected-return snapshot for an ALREADY-HELD
     position (2026-08-30, user request) -- distinct from log_trade_outcome,
     which fires at real trade execution. If a trade_outcomes row already
-    exists for this ticker (bought before this feature shipped), updates
-    its MOST RECENT row's catalyst columns in place rather than creating a
+    exists for this ticker (bought before this feature shipped), fills
+    its MOST RECENT row's catalyst columns only if they were never set at
+    entry (marked in notes), rather than creating a
     confusing duplicate with a fabricated entry price; otherwise inserts a
     new row using position_stops' real entry_price/opened_at as the best
     available entry data, with approval_id left NULL (nullable FK -- no
@@ -2752,15 +2753,25 @@ def backfill_catalyst_outcome(
             )
             row = cur.fetchone()
             if row:
+                # Only rows with no entry-time snapshot get filled, and they're
+                # marked in notes. Overwriting a real entry-time snapshot with
+                # today's view was look-ahead (professor C6, 2026-10-28).
                 cur.execute(
                     "UPDATE trade_outcomes SET catalyst_event=%s, catalyst_date=%s, "
                     "catalyst_is_priced_in=%s, expected_return_pct=%s, expected_downside_pct=%s, "
                     "thesis_summary=%s, sources_json=%s, source_count=%s, "
-                    "weeks_to_catalyst=%s, expected_return_per_week=%s WHERE id=%s",
+                    "weeks_to_catalyst=%s, expected_return_per_week=%s, "
+                    "notes=CONCAT_WS('; ', notes, %s) "
+                    "WHERE id=%s AND catalyst_event IS NULL AND expected_return_pct IS NULL "
+                    "AND thesis_summary IS NULL",
                     (catalyst_event, catalyst_date, catalyst_is_priced_in,
                      expected_return_pct, expected_downside_pct, thesis_summary,
-                     sources_json, source_count, weeks_to_catalyst, expected_return_per_week, row[0]),
+                     sources_json, source_count, weeks_to_catalyst, expected_return_per_week,
+                     f"catalyst fields backfilled {datetime.now(timezone.utc).date()}", row[0]),
                 )
+                if cur.rowcount == 0:
+                    logging.info(f"backfill_catalyst_outcome({ticker}): row {row[0]} already has an "
+                                 f"entry-time snapshot — left unchanged")
             else:
                 cur.execute(
                     "INSERT INTO trade_outcomes "
@@ -2812,10 +2823,10 @@ def compute_outcome_metrics(
 
 def close_trade_outcome(ticker: str, exit_price: float, exit_date=None) -> bool:
     """
-    Closes the most recent still-open (exit_date IS NULL) trade_outcomes row
-    for this ticker: computes outcome_pct, was_correct, and alpha vs. SPY over
-    the same holding window. Called after a confirmed EXIT fill.
-    Returns True if a row was closed.
+    Closes every still-open (exit_date IS NULL) trade_outcomes row for this
+    ticker: computes outcome_pct, was_correct, and alpha vs. SPY over each
+    row's holding window. Called after a confirmed full exit.
+    Returns True if any row was closed.
     """
     from datetime import datetime, timezone as _tz
 

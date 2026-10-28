@@ -645,3 +645,17 @@ def test_close_trade_outcome_closes_every_open_row_for_the_ticker():
         assert db.close_trade_outcome("NVDA", exit_price=110.0) is True
     updated_ids = [c[0][1][-1] for c in cur.execute.call_args_list if c[0][0].startswith("UPDATE")]
     assert updated_ids == [11, 10]
+
+
+def test_backfill_never_overwrites_an_entry_time_snapshot():
+    """Professor C6: the UPDATE only applies to rows with no catalyst snapshot."""
+    import db
+    cur = MagicMock()
+    cur.fetchone.return_value = (5,)
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
+        db.backfill_catalyst_outcome("NVDA", 7, "Accelerator", 100.0, None, "earnings", "2026-11-19",
+                                     False, 10.0, -5.0, "thesis", [], 0)
+    sql = cur.execute.call_args_list[-1][0][0]
+    assert "catalyst_event IS NULL" in sql and "notes=CONCAT_WS" in sql

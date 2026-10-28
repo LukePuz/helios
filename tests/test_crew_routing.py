@@ -423,6 +423,7 @@ class TestConvictionSwap:
              patch("db.log_pending_approval") as mock_log_approval, \
              patch("execution.execute_manual",
                    return_value={"success": False, "message": "no fill"}), \
+             patch("db.log_signal"), \
              patch("alerts._send") as mock_alert:
             mock_rm_cls.return_value.size_position.return_value = self._cash_blocked_sizing()
             mock_rm_cls.return_value.would_size_after_swap.return_value = 1

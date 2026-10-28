@@ -62,3 +62,23 @@ def test_env_filter_excludes_degraded_rows():
         db.get_latest_signal_for("NVDA")
     sql, params = cur.execute.call_args.args
     assert "NOT LIKE %s" in sql and params[-1] == db.DEGRADED_SIGNAL_PREFIX + "%"
+
+
+@pytest.mark.parametrize("call, writer", [
+    (lambda: db.log_trade("GOOG", "BUY", 1, 300.0, "x"), "log_trade"),
+    (lambda: db.log_signal("GOOG", "SCREENED_OUT", 0.0, "roundup"), "log_signal"),
+    (lambda: db.log_order("GOOG", "BUY", "MARKET", 1, status="unconfirmed"), "log_order"),
+])
+def test_connection_failure_spills_instead_of_raising(spill, call, writer):
+    """Limitations audit 18:53 #8: a DNS failure getting the connection
+    (GOOG/CRWV SCREENED_OUT, 17:20) raised past the spill and lost the row."""
+    err = psycopg2.OperationalError('could not translate host name "db" to address')
+    with patch("db._get_conn", side_effect=err), patch("db._put_conn") as put, \
+         patch("alerts._send"):
+        result = call()
+    rows = [json.loads(l) for l in spill.read_text().splitlines()]
+    assert len(rows) == 1 and rows[0]["writer"] == writer
+    assert rows[0]["record"].get("symbol", rows[0]["record"].get("ticker")) == "GOOG"
+    put.assert_not_called()
+    if writer == "log_order":
+        assert result == -1

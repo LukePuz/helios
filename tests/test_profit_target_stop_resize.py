@@ -27,6 +27,8 @@ def _client(remaining):
 def test_stop_is_cancelled_then_replaced_for_remaining_shares_at_breakeven():
     calls = []
     with patch("db.get_position_stop", return_value={"stop_price": 90.0}), \
+         patch("db.log_trade"), patch("db.log_order", return_value=1), \
+         patch("db.update_order_fill"), \
          patch("db.set_stop_broker_order_id") as set_id, \
          patch("tasks.manage_cancel_stop_orders_for", side_effect=lambda t: calls.append("cancel")), \
          patch("ibkr.place_market_order",

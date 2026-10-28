@@ -775,8 +775,22 @@ def _record_write_failure(writer: str, exc: Exception, record: dict) -> None:
         pass
 
 
+def _writer_conn(writer: str, record: dict):
+    """A pooled connection for a writer, or None after spilling the record.
+    Getting the connection used to sit outside the writers' try, so a DNS or
+    pool failure lost the row with no spill (limitations audit 18:53, #8)."""
+    try:
+        return _get_conn()
+    except Exception as e:
+        _record_write_failure(writer, e, record)
+        return None
+
+
 def log_trade(symbol: str, side: str, quantity: int, price: float, reason: str) -> None:
-    conn = _get_conn()
+    rec = {"symbol": symbol, "side": side, "quantity": quantity, "price": price, "reason": reason}
+    conn = _writer_conn("log_trade", rec)
+    if conn is None:
+        return
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -787,8 +801,7 @@ def log_trade(symbol: str, side: str, quantity: int, price: float, reason: str) 
         conn.commit()
     except Exception as e:
         conn.rollback()
-        _record_write_failure("log_trade", e, {"symbol": symbol, "side": side, "quantity": quantity,
-                                               "price": price, "reason": reason})
+        _record_write_failure("log_trade", e, rec)
     finally:
         _put_conn(conn)
 
@@ -796,7 +809,12 @@ def log_trade(symbol: str, side: str, quantity: int, price: float, reason: str) 
 def log_signal(symbol: str, signal: str, confidence: float, reasoning: str,
                model: str | None = None, provenance: dict | None = None,
                decision: dict | None = None, prompt: str | None = None) -> None:
-    conn = _get_conn()
+    rec = {"symbol": symbol, "signal": signal, "confidence": confidence, "reasoning": reasoning,
+           "trading_env": TRADING_ENV, "model": model, "provenance": provenance,
+           "decision": decision}
+    conn = _writer_conn("log_signal", rec)
+    if conn is None:
+        return
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -815,9 +833,6 @@ def log_signal(symbol: str, signal: str, confidence: float, reasoning: str,
         # (51-53), else the bare row marked as degraded so it can't pass for
         # a legacy row (professor C11/M40). Both are also spilled in full.
         conn.rollback()
-        rec = {"symbol": symbol, "signal": signal, "confidence": confidence, "reasoning": reasoning,
-               "trading_env": TRADING_ENV, "model": model, "provenance": provenance,
-               "decision": decision}
         _spill("log_signal", rec, "missing columns")
         try:
             with conn.cursor() as cur:
@@ -847,10 +862,7 @@ def log_signal(symbol: str, signal: str, confidence: float, reasoning: str,
             _record_write_failure("log_signal", e, rec)
     except Exception as e:
         conn.rollback()
-        _record_write_failure("log_signal", e, {
-            "symbol": symbol, "signal": signal, "confidence": confidence, "reasoning": reasoning,
-            "trading_env": TRADING_ENV, "model": model, "provenance": provenance,
-            "decision": decision})
+        _record_write_failure("log_signal", e, rec)
     finally:
         _put_conn(conn)
 
@@ -2590,7 +2602,13 @@ def log_order(
     intent: str | None = None,
 ) -> int:
     """Logs a newly-placed order. Returns the local orders.id (-1 on failure)."""
-    conn = _get_conn()
+    conn = _writer_conn("log_order", {
+        "ticker": ticker, "side": side, "order_type": order_type, "qty": qty,
+        "broker_order_id": broker_order_id, "stop_price": stop_price,
+        "decision_price": decision_price, "approval_id": approval_id, "status": status,
+        "intent": intent})
+    if conn is None:
+        return -1
     try:
         with conn.cursor() as cur:
             cur.execute(

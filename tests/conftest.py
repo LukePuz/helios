@@ -77,3 +77,12 @@ def _no_live_redis(monkeypatch):
     import stop_lock
     _FakeLock.held = set()
     monkeypatch.setattr(stop_lock, "_redis", lambda: _FakeRedis())
+
+
+@pytest.fixture(autouse=True)
+def _spill_to_tmp(tmp_path, monkeypatch):
+    """A test whose db write hits the blocked connection gets spilled; keep
+    that out of logs/db_write_spill.jsonl, and reset the alert throttle."""
+    import db
+    monkeypatch.setattr(db, "_SPILL_PATH", tmp_path / "db_write_spill.jsonl")
+    monkeypatch.setattr(db, "_LAST_WRITE_ALERT", {})

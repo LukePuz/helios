@@ -836,7 +836,8 @@ def get_chat_history(user_id: str, limit: int = 12, max_age_hours: float = 4) ->
 
 
 # Signal types crew.py logs for routing decisions, not analyst verdicts.
-_NON_ANALYST_SIGNALS = ("SCREENED_OUT", "CATALYST_BLOCKED", "COOLDOWN_SKIPPED", "SELL_NO_POSITION")
+_NON_ANALYST_SIGNALS = ("SCREENED_OUT", "CATALYST_BLOCKED", "COOLDOWN_SKIPPED", "SELL_NO_POSITION",
+                        "EARNINGS_BLOCKED")
 
 
 def get_latest_signal_for(ticker: str) -> dict | None:

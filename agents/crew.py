@@ -674,6 +674,24 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
         except Exception as e:
             log.warning(f"[{ticker}] Catalyst gate skipped: {e}")
 
+        # Earnings blackout (2026-10-27, limitations audit). With 1-share buys
+        # live, a stop 1.75x ATR away is no protection against an earnings
+        # gap, and the default path had no earnings rule at all. Decided by
+        # the lead session under Luke's delegation (Jarvis, bus #36).
+        from config import EARNINGS_ENTRY_BLACKOUT_DAYS
+        if EARNINGS_ENTRY_BLACKOUT_DAYS and db.is_near_earnings(ticker, EARNINGS_ENTRY_BLACKOUT_DAYS):
+            next_er = db.get_next_earnings(ticker)
+            reason = (f"earnings {next_er} within {EARNINGS_ENTRY_BLACKOUT_DAYS} days — "
+                      f"no new {action} until after the report")
+            log.info(f"[{ticker}] Entry blocked: {reason}")
+            if _feed_emit:
+                _feed_emit("risk", ticker, f"Blocked — {reason}", "info")
+            try:
+                db.log_signal(ticker, "EARNINGS_BLOCKED", conviction / 10.0, reason)
+            except Exception:
+                pass
+            return
+
         try:
             rm = RiskManager(trading_client)
         except Exception as e:

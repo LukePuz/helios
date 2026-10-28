@@ -12,6 +12,15 @@ import pytest
 from agents import crew
 
 
+@pytest.fixture(autouse=True)
+def _no_earnings_nearby():
+    """_route_to_approval checks the earnings calendar before OPEN/ADD
+    (2026-10-27 earnings blackout). Default: nothing reporting soon."""
+    with patch("db.is_near_earnings", return_value=False), \
+         patch("db.get_next_earnings", return_value=None):
+        yield
+
+
 def _analyst_result(action="TRIM", ticker="NVDA", conviction=6, bucket="Accelerator"):
     return {
         "ticker": ticker,
@@ -515,3 +524,18 @@ def test_stub_result_is_not_captured_as_a_thesis():
     with patch("db.update_latest_thesis") as update:
         crew._capture_latest_thesis("NVDA", {"model_used": "stub", "action": "WATCH", "conviction": 1})
     update.assert_not_called()
+
+
+def test_open_is_blocked_inside_the_earnings_blackout():
+    result = _analyst_result(action="OPEN", ticker="MSFT", conviction=8)
+    with patch("db.is_near_earnings", return_value=True), \
+         patch("db.get_next_earnings", return_value="2026-10-28"), \
+         patch("db.has_active_approval", return_value=False), \
+         patch("db.get_last_executed_approval", return_value=None), \
+         patch("db.log_signal") as log_signal, \
+         patch("agents.crew._get_price", return_value=100.0), \
+         patch("catalyst_service.gates.catalyst_gate_check", return_value={"approved": True}), \
+         patch("risk_manager.RiskManager") as mock_rm_cls:
+        crew._route_to_approval(result, {"regime": "Neutral"}, MagicMock())
+    mock_rm_cls.return_value.size_position.assert_not_called()
+    assert log_signal.call_args[0][1] == "EARNINGS_BLOCKED"

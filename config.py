@@ -322,6 +322,9 @@ STALE_PRICE_RETRY_MINUTES = 3
 # ---------------------------------------------------------------------------
 TRIM_FRACTION = 0.33   # analyst TRIM sells this fraction of the held position
 
+# No new OPEN/ADD within this many calendar days before earnings (0 = off).
+EARNINGS_ENTRY_BLACKOUT_DAYS = int(os.getenv("EARNINGS_ENTRY_BLACKOUT_DAYS", "5"))
+
 # When the first tranche buys less than 1 share, buy exactly 1 if that share
 # fits the hard per-position cap and the cash-reserve cap (risk_manager.size_position).
 ALLOW_ONE_SHARE_ABOVE_ALLOCATION = os.getenv("ALLOW_ONE_SHARE_ABOVE_ALLOCATION", "true").lower() == "true"

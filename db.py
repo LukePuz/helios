@@ -690,6 +690,11 @@ _MIGRATIONS: list[tuple[int, str]] = [
     # Why an approval ended in its status (SEF ask, 2026-10-28): EXPIRED has
     # several causes (age, superseded, past expires_at). NULL before migration.
     (57, "ALTER TABLE pending_approvals ADD COLUMN IF NOT EXISTS status_reason TEXT;"),
+    # Native TRAIL parameters at conversion, so the recorded stop can follow
+    # the trail (trailing_high - trail) instead of freezing at the conversion
+    # value (limitations audit 2026-10-28 12:53, #3 follow-up).
+    (58, "ALTER TABLE position_stops ADD COLUMN IF NOT EXISTS trail_amount DECIMAL, "
+         "ADD COLUMN IF NOT EXISTS trail_percent DECIMAL;"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -1489,6 +1494,23 @@ def update_trailing_stop(ticker: str, new_stop: float, trailing_high: float) -> 
         _put_conn(conn)
 
 
+def set_trail_params(ticker: str, trail_amount: float | None, trail_percent: float | None) -> None:
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE position_stops SET trail_amount=%s, trail_percent=%s, updated_at=NOW() "
+                "WHERE ticker=%s AND trading_env=%s",
+                (trail_amount, trail_percent, ticker, TRADING_ENV),
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"set_trail_params failed: {e}")
+    finally:
+        _put_conn(conn)
+
+
 def clear_trailing_active(ticker: str) -> None:
     """The position's broker stop is a fixed STP again (see
     tasks.manage_stop_place)."""
@@ -1586,15 +1608,21 @@ def delete_position_stop(ticker: str) -> None:
 def get_all_position_stops() -> list[dict]:
     conn = _get_conn()
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT ticker, entry_price, stop_price, stop_method, trailing_active, "
+        base = ("SELECT ticker, entry_price, stop_price, stop_method, trailing_active, "
                 "trailing_high, trail_distance_pct, thesis_bucket, conviction, broker_order_id, "
-                "opened_at, profit_target_taken, setup_category, valuation_tier_at_entry "
-                "FROM position_stops WHERE trading_env=%s ORDER BY ticker",
-                (TRADING_ENV,),
-            )
-            rows = cur.fetchall()
+                "opened_at, profit_target_taken, setup_category, valuation_tier_at_entry")
+        try:
+            with conn.cursor() as cur:
+                cur.execute(base + ", trail_amount, trail_percent "
+                            "FROM position_stops WHERE trading_env=%s ORDER BY ticker", (TRADING_ENV,))
+                rows = cur.fetchall()
+        except psycopg2.errors.UndefinedColumn:
+            # Migration 58 not applied yet: stop checks must still run.
+            conn.rollback()
+            with conn.cursor() as cur:
+                cur.execute(base + ", NULL, NULL "
+                            "FROM position_stops WHERE trading_env=%s ORDER BY ticker", (TRADING_ENV,))
+                rows = cur.fetchall()
         return [
             {
                 "ticker": r[0], "entry_price": float(r[1]), "stop_price": float(r[2]),
@@ -1605,6 +1633,8 @@ def get_all_position_stops() -> list[dict]:
                 "broker_order_id": int(r[9]) if r[9] else None,
                 "opened_at": r[10], "profit_target_taken": bool(r[11]),
                 "setup_category": r[12], "valuation_tier_at_entry": r[13],
+                "trail_amount": float(r[14]) if r[14] else None,
+                "trail_percent": float(r[15]) if r[15] else None,
             }
             for r in rows
         ]

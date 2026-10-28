@@ -1312,6 +1312,7 @@ class RiskManager:
                             result = tasks.manage_place_trailing_stop(ticker, qty, trail_percent=trail_pct)
                         db.set_stop_broker_order_id(ticker, result["order_id"])
                         db.update_trailing_stop(ticker, new_stop, current)
+                        db.set_trail_params(ticker, trail_amount, trail_pct)
                         log.info(f"[{ticker}] Converted to native TRAIL stop ({method_label}), "
                                 f"orderId={result['order_id']}")
                     except Exception as e:
@@ -1341,10 +1342,21 @@ class RiskManager:
                     # Already converted to a native TRAIL order — the broker
                     # is ratcheting it automatically. Just track the new high
                     # in DB for dashboard visibility; no order action needed.
+                    # The recorded stop follows the trail as a lower bound
+                    # (new high - trail), so a later partial sale, TRIM or
+                    # restore that replaces the TRAIL with a fixed STP starts
+                    # from about where the trail was, not the conversion value
+                    # (limitations audit 12:53, #3 follow-up).
                     prev_high = stop_record.get("trailing_high") or entry
                     if current > prev_high:
+                        est = None
+                        if stop_record.get("trail_amount"):
+                            est = round(current - stop_record["trail_amount"], 2)
+                        elif stop_record.get("trail_percent"):
+                            est = round(current * (1 - stop_record["trail_percent"] / 100), 2)
+                        new_db_stop = max(stop_px, est) if est is not None else stop_px
                         try:
-                            db.update_trailing_stop(ticker, stop_px, current)
+                            db.update_trailing_stop(ticker, new_db_stop, current)
                         except Exception as e:
                             log.warning(f"Failed to update trailing high for {ticker}: {e}")
 

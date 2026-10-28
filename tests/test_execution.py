@@ -631,3 +631,17 @@ def test_log_trade_outcome_skips_a_second_row_for_the_same_approval():
                              bucket="Accelerator", entry_price=100.0)
     assert cur.execute.call_count == 1  # only the existence check, no INSERT
     conn.rollback.assert_called_once()
+
+
+def test_close_trade_outcome_closes_every_open_row_for_the_ticker():
+    """Professor C5: OPEN + ADD then EXIT used to close only the newest row."""
+    import db
+    cur = MagicMock()
+    cur.fetchall.return_value = [(11, 100.0, None), (10, 90.0, None)]
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"), \
+         patch("yfinance.Ticker"):
+        assert db.close_trade_outcome("NVDA", exit_price=110.0) is True
+    updated_ids = [c[0][1][-1] for c in cur.execute.call_args_list if c[0][0].startswith("UPDATE")]
+    assert updated_ids == [11, 10]

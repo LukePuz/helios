@@ -2824,20 +2824,19 @@ def close_trade_outcome(ticker: str, exit_price: float, exit_date=None) -> bool:
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
+            # Every open row for the ticker: the position is gone, so an
+            # OPEN followed by ADDs must close all of its rows, not just the
+            # newest (professor C5, 2026-10-28).
             cur.execute(
                 "SELECT id, entry_price, entry_benchmark_price FROM trade_outcomes "
                 "WHERE ticker=%s AND trading_env=%s AND exit_date IS NULL "
-                "ORDER BY entry_date DESC LIMIT 1",
+                "ORDER BY entry_date DESC",
                 (ticker, TRADING_ENV),
             )
-            row = cur.fetchone()
-            if not row:
+            open_rows = cur.fetchall()
+            if not open_rows:
                 logging.warning(f"close_trade_outcome: no open outcome row for {ticker}")
                 return False
-
-            outcome_id, entry_price, entry_benchmark_price = row
-            entry_price = float(entry_price)
-            entry_benchmark_price = float(entry_benchmark_price) if entry_benchmark_price else None
 
             exit_benchmark_price = None
             try:
@@ -2848,21 +2847,24 @@ def close_trade_outcome(ticker: str, exit_price: float, exit_date=None) -> bool:
             except Exception as e:
                 logging.debug(f"close_trade_outcome: SPY exit price fetch failed: {e}")
 
-            metrics = compute_outcome_metrics(
-                entry_price, exit_price, entry_benchmark_price, exit_benchmark_price
-            )
-            outcome_pct          = metrics["outcome_pct"]
-            was_correct          = metrics["was_correct"]
-            benchmark_return_pct = metrics["benchmark_return_pct"]
-            alpha_pct            = metrics["alpha_pct"]
+            for outcome_id, entry_price, entry_benchmark_price in open_rows:
+                entry_price = float(entry_price)
+                entry_benchmark_price = float(entry_benchmark_price) if entry_benchmark_price else None
+                metrics = compute_outcome_metrics(
+                    entry_price, exit_price, entry_benchmark_price, exit_benchmark_price
+                )
+                outcome_pct          = metrics["outcome_pct"]
+                was_correct          = metrics["was_correct"]
+                benchmark_return_pct = metrics["benchmark_return_pct"]
+                alpha_pct            = metrics["alpha_pct"]
 
-            cur.execute(
-                "UPDATE trade_outcomes SET exit_price=%s, exit_date=%s, outcome_pct=%s, "
-                "was_correct=%s, exit_benchmark_price=%s, benchmark_return_pct=%s, alpha_pct=%s "
-                "WHERE id=%s",
-                (exit_price, exit_date, outcome_pct, was_correct, exit_benchmark_price,
-                 benchmark_return_pct, alpha_pct, outcome_id),
-            )
+                cur.execute(
+                    "UPDATE trade_outcomes SET exit_price=%s, exit_date=%s, outcome_pct=%s, "
+                    "was_correct=%s, exit_benchmark_price=%s, benchmark_return_pct=%s, alpha_pct=%s "
+                    "WHERE id=%s",
+                    (exit_price, exit_date, outcome_pct, was_correct, exit_benchmark_price,
+                     benchmark_return_pct, alpha_pct, outcome_id),
+                )
         conn.commit()
         logging.info(
             f"[{ticker}] Outcome closed: {outcome_pct:+.1%} "

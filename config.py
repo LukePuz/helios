@@ -321,6 +321,10 @@ STALE_PRICE_RETRY_MINUTES = 3
 # Sell behaviour
 # ---------------------------------------------------------------------------
 TRIM_FRACTION = 0.33   # analyst TRIM sells this fraction of the held position
+
+# When the first tranche buys less than 1 share, buy exactly 1 if that share
+# fits the hard per-position cap and the cash-reserve cap (risk_manager.size_position).
+ALLOW_ONE_SHARE_ABOVE_ALLOCATION = os.getenv("ALLOW_ONE_SHARE_ABOVE_ALLOCATION", "true").lower() == "true"
 # When a monitored stop level is breached and NO protective stop exists at
 # the broker, execute a market sell of the full position instead of only
 # alerting. Only ever reduces exposure; set False to fall back to alert-only.

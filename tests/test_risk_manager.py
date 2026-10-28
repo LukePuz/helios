@@ -779,3 +779,39 @@ def test_latest_signal_query_skips_routing_rows():
     assert "signal NOT IN %s" in sql
     assert "SCREENED_OUT" in params[1] and "CATALYST_BLOCKED" in params[1]
     assert result["confidence"] == 0.7
+
+
+class TestOneShareAboveAllocation:
+    """2026-10-27: when the first tranche buys less than 1 share, buy exactly
+    1 if it fits the hard per-position cap and the cash-reserve cap. On a
+    $100k standard account: Accelerator conviction 5 in Neutral -> 1.875%
+    target, 55% tranche ~= $1,031; the hard cap is 7% = $7,000."""
+
+    def _size(self, price, cash=None, stop_offset=10.0):
+        client = _make_client(portfolio_value=100_000.0, cash=cash)
+        with patch.object(risk_manager.RiskManager, "calculate_stop",
+                          return_value=(price - stop_offset, "mocked")), \
+             patch("risk_manager.TRADING_ENV", "paper"), \
+             patch("risk_manager.ALLOW_ONE_SHARE_ABOVE_ALLOCATION", True), \
+             patch("db.get_state", side_effect=lambda k, d=None: {"trading_halted_paper": "false",
+                                                                    "high_water_mark_paper": "100000"}.get(k, d)), \
+             patch("db.set_state"):
+            rm = risk_manager.RiskManager(client)
+            return rm.size_position("XYZ", conviction=5, bucket="Accelerator",
+                                    regime="Neutral", price=price)
+
+    def test_buys_one_share_when_within_caps(self):
+        sizing = self._size(2_500.0)
+        assert sizing["shares_initial"] == 1
+        assert any("buying 1 share" in f for f in sizing["flags"])
+
+    def test_no_share_when_one_share_exceeds_the_position_cap(self):
+        assert self._size(8_000.0)["shares_initial"] == 0
+
+    def test_no_share_when_one_share_exceeds_the_cash_cap(self):
+        # 20% of $10k cash = $2,000 < one $2,500 share
+        assert self._size(2_500.0, cash=10_000.0)["shares_initial"] == 0
+
+    def test_risk_cap_still_applies_to_the_one_share(self):
+        # $2,500 stop distance on one share > 2% of $100k
+        assert self._size(2_600.0, stop_offset=2_500.0)["shares_initial"] == 0

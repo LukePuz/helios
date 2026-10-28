@@ -50,8 +50,10 @@ try:
         CATEGORY_RISK_PCT_PER_TRADE,
         CATEGORY_SOFT_CEILING_PCT,
         PORTFOLIO_HEAT_CAP_PCT,
+        ALLOW_ONE_SHARE_ABOVE_ALLOCATION,
     )
 except ImportError:
+    ALLOW_ONE_SHARE_ABOVE_ALLOCATION = False
     TRADING_ENV                   = "paper"
     DRAWDOWN_HALT_PCT             = 0.10
     BUCKET_SIZE_TABLE             = {
@@ -474,6 +476,24 @@ class RiskManager:
 
         # Whole shares only — IBKR rejects fractional stock orders on most tickers
         shares_initial = int(initial_dollar / price)
+
+        # One share above the allocation (2026-10-27). On a micro account the
+        # 55% first tranche is often smaller than one share of a $400-600
+        # name, so every pass since Oct 13 sized to 0 and nothing traded.
+        # Allow exactly 1 share when it still fits the hard per-position cap
+        # and the cash-reserve cap; the single-share cap above and the
+        # per-trade risk cap below still apply. Decided by the lead session
+        # after Luke delegated the call (Jarvis, bus #36).
+        if (shares_initial < 1 and ALLOW_ONE_SHARE_ABOVE_ALLOCATION
+                and price <= pv * hard_cap and price <= cash_cap):
+            flags.append(
+                f"Allocation ${initial_dollar:,.2f} is under 1 share; buying 1 share "
+                f"(${price:,.2f} = {price / pv:.1%} of portfolio, within the "
+                f"{hard_cap:.0%} position cap)"
+            )
+            shares_initial = 1
+            initial_dollar = price
+
         if shares_initial < 1:
             cash_blocked = cash_reserve <= 0 or cash_capped
             if cash_blocked:

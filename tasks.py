@@ -2556,7 +2556,9 @@ def weekly_self_review(self):
                 f"{OLLAMA_HOST}/api/generate",
                 json={"model": ANALYST_MODEL, "prompt": prompt, "stream": False,
                       "options": {"temperature": 0.3, "num_predict": 500, "num_ctx": 8192}},
-                timeout=180,
+                # Same 400s as analyst.py: 72B calls take ~180-195s, and 180
+                # timed out the 2026-10-11 review.
+                timeout=400,
             )
             resp.raise_for_status()
             summary = resp.json().get("response", "").strip()

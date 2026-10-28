@@ -216,7 +216,13 @@ def _capture_latest_thesis(ticker: str, result: dict) -> None:
     500 chars for db.log_signal, and only OPEN/ADD/TRIM/EXIT that pass
     the conviction/UDR gate ever reach pending_approvals.analyst_json).
     Failures are logged, never raised -- losing a thesis snapshot must
-    never block the review itself."""
+    never block the review itself.
+
+    Stub results (model unavailable) are skipped: on outage days they wrote
+    "conviction 1, WATCH" snapshots that looked like real verdicts."""
+    if result.get("model_used") == "stub":
+        log.info(f"[{ticker}] Skipping thesis capture for stub result (model unavailable)")
+        return
     try:
         import db
         from datetime import datetime, timezone

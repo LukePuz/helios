@@ -506,3 +506,12 @@ class TestBackfillCatalystTracking:
         assert kwargs["entry_date"] == opened
         assert kwargs["bucket"] == "Moonshot"
         assert kwargs["conviction"] == 7
+
+
+def test_stub_result_is_not_captured_as_a_thesis():
+    """Audit 2026-10-27 finding 8: model-outage stubs must not land in
+    latest_thesis / thesis_history as if they were real verdicts."""
+    from agents import crew
+    with patch("db.update_latest_thesis") as update:
+        crew._capture_latest_thesis("NVDA", {"model_used": "stub", "action": "WATCH", "conviction": 1})
+    update.assert_not_called()

@@ -859,3 +859,27 @@ class TestSwapPreCheck:
              patch("db.get_state", return_value=None), patch("db.set_state"):
             assert rm.would_size_after_swap("NEW", 7, "Accelerator", "Neutral", 5_000.0,
                                             {"ticker": "OLD", "market_value": 100.0}) == 0
+
+    def _with_conc(self, conc, sizing):
+        rm = self._rm(cash=0.0)
+        with patch.object(risk_manager.RiskManager, "size_position", return_value=sizing), \
+             patch.object(risk_manager.RiskManager, "check_concentration", return_value=conc), \
+             patch("db.get_state", return_value=None), patch("db.set_state"):
+            return rm.would_size_after_swap("NEW", 7, "Accelerator", "Neutral", 100.0,
+                                            {"ticker": "OLD", "market_value": 20_000.0})
+
+    def test_concentration_cap_to_zero_blocks_the_swap(self):
+        """Professor M36: the caps crew applies after sizing count here too."""
+        n = self._with_conc({"passed": False, "ai_infra_size_cap_pct": 0.0},
+                            {"shares_initial": 3, "position_size_pct": 0.05, "order_pct": 0.003})
+        assert n == 0
+
+    def test_concentration_cap_trims_shares(self):
+        n = self._with_conc({"passed": False, "theme_size_cap_pct": 0.02},
+                            {"shares_initial": 40, "position_size_pct": 0.04, "order_pct": 0.04})
+        assert n == 20
+
+    def test_concentration_pass_keeps_shares(self):
+        n = self._with_conc({"passed": True},
+                            {"shares_initial": 3, "position_size_pct": 0.05, "order_pct": 0.003})
+        assert n == 3

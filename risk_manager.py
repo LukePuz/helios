@@ -1146,7 +1146,23 @@ class RiskManager:
 
         try:
             sim = RiskManager(_View(), start_value=self.start_value)
-            return int(sim.size_position(ticker, conviction, bucket, regime, price).get("shares_initial", 0))
+            sizing = sim.size_position(ticker, conviction, bucket, regime, price)
+            shares = int(sizing.get("shares_initial", 0))
+            if shares <= 0:
+                return 0
+            # Same concentration cap crew applies after sizing (professor M36):
+            # a swap whose buy the caps cut to 0 must not sell the holding.
+            proposed = max(sizing.get("position_size_pct") or 0, sizing.get("order_pct") or 0)
+            conc = sim.check_concentration(ticker, proposed, bucket=bucket)
+            if not conc.get("passed", False):
+                caps = [c for c in (conc.get("ai_infra_size_cap_pct"), conc.get("theme_size_cap_pct"),
+                                    conc.get("moonshot_size_cap_pct")) if c is not None]
+                cap = min(caps) if caps else None
+                if cap is not None and cap < proposed:
+                    order_pct = sizing.get("order_pct") or 0
+                    base = order_pct if order_pct > 0 else proposed
+                    shares = min(shares, int(shares * cap / base + 1e-9)) if base > 0 else 0
+            return shares
         except Exception as e:
             log.warning(f"[{ticker}] swap pre-check sizing failed: {e}")
             return 0

@@ -981,6 +981,10 @@ def run_daily_scan(self):
         high_medium = [c for c in candidates if c["priority"] in ("HIGH", "MEDIUM")]
 
         log.info(f"Daily scan: {len(high_medium)} candidates to analyze")
+        try:
+            log.info(_scan_summary(regime, candidates))
+        except Exception as e:
+            log.debug(f"scan summary failed: {e}")
         if high_medium:
             analyze_candidates.apply_async(
                 args=[high_medium], kwargs={"max_per_run": 5},
@@ -989,6 +993,23 @@ def run_daily_scan(self):
     except Exception as e:
         log.error(f"run_daily_scan failed: {e}")
         raise self.retry(exc=e, countdown=300)
+
+
+def _scan_summary(regime: dict, candidates: list[dict]) -> str:
+    """One line per daily scan: regime, threshold, counts by priority, top
+    scores, and regime inputs that were unavailable. On 10-15 the regime moved
+    55 -> 53, the MEDIUM threshold went 50 -> 65 and candidates fell from 20-33
+    a day to 1-2 without anything saying why (audit 2026-10-28 05:00, #4)."""
+    from collections import Counter
+    from agents.scanner import _regime_threshold
+    name = regime.get("regime", "Neutral")
+    counts = Counter(c.get("priority") for c in candidates)
+    top = sorted((c.get("composite_score") or 0 for c in candidates), reverse=True)[:3]
+    missing = regime.get("missing_inputs") or (regime.get("signals") or {}).get("missing_inputs") or []
+    return (f"Scan summary: regime {name} score {regime.get('score')} -> threshold "
+            f"{_regime_threshold(name)}; HIGH {counts.get('HIGH', 0)} MEDIUM {counts.get('MEDIUM', 0)} "
+            f"LOW {counts.get('LOW', 0)} PASS {counts.get('PASS', 0)}; top scores {top}"
+            + (f"; regime inputs unavailable: {', '.join(missing)}" if missing else ""))
 
 
 @app.task(name="tasks.review_positions", bind=True, max_retries=2)

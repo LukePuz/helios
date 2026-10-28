@@ -651,6 +651,14 @@ def assess_regime() -> dict:
         "volume":     (volume_raw,     volume_notes),
         "markov":     (markov_raw,     markov_notes),
     }
+    # Inputs that couldn't be read score Neutral (0), which pulls the score
+    # toward the 40-54 band without anyone noticing (limitations audit
+    # 2026-10-28 05:00, finding 4). Record which ones, so a regime change can
+    # be told apart from a data outage.
+    missing_inputs = [name for name, (_, notes) in scores_map.items()
+                      if "unavailable" in str(notes).lower()]
+    if missing_inputs:
+        log.warning(f"Regime inputs unavailable (scored Neutral): {', '.join(missing_inputs)}")
     key_drivers = [
         notes for name, (raw, notes) in scores_map.items() if raw >= 2
     ]
@@ -722,7 +730,9 @@ def assess_regime() -> dict:
         # table applies (see config.py's *_BY_STYLE dicts), the same way
         # `regime` itself is read directly for the sizing multiplier.
         "trade_style": trade_style,
+        "missing_inputs": missing_inputs,
         "signals": {
+            "missing_inputs": missing_inputs,
             "trend":      {"score": trend_raw,      "notes": trend_notes},
             "trade_style": {"label": trade_style, "efficiency_ratio": efficiency_ratio,
                              "notes": trade_style_notes},
@@ -755,7 +765,8 @@ def assess_regime() -> dict:
     _regime_cache = packet
     _cache_ts = time.monotonic()
 
-    log.info(f"Regime assessment complete: {regime} (score={score})")
+    log.info(f"Regime assessment complete: {regime} (score={score})"
+             + (f", {len(missing_inputs)} input(s) unavailable" if missing_inputs else ""))
     return packet
 
 

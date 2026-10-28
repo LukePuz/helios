@@ -1,9 +1,10 @@
 # AI prompt protocol (ISEF / Regeneron STS)
 
-Helios is a pre-registered study headed for ISEF and Regeneron STS. ISEF Rule 8
-permits AI-written code only with explicit citation of what the AI generated,
-and Form 2A requires an AI Prompt Log of prompts and responses. This file is
-committed so the protocol applies on every machine that works on this repo.
+Helios is a study with a planned OSF pre-registration, headed for ISEF and
+Regeneron STS. ISEF Rule 8 permits AI-written code only with explicit citation
+of what the AI generated, and Form 2A requires an AI Prompt Log of prompts and
+responses. This file is committed so the protocol applies on every machine that
+works on this repo.
 Personal notes go in the root `CLAUDE.md`, which is gitignored.
 
 Raw prompts and full transcripts are captured automatically by the hooks in
@@ -33,7 +34,7 @@ his answer before acting on that part:
 - metrics, scoring, or evaluation criteria
 - the sample, universe, date range, or inclusion/exclusion rules
 - analysis or statistical choices
-- anything that would change or contradict the OSF pre-registration
+- anything that would change or contradict the planned OSF pre-registration
 
 Short follow-ups inside an ongoing request ("yes", "go", "do the second one")
 continue the current request. They don't need a new refinement. The hooks

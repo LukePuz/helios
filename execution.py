@@ -680,37 +680,41 @@ def execute_approved(
         # pending_approvals columns, since only conviction/thesis_bucket are
         # promoted to top-level columns there.
         analyst_json = approval.get("analyst_json") or {}
-        db.log_trade_outcome(
-            approval_id=approval["id"],
-            ticker=ticker,
-            action=action,
-            conviction=approval.get("conviction", 5),
-            bucket=approval.get("thesis_bucket", ""),
-            entry_price=current_price,
-            thesis_strength=analyst_json.get("thesis_strength"),
-            catalyst_quality=analyst_json.get("catalyst_quality"),
-            valuation_risk_reward=analyst_json.get("valuation_risk_reward"),
-            data_completeness=analyst_json.get("data_completeness"),
-            chase_risk=analyst_json.get("chase_risk"),
-            chase_risk_pct_from_kijun=analyst_json.get("chase_risk_pct_from_kijun"),
-            price_action=analyst_json.get("price_action"),
-            price_action_structure=analyst_json.get("price_action_structure"),
-            # Catalyst/expected-return tracking (2026-08-30, user request) --
-            # promotes what used to only live in this same analyst_json blob
-            # into first-class trade_outcomes columns so it can actually be
-            # compared against what happens later, not just referenced at
-            # the moment of the original call.
-            catalyst_event=(analyst_json.get("catalyst") or {}).get("event"),
-            catalyst_date=(analyst_json.get("catalyst") or {}).get("date"),
-            catalyst_is_priced_in=(analyst_json.get("catalyst") or {}).get("is_priced_in"),
-            expected_return_pct=analyst_json.get("expected_return_pct"),
-            expected_downside_pct=analyst_json.get("expected_downside_pct"),
-            thesis_summary=analyst_json.get("thesis_summary"),
-            sources=analyst_json.get("sources"),
-            source_count=analyst_json.get("source_count"),
-            weeks_to_catalyst=analyst_json.get("weeks_to_catalyst"),
-            expected_return_per_week=analyst_json.get("expected_return_per_week"),
-        )
+        # BUYs only (professor C5, 2026-10-27). A SELL used to add an EXIT
+        # outcome row right after close_trade_outcome closed the BUY's row,
+        # and nothing ever closed it.
+        if side == "BUY":
+            db.log_trade_outcome(
+                approval_id=approval["id"],
+                ticker=ticker,
+                action=action,
+                conviction=approval.get("conviction", 5),
+                bucket=approval.get("thesis_bucket", ""),
+                entry_price=current_price,
+                thesis_strength=analyst_json.get("thesis_strength"),
+                catalyst_quality=analyst_json.get("catalyst_quality"),
+                valuation_risk_reward=analyst_json.get("valuation_risk_reward"),
+                data_completeness=analyst_json.get("data_completeness"),
+                chase_risk=analyst_json.get("chase_risk"),
+                chase_risk_pct_from_kijun=analyst_json.get("chase_risk_pct_from_kijun"),
+                price_action=analyst_json.get("price_action"),
+                price_action_structure=analyst_json.get("price_action_structure"),
+                # Catalyst/expected-return tracking (2026-08-30, user request) --
+                # promotes what used to only live in this same analyst_json blob
+                # into first-class trade_outcomes columns so it can actually be
+                # compared against what happens later, not just referenced at
+                # the moment of the original call.
+                catalyst_event=(analyst_json.get("catalyst") or {}).get("event"),
+                catalyst_date=(analyst_json.get("catalyst") or {}).get("date"),
+                catalyst_is_priced_in=(analyst_json.get("catalyst") or {}).get("is_priced_in"),
+                expected_return_pct=analyst_json.get("expected_return_pct"),
+                expected_downside_pct=analyst_json.get("expected_downside_pct"),
+                thesis_summary=analyst_json.get("thesis_summary"),
+                sources=analyst_json.get("sources"),
+                source_count=analyst_json.get("source_count"),
+                weeks_to_catalyst=analyst_json.get("weeks_to_catalyst"),
+                expected_return_per_week=analyst_json.get("expected_return_per_week"),
+            )
 
         # Send trade alert — full rationale + all conviction scores + bucket,
         # not just the bare fill details, per explicit user request.

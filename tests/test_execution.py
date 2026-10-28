@@ -617,3 +617,17 @@ class TestStopRestoredAfterFailedSell:
              patch("alerts._send") as send:
             execution._restore_stop_after_failed_sell("NVDA")
         assert "UNPROTECTED" in send.call_args[0][0]
+
+
+def test_log_trade_outcome_skips_a_second_row_for_the_same_approval():
+    import db
+    cur = MagicMock()
+    cur.fetchone.return_value = (1,)
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"), \
+         patch("yfinance.Ticker"):
+        db.log_trade_outcome(approval_id=62, ticker="NVDA", action="OPEN", conviction=7,
+                             bucket="Accelerator", entry_price=100.0)
+    assert cur.execute.call_count == 1  # only the existence check, no INSERT
+    conn.rollback.assert_called_once()

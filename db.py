@@ -2650,6 +2650,17 @@ def log_trade_outcome(
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
+            # One outcome row per approval: 07-29 logged two rows seconds apart
+            # for approvals 62, 67 and 71 (SEF data QA, 2026-10-27).
+            cur.execute(
+                "SELECT 1 FROM trade_outcomes WHERE approval_id=%s AND trading_env=%s LIMIT 1",
+                (approval_id, TRADING_ENV),
+            )
+            if cur.fetchone():
+                logging.warning(f"log_trade_outcome: approval {approval_id} already has an "
+                                f"outcome row — not adding another")
+                conn.rollback()
+                return
             cur.execute(
                 "INSERT INTO trade_outcomes "
                 "(approval_id, trading_env, ticker, action, conviction, thesis_bucket, entry_price, "

@@ -988,7 +988,7 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
     # control (drawdown halt, concentration caps, price-drift abort, ATR
     # stop placement) still applies unchanged, only the human-in-the-loop
     # tap is removed.
-    from execution import execute_approved
+    from execution import execute_approved, last_outcome_reason
 
     if not db.claim_approval_for_execution(approval_id):
         log.error(f"[{ticker}] Could not claim approval #{approval_id} for auto-execution")
@@ -996,7 +996,8 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
 
     approval = db.get_approval_by_id(approval_id)
     success = execute_approved(approval, trigger="auto")
-    db.update_approval_status(approval_id, "APPROVED" if success else "FAILED")
+    db.update_approval_status(approval_id, "APPROVED" if success else "FAILED",
+                              reason=None if success else last_outcome_reason())
     log.info(f"[{ticker}] Approval #{approval_id} auto-{'executed' if success else 'execution FAILED'}")
 
     if _feed_emit:

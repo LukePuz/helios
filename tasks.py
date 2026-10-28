@@ -776,7 +776,7 @@ def retry_deferred_entry(self, approval_id: int, gap_retry_attempt: int = 1, pri
     gap-confirmation and stale-price paths have their own hard retry cap).
     """
     import db
-    from execution import execute_approved
+    from execution import execute_approved, last_outcome_reason
 
     approval = db.get_approval_by_id(approval_id)
     if not approval:
@@ -820,6 +820,7 @@ def retry_deferred_entry(self, approval_id: int, gap_retry_attempt: int = 1, pri
     # Re-size against the account as it is now: positions, cash and caps may
     # have changed since approval (audit 10-28 10:53 #2 residual).
     shares_now = _deferred_buy_shares_now(approval)
+    resized = None
     if shares_now is not None:
         approved = int((approval.get("risk_json") or {}).get("shares_initial") or 0)
         if shares_now <= 0:
@@ -832,12 +833,17 @@ def retry_deferred_entry(self, approval_id: int, gap_retry_attempt: int = 1, pri
             log.info(f"retry_deferred_entry: [{ticker}] approval #{approval_id} reduced "
                      f"{approved} -> {shares_now} shares at execution")
             approval = {**approval, "risk_json": {**approval["risk_json"], "shares_initial": shares_now}}
+            # risk_json keeps the approved size; record why fewer were bought.
+            resized = f"reduced {approved} -> {shares_now} shares at execution"
 
     success = execute_approved(
         approval, trigger="auto_retry",
         gap_retry_attempt=gap_retry_attempt, price_retry_attempt=price_retry_attempt,
     )
-    db.update_approval_status(approval_id, "APPROVED" if success else "FAILED")
+    if success:
+        db.update_approval_status(approval_id, "APPROVED", reason=resized)
+    else:
+        db.update_approval_status(approval_id, "FAILED", reason=last_outcome_reason())
     log.info(f"retry_deferred_entry: [{ticker}] approval #{approval_id} "
              f"{'executed' if success else 'still failed'} on retry "
              f"(gap_attempt={gap_retry_attempt}, price_attempt={price_retry_attempt})")

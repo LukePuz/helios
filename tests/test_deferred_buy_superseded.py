@@ -40,7 +40,7 @@ def test_older_contrary_verdict_does_not_drop_it():
               "timestamp": datetime.now(timezone.utc) - timedelta(hours=5)}
     status, execute = _run(_approval(), latest=latest)
     execute.assert_called_once()
-    status.assert_called_once_with(7, "APPROVED")
+    status.assert_called_once_with(7, "APPROVED", reason=None)
 
 
 def test_newer_buy_verdict_keeps_it():

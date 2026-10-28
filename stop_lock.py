@@ -82,7 +82,8 @@ def ticker_lock(ticker: str, wait: float | None = None):
 
 def locked_by_ticker(ticker_of, on_busy=None):
     """Decorator: run the function under ticker_lock(ticker_of(*args, **kwargs)).
-    If the lock stays busy, log and return on_busy instead of running."""
+    If the lock stays busy, log and return on_busy instead of running (or
+    on_busy() if it is callable)."""
     def deco(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
@@ -93,6 +94,6 @@ def locked_by_ticker(ticker_of, on_busy=None):
             except TickerBusy:
                 log.error(f"[{ticker}] {fn.__name__} skipped: another stop change held the "
                           f"ticker for {DEFAULT_WAIT_S}s")
-                return on_busy
+                return on_busy() if callable(on_busy) else on_busy
         return wrapper
     return deco

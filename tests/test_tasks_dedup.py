@@ -273,7 +273,7 @@ class TestRetryDeferredEntry:
         mock_execute.assert_called_once_with(
             approval, trigger="auto_retry", gap_retry_attempt=1, price_retry_attempt=1,
         )
-        mock_update.assert_called_once_with(1, "APPROVED")
+        mock_update.assert_called_once_with(1, "APPROVED", reason=None)
 
     def test_skips_approval_not_in_failed_status(self):
         """Already handled some other way -- e.g. a fresher event

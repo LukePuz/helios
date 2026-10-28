@@ -243,7 +243,9 @@ def _handle_callback(update: dict) -> None:
 
             success = _execute_approved_order(approval)
             status  = "APPROVED" if success else "FAILED"
-            db.update_approval_status(approval_id, status)
+            from execution import last_outcome_reason
+            db.update_approval_status(approval_id, status,
+                                      reason=None if success else last_outcome_reason())
             try:
                 from feed import emit as _fe
                 if success:

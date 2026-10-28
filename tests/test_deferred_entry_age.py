@@ -33,4 +33,4 @@ def test_fresh_approval_still_executes():
         tasks.retry_deferred_entry.run(7)
     execute.assert_called_once()
     analyse.assert_not_called()
-    status.assert_called_once_with(7, "APPROVED")
+    status.assert_called_once_with(7, "APPROVED", reason=None)

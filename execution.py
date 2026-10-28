@@ -17,6 +17,7 @@ path now backs all four call sites, so a fix here fixes it everywhere.
 import logging
 
 from stop_lock import locked_by_ticker
+import threading
 
 log = logging.getLogger(__name__)
 
@@ -171,9 +172,27 @@ def _whole_position_stop(ticker: str, new_stop: float, filled_qty: float):
     return stop, (avg_cost, total_qty)
 
 
+# Why the last execute_approved call in this thread returned False, for the
+# approval's status_reason. Every False used to be recorded as a bare FAILED,
+# whether it was a scheduled retry, a deliberate skip or a real failure
+# (professor M-6, 2026-10-28). The status stays FAILED (retry_deferred_entry
+# keys on it); the reason says which.
+_OUTCOME = threading.local()
+
+
+def _outcome(reason: str) -> bool:
+    _OUTCOME.reason = reason
+    return False
+
+
+def last_outcome_reason() -> str | None:
+    return getattr(_OUTCOME, "reason", None)
+
+
 # The whole execution holds the ticker's stop lock: a SELL cancels the stop,
 # sells and re-places it; a BUY places the first stop (stop_lock).
-@locked_by_ticker(lambda approval, *a, **k: approval["ticker"], on_busy=False)
+@locked_by_ticker(lambda approval, *a, **k: approval["ticker"],
+                  on_busy=lambda: _outcome("skipped: another stop change held the ticker"))
 def execute_approved(
     approval: dict, trigger: str = "telegram",
     gap_retry_attempt: int = 1, price_retry_attempt: int = 1,
@@ -193,8 +212,9 @@ def execute_approved(
     gate independently of the other. Both are distinct from the
     market-hours-closed retry, which always starts fresh attempt counts of 1.
 
-    Returns True on success.
+    Returns True on success; on False, last_outcome_reason() says why.
     """
+    _OUTCOME.reason = None
     ticker    = approval["ticker"]
     action    = approval["action"]
     risk_json = approval.get("risk_json") or {}
@@ -215,7 +235,7 @@ def execute_approved(
             )
         except Exception:
             pass
-        return False
+        return _outcome("failed: IBKR unreachable")
 
     try:
         import ibkr
@@ -226,7 +246,7 @@ def execute_approved(
         shares = risk_json.get("shares_initial", 0)
         if shares <= 0:
             log.error(f"[{ticker}] No shares_initial in risk_json — cannot execute")
-            return False
+            return _outcome("failed: no shares_initial in risk_json")
 
         # Drawdown halt — block new BUY entries if portfolio is in drawdown
         if action in ("OPEN", "ADD"):
@@ -241,7 +261,7 @@ def execute_approved(
                         f"Portfolio drawdown limit is active. No new BUY entries allowed.\n"
                         f"Review and reset the halt flag when drawdown is resolved."
                     )
-                    return False
+                    return _outcome("blocked: drawdown halt active")
             except Exception as halt_err:
                 log.warning(f"[{ticker}] Drawdown halt check failed: {halt_err}")
 
@@ -287,7 +307,7 @@ def execute_approved(
                         f"Will retry automatically at the next open "
                         f"({eta_et.strftime('%a %I:%M %p ET')}) with a fresh price/drift check."
                     )
-                    return False
+                    return _outcome("deferred: market closed, retry scheduled for the open")
             except Exception as e:
                 log.warning(f"[{ticker}] Market-hours check failed, proceeding: {e}")
         elif action in ("TRIM", "EXIT"):
@@ -301,7 +321,7 @@ def execute_approved(
                 owned = 0.0
             if owned <= 0:
                 log.error(f"[{ticker}] {action} requested but no position found")
-                return False
+                return _outcome("failed: no position to sell")
             shares = owned if action == "EXIT" else min(shares, owned)
             # NOTE: broker stops are cancelled AFTER the drift check below —
             # cancelling first meant a drift abort left the position both
@@ -392,7 +412,7 @@ def execute_approved(
                                 )
                             except Exception:
                                 pass
-                            return False
+                            return _outcome("deferred: stale price, re-check scheduled")
                         log.error(
                             f"[{ticker}] Could not get a fresh price after "
                             f"{STALE_PRICE_MAX_RETRIES} checks — giving up rather than "
@@ -409,7 +429,7 @@ def execute_approved(
                             )
                         except Exception:
                             pass
-                        return False
+                        return _outcome("skipped: price still stale after retries")
                     try:
                         alert_module._send(
                             f"⚠️ STALE PRICE — {ticker}\n"
@@ -438,7 +458,7 @@ def execute_approved(
                         )
                     except Exception:
                         pass
-                    return False
+                    return _outcome("skipped: price drifted since sizing")
                 # A risk-reducing SELL must never be blocked by drift — a big
                 # move is often exactly why we're exiting. Warn and proceed.
                 log.warning(
@@ -474,7 +494,7 @@ def execute_approved(
                         f"(now ${gap['current_price']:.2f}). Skipping — this looks like a fade, "
                         f"not a move that's holding."
                     )
-                    return False
+                    return _outcome("skipped: opening gap fading")
                 if gap["status"] == "pending":
                     if gap_retry_attempt >= GAP_CONFIRMATION_MAX_RETRIES:
                         log.warning(
@@ -487,7 +507,7 @@ def execute_approved(
                             f"clearly confirmed or failed within the check window. Skipping this "
                             f"entry rather than guess — re-run analysis if the thesis still holds."
                         )
-                        return False
+                        return _outcome("skipped: opening gap unconfirmed after max checks")
                     from datetime import datetime, timedelta, timezone
                     eta = datetime.now(timezone.utc) + timedelta(minutes=GAP_CONFIRMATION_RETRY_MINUTES)
                     log.info(
@@ -508,7 +528,7 @@ def execute_approved(
                         f"move holds before entering (check {gap_retry_attempt}/{GAP_CONFIRMATION_MAX_RETRIES}). "
                         f"Will re-check in {GAP_CONFIRMATION_RETRY_MINUTES} min."
                     )
-                    return False
+                    return _outcome("deferred: waiting for gap confirmation, re-check scheduled")
                 # "confirmed" or "no_gap" -- proceed normally.
             except Exception as e:
                 # Fails closed like the stale-price check above (limitations
@@ -526,14 +546,14 @@ def execute_approved(
                         )
                     except Exception as e2:
                         log.error(f"[{ticker}] Could not schedule gap re-check: {e2}")
-                    return False
+                    return _outcome("deferred: gap re-check scheduled")
                 log.error(f"[{ticker}] Gap-confirmation check failed again ({e}); skipping {action}")
                 alert_module._send(
                     f"⚠️ ORDER SKIPPED — Gap Check Failed\n"
                     f"<b>{ticker}</b>: the opening-gap check could not run ({str(e)[:120]}). "
                     f"Skipping this entry rather than buy unchecked."
                 )
-                return False
+                return _outcome("skipped: gap check could not run")
 
         if side == "SELL":
             # Cancel the existing broker stop only now that the sell is
@@ -612,7 +632,7 @@ def execute_approved(
                     )
                 except Exception:
                     pass
-                return False
+                return _outcome("unconfirmed: no fill within the wait window (reconcile checks later)")
         else:
             # Bracket path returns no fill info by design — TWS enforces the
             # entry+stop pairing atomically, so assume the requested size.
@@ -807,7 +827,7 @@ def execute_approved(
 
     except Exception as e:
         log.error(f"[{ticker}] Order execution failed: {e}")
-        return False
+        return _outcome("failed: exception during execution")
 
 
 # ---------------------------------------------------------------------------

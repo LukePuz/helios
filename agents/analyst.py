@@ -429,13 +429,27 @@ def _call_ollama(prompt: str, num_ctx: int = _NUM_CTX) -> str | None:
             timeout=400,
         )
         resp.raise_for_status()
+        _LAST_CALL_FAILURE["kind"] = None
         return resp.json().get("response", "")
+    except requests.exceptions.Timeout:
+        # Was reported as "unreachable" (limitations audit 12:53, #8).
+        _LAST_CALL_FAILURE["kind"] = "timeout"
+        log.warning(f"Ollama call timed out after 400 s at {OLLAMA_HOST}")
+        return None
     except requests.exceptions.ConnectionError:
+        _LAST_CALL_FAILURE["kind"] = "unreachable"
         log.warning(f"Ollama not reachable at {OLLAMA_HOST}")
         return None
     except Exception as e:
+        _LAST_CALL_FAILURE["kind"] = "error"
         log.warning(f"Ollama call failed: {e}")
         return None
+
+
+# Why the last _call_ollama returned None, for the stub's reason text.
+_LAST_CALL_FAILURE: dict = {"kind": None}
+_STUB_REASONS = {"timeout": "Ollama timed out", "unreachable": "Ollama unreachable",
+                 "error": "Ollama call failed"}
 
 
 def count_distinct_sources(sources: list) -> int:
@@ -785,7 +799,8 @@ def analyze(
 
     raw_response = _call_ollama(prompt)
     if not raw_response:
-        return _stub_recommendation(candidate, "Ollama unreachable")
+        return _stub_recommendation(
+            candidate, _STUB_REASONS.get(_LAST_CALL_FAILURE["kind"], "Ollama returned nothing"))
 
     parsed = _extract_json(raw_response)
     if not parsed:

@@ -149,7 +149,7 @@ def _alert_stop_refused(ticker: str, qty: float, err: Exception) -> None:
         pass
 
 
-def _queue_stop_for_retry(ticker: str, qty: float, stop_price: float) -> None:
+def _queue_stop_for_retry(ticker: str, qty: float, stop_price: float, alert: bool = True) -> None:
     """A stop request never reached the orders worker (busy or stuck):
     nothing was sent. Hand it to the reconcile re-protect queue, which
     places the recorded stop for the held shares every cycle until done,
@@ -162,6 +162,8 @@ def _queue_stop_for_retry(ticker: str, qty: float, stop_price: float) -> None:
         tasks._queue_reprotect(ticker, {"intent": "BUY"}, None)
     except Exception as e:
         log.error(f"[{ticker}] Could not queue the stop retry: {e}")
+    if not alert:
+        return  # the caller already sent its own alert (professor M81)
     try:
         alert_module._send(
             f"⚠️ STOP DELAYED — {ticker}\n"
@@ -916,7 +918,7 @@ def execute_approved(
                         # real short just fails again) rather than drop it or
                         # retry inline (professor run 11 follow-up).
                         _alert_stop_refused(ticker, stop_qty, e)
-                        _queue_stop_for_retry(ticker, stop_qty, float(stop_price))
+                        _queue_stop_for_retry(ticker, stop_qty, float(stop_price), alert=False)
                         stop_placed = True
                         break
                     if isinstance(e, tasks.OrdersCallUnknown):

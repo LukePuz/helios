@@ -397,7 +397,7 @@ def test_sell_above_the_long_position_is_refused_after_a_fresh_read():
     """Run 11 follow-up: flat or smaller long also opens a short; a lagging
     cache is re-read before refusing."""
     import pytest
-    pos = lambda q: [MagicMock(contract=MagicMock(symbol="AMD"), position=q)]
+    pos = lambda q: [MagicMock(contract=MagicMock(symbol="AMD", secType="STK"), position=q)]
     fake_ib = MagicMock()
     fake_ib.positions.return_value = pos(2)
     fake_ib.reqPositions.return_value = pos(2)
@@ -417,3 +417,10 @@ def test_unset_price_fields_read_as_no_price():
     assert ibkr._price_or_none(1.7976931348623157e308) is None
     assert ibkr._price_or_none(0) is None and ibkr._price_or_none(None) is None
     assert ibkr._price_or_none(185.5) == 185.5
+
+
+def test_long_qty_counts_stock_only():
+    """m47: a short option on the symbol is not a short stock position."""
+    pos = [MagicMock(contract=MagicMock(symbol="AMD", secType="STK"), position=5),
+           MagicMock(contract=MagicMock(symbol="AMD", secType="OPT"), position=-2)]
+    assert ibkr._long_qty(pos, "AMD") == 5

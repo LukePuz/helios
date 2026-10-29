@@ -1277,6 +1277,7 @@ def _queue_reprotect(ticker: str, order: dict, fill_price: float | None) -> None
 
 
 _REPROTECT_MAX_TRIES = 4  # reconcile_stop_orders cycles, 15 min apart (~1 h)
+_BUY_FLAT_MAX_TRIES = 2   # ~30 min for a new BUY's position to show up
 
 
 def _retry_pending_reprotects() -> None:
@@ -1296,9 +1297,21 @@ def _retry_pending_reprotects() -> None:
     for ticker, rec in pending.items():
         result = _reprotect_after_late_sell(ticker, rec, rec.get("fill_price"), from_queue=True)
         tries = int(rec.get("tries", 0)) + 1
-        # A BUY that still reads flat is retried for ~30 min (6 cycles)
-        # before giving up to the no-stop alert (professor M60).
-        if result is False and tries >= _REPROTECT_MAX_TRIES:
+        # A BUY that still reads flat is retried for 2 cycles (~30 min; they
+        # are 15 min apart, so the old 6 was ~90 min, professor m55), then
+        # handed to Luke like a failed retry (professor M60).
+        flat_buy = result is None and rec.get("intent") == "BUY"
+        if flat_buy and tries >= _BUY_FLAT_MAX_TRIES:
+            log.error(f"[{ticker}] reconcile: queued BUY stop still reads flat after {tries} tries")
+            try:
+                import alerts
+                alerts._send(f"🚨 STOP NOT PLACED — <b>{ticker}</b>\nAfter a BUY the broker still "
+                             f"shows no position (~30 min), so no stop was placed. Check TWS: if the "
+                             f"shares are there, place the stop by hand.")
+            except Exception:
+                pass
+            outcome[ticker] = (rec, None)
+        elif result is False and tries >= _REPROTECT_MAX_TRIES:
             # ~1 h of failures: stop retrying (each try cancels and re-places)
             # and hand it to Luke (professor M79).
             log.error(f"[{ticker}] reconcile: queued re-protect failed {tries} times; giving up")
@@ -1310,7 +1323,7 @@ def _retry_pending_reprotects() -> None:
             except Exception:
                 pass
             outcome[ticker] = (rec, None)
-        elif result is False or (result is None and rec.get("intent") == "BUY" and tries < 6):
+        elif result is False or flat_buy:
             outcome[ticker] = (rec, {**rec, "tries": tries})
         else:
             log.info(f"[{ticker}] reconcile: queued re-protect done ({result})")

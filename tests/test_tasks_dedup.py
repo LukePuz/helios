@@ -1281,3 +1281,18 @@ def test_restore_does_not_overwrite_a_queued_profit_target():
         tasks._queue_reprotect("AMD", {"intent": "RESTORE"}, None)
     rec = json.loads(state["reprotect_pending"])["AMD"]
     assert rec["intent"] == "PROFIT_TARGET" and rec["stop_price"] == 101.0
+
+
+def test_flat_buy_hands_off_after_about_30_minutes():
+    """m55: a queued BUY stop whose position still reads flat alerts and drops
+    after 2 cycles, not 6 (~90 min)."""
+    import json
+    import tasks
+    state = {"reprotect_pending": json.dumps({"AMD": {"intent": "BUY", "tries": 1, "nonce": "n"}})}
+    with patch("db.get_state", side_effect=lambda k: state.get(k)), \
+         patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+         patch("tasks._reprotect_after_late_sell", return_value=None), \
+         patch("alerts._send") as send:
+        tasks._retry_pending_reprotects()
+    assert json.loads(state["reprotect_pending"]) == {}
+    assert "STOP NOT PLACED" in send.call_args[0][0]

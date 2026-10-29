@@ -880,6 +880,7 @@ def test_refused_stop_is_not_retried():
     assert place.call_count == 1
     queued.assert_called_once()
     assert any("STOP REFUSED" in c[0][0] for c in send.call_args_list)
+    assert not any("STOP DELAYED" in c[0][0] for c in send.call_args_list)  # M81: one alert
 
 
 def test_lock_lost_stop_is_queued_and_failed_stop_queued_too():

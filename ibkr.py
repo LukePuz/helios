@@ -225,7 +225,10 @@ class SellExceedsPosition(RuntimeError):
 
 
 def _long_qty(positions, ticker: str) -> float:
-    return sum(float(p.position) for p in positions if p.contract.symbol == ticker)
+    # Stock only: a short option on the same symbol must not read as a short
+    # stock position and block the stop (professor m47).
+    return sum(float(p.position) for p in positions
+               if p.contract.symbol == ticker and getattr(p.contract, "secType", "STK") == "STK")
 
 
 def _refuse_sell_on_short(ib, ticker: str, qty: float | None = None) -> None:

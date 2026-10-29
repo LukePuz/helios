@@ -109,6 +109,34 @@ def _try_start_redis() -> None:
     )
 
 
+def _adopt_position(client, rm, symbol, qty, manage_stop_place, resting_sell_stops):
+    """Adopt one unrecorded IBKR position under its ticker lock. Re-checks
+    first: another path may have written the record meanwhile, and a stop
+    already resting covers its shares (audit 02:53, A0253-5)."""
+    import db
+    if db.get_position_stop(symbol):
+        return None
+    resting = sum(float(o["qty"]) for o in resting_sell_stops(symbol))
+    need = round(abs(qty) - resting, 4)
+    pos = client.get_open_position(symbol)
+    entry_price = float(pos.avg_entry_price)
+    stop_price, stop_method = rm.calculate_stop(symbol, entry_price, "Accelerator")
+    db.upsert_position_stop(
+        ticker=symbol, entry_price=entry_price, stop_price=stop_price,
+        stop_method=f"AUTO-ADOPTED ({stop_method}) — verify bucket/stop manually",
+        bucket="Accelerator", conviction=5, trail_distance_pct=None,
+    )
+    if need <= 0:
+        return f"{symbol} ({qty} shares, record only: existing stops cover {resting:g})"
+    try:
+        stop_result = manage_stop_place(symbol, need, stop_price)
+        db.set_stop_broker_order_id(symbol, stop_result["order_id"])
+        return f"{symbol} ({need:g} shares, stop placed @ ${stop_price:.2f})"
+    except Exception as e:
+        return (f"{symbol} ({qty} shares, DB stop ${stop_price:.2f} — "
+                f"BROKER STOP PLACEMENT FAILED: {e})")
+
+
 def _reconcile_positions() -> None:
     """
     Compare DB-recorded positions against live IBKR holdings and ACT on
@@ -149,23 +177,15 @@ def _reconcile_positions() -> None:
             from tasks import manage_stop_place
             rm = RiskManager(client)
             adopted: list[str] = []
+            import stop_lock
+            from tasks import _resting_sell_stops
             for symbol, qty in in_ibkr_not_db.items():
                 try:
-                    pos = client.get_open_position(symbol)
-                    entry_price = float(pos.avg_entry_price)
-                    stop_price, stop_method = rm.calculate_stop(symbol, entry_price, "Accelerator")
-                    db.upsert_position_stop(
-                        ticker=symbol, entry_price=entry_price, stop_price=stop_price,
-                        stop_method=f"AUTO-ADOPTED ({stop_method}) — verify bucket/stop manually",
-                        bucket="Accelerator", conviction=5, trail_distance_pct=None,
-                    )
-                    try:
-                        stop_result = manage_stop_place(symbol, abs(qty), stop_price)
-                        db.set_stop_broker_order_id(symbol, stop_result["order_id"])
-                        adopted.append(f"{symbol} ({qty} shares, stop placed @ ${stop_price:.2f})")
-                    except Exception as e:
-                        adopted.append(f"{symbol} ({qty} shares, DB stop ${stop_price:.2f} — "
-                                       f"BROKER STOP PLACEMENT FAILED: {e})")
+                    with stop_lock.ticker_lock(symbol):
+                        msg = _adopt_position(client, rm, symbol, qty, manage_stop_place,
+                                              _resting_sell_stops)
+                    if msg:
+                        adopted.append(msg)
                 except Exception as e:
                     logging.error(f"Could not adopt orphaned position {symbol}: {e}")
 
@@ -337,7 +357,8 @@ def _auto_start_services() -> None:
     def _start():
         time.sleep(6)  # Give the dashboard time to come up first
         import process_manager as pm
-        for name in pm.SERVICES:
+
+        def _start_one(name):
             result = pm.start(name)
             if result == "ok":
                 logging.info(f"Auto-started {pm.SERVICES[name]['label']}.")
@@ -345,7 +366,17 @@ def _auto_start_services() -> None:
                 logging.info(f"{pm.SERVICES[name]['label']} already running.")
             else:
                 logging.warning(f"Could not start {pm.SERVICES[name]['label']}: {result}")
+
+        # Orders worker first, then the startup reconcile, then everything
+        # else: with beat and the other workers already up, overdue
+        # reconcile tasks raced the adoption and a fresh market BUY could be
+        # cancelled as "stale" (audit 02:53, A0253-5).
+        if "celery_orders_worker" in pm.SERVICES:
+            _start_one("celery_orders_worker")
         _startup_reconcile()
+        for name in pm.SERVICES:
+            if name != "celery_orders_worker":
+                _start_one(name)
 
     t = threading.Thread(target=_start, daemon=True, name="service-autostart")
     t.start()

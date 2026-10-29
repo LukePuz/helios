@@ -515,7 +515,8 @@ app.conf.beat_schedule = {
     # the 05:00 wake.
     "refresh-earnings": {
         "task":     "tasks.refresh_earnings_calendar",
-        "schedule": crontab(hour=8, minute=0, day_of_week="mon"),
+        # Daily: weekly left moved dates stale for days in earnings season (A1453-2).
+        "schedule": crontab(hour=8, minute=0, day_of_week="mon-fri"),
         "options":  {"queue": INGESTION_QUEUE, "expires": 24 * 3600},
     },
     # Macro calendar (FOMC/CPI/jobs/election) — weekly is plenty since the

@@ -1320,3 +1320,35 @@ def test_backstop_does_not_sell_after_a_split():
     pos.avg_entry_price = 1800.0  # 1:10 reverse split
     with patch("db.get_position_stop", return_value={"entry_price": 180.0}):
         assert tasks._split_ratio("NVDA", pos) == 0.1
+
+
+def test_earnings_refresh_replaces_moved_dates_and_flags_estimates():
+    """A1453-2: a moved date replaces the old future row; a two-date window is
+    stored as an estimate; names with no date are named in the log."""
+    from datetime import date, timedelta
+    from unittest.mock import MagicMock
+    import db
+    from ingestion import earnings_calendar as ec
+    d1 = date.today() + timedelta(days=5)
+    cal = {"AAA": {"Earnings Date": [d1]},
+           "BBB": {"Earnings Date": [d1, d1 + timedelta(days=4)]},
+           "CCC": {"Earnings Date": []}}
+    fake_yf = MagicMock()
+    fake_yf.Ticker.side_effect = lambda t: MagicMock(calendar=cal[t])
+    with patch.dict("sys.modules", {"yfinance": fake_yf}), \
+         patch("knowledge_loader.get_all_tickers", return_value=["AAA", "BBB", "CCC"]), \
+         patch("db.upsert_earnings_date") as up, patch.object(ec.time, "sleep"), \
+         patch("catalyst_service.storage.upsert_earnings_from_sources", create=True), \
+         patch.object(ec.log, "info") as info:
+        ec.refresh_all_earnings()
+    calls = {c.args[0]: c.kwargs for c in up.call_args_list}
+    assert calls["AAA"] == {"confirmed": True, "replace_future": True}
+    assert calls["BBB"]["confirmed"] is False
+    assert "no upcoming date for CCC" in info.call_args[0][0]
+    cur = MagicMock()
+    cur.fetchall.return_value = [(d1 + timedelta(days=7),)]
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
+        db.upsert_earnings_date("AAA", d1, confirmed=True, replace_future=True)
+    assert "DELETE FROM earnings_calendar" in cur.execute.call_args_list[0][0][0]

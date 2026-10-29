@@ -3606,10 +3606,25 @@ def get_portfolio_heat_pct(equity: float, positions: dict[str, dict]) -> dict:
 # Earnings calendar
 # ---------------------------------------------------------------------------
 
-def upsert_earnings_date(ticker: str, earnings_date, confirmed: bool = False) -> None:
+def upsert_earnings_date(ticker: str, earnings_date, confirmed: bool = False,
+                         replace_future: bool = False) -> None:
+    """With replace_future, other future dates for the ticker are removed in
+    the same transaction: when the source moves a date, the old row stayed
+    and a ticker carried two "next" dates (audit 14:53, A1453-2; the
+    META/TSLA conflicts). Removed dates are logged."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
+            if replace_future:
+                cur.execute(
+                    "DELETE FROM earnings_calendar WHERE ticker=%s AND earnings_date >= CURRENT_DATE "
+                    "AND earnings_date <> %s RETURNING earnings_date",
+                    (ticker, earnings_date),
+                )
+                gone = [str(r[0]) for r in cur.fetchall()]
+                if gone:
+                    logging.info(f"[{ticker}] earnings date moved to {earnings_date}; "
+                                 f"removed {', '.join(gone)}")
             cur.execute(
                 "INSERT INTO earnings_calendar (ticker, earnings_date, confirmed, refreshed_at) "
                 "VALUES (%s,%s,%s,NOW()) "

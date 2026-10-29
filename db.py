@@ -3634,8 +3634,10 @@ def upsert_earnings_date(ticker: str, earnings_date, confirmed: bool = False,
                     logging.warning(f"[{ticker}] earnings history write failed ({e}); "
                                     f"old dates kept this time")
             if replace_future and history_ok:
+                # Strictly after today: a pre-market report's row must survive
+                # yfinance rolling to next quarter by 08:00 (T+0 review).
                 cur.execute(
-                    "DELETE FROM earnings_calendar WHERE ticker=%s AND earnings_date >= CURRENT_DATE "
+                    "DELETE FROM earnings_calendar WHERE ticker=%s AND earnings_date > CURRENT_DATE "
                     "AND earnings_date <> %s RETURNING earnings_date",
                     (ticker, earnings_date),
                 )

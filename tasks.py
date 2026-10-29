@@ -1279,6 +1279,7 @@ def _queue_reprotect(ticker: str, order: dict, fill_price: float | None) -> None
 
 _MANUAL_ACTIONS_KEY = "manual_actions"
 _MANUAL_REALERT_S = 3600
+_MANUAL_FLAT_ONLY_READS = 24  # cycles (~6 h) before a clear_on_flat=False item clears on flat
 
 
 def _manual_actions_edit(fn) -> None:
@@ -1355,8 +1356,10 @@ def _review_manual_actions() -> None:
         need = 3 if empty else 1  # earlier flat reads needed, besides this one
         if qty > 0 and covered is not None and covered >= qty:
             cleared.append(ticker)
-        elif (qty <= 0 and rec.get("clear_on_flat", True)
-              and int(rec.get("flat_reads", 0)) >= need):
+        elif qty <= 0 and int(rec.get("flat_reads", 0)) >= (
+                need if rec.get("clear_on_flat", True) else _MANUAL_FLAT_ONLY_READS):
+            # A "reads flat" item still clears after ~6 h flat, so shares sold
+            # by hand don't re-alert forever.
             cleared.append(ticker)  # flat on 2 cycles in a row, or 4 if the reads are empty (C28)
         else:
             if qty <= 0:
@@ -1898,6 +1901,14 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
             # would sell the whole position at market (audit 14:53, A1453-1).
             log.error(f"[{ticker}] Backstop sell blocked: recorded entry vs broker average cost "
                       f"suggests a {ratio:g}:1 split; stop levels need rescaling")
+            try:
+                already = ticker in json.loads(db.get_state(_MANUAL_ACTIONS_KEY) or "{}")
+            except Exception:
+                already = False
+            if already:
+                return False  # tracked; the hourly STILL OPEN re-alert covers it
+            open_manual_action(ticker, f"check a possible {ratio:g}:1 split and rescale the stop "
+                                       f"record", clear_on_flat=False)
             try:
                 import alerts
                 alerts._send(f"⚠️ POSSIBLE SPLIT — <b>{ticker}</b>\nThe recorded entry is about "

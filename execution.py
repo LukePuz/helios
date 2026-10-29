@@ -1198,7 +1198,7 @@ def execute_manual(
                     log.warning(f"[{ticker}] Stop attempt {attempt}/3: {e}")
                     if type(e).__name__ == "SellExceedsPosition":
                         _alert_stop_refused(ticker, filled_qty, e)
-                        _queue_stop_for_retry(ticker, filled_qty, float(stop_price))
+                        _queue_stop_for_retry(ticker, filled_qty, float(stop_price), alert=False)
                         stop_placed = True
                         break
                     if isinstance(e, tasks.OrdersCallUnknown):

@@ -461,9 +461,11 @@ class TestReconcileUnconfirmedOrders:
              patch("db.delete_position_stop") as delete, \
              patch("db.close_trade_outcome") as close, \
              patch("db.mark_profit_target_taken") as taken, \
+             patch("tasks._queue_reprotect") as queued, \
+             patch("tasks._retry_pending_reprotects"), \
              patch("alerts._send") as send:
             tasks.reconcile_unconfirmed_orders.run()
-        self.extra = {"delete": delete, "close": close, "taken": taken}
+        self.extra = {"delete": delete, "close": close, "taken": taken, "queued": queued}
         return cancel, place, send
 
     def test_late_sell_that_closed_the_position_places_no_stop(self):
@@ -523,6 +525,27 @@ class TestReconcileUnconfirmedOrders:
             tasks.reconcile_unconfirmed_orders.run()
         log_trade.assert_not_called()
         send.assert_not_called()
+
+    def test_failed_reprotect_is_queued_for_retry(self):
+        """Professor M50: a busy/failed re-protect after the SELL was booked
+        used to be dropped."""
+        from unittest.mock import MagicMock
+        self._run_sell([MagicMock(symbol="CRWD", qty=20)], stop_rec=None)
+        self.extra["queued"].assert_called_once()
+
+    def test_order_not_marked_means_no_trade_logged(self):
+        """Professor M51: log_trade ran before update_order_fill, so a failed
+        update re-logged the trade every cycle."""
+        with patch("db.get_unconfirmed_orders", return_value=[self._order()]), \
+             patch("ibkr.get_fill_for_order",
+                   return_value={"filled_qty": 144.0, "fill_price": 181.3}), \
+             patch("db.update_order_fill", return_value=False), \
+             patch("db.log_trade") as log_trade, \
+             patch("tasks._retry_pending_reprotects"), \
+             patch("tasks.manage_stop_place") as place, patch("alerts._send"):
+            tasks.reconcile_unconfirmed_orders.run()
+        log_trade.assert_not_called()
+        place.assert_not_called()
 
     def test_late_exit_closes_stop_record_and_outcome(self):
         """Professor M-3: a late full exit left position_stops behind, so
@@ -905,3 +928,17 @@ class TestBackfillCatalystTrackingTask:
         with patch("agents.crew.backfill_catalyst_tracking", side_effect=Exception("db down")):
             with pytest.raises(Exception):
                 tasks.backfill_catalyst_tracking.run()
+
+
+def test_pending_reprotects_retry_until_done():
+    import json
+    state = {"reprotect_pending": json.dumps({"AMD": {"intent": "TRIM", "stop_price": None,
+                                                     "fill_price": 100.0},
+                                             "NVDA": {"intent": None, "stop_price": None,
+                                                      "fill_price": 50.0}})}
+    results = {"AMD": True, "NVDA": False}
+    with patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
+         patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+         patch("tasks._reprotect_after_late_sell", side_effect=lambda t, *a: results[t]):
+        tasks._retry_pending_reprotects()
+    assert set(json.loads(state["reprotect_pending"])) == {"NVDA"}

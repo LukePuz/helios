@@ -2647,8 +2647,9 @@ def compute_slippage_pct(decision_price: float | None, fill_price: float | None,
     return raw if side == "BUY" else -raw
 
 
-def update_order_fill(order_id: int, fill_price: float, filled_qty: float, status: str) -> None:
-    """Records the fill and computes slippage_pct vs decision_price if one was logged."""
+def update_order_fill(order_id: int, fill_price: float, filled_qty: float, status: str) -> bool:
+    """Records the fill and computes slippage_pct vs decision_price if one was logged.
+    Returns False if the write failed (reconcile relies on it, professor M51)."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
@@ -2665,9 +2666,11 @@ def update_order_fill(order_id: int, fill_price: float, filled_qty: float, statu
                 (fill_price, filled_qty, status, slippage_pct, order_id),
             )
         conn.commit()
+        return True
     except Exception as e:
         conn.rollback()
         logging.error(f"update_order_fill failed: {e}")
+        return False
     finally:
         _put_conn(conn)
 

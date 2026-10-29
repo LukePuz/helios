@@ -10,6 +10,7 @@ Start worker:   celery -A tasks worker --loglevel=info --pool=solo
 Start scheduler: celery -A tasks beat --loglevel=info
 """
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -1026,6 +1027,8 @@ def reconcile_unconfirmed_orders(self):
         log.error(f"reconcile_unconfirmed_orders: could not load unconfirmed orders: {e}")
         raise self.retry(exc=e, countdown=120)
 
+    _retry_pending_reprotects()
+
     for order in pending:
         ticker = order["ticker"]
         try:
@@ -1059,13 +1062,19 @@ def reconcile_unconfirmed_orders(self):
                     + ("" if complete else f" ({total_qty:g} of {order['qty']:g} filled)"))
 
         intent = order.get("intent")
+        # Mark the order first: if that write fails, stop here, or the next
+        # cycle would log the same trade again and re-place a BUY stop
+        # (professor M51). A failed log_trade after this is spilled.
+        if db.update_order_fill(order["id"], fill_price=total_avg, filled_qty=total_qty,
+                                status="filled" if complete else "partial") is False:
+            log.error(f"[{ticker}] reconcile: could not mark order {order['id']} filled; "
+                      f"trade not logged this cycle")
+            continue
         db.log_trade(
             symbol=ticker, side=order["side"], quantity=fill_qty, price=fill_price,
             reason=(f"{intent + ' ' if intent else ''}Late-fill reconciled (order placed "
                     f"unconfirmed, filled after the wait window)"),
         )
-        db.update_order_fill(order["id"], fill_price=total_avg, filled_qty=total_qty,
-                             status="filled" if complete else "partial")
 
         stop_placed: bool | None = False
         approval = db.get_approval_by_id(order["approval_id"]) if order["approval_id"] else None
@@ -1094,6 +1103,10 @@ def reconcile_unconfirmed_orders(self):
             # before the sale) leaves the rest without a stop. Re-protect it at
             # the recorded stop (professor C12, 2026-10-28).
             stop_placed = _reprotect_after_late_sell(ticker, order, fill_price)
+            if stop_placed is False:
+                # Busy ticker or a failed placement: the order is already
+                # marked filled, so remember to retry (professor M50).
+                _queue_reprotect(ticker, order, fill_price)
 
         alert_lines = [
             f"🔁 LATE FILL RECONCILED — <b>{ticker}</b>",
@@ -1109,6 +1122,38 @@ def reconcile_unconfirmed_orders(self):
             alerts._send("\n".join(alert_lines))
         except Exception:
             pass
+
+
+_REPROTECT_STATE_KEY = "reprotect_pending"
+
+
+def _queue_reprotect(ticker: str, order: dict, fill_price: float | None) -> None:
+    import db
+    pending = json.loads(db.get_state(_REPROTECT_STATE_KEY) or "{}")
+    pending[ticker] = {"intent": order.get("intent"), "stop_price": order.get("stop_price"),
+                       "fill_price": fill_price}
+    db.set_state(_REPROTECT_STATE_KEY, json.dumps(pending))
+
+
+def _retry_pending_reprotects() -> None:
+    """Re-protect after late SELL fills whose first attempt failed or found
+    the ticker busy (professor M50). Runs every reconcile cycle until each
+    one places a stop or finds nothing held."""
+    import db
+    try:
+        pending = json.loads(db.get_state(_REPROTECT_STATE_KEY) or "{}")
+    except Exception:
+        pending = {}
+    if not pending:
+        return
+    left = {}
+    for ticker, rec in pending.items():
+        result = _reprotect_after_late_sell(ticker, rec, rec.get("fill_price"))
+        if result is False:
+            left[ticker] = rec
+        else:
+            log.info(f"[{ticker}] reconcile: queued re-protect done ({result})")
+    db.set_state(_REPROTECT_STATE_KEY, json.dumps(left))
 
 
 @locked_by_ticker(lambda ticker, *a, **k: ticker, on_busy=False)

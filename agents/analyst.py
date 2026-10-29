@@ -164,12 +164,14 @@ def _code_mixed_check() -> dict:
     import time
     now = time.monotonic()
     if _DISK_CHECK["value"] is None or now - _DISK_CHECK["at"] > 60:
-        disk = _git_code_sha().get("head_sha")
-        boot = _CODE_SHA.get("head_sha")
-        strip = lambda x: (x or "").replace("-dirty", "")
+        disk_all = _git_code_sha()
+        # code_sha (last commit outside research-log/, -dirty kept) so a
+        # log-only pull isn't flagged and a hot edit is (professor M75 b, c).
+        disk, boot = disk_all.get("code_sha"), _CODE_SHA.get("code_sha")
         _DISK_CHECK.update(at=now, value={
-            "disk_head_sha": disk,
-            "code_mixed": bool(disk and boot and strip(disk) != strip(boot)),
+            "disk_head_sha": disk_all.get("head_sha"),
+            "disk_code_sha": disk,
+            "code_mixed": bool(disk and boot and disk != boot),
         })
     return _DISK_CHECK["value"]
 
@@ -209,6 +211,16 @@ def _provenance(prompt: str) -> dict:
             "prompt_template_sha": hashlib.sha256(
                 inspect.getsource(_build_prompt).encode()).hexdigest()[:12],
         }
+    if _PROVENANCE_STATIC.get("model_digest") is None:
+        # The first /api/tags call failed (Ollama still loading): don't stamp
+        # every decision of this process without a digest (professor M77).
+        try:
+            tags = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5).json().get("models", [])
+            digest = next((m.get("digest") for m in tags if m.get("name") == ANALYST_MODEL), None)
+            if digest:
+                _PROVENANCE_STATIC["model_digest"] = digest[:12]
+        except Exception:
+            pass
     import hashlib
     return {**_PROVENANCE_STATIC, **_code_mixed_check(),
             "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:12]}

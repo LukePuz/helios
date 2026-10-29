@@ -138,6 +138,21 @@ LLM_EVENT_EXPIRES_SECONDS = 4 * 3600
 # sets for it) — if so, call the broker directly; if not, dispatch a task to
 # the "orders" queue and wait for the result. The direct-call branch also
 # means celery_orders_worker's own tasks never call back into themselves.
+from celery.signals import worker_init
+
+
+@worker_init.connect
+def _pin_code_stamp(**_):
+    """Import the analyst (which reads the commit stamp) in the worker's
+    parent at boot, before the pool forks, so the stamp and the analyst code
+    come from the files present at start, not whatever is on disk at the
+    first analysis (professor M75 a)."""
+    try:
+        import agents.analyst  # noqa: F401
+    except Exception as e:
+        log.warning(f"could not pre-import agents.analyst at worker start: {e}")
+
+
 ORDERS_QUEUE = "orders"
 _ORDERS_WORKER_CLIENT_ID = "30"
 
@@ -1336,6 +1351,17 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
             remaining = round(abs(float(pos.qty)), 4) if pos else 0.0
         except Exception:
             return False
+    if pos is not None and float(pos.qty) < 0:
+        # A SELL stop on a short adds to it (professor M63 residual): alert
+        # and drop the retry rather than place one.
+        log.error(f"[{ticker}] reconcile: broker shows a SHORT ({float(pos.qty):g}); no stop placed")
+        try:
+            import alerts
+            alerts._send(f"🚨 SHORT POSITION — <b>{ticker}</b>\n{float(pos.qty):g} shares at the "
+                         f"broker. No stop was placed. Check TWS now.")
+        except Exception:
+            pass
+        return None
     if remaining <= 0 and from_queue:
         # A queued retry carries an old fill price, and the rest may have
         # exited since by its stop: leave the close to reconcile_stop_orders'

@@ -376,3 +376,17 @@ def test_trail_stop_price_is_the_trigger_not_the_distance():
     with patch.object(ibkr, "get_ib", return_value=fake_ib):
         [o] = ibkr.get_open_orders()
     assert o["stop_price"] == 185.5
+
+
+def test_sell_orders_refused_on_a_short():
+    """Professor M63 residual: one check where every SELL is placed."""
+    import pytest
+    fake_ib = MagicMock()
+    fake_ib.positions.return_value = [MagicMock(contract=MagicMock(symbol="AMD"), position=-3)]
+    with patch.object(ibkr, "get_ib", return_value=fake_ib):
+        for call in (lambda: ibkr.place_stop_order("AMD", 3, 90.0),
+                     lambda: ibkr.place_trailing_stop_order("AMD", 3, trail_percent=8.0),
+                     lambda: ibkr.place_market_order("AMD", "SELL", 3)):
+            with pytest.raises(RuntimeError, match="SHORT"):
+                call()
+    fake_ib.placeOrder.assert_not_called()

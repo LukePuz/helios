@@ -148,11 +148,18 @@ def _rotate_log_if_large(log_path: Path) -> None:
     `open(path, "a")`, not a Python logging handler), so RotatingFileHandler
     doesn't apply — these grow unbounded otherwise. Rename to .1 (dropping
     any previous .1) right before a fresh start, since that's the one
-    moment nothing is actively writing to the file."""
+    moment nothing is actively writing to the file. The previous .1 is moved
+    to logs/archive/ with its date instead of deleted: the LLM worker log is
+    the raw record of past verdicts (professor M76, 2026-10-29)."""
     try:
         if log_path.exists() and log_path.stat().st_size > _LOG_ROTATE_MAX_BYTES:
             backup = log_path.with_suffix(log_path.suffix + ".1")
-            backup.unlink(missing_ok=True)
+            if backup.exists():
+                import time as _t
+                archive = log_path.parent / "archive"
+                archive.mkdir(exist_ok=True)
+                stamp = _t.strftime("%Y%m%d-%H%M%S", _t.localtime(backup.stat().st_mtime))
+                backup.rename(archive / f"{log_path.stem}.{stamp}{log_path.suffix}")
             log_path.rename(backup)
     except Exception:
         pass  # rotation is best-effort — never block a service start over it

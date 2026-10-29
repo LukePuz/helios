@@ -372,12 +372,20 @@ def _startup_reconcile() -> None:
     # Under the late-fill reconcile's run lock: if this pass overran and beat
     # has started, the stale-BUY cancel mustn't overlap that task booking the
     # same order's fill (A0653-7). Waits up to 120 s for it.
-    lock = None
+    # Renewed while held (professor M78). If the late-fill reconcile holds it
+    # for 120 s the cancel still runs unlocked: a stale market BUY filling at
+    # the open with no stop is the worse failure.
+    lock, done = None, threading.Event()
     try:
         import stop_lock
         lock = stop_lock._redis().lock("helios:task:reconcile_unconfirmed_orders",
-                                       timeout=stop_lock.LOCK_TTL_S, blocking_timeout=120)
-        if not lock.acquire():
+                                       timeout=stop_lock.LOCK_TTL_S, blocking_timeout=120,
+                                       thread_local=False)
+        if lock.acquire():
+            threading.Thread(target=stop_lock._keep_renewed,
+                             args=(lock, "startup-open-orders", done, 600),
+                             daemon=True).start()
+        else:
             lock = None
             logging.warning("Open-order reconciliation: late-fill reconcile busy for 120 s; "
                             "running without its lock")
@@ -387,6 +395,7 @@ def _startup_reconcile() -> None:
     try:
         _reconcile_open_orders()
     finally:
+        done.set()
         if lock is not None:
             try:
                 lock.release()

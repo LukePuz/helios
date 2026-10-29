@@ -219,6 +219,17 @@ def get_historical_bars(
 # Order execution
 # ---------------------------------------------------------------------------
 
+def _refuse_sell_on_short(ib, ticker: str) -> None:
+    """Every SELL here (stop, trail, market) assumes a long position; on a
+    short it would add to it. Callers size from abs(qty) in many places, so
+    the check sits where all of them meet (professor M63 residual). Reads
+    ib_async's position cache, kept current by the subscription."""
+    for p in ib.positions():
+        if p.contract.symbol == ticker and float(p.position) < 0:
+            raise RuntimeError(f"{ticker}: broker shows a SHORT of {float(p.position):g}; "
+                               f"SELL order refused")
+
+
 def place_market_order(ticker: str, side: str, qty: float, fill_timeout: float = 30.0) -> dict:
     """
     Place a market order and wait for the fill. side = 'BUY' or 'SELL'.
@@ -239,6 +250,8 @@ def place_market_order(ticker: str, side: str, qty: float, fill_timeout: float =
     that caller itself checks market hours first.
     """
     ib = get_ib()
+    if side == "SELL":
+        _refuse_sell_on_short(ib, ticker)
     contract = _stock(ib, ticker)
 
     # Subscribe to delayed data briefly to satisfy TWS precautionary check
@@ -487,6 +500,7 @@ def place_trailing_stop_order(
         raise ValueError("place_trailing_stop_order: give exactly one of trail_percent/trail_amount")
 
     ib = get_ib()
+    _refuse_sell_on_short(ib, ticker)
     contract = _stock(ib, ticker)
     order_kwargs = {"trailingPercent": trail_percent} if trail_percent is not None else {"auxPrice": trail_amount}
     order = ibi.Order(
@@ -503,6 +517,7 @@ def place_trailing_stop_order(
 def place_stop_order(ticker: str, qty: float, stop_price: float) -> dict:
     """Place a GTC sell stop-loss order. Returns order_id for lifecycle tracking."""
     ib = get_ib()
+    _refuse_sell_on_short(ib, ticker)
     contract = _stock(ib, ticker)
     order    = ibi.StopOrder("SELL", qty, stop_price, tif="GTC")
     trade    = ib.placeOrder(contract, order)

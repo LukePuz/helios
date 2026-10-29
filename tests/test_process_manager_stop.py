@@ -89,3 +89,15 @@ def test_orders_worker_stops_after_the_other_workers(procs):
     l.terminate = lambda: order.append("llm")
     pm.stop_all()
     assert order == ["llm", "orders"]
+
+
+def test_rotation_archives_the_previous_backup(tmp_path, monkeypatch):
+    """Professor M76: the old .1 used to be deleted."""
+    monkeypatch.setattr(pm, "_LOG_ROTATE_MAX_BYTES", 10)
+    log = tmp_path / "celery_llm_worker.log"
+    (tmp_path / "celery_llm_worker.log.1").write_text("old verdicts")
+    log.write_text("x" * 50)
+    pm._rotate_log_if_large(log)
+    assert (tmp_path / "celery_llm_worker.log.1").read_text() == "x" * 50
+    [archived] = list((tmp_path / "archive").iterdir())
+    assert archived.read_text() == "old verdicts" and archived.name.startswith("celery_llm_worker.")

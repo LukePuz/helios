@@ -27,12 +27,37 @@ def test_code_mixed_flags_a_pull_without_restart():
     from unittest.mock import patch
     from agents import analyst
     analyst._DISK_CHECK.update(at=0.0, value=None)
-    with patch.dict(analyst._CODE_SHA, {"head_sha": "aaa111"}), \
-         patch.object(analyst, "_git_code_sha", return_value={"head_sha": "bbb222-dirty"}):
+    with patch.dict(analyst._CODE_SHA, {"code_sha": "aaa111", "head_sha": "aaa111"}), \
+         patch.object(analyst, "_git_code_sha",
+                      return_value={"code_sha": "bbb222", "head_sha": "ccc333"}):
         v = analyst._code_mixed_check()
-    assert v == {"disk_head_sha": "bbb222-dirty", "code_mixed": True}
+    assert v["code_mixed"] is True and v["disk_code_sha"] == "bbb222"
     analyst._DISK_CHECK.update(at=0.0, value=None)
-    with patch.dict(analyst._CODE_SHA, {"head_sha": "aaa111"}), \
-         patch.object(analyst, "_git_code_sha", return_value={"head_sha": "aaa111-dirty"}):
+    # log-only pull: HEAD moved, code_sha didn't (M75 b)
+    with patch.dict(analyst._CODE_SHA, {"code_sha": "aaa111", "head_sha": "aaa111"}), \
+         patch.object(analyst, "_git_code_sha",
+                      return_value={"code_sha": "aaa111", "head_sha": "ddd444"}):
         assert analyst._code_mixed_check()["code_mixed"] is False
     analyst._DISK_CHECK.update(at=0.0, value=None)
+    # hot edit: -dirty appears (M75 c)
+    with patch.dict(analyst._CODE_SHA, {"code_sha": "aaa111", "head_sha": "aaa111"}), \
+         patch.object(analyst, "_git_code_sha",
+                      return_value={"code_sha": "aaa111-dirty", "head_sha": "aaa111-dirty"}):
+        assert analyst._code_mixed_check()["code_mixed"] is True
+    analyst._DISK_CHECK.update(at=0.0, value=None)
+
+
+def test_missing_model_digest_is_retried():
+    """Professor M77: a failed first lookup no longer sticks for the process."""
+    from unittest.mock import MagicMock, patch
+    from agents import analyst
+    saved = analyst._PROVENANCE_STATIC
+    analyst._PROVENANCE_STATIC = {"code_sha": "x", "model_digest": None}
+    try:
+        resp = MagicMock()
+        resp.json.return_value = {"models": [{"name": analyst.ANALYST_MODEL, "digest": "abcdef1234567890"}]}
+        with patch.object(analyst.requests, "get", return_value=resp), \
+             patch.object(analyst, "_code_mixed_check", return_value={}):
+            assert analyst._provenance("p")["model_digest"] == "abcdef123456"
+    finally:
+        analyst._PROVENANCE_STATIC = saved

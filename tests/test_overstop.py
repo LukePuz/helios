@@ -214,3 +214,17 @@ def test_short_position_gets_no_sell_stop():
         msg = tasks._fix_overstop("AMD")
     place.assert_not_called()
     assert "SHORT" in msg
+
+
+def test_queued_reprotect_places_no_stop_on_a_short():
+    """Professor M63 residual: the queue path used abs(qty)."""
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="AMD", qty=-5)]
+    with patch("ibkr.get_client", return_value=client), \
+         patch("tasks.manage_stop_place") as place, \
+         patch("tasks.manage_cancel_stop_orders_for") as cancel, \
+         patch("alerts._send") as send:
+        assert tasks._reprotect_after_late_sell("AMD", {"intent": "RESTORE"}, None,
+                                                from_queue=True) is None
+    place.assert_not_called(); cancel.assert_not_called()
+    assert "SHORT" in send.call_args[0][0]

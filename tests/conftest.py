@@ -72,8 +72,16 @@ class _FakeLock:
 
 
 class _FakeRedis:
+    store: dict = {}
+
     def lock(self, name, **kw):
         return _FakeLock(name, **kw)
+
+    def set(self, key, value, ex=None):
+        _FakeRedis.store[key] = value
+
+    def exists(self, key):
+        return int(key in _FakeRedis.store)
 
 
 @pytest.fixture(autouse=True)
@@ -81,6 +89,7 @@ def _no_live_redis(monkeypatch):
     import stop_lock
     _FakeLock.held = set()
     _FakeLock.renewed = []
+    _FakeRedis.store = {}
     monkeypatch.setattr(stop_lock, "_redis", lambda: _FakeRedis())
 
 

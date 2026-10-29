@@ -173,11 +173,28 @@ class TestOrdersCallResult:
     def test_no_result_at_all_is_unknown(self, monkeypatch):
         from celery.exceptions import TimeoutError as CeleryTimeout
         monkeypatch.setenv("IB_CLIENT_ID", "20")
-        fake = MagicMock()
+        from conftest import _FakeRedis
+        fake = MagicMock(id="t1")
         fake.get.side_effect = CeleryTimeout()
+        _FakeRedis.store[tasks._STARTED_KEY.format("t1")] = "1"  # worker picked it up
         with patch.object(tasks._broker_place_stop_order, "apply_async", return_value=fake):
             with pytest.raises(tasks.OrdersCallUnknown):
                 tasks.manage_stop_place("NVDA", 10, 180.0)
+
+    def test_never_started_is_expired_not_unknown(self, monkeypatch):
+        """A0253-9: a request stuck behind a busy worker was never sent."""
+        from celery.exceptions import TimeoutError as CeleryTimeout
+        monkeypatch.setenv("IB_CLIENT_ID", "20")
+        fake = MagicMock(id="t2")
+        fake.get.side_effect = CeleryTimeout()
+        with patch.object(tasks._broker_place_stop_order, "apply_async", return_value=fake):
+            with pytest.raises(tasks.OrdersCallExpired):
+                tasks.manage_stop_place("NVDA", 10, 180.0)
+
+    def test_broker_task_marks_itself_started_even_when_refusing(self):
+        from conftest import _FakeRedis
+        tasks._broker_cancel_order.apply(args=[5], kwargs={"deadline": 1.0}, task_id="t3")
+        assert _FakeRedis.store.get(tasks._STARTED_KEY.format("t3")) == "1"
 
     def test_revoked_before_running_is_expired(self, monkeypatch):
         from celery.exceptions import TaskRevokedError

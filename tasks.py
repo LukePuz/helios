@@ -169,9 +169,33 @@ def _past(deadline) -> bool:
     return deadline is not None and time.time() > deadline
 
 
+_STARTED_KEY = "helios:orders:started:{}"
+
+
+def _mark_started(task) -> None:
+    """Record that the orders worker picked this request up. Written before
+    the deadline check, so a missing marker after the deadline means the
+    worker never touched it and will refuse it when it does (A0253-9)."""
+    try:
+        import stop_lock
+        stop_lock._redis().set(_STARTED_KEY.format(task.request.id), "1", ex=900)
+    except Exception as e:
+        log.warning(f"{task.name}: could not write started marker: {e}")
+
+
+def _was_started(task_id: str) -> bool | None:
+    """True/False from the started marker; None if Redis can't be read."""
+    try:
+        import stop_lock
+        return bool(stop_lock._redis().exists(_STARTED_KEY.format(task_id)))
+    except Exception:
+        return None
+
+
 @app.task(name="tasks._broker_place_stop_order", bind=True, max_retries=1)
 def _broker_place_stop_order(self, ticker: str, qty: float, stop_price: float,
                              deadline: float | None = None) -> dict:
+    _mark_started(self)
     if _past(deadline):
         return _EXPIRED
     import ibkr
@@ -180,6 +204,7 @@ def _broker_place_stop_order(self, ticker: str, qty: float, stop_price: float,
 
 @app.task(name="tasks._broker_cancel_stop_orders_for", bind=True, max_retries=1)
 def _broker_cancel_stop_orders_for(self, ticker: str, deadline: float | None = None):
+    _mark_started(self)
     if _past(deadline):
         return _EXPIRED
     import ibkr
@@ -188,6 +213,7 @@ def _broker_cancel_stop_orders_for(self, ticker: str, deadline: float | None = N
 
 @app.task(name="tasks._broker_cancel_order", bind=True, max_retries=1)
 def _broker_cancel_order(self, order_id: int, deadline: float | None = None):
+    _mark_started(self)
     if _past(deadline):
         return _EXPIRED
     import ibkr
@@ -199,6 +225,7 @@ def _broker_place_trailing_stop_order(self, ticker: str, qty: float,
                                        trail_amount: float | None = None,
                                        trail_percent: float | None = None,
                                        deadline: float | None = None) -> dict:
+    _mark_started(self)
     if _past(deadline):
         return _EXPIRED
     import ibkr
@@ -234,6 +261,11 @@ def _orders_call(task, args, kwargs=None, timeout: int = 30):
         except TaskRevokedError as e:
             raise OrdersCallExpired(f"{task.name} expired before it ran") from e
         except CeleryTimeout as e:
+            # Never picked up (the worker was busy) is not "maybe sent": it
+            # will be refused when the worker reaches it (A0253-9).
+            if _was_started(res.id) is False:
+                raise OrdersCallExpired(f"{task.name} never started (orders worker busy); "
+                                        f"nothing sent") from e
             raise OrdersCallUnknown(f"{task.name}: no result after "
                                     f"{timeout + _ORDERS_EXTRA_WAIT_S}s") from e
     if out == _EXPIRED:

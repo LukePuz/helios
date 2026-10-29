@@ -185,9 +185,24 @@ def _log_route_exit(ticker: str, kind: str, result: dict, reason: str) -> None:
     log.info only, so the final disposition of a pass wasn't observable."""
     try:
         import db
-        db.log_signal(ticker, kind, (result.get("conviction") or 0) / 10.0, reason[:500])
+        db.log_signal(ticker, kind, (result.get("conviction") or 0) / 10.0, reason[:500],
+                      **_route_row_fields(result, kind))
     except Exception as e:
         log.warning(f"[{ticker}] route-exit signal log failed: {e}")
+
+
+def _route_row_fields(result: dict, kind: str) -> dict:
+    """Model and provenance of the verdict a routing row belongs to, so the
+    row stands on its own (SEF run 13, 2026-10-28: ROUTE_* rows had NULL model
+    and provenance and had to be joined to the preceding verdict). The
+    prompt_sha in provenance identifies that verdict's signals row."""
+    prov = result.get("provenance") or None
+    return {
+        "model": (prov or {}).get("model"),
+        "provenance": prov,
+        "decision": {"route_exit": kind, "verdict_action": result.get("action"),
+                     "verdict_conviction": result.get("conviction")},
+    }
 
 
 def _earnings_review_event(ticker: str, earnings_date, today=None) -> dict:
@@ -761,7 +776,8 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
             if _feed_emit:
                 _feed_emit("risk", ticker, f"Blocked — {reason}", "info")
             try:
-                db.log_signal(ticker, "EARNINGS_BLOCKED", conviction / 10.0, reason)
+                db.log_signal(ticker, "EARNINGS_BLOCKED", conviction / 10.0, reason,
+                              **_route_row_fields(result, "EARNINGS_BLOCKED"))
             except Exception:
                 pass
             return

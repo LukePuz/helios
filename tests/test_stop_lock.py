@@ -124,3 +124,21 @@ def test_expired_lock_is_detected_and_taken_by_another(monkeypatch):
         assert other.acquire()
     # Our release fails (logged) and leaves the other holder's lock alone.
     assert "helios:stop_lock:AMD" in _FakeLock.held
+
+
+def test_every_stop_changing_function_is_locked():
+    """Professor run 13: a helper inserted above a decorated function steals its
+    @locked_by_ticker (5ee5806 did it to _execute_backstop_sell; an earlier edit on 10-29
+    did it to _reprotect_after_late_sell). Direct-call tests can't see that, so check
+    the wrapper is on each function that changes stops or sells."""
+    import execution
+    import risk_manager
+    import tasks
+    locked = [execution.execute_approved, execution.execute_manual,
+              tasks._reprotect_after_late_sell, tasks._execute_backstop_sell, tasks._fix_overstop,
+              risk_manager.RiskManager._ratchet_ladder_stop,
+              risk_manager.RiskManager._breakeven_without_sale,
+              risk_manager.RiskManager._partial_sell_and_resize_stop]
+    for fn in locked:
+        assert hasattr(fn, "__wrapped__"), f"{fn.__qualname__} lost its ticker lock"
+    assert not hasattr(tasks._split_ratio, "__wrapped__")

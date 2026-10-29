@@ -1805,7 +1805,6 @@ def _schedule_backstop_retry(ticker: str, alert: dict) -> None:
         log.error(f"[{ticker}] Could not schedule backstop-sell retry: {e}")
 
 
-@locked_by_ticker(lambda ticker, *a, **k: ticker, on_busy=False)
 def _split_ratio(ticker: str, pos) -> float | None:
     """The split ratio (e.g. 4.0, or 0.1 for 1:10) if the recorded entry and
     the broker's average cost differ by a near-whole factor of 2 or more. The
@@ -1827,6 +1826,7 @@ def _split_ratio(ticker: str, pos) -> float | None:
     return None
 
 
+@locked_by_ticker(lambda ticker, *a, **k: ticker, on_busy=False)
 def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) -> bool:
     """Market-sell the full position when its stop level is breached and no
     protective stop exists at the broker. This monitor is the last line of

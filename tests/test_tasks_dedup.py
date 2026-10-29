@@ -1116,3 +1116,31 @@ def test_stop_reconcile_skips_while_a_previous_run_holds_the_lock():
     with patch("ibkr.get_client") as client:
         tasks.reconcile_stop_orders.run()
     client.assert_not_called()
+
+
+def test_ingestion_staleness_is_calendar_aware():
+    """A0653-6: options_flow outside RTH and Monday daily jobs aren't stale."""
+    from datetime import datetime, timedelta
+    from unittest.mock import patch
+    from zoneinfo import ZoneInfo
+
+    class _DT(datetime):
+        fixed = None
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.fixed.astimezone(tz) if tz else cls.fixed
+
+    def stale_at(fixed):
+        _DT.fixed = fixed
+        rows = [{"source": "options_flow", "last_success_at": fixed - timedelta(hours=14)},
+                {"source": "price_history", "last_success_at": fixed - timedelta(hours=63)}]
+        with patch("db.get_ingestion_health", return_value=rows), \
+             patch("datetime.datetime", _DT):
+            return " ".join(tasks._get_stale_ingestion_sources())
+
+    ny = ZoneInfo("America/New_York")
+    mon = stale_at(datetime(2026, 11, 2, 6, 0, tzinfo=ny))    # Monday pre-market
+    assert "options_flow" not in mon and "price_history" not in mon
+    tue = stale_at(datetime(2026, 11, 3, 11, 0, tzinfo=ny))   # Tuesday in RTH
+    assert "options_flow" in tue and "price_history" in tue

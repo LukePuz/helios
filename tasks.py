@@ -2199,10 +2199,23 @@ def _get_stale_ingestion_sources() -> list[str]:
         "candidate_scan": 10080,
     }
 
+    # Calendar awareness (audit 06:53, A0653-6): options_flow only polls in
+    # regular hours, and the weekday-only daily jobs don't run at weekends,
+    # so off-hours and Monday checks reported them stale every week.
+    from zoneinfo import ZoneInfo
+    et = datetime.now(ZoneInfo("America/New_York"))
+    rth = et.weekday() < 5 and (9, 45) <= (et.hour, et.minute) < (16, 0)
+    rth_only = {"options_flow"}
+    weekday_daily = {"fundamentals", "price_history", "arxiv"}
+
     stale = []
     now = datetime.now(timezone.utc)
     health = {h["source"]: h for h in db.get_ingestion_health()}
     for source, max_gap in expected_minutes.items():
+        if source in rth_only and not rth:
+            continue
+        if source in weekday_daily and et.weekday() == 0:
+            max_gap += 2 * 1440  # Friday's run is the last before Monday's
         rec = health.get(source)
         if not rec or not rec.get("last_success_at"):
             stale.append(f"{source}: never succeeded")

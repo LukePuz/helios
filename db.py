@@ -711,6 +711,11 @@ _MIGRATIONS: list[tuple[int, str]] = [
     # Which regime row a scan used: score, overall/sector source, row time,
     # last bar date (professor C25). NULL before 10-30.
     (61, "ALTER TABLE scanner_candidates ADD COLUMN IF NOT EXISTS regime_detail JSONB;"),
+    # Append-only: the date the refresh believed each day, since a moved date
+    # now replaces the old row in earnings_calendar (A1453-2, SEF 10-29).
+    (62, "CREATE TABLE IF NOT EXISTS earnings_calendar_history ("
+         "id SERIAL PRIMARY KEY, ticker VARCHAR(10) NOT NULL, earnings_date DATE NOT NULL, "
+         "confirmed BOOLEAN, recorded_at TIMESTAMPTZ DEFAULT NOW());"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -3616,6 +3621,14 @@ def upsert_earnings_date(ticker: str, earnings_date, confirmed: bool = False,
     try:
         with conn.cursor() as cur:
             if replace_future:
+                try:
+                    cur.execute("SAVEPOINT hist")
+                    cur.execute(
+                        "INSERT INTO earnings_calendar_history (ticker, earnings_date, confirmed) "
+                        "VALUES (%s,%s,%s)", (ticker, earnings_date, confirmed))
+                    cur.execute("RELEASE SAVEPOINT hist")
+                except Exception:
+                    cur.execute("ROLLBACK TO SAVEPOINT hist")  # migration 62 not run yet
                 cur.execute(
                     "DELETE FROM earnings_calendar WHERE ticker=%s AND earnings_date >= CURRENT_DATE "
                     "AND earnings_date <> %s RETURNING earnings_date",

@@ -1351,4 +1351,6 @@ def test_earnings_refresh_replaces_moved_dates_and_flags_estimates():
     conn.cursor.return_value.__enter__.return_value = cur
     with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
         db.upsert_earnings_date("AAA", d1, confirmed=True, replace_future=True)
-    assert "DELETE FROM earnings_calendar" in cur.execute.call_args_list[0][0][0]
+    sqls = [c[0][0] for c in cur.execute.call_args_list]
+    assert any("INSERT INTO earnings_calendar_history" in q for q in sqls)
+    assert any("DELETE FROM earnings_calendar " in q for q in sqls)

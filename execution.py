@@ -238,6 +238,7 @@ def _restore_stop_after_failed_sell(ticker: str) -> None:
             )
         except Exception:
             pass
+        tasks.open_manual_action(ticker, f"restore the stop @ ${float(stop_rec['stop_price']):.2f}")
 
 
 def _whole_position_stop(ticker: str, new_stop: float, filled_qty: float):
@@ -860,6 +861,8 @@ def execute_approved(
                             + f"place stop @ ${stop_rec['stop_price']:.2f} for {remaining} shares "
                             f"manually if it isn't back within ~15 min."
                         )
+                        tasks.open_manual_action(ticker, f"re-place the stop @ "
+                                                         f"${float(stop_rec['stop_price']):.2f} after a TRIM")
                 elif remaining <= 0:
                     # A TRIM that sold the last share closes the position:
                     # close its outcome row too, or it stays open and a later
@@ -955,6 +958,7 @@ def execute_approved(
                         + ("It is queued and retried every reconcile cycle, but " if queued else "")
                         + "place the stop manually in TWS now."
                     )
+                    tasks.open_manual_action(ticker, f"place a stop @ ${float(stop_price):.2f}")
                 except Exception:
                     pass
 

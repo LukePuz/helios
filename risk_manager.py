@@ -1399,6 +1399,9 @@ class RiskManager:
                                             "reason":        f"TRAIL conversion failed and the ${float(stop_px):.2f} "
                                                              f"stop could not be restored — place it manually in TWS",
                                         })
+                                        tasks.open_manual_action(
+                                            ticker, f"restore the stop @ ${float(stop_px):.2f} after a "
+                                                    f"failed TRAIL conversion")
                                 elif current > prev_high and new_stop > stop_px:
                                     try:
                                         import tasks

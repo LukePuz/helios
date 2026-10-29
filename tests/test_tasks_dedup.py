@@ -1354,3 +1354,24 @@ def test_earnings_refresh_replaces_moved_dates_and_flags_estimates():
     sqls = [c[0][0] for c in cur.execute.call_args_list]
     assert any("INSERT INTO earnings_calendar_history" in q for q in sqls)
     assert any("DELETE FROM earnings_calendar " in q for q in sqls)
+
+
+def test_manual_actions_clear_when_covered_and_realert_when_not():
+    """A1453-4: an open manual action is cleared once stops cover the shares,
+    and re-alerted hourly while they don't."""
+    import json
+    import time
+    import tasks
+    state = {"manual_actions": json.dumps({
+        "AMD": {"what": "place a stop", "first_seen": time.time() - 7200, "last_alert": time.time() - 3700},
+        "NVDA": {"what": "place a stop", "first_seen": time.time() - 600, "last_alert": time.time() - 600}})}
+    with patch("db.get_state", side_effect=lambda k: state.get(k)), \
+         patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+         patch("ibkr.get_client") as client, \
+         patch("execution._stops_still_resting", side_effect=lambda t: {"AMD": 0.0, "NVDA": 1.0}[t]), \
+         patch("alerts._send") as send:
+        client.return_value.get_all_positions.return_value = [_Pos("AMD", 5.0), _Pos("NVDA", 1.0)]
+        tasks._review_manual_actions()
+    items = json.loads(state["manual_actions"])
+    assert "NVDA" not in items and "AMD" in items
+    assert "STILL OPEN" in send.call_args[0][0] and "AMD" in send.call_args[0][0]

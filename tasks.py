@@ -1277,6 +1277,101 @@ def _queue_reprotect(ticker: str, order: dict, fill_price: float | None) -> None
     _reprotect_queue_edit(add)
 
 
+_MANUAL_ACTIONS_KEY = "manual_actions"
+_MANUAL_REALERT_S = 3600
+
+
+def _manual_actions_edit(fn) -> None:
+    import db
+    lock = None
+    try:
+        lock = stop_lock._redis().lock("helios:manual_actions", timeout=30, blocking_timeout=35)
+        if not lock.acquire():
+            lock = None
+    except Exception:
+        lock = None
+    try:
+        try:
+            items = json.loads(db.get_state(_MANUAL_ACTIONS_KEY) or "{}")
+        except Exception:
+            items = {}
+        db.set_state(_MANUAL_ACTIONS_KEY, json.dumps(fn(items)))
+    finally:
+        if lock is not None:
+            try:
+                lock.release()
+            except Exception:
+                pass
+
+
+def open_manual_action(ticker: str, what: str) -> None:
+    """Record that an alert asked Luke to fix a stop by hand. The stop check
+    clears it once the position is covered or flat, and re-alerts hourly
+    until then; one Telegram send used to be the only trace (audit 14:53,
+    A1453-4)."""
+    import time
+
+    def add(items):
+        now = time.time()
+        rec = items.get(ticker) or {"first_seen": now}
+        items[ticker] = {**rec, "what": what, "last_alert": now}
+        return items
+    try:
+        _manual_actions_edit(add)
+    except Exception as e:
+        log.warning(f"[{ticker}] could not record the manual action: {e}")
+
+
+def _review_manual_actions() -> None:
+    """Each stop-check cycle: clear manual-action items whose position is now
+    covered by resting stops (or gone), re-alert the rest hourly."""
+    import time
+    import db
+    import execution
+    import ibkr
+    try:
+        items = json.loads(db.get_state(_MANUAL_ACTIONS_KEY) or "{}")
+    except Exception:
+        return
+    if not items:
+        return
+    try:
+        held = {p.symbol: abs(float(p.qty)) for p in ibkr.get_client().get_all_positions()}
+    except Exception as e:
+        log.warning(f"manual-action review: position read failed ({e})")
+        return
+    now = time.time()
+    cleared, realert = [], []
+    for ticker, rec in items.items():
+        qty = held.get(ticker, 0.0)
+        covered = execution._stops_still_resting(ticker) if qty > 0 else None
+        if qty <= 0 or (covered is not None and covered >= qty):
+            cleared.append(ticker)
+        elif now - float(rec.get("last_alert", 0)) >= _MANUAL_REALERT_S:
+            realert.append(ticker)
+    for ticker in realert:
+        rec = items[ticker]
+        mins = int((now - float(rec.get("first_seen", now))) / 60)
+        try:
+            import alerts
+            alerts._send(f"🔁 STILL OPEN — <b>{ticker}</b>\nAsked {mins} min ago and still not "
+                         f"covered: {rec.get('what', 'place a stop')}. Check TWS.")
+        except Exception:
+            pass
+
+    def apply(current):
+        for t in cleared:
+            if t in current:
+                log.info(f"[{t}] manual action cleared: position covered or closed")
+                current.pop(t)
+        for t in realert:
+            if t in current:
+                current[t]["last_alert"] = now
+        return current
+    if cleared or realert:
+        _manual_actions_edit(apply)
+
+
 _REPROTECT_MAX_TRIES = 4  # reconcile_stop_orders cycles, 15 min apart (~1 h)
 _BUY_FLAT_MAX_TRIES = 2   # ~30 min for a new BUY's position to show up
 
@@ -1311,6 +1406,7 @@ def _retry_pending_reprotects() -> None:
                              f"shares are there, place the stop by hand.")
             except Exception:
                 pass
+            open_manual_action(ticker, "the stop after a BUY was never placed")
             outcome[ticker] = (rec, None)
         elif result is False and tries >= _REPROTECT_MAX_TRIES:
             # ~1 h of failures: stop retrying (each try cancels and re-places)
@@ -1323,6 +1419,7 @@ def _retry_pending_reprotects() -> None:
                              f"place a stop in TWS; the stop check keeps flagging it until covered.")
             except Exception:
                 pass
+            open_manual_action(ticker, "the automatic stop retry gave up")
             outcome[ticker] = (rec, None)
         elif result is False or flat_buy:
             outcome[ticker] = (rec, {**rec, "tries": tries})
@@ -2823,7 +2920,13 @@ def reconcile_stop_orders(self):
     """One run at a time (professor M71): a run can outlast the 900 s
     schedule, and two runs could double-book an exit or both fix one
     ticker's coverage. See _reconcile_stop_orders_body for what it does."""
-    _run_singleton("reconcile_stop_orders", lambda: _reconcile_stop_orders_body(self))
+    def run():
+        _reconcile_stop_orders_body(self)
+        try:
+            _review_manual_actions()
+        except Exception as e:
+            log.warning(f"manual-action review failed: {e}")
+    _run_singleton("reconcile_stop_orders", run)
 
 
 def _run_singleton(name: str, fn, max_hold_s: float = 1800) -> None:

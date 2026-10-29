@@ -134,6 +134,30 @@ def _alert_stop_unknown(ticker: str, qty: float, stop_price: float) -> None:
         pass
 
 
+def _queue_stop_for_retry(ticker: str, qty: float, stop_price: float) -> None:
+    """A stop request never reached the orders worker (busy or stuck):
+    nothing was sent. Hand it to the reconcile re-protect queue, which
+    places the recorded stop for the held shares every cycle until done,
+    instead of blocking this worker on retries (audit 04:53, A0453-3)."""
+    import alerts as alert_module
+    import tasks
+    log.error(f"[{ticker}] Stop request not picked up by the orders worker; queued for the "
+              f"reconcile retry ({qty:g} @ ${stop_price:.2f})")
+    try:
+        tasks._queue_reprotect(ticker, {"intent": "BUY"}, None)
+    except Exception as e:
+        log.error(f"[{ticker}] Could not queue the stop retry: {e}")
+    try:
+        alert_module._send(
+            f"⚠️ STOP DELAYED — {ticker}\n"
+            f"The orders worker didn't pick up the stop for {qty:g} shares @ ${stop_price:.2f} "
+            f"(nothing was sent). It is queued and retried every reconcile cycle; check the "
+            f"orders worker if this repeats."
+        )
+    except Exception:
+        pass
+
+
 # Order states after which nothing can fill (ib_async OrderStatus).
 _DEAD_ORDER_STATUSES = ("Cancelled", "ApiCancelled", "Inactive")
 
@@ -855,6 +879,12 @@ def execute_approved(
                         _alert_stop_unknown(ticker, stop_qty, float(stop_price))
                         stop_placed = True  # not "failed": unknown, alerted above
                         break
+                    if isinstance(e, tasks.OrdersCallExpired):
+                        # The orders worker is busy or stuck; retrying here
+                        # only queues behind it again (A0453-3).
+                        _queue_stop_for_retry(ticker, stop_qty, float(stop_price))
+                        stop_placed = True  # handed to the retry queue, alerted
+                        break
                     if stop_attempt < 3:
                         import time as _time
                         _time.sleep(2 * stop_attempt)
@@ -1089,6 +1119,10 @@ def execute_manual(
                     log.warning(f"[{ticker}] Stop attempt {attempt}/3: {e}")
                     if isinstance(e, tasks.OrdersCallUnknown):
                         _alert_stop_unknown(ticker, filled_qty, float(stop_price))  # C24
+                        stop_placed = True
+                        break
+                    if isinstance(e, tasks.OrdersCallExpired):
+                        _queue_stop_for_retry(ticker, filled_qty, float(stop_price))  # A0453-3
                         stop_placed = True
                         break
                     if attempt < 3:

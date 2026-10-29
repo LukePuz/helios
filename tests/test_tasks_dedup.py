@@ -1079,3 +1079,12 @@ def test_held_before_fill_reads_flat_as_not_held():
     client.get_all_positions.return_value = []
     with patch("ibkr.get_client", return_value=client):
         assert tasks._held_before_fill("AMD", 1) is False
+
+
+def test_stop_reconcile_skips_while_a_previous_run_holds_the_lock():
+    """Professor M71: overlapping stop reconciles could double-book an exit."""
+    from conftest import _FakeLock
+    _FakeLock.held.add("helios:task:reconcile_stop_orders")
+    with patch("ibkr.get_client") as client:
+        tasks.reconcile_stop_orders.run()
+    client.assert_not_called()

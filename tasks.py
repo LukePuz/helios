@@ -1072,34 +1072,10 @@ def reconcile_unconfirmed_orders(self):
     # One run at a time: lock waits and broker calls can now make a run
     # outlast the 300 s schedule, and two runs would book the same fill
     # (audit 22:53, A2253-5). The key expires on its own if a run dies.
-    # Renewed while the run lasts, like the stop lock; without Redis the run
-    # is skipped rather than run unguarded (Celery itself needs Redis, and
-    # the retry queue's read-modify-write relies on one run at a time)
-    # (audit 00:53, A0053-6).
-    import threading
-    import stop_lock
-    try:
-        run_lock = stop_lock._redis().lock("helios:task:reconcile_unconfirmed_orders",
-                                           timeout=stop_lock.LOCK_TTL_S, blocking_timeout=0,
-                                           thread_local=False)
-        if not run_lock.acquire():
-            log.info("reconcile_unconfirmed_orders: previous run still going, skipping")
-            return
-    except Exception as e:
-        log.error(f"reconcile_unconfirmed_orders: run lock unavailable ({e}); skipping this run")
-        return
-    done = threading.Event()
-    threading.Thread(target=stop_lock._keep_renewed,
-                     args=(run_lock, "reconcile_unconfirmed_orders", done, 1800),
-                     daemon=True).start()
-    try:
-        _reconcile_unconfirmed_orders_locked(self)
-    finally:
-        done.set()
-        try:
-            run_lock.release()
-        except Exception:
-            pass
+    # Renewed while the run lasts; without Redis the run is skipped rather
+    # than run unguarded (audit 00:53, A0053-6).
+    _run_singleton("reconcile_unconfirmed_orders",
+                   lambda: _reconcile_unconfirmed_orders_locked(self))
 
 
 def _reconcile_unconfirmed_orders_locked(task):
@@ -2640,6 +2616,40 @@ def _reconcile_alert_due(issue_key: str) -> bool:
 
 @app.task(name="tasks.reconcile_stop_orders", bind=True, max_retries=2)
 def reconcile_stop_orders(self):
+    """One run at a time (professor M71): a run can outlast the 900 s
+    schedule, and two runs could double-book an exit or both fix one
+    ticker's coverage. See _reconcile_stop_orders_body for what it does."""
+    _run_singleton("reconcile_stop_orders", lambda: _reconcile_stop_orders_body(self))
+
+
+def _run_singleton(name: str, fn, max_hold_s: float = 1800) -> None:
+    """Run fn under a renewed Redis run lock; skip if another run holds it
+    or Redis is unavailable (audit 00:53 A0053-6, professor M71)."""
+    import threading
+    import stop_lock
+    try:
+        run_lock = stop_lock._redis().lock(f"helios:task:{name}", timeout=stop_lock.LOCK_TTL_S,
+                                           blocking_timeout=0, thread_local=False)
+        if not run_lock.acquire():
+            log.info(f"{name}: previous run still going, skipping")
+            return
+    except Exception as e:
+        log.error(f"{name}: run lock unavailable ({e}); skipping this run")
+        return
+    done = threading.Event()
+    threading.Thread(target=stop_lock._keep_renewed, args=(run_lock, name, done, max_hold_s),
+                     daemon=True).start()
+    try:
+        fn()
+    finally:
+        done.set()
+        try:
+            run_lock.release()
+        except Exception:
+            pass
+
+
+def _reconcile_stop_orders_body(self):
     """
     Safety net: diff broker-side sell-stop orders against actual positions.
     - Cancels orphaned stops (stop exists, position doesn't) → prevents

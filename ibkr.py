@@ -581,6 +581,9 @@ def get_open_orders() -> list[dict]:
             "qty":        float(o.totalQuantity),
             "stop_price": float(getattr(o, "auxPrice", 0) or 0) or None,
             "status":     trade.orderStatus.status,
+            # Unfilled part; totalQuantity alone overstates a part-filled
+            # stop's coverage (professor M64).
+            "remaining":  float(getattr(trade.orderStatus, "remaining", 0) or 0) or None,
         })
     return results
 

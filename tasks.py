@@ -145,60 +145,119 @@ def _is_orders_worker() -> bool:
     return os.getenv("IB_CLIENT_ID") == _ORDERS_WORKER_CLIENT_ID
 
 
+# Every broker task takes the caller's deadline (epoch seconds) and refuses
+# to act once it has passed, so a request the caller has given up on can't
+# act afterwards. The caller then waits on the task's real result instead
+# of guessing from open orders (professor C21/C22, 2026-10-29: a slow cancel
+# judged "failed" from a 5 s open-orders check still ran later and left the
+# position naked; matching on qty/price could adopt a stuck old stop).
+class OrdersCallExpired(Exception):
+    """The orders worker refused the request: it arrived after its deadline,
+    so nothing was sent to the broker."""
+
+
+class OrdersCallUnknown(Exception):
+    """No result from the orders worker even after the extra wait: the broker
+    call may or may not have happened."""
+
+
+_EXPIRED = {"_expired": True}
+
+
+def _past(deadline) -> bool:
+    import time
+    return deadline is not None and time.time() > deadline
+
+
 @app.task(name="tasks._broker_place_stop_order", bind=True, max_retries=1)
-def _broker_place_stop_order(self, ticker: str, qty: float, stop_price: float) -> dict:
+def _broker_place_stop_order(self, ticker: str, qty: float, stop_price: float,
+                             deadline: float | None = None) -> dict:
+    if _past(deadline):
+        return _EXPIRED
     import ibkr
     return ibkr.place_stop_order(ticker, qty, stop_price)
 
 
 @app.task(name="tasks._broker_cancel_stop_orders_for", bind=True, max_retries=1)
-def _broker_cancel_stop_orders_for(self, ticker: str) -> int:
+def _broker_cancel_stop_orders_for(self, ticker: str, deadline: float | None = None):
+    if _past(deadline):
+        return _EXPIRED
     import ibkr
     return ibkr.cancel_stop_orders_for(ticker)
 
 
 @app.task(name="tasks._broker_cancel_order", bind=True, max_retries=1)
-def _broker_cancel_order(self, order_id: int) -> bool:
+def _broker_cancel_order(self, order_id: int, deadline: float | None = None):
+    if _past(deadline):
+        return _EXPIRED
     import ibkr
     return ibkr.cancel_order(order_id)
 
 
-def _orders_call(task, args, kwargs=None, timeout: int = 30):
-    """Run a broker task on the orders worker and wait for it. The request
-    expires when the caller stops waiting, and is revoked on a timeout, so a
-    stop or cancel that sat queued can't run later outside the caller's
-    ticker lock (professor C17, 2026-10-28: a timed-out STP stayed queued and
-    the caller's retry placed another)."""
-    from celery.result import allow_join_result
-    with allow_join_result():
-        res = task.apply_async(args=args, kwargs=kwargs or {}, queue=ORDERS_QUEUE,
-                               expires=timeout)
-        try:
-            return res.get(timeout=timeout)
-        except Exception:
-            try:
-                res.revoke()
-            except Exception:
-                pass
-            raise
-
-
-def _resting_stop_matching(ticker: str, qty: float, stop_price: float) -> dict | None:
-    """A working SELL stop for ticker with this qty and price, if the broker
-    has one: the result of a placement whose reply we stopped waiting for."""
+@app.task(name="tasks._broker_place_trailing_stop_order", bind=True, max_retries=1)
+def _broker_place_trailing_stop_order(self, ticker: str, qty: float,
+                                       trail_amount: float | None = None,
+                                       trail_percent: float | None = None,
+                                       deadline: float | None = None) -> dict:
+    if _past(deadline):
+        return _EXPIRED
     import ibkr
-    for o in ibkr.get_open_orders():
-        if (o["ticker"] == ticker and o["action"] == "SELL" and o["order_type"] == "STP"
-                and abs(o["qty"] - float(qty)) < 1e-6
-                and o.get("stop_price") and abs(o["stop_price"] - float(stop_price)) < 0.006):
-            return {"order_id": o["order_id"], "stop_price": o["stop_price"]}
-    return None
+    return ibkr.place_trailing_stop_order(ticker, qty, trail_amount=trail_amount,
+                                           trail_percent=trail_percent)
+
+
+# How long past its own timeout a caller keeps waiting for a broker task it
+# has already handed off. The task can't start after the deadline, so this
+# only covers one that started in time and is still running (a slow cancel:
+# 5 s polls per order plus reconnect backoff).
+_ORDERS_EXTRA_WAIT_S = 120
+
+
+def _orders_call(task, args, kwargs=None, timeout: int = 30):
+    """Run a broker task on the orders worker and return its real result.
+    Raises OrdersCallExpired if it was refused for arriving late (nothing
+    sent), OrdersCallUnknown if no result came even after the extra wait."""
+    import time
+    from celery.exceptions import TaskRevokedError
+    from celery.exceptions import TimeoutError as CeleryTimeout
+    from celery.result import allow_join_result
+    deadline = time.time() + timeout
+    with allow_join_result():
+        res = task.apply_async(args=args, kwargs={**(kwargs or {}), "deadline": deadline},
+                               queue=ORDERS_QUEUE, expires=timeout)
+        try:
+            try:
+                out = res.get(timeout=timeout)
+            except CeleryTimeout:
+                log.warning(f"{task.name}: no reply in {timeout}s; waiting for the result")
+                out = res.get(timeout=_ORDERS_EXTRA_WAIT_S)
+        except TaskRevokedError as e:
+            raise OrdersCallExpired(f"{task.name} expired before it ran") from e
+        except CeleryTimeout as e:
+            raise OrdersCallUnknown(f"{task.name}: no result after "
+                                    f"{timeout + _ORDERS_EXTRA_WAIT_S}s") from e
+    if out == _EXPIRED:
+        raise OrdersCallExpired(f"{task.name} reached the worker after its deadline")
+    return out
+
+
+# Order states that are no longer protecting anything (ib_async OrderStatus).
+_NOT_WORKING = {"PendingCancel", "Cancelled", "ApiCancelled", "Inactive", "Filled"}
 
 
 def _resting_sell_stops(ticker: str, types=("STP", "STP LMT", "TRAIL")) -> list[dict]:
+    """Working SELL stops for ticker, with qty = the unfilled remainder
+    (professor M64: totalQuantity counted part-filled, cancelling and
+    inactive stops as coverage)."""
     import ibkr
-    return [o for o in ibkr.get_open_orders()
-            if o["ticker"] == ticker and o["action"] == "SELL" and o["order_type"] in types]
+    out = []
+    for o in ibkr.get_open_orders():
+        if (o["ticker"] != ticker or o["action"] != "SELL" or o["order_type"] not in types
+                or o.get("status") in _NOT_WORKING):
+            continue
+        rem = o.get("remaining")
+        out.append({**o, "qty": float(rem) if rem not in (None, 0) else float(o["qty"])})
+    return out
 
 
 def manage_stop_place(ticker: str, qty: float, stop_price: float, timeout: int = 30) -> dict:
@@ -220,23 +279,8 @@ def manage_stop_place(ticker: str, qty: float, stop_price: float, timeout: int =
         import ibkr
         result = ibkr.place_stop_order(ticker, qty, stop_price)
     else:
-        try:
-            result = _orders_call(_broker_place_stop_order, [ticker, qty, stop_price],
-                                  timeout=timeout)
-        except Exception as e:
-            # The placement may have reached the broker after we stopped
-            # waiting: adopt that stop rather than let a retry add a second.
-            import time
-            time.sleep(5)
-            try:
-                found = _resting_stop_matching(ticker, qty, stop_price)
-            except Exception:
-                found = None
-            if not found:
-                raise
-            log.warning(f"[{ticker}] stop placement reply lost ({e}); adopting resting "
-                        f"stop {found['order_id']} @ ${found['stop_price']:.2f}")
-            result = found
+        result = _orders_call(_broker_place_stop_order, [ticker, qty, stop_price],
+                              timeout=timeout)
     try:
         import db
         db.clear_trailing_active(ticker)
@@ -250,30 +294,7 @@ def manage_cancel_stop_orders_for(ticker: str, timeout: int = 30) -> int:
     if _is_orders_worker():
         import ibkr
         return ibkr.cancel_stop_orders_for(ticker)
-    try:
-        return _orders_call(_broker_cancel_stop_orders_for, [ticker], timeout=timeout)
-    except Exception as e:
-        # revoke() can't stop a cancel already running at the broker: judge
-        # by what is resting now, not by the exception (professor C17).
-        import time
-        time.sleep(5)
-        try:
-            resting = _resting_sell_stops(ticker)
-        except Exception:
-            raise e
-        if resting:
-            raise
-        log.warning(f"[{ticker}] stop cancel reply lost ({e}); broker shows no resting stops")
-        return 0
-
-
-@app.task(name="tasks._broker_place_trailing_stop_order", bind=True, max_retries=1)
-def _broker_place_trailing_stop_order(self, ticker: str, qty: float,
-                                       trail_amount: float | None = None,
-                                       trail_percent: float | None = None) -> dict:
-    import ibkr
-    return ibkr.place_trailing_stop_order(ticker, qty, trail_amount=trail_amount,
-                                           trail_percent=trail_percent)
+    return _orders_call(_broker_cancel_stop_orders_for, [ticker], timeout=timeout)
 
 
 def manage_place_trailing_stop(ticker: str, qty: float, trail_amount: float | None = None,
@@ -285,25 +306,9 @@ def manage_place_trailing_stop(ticker: str, qty: float, trail_amount: float | No
         import ibkr
         return ibkr.place_trailing_stop_order(ticker, qty, trail_amount=trail_amount,
                                                trail_percent=trail_percent)
-    try:
-        return _orders_call(_broker_place_trailing_stop_order, [ticker, qty],
-                            {"trail_amount": trail_amount, "trail_percent": trail_percent},
-                            timeout=timeout)
-    except Exception as e:
-        # Same as manage_stop_place: adopt a TRAIL that landed after we
-        # stopped waiting rather than let the caller add a fixed stop too.
-        import time
-        time.sleep(5)
-        try:
-            found = next((o for o in _resting_sell_stops(ticker, ("TRAIL",))
-                          if abs(o["qty"] - float(qty)) < 1e-6), None)
-        except Exception:
-            found = None
-        if not found:
-            raise
-        log.warning(f"[{ticker}] TRAIL placement reply lost ({e}); adopting resting "
-                    f"TRAIL {found['order_id']}")
-        return {"order_id": found["order_id"]}
+    return _orders_call(_broker_place_trailing_stop_order, [ticker, qty],
+                        {"trail_amount": trail_amount, "trail_percent": trail_percent},
+                        timeout=timeout)
 
 
 def manage_cancel_order(order_id: int, timeout: int = 30) -> bool:
@@ -1131,7 +1136,9 @@ def _reconcile_unconfirmed_orders_locked(task):
                 except Exception as e:
                     log.error(f"[{ticker}] reconcile_unconfirmed_orders: stop placement failed: {e}")
                     stop_placed = False
-                if stop_placed is False:
+                if stop_placed is not True:
+                    # None here is a flat read right after a BUY fill (cache
+                    # lag), not "nothing held": keep retrying (professor M60).
                     _queue_reprotect(ticker, {"intent": "BUY"}, None)
             if approval.get("status") == "FAILED":
                 db.update_approval_status(order["approval_id"], "APPROVED")
@@ -1186,8 +1193,11 @@ def _retry_pending_reprotects() -> None:
     left = {}
     for ticker, rec in pending.items():
         result = _reprotect_after_late_sell(ticker, rec, rec.get("fill_price"), from_queue=True)
-        if result is False:
-            left[ticker] = rec
+        tries = int(rec.get("tries", 0)) + 1
+        # A BUY that still reads flat is retried for ~30 min (6 cycles)
+        # before giving up to the no-stop alert (professor M60).
+        if result is False or (result is None and rec.get("intent") == "BUY" and tries < 6):
+            left[ticker] = {**rec, "tries": tries}
         else:
             log.info(f"[{ticker}] reconcile: queued re-protect done ({result})")
     db.set_state(_REPROTECT_STATE_KEY, json.dumps(left))

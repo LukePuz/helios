@@ -24,6 +24,16 @@ from unittest.mock import MagicMock, patch
 import tasks
 
 
+
+def _assert_dispatched(mock_dispatch, args, kwargs=None):
+    """Dispatch to the orders queue with an expiry and the caller's deadline."""
+    call = mock_dispatch.call_args
+    assert mock_dispatch.call_count == 1
+    assert call.kwargs["args"] == args and call.kwargs["queue"] == "orders"
+    assert call.kwargs["expires"] == 30
+    kw = dict(call.kwargs["kwargs"]); assert kw.pop("deadline") > 0
+    assert kw == (kwargs or {})
+
 class TestIsOrdersWorker:
     def test_true_when_client_id_matches(self, monkeypatch):
         monkeypatch.setenv("IB_CLIENT_ID", "30")
@@ -66,8 +76,7 @@ class TestManageStopPlace:
              patch("ibkr.place_stop_order") as mock_direct:
             result = tasks.manage_stop_place("NVDA", 10, 180.0)
 
-        mock_dispatch.assert_called_once_with(args=["NVDA", 10, 180.0], kwargs={}, queue="orders",
-                                              expires=30)
+        _assert_dispatched(mock_dispatch, ["NVDA", 10, 180.0])
         fake_result.get.assert_called_once_with(timeout=30)
         mock_direct.assert_not_called()
         assert result == {"order_id": 99}
@@ -91,7 +100,7 @@ class TestManageCancelStopOrdersFor:
                            return_value=fake_result) as mock_dispatch:
             result = tasks.manage_cancel_stop_orders_for("DDOG")
 
-        mock_dispatch.assert_called_once_with(args=["DDOG"], kwargs={}, queue="orders", expires=30)
+        _assert_dispatched(mock_dispatch, ["DDOG"])
         assert result == 2
 
 
@@ -115,7 +124,7 @@ class TestManageCancelOrder:
                            return_value=fake_result) as mock_dispatch:
             result = tasks.manage_cancel_order(11)
 
-        mock_dispatch.assert_called_once_with(args=[11], kwargs={}, queue="orders", expires=30)
+        _assert_dispatched(mock_dispatch, [11])
         assert result is False
 
 
@@ -144,63 +153,61 @@ class TestManagePlaceTrailingStop:
                            return_value=fake_result) as mock_dispatch:
             result = tasks.manage_place_trailing_stop("SNOW", 91, trail_percent=8.0)
 
-        mock_dispatch.assert_called_once_with(
-            args=["SNOW", 91], kwargs={"trail_amount": None, "trail_percent": 8.0},
-            queue="orders", expires=30,
-        )
+        _assert_dispatched(mock_dispatch, ["SNOW", 91], {"trail_amount": None, "trail_percent": 8.0})
         assert result == {"order_id": 55}
 
 
-class TestTimedOutDispatch:
-    """Professor C17 (2026-10-28): a timed-out request stayed queued and ran
-    later outside the lock, and a retry could stack a second stop."""
+class TestOrdersCallResult:
+    """Professor C21/C22 (2026-10-29): judge a timed-out broker call by its
+    real result, never by guessing from open orders."""
 
-    def test_timeout_revokes_the_request(self, monkeypatch):
+    def test_slow_reply_is_waited_for(self, monkeypatch):
+        from celery.exceptions import TimeoutError as CeleryTimeout
         monkeypatch.setenv("IB_CLIENT_ID", "20")
         fake = MagicMock()
-        fake.get.side_effect = TimeoutError("no reply")
-        still = [{"order_id": 5, "ticker": "NVDA", "action": "SELL", "order_type": "STP",
-                  "qty": 10.0, "stop_price": 150.0, "status": "Submitted"}]
-        with patch.object(tasks._broker_cancel_stop_orders_for, "apply_async", return_value=fake), \
-             patch("ibkr.get_open_orders", return_value=still), patch("time.sleep"):
-            with pytest.raises(TimeoutError):
-                tasks.manage_cancel_stop_orders_for("NVDA")
-        fake.revoke.assert_called_once()
+        fake.get.side_effect = [CeleryTimeout(), 2]
+        with patch.object(tasks._broker_cancel_stop_orders_for, "apply_async", return_value=fake):
+            assert tasks.manage_cancel_stop_orders_for("NVDA") == 2
+        assert fake.get.call_args_list[1].kwargs["timeout"] == tasks._ORDERS_EXTRA_WAIT_S
 
-    def test_lost_stop_reply_adopts_the_resting_stop(self, monkeypatch):
+    def test_no_result_at_all_is_unknown(self, monkeypatch):
+        from celery.exceptions import TimeoutError as CeleryTimeout
         monkeypatch.setenv("IB_CLIENT_ID", "20")
         fake = MagicMock()
-        fake.get.side_effect = TimeoutError("no reply")
-        resting = [{"order_id": 77, "ticker": "NVDA", "action": "SELL", "order_type": "STP",
-                    "qty": 10.0, "stop_price": 180.0, "status": "Submitted"}]
-        with patch.object(tasks._broker_place_stop_order, "apply_async", return_value=fake), \
-             patch("ibkr.get_open_orders", return_value=resting), \
-             patch("time.sleep"), patch("db.clear_trailing_active"):
-            assert tasks.manage_stop_place("NVDA", 10, 180.0) == {"order_id": 77, "stop_price": 180.0}
-
-    def test_lost_stop_reply_with_nothing_resting_raises(self, monkeypatch):
-        monkeypatch.setenv("IB_CLIENT_ID", "20")
-        fake = MagicMock()
-        fake.get.side_effect = TimeoutError("no reply")
-        with patch.object(tasks._broker_place_stop_order, "apply_async", return_value=fake), \
-             patch("ibkr.get_open_orders", return_value=[]), patch("time.sleep"):
-            with pytest.raises(TimeoutError):
+        fake.get.side_effect = CeleryTimeout()
+        with patch.object(tasks._broker_place_stop_order, "apply_async", return_value=fake):
+            with pytest.raises(tasks.OrdersCallUnknown):
                 tasks.manage_stop_place("NVDA", 10, 180.0)
 
-    def test_lost_cancel_reply_with_no_stops_resting_counts_as_done(self, monkeypatch):
+    def test_revoked_before_running_is_expired(self, monkeypatch):
+        from celery.exceptions import TaskRevokedError
         monkeypatch.setenv("IB_CLIENT_ID", "20")
         fake = MagicMock()
-        fake.get.side_effect = TimeoutError("no reply")
-        with patch.object(tasks._broker_cancel_stop_orders_for, "apply_async", return_value=fake), \
-             patch("ibkr.get_open_orders", return_value=[]), patch("time.sleep"):
-            assert tasks.manage_cancel_stop_orders_for("NVDA") == 0
+        fake.get.side_effect = TaskRevokedError("expired")
+        with patch.object(tasks._broker_cancel_order, "apply_async", return_value=fake):
+            with pytest.raises(tasks.OrdersCallExpired):
+                tasks.manage_cancel_order(5)
 
-    def test_lost_trail_reply_adopts_the_resting_trail(self, monkeypatch):
+    def test_worker_refusal_after_deadline_is_expired(self, monkeypatch):
         monkeypatch.setenv("IB_CLIENT_ID", "20")
         fake = MagicMock()
-        fake.get.side_effect = TimeoutError("no reply")
-        resting = [{"order_id": 88, "ticker": "SNOW", "action": "SELL", "order_type": "TRAIL",
-                    "qty": 91.0, "stop_price": None, "status": "Submitted"}]
-        with patch.object(tasks._broker_place_trailing_stop_order, "apply_async", return_value=fake), \
-             patch("ibkr.get_open_orders", return_value=resting), patch("time.sleep"):
-            assert tasks.manage_place_trailing_stop("SNOW", 91, trail_percent=8.0) == {"order_id": 88}
+        fake.get.return_value = tasks._EXPIRED
+        with patch.object(tasks._broker_place_trailing_stop_order, "apply_async", return_value=fake):
+            with pytest.raises(tasks.OrdersCallExpired):
+                tasks.manage_place_trailing_stop("SNOW", 91, trail_percent=8.0)
+
+    def test_broker_task_does_nothing_past_its_deadline(self):
+        with patch("ibkr.cancel_stop_orders_for") as cancel:
+            assert tasks._broker_cancel_stop_orders_for.run("NVDA", deadline=1.0) == tasks._EXPIRED
+        cancel.assert_not_called()
+
+    def test_not_working_and_part_filled_stops_counted_by_remaining(self):
+        orders = [
+            {"order_id": 1, "ticker": "AMD", "action": "SELL", "order_type": "STP", "qty": 10.0,
+             "stop_price": 90.0, "status": "Submitted", "remaining": 4.0},
+            {"order_id": 2, "ticker": "AMD", "action": "SELL", "order_type": "STP", "qty": 10.0,
+             "stop_price": 90.0, "status": "PendingCancel", "remaining": 10.0},
+        ]
+        with patch("ibkr.get_open_orders", return_value=orders):
+            rs = tasks._resting_sell_stops("AMD")
+        assert [(o["order_id"], o["qty"]) for o in rs] == [(1, 4.0)]

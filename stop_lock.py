@@ -39,6 +39,20 @@ class TickerBusy(Exception):
     """Another process held the ticker's stop lock for the whole wait."""
 
 
+class LockLost(Exception):
+    """This thread's lock on the ticker lapsed (a renewal failed or the hold
+    cap passed), so another process may now be changing its stops: stop
+    before sending anything else (professor M69)."""
+
+
+def assert_held(ticker: str) -> None:
+    """Raise LockLost if this thread holds ticker's lock but it has lapsed.
+    No-op when the thread isn't inside ticker_lock for it."""
+    ev = getattr(_local, "lost", {}).get(ticker)
+    if ev is not None and ev.is_set():
+        raise LockLost(ticker)
+
+
 def _redis():
     global _client
     if _client is None:
@@ -75,14 +89,19 @@ def ticker_lock(ticker: str, wait: float | None = None):
 
     held[ticker] = 1
     done = threading.Event()
+    lost = threading.Event()
+    if not hasattr(_local, "lost"):
+        _local.lost = {}
+    _local.lost[ticker] = lost
     if lock is not None:
-        threading.Thread(target=_keep_renewed, args=(lock, ticker, done),
+        threading.Thread(target=_keep_renewed, args=(lock, ticker, done, None, lost),
                          daemon=True, name=f"stop-lock-{ticker}").start()
     try:
         yield
     finally:
         done.set()
         held.pop(ticker, None)
+        _local.lost.pop(ticker, None)
         if lock is not None:
             try:
                 lock.release()
@@ -92,7 +111,8 @@ def ticker_lock(ticker: str, wait: float | None = None):
 
 
 def _keep_renewed(lock, ticker: str, done: threading.Event,
-                  max_hold_s: float | None = None) -> None:
+                  max_hold_s: float | None = None,
+                  lost: threading.Event | None = None) -> None:
     """Renew until done, but never past max_hold_s: an IBKR call can hang
     with no timeout, and a lock renewed forever would freeze every stop
     change on the ticker until a restart (audit 02:53, A0253-2)."""
@@ -100,6 +120,8 @@ def _keep_renewed(lock, ticker: str, done: threading.Event,
     limit = time.monotonic() + (MAX_HOLD_S if max_hold_s is None else max_hold_s)
     while not done.wait(LOCK_RENEW_S):
         if time.monotonic() > limit:
+            if lost is not None:
+                lost.set()
             log.error(f"[{ticker}] lock held past {max_hold_s or MAX_HOLD_S:.0f}s; no longer "
                       f"renewing (it expires in {LOCK_TTL_S}s)")
             try:
@@ -113,6 +135,8 @@ def _keep_renewed(lock, ticker: str, done: threading.Event,
         try:
             lock.reacquire()
         except Exception as e:
+            if lost is not None:
+                lost.set()
             log.error(f"[{ticker}] stop lock renew failed (another stop change may get in): {e}")
             return
 

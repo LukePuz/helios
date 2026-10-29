@@ -1596,6 +1596,8 @@ class RiskManager:
             return None
 
         try:
+            import stop_lock
+            stop_lock.assert_held(ticker)  # professor M69
             order_result = ibkr.place_market_order(ticker, "SELL", sell_qty)
         except Exception as e:
             log.error(f"[{ticker}] Profit-target partial sell FAILED: {e}")

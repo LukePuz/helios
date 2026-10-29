@@ -704,6 +704,8 @@ def execute_approved(
         if not bracket_used:
             # Submit market order — result includes the confirmed fill price
             try:
+                import stop_lock
+                stop_lock.assert_held(ticker)  # professor M69
                 order_result = ibkr.place_market_order(ticker, side, shares)
             except Exception:
                 if side == "SELL":
@@ -1042,6 +1044,8 @@ def execute_manual(
                                f"cancelled (selling on top of it could short). Check TWS."}
 
     try:
+        import stop_lock
+        stop_lock.assert_held(ticker)  # professor M69
         order_result = ibkr.place_market_order(ticker, side, qty)
     except Exception as e:
         if side == "SELL":

@@ -19,6 +19,7 @@ from celery import Celery
 from celery.schedules import crontab
 
 import log_redaction
+import stop_lock
 from stop_lock import locked_by_ticker, ticker_lock
 
 log_redaction.install()  # bot token / account id out of every worker log
@@ -318,6 +319,7 @@ def manage_stop_place(ticker: str, qty: float, stop_price: float, timeout: int =
     2026-10-28 a partial sale, TRIM or failed-sell restore left the flag TRUE
     and the trail never came back (limitations audit 12:53, finding 3).
     Callers that convert to a trail set it again via update_trailing_stop."""
+    stop_lock.assert_held(ticker)  # professor M69
     if _is_orders_worker():
         import ibkr
         result = ibkr.place_stop_order(ticker, qty, stop_price)
@@ -334,6 +336,7 @@ def manage_stop_place(ticker: str, qty: float, stop_price: float, timeout: int =
 
 def manage_cancel_stop_orders_for(ticker: str, timeout: int = 30) -> int:
     """Cancel all resting stop orders for a ticker — see manage_stop_place."""
+    stop_lock.assert_held(ticker)  # professor M69
     if _is_orders_worker():
         import ibkr
         return ibkr.cancel_stop_orders_for(ticker)
@@ -345,6 +348,7 @@ def manage_place_trailing_stop(ticker: str, qty: float, trail_amount: float | No
     """Place a native TRAIL stop (the trailing-stop conversion path) — see
     manage_stop_place. Exactly one of trail_amount/trail_percent, matching
     ibkr.place_trailing_stop_order's own contract."""
+    stop_lock.assert_held(ticker)  # professor M69
     if _is_orders_worker():
         import ibkr
         return ibkr.place_trailing_stop_order(ticker, qty, trail_amount=trail_amount,
@@ -1642,6 +1646,7 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
             owned = round(owned - resting, 4)
             if owned <= 0:
                 return False
+        stop_lock.assert_held(ticker)  # professor M69
         result = ibkr.place_market_order(ticker, "SELL", owned)
         filled = float(result.get("filled_qty") or 0)
         if filled <= 0:

@@ -86,3 +86,23 @@ def test_renewal_stops_after_the_hold_cap(monkeypatch):
     assert not t.is_alive()  # gave up on its own, done never set
     assert lock.reacquire.call_count >= 1
     send.assert_called_once()
+
+
+def test_lost_lock_stops_further_broker_calls(monkeypatch):
+    """Professor M69: after the renewal gives up, the holder must not act."""
+    import time
+    import pytest
+    import tasks
+    from unittest.mock import patch
+    monkeypatch.setattr(stop_lock, "LOCK_RENEW_S", 0.01)
+    monkeypatch.setattr(stop_lock, "MAX_HOLD_S", 0.03)
+    with patch("alerts._send"), patch.object(tasks, "_orders_call") as call:
+        with stop_lock.ticker_lock("AMD"):
+            time.sleep(0.15)
+            with pytest.raises(stop_lock.LockLost):
+                tasks.manage_stop_place("AMD", 1, 90.0)
+    call.assert_not_called()
+
+
+def test_assert_held_is_a_no_op_outside_the_lock():
+    stop_lock.assert_held("AMD")

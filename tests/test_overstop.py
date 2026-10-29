@@ -108,3 +108,48 @@ def test_no_stop_placed_at_or_above_the_last_price():
             msg = tasks._fix_overstop("AMD")
         place.assert_not_called()
         assert "nothing was placed" in msg
+
+
+class TestBackstopSellReads:
+    """Professor M61: read errors, shorts and stuck stops in the backstop."""
+
+    _alert = {"current_price": 140.0, "stop_price": 150.0}
+
+    def _client(self, qty):
+        client = MagicMock()
+        client.get_all_positions.return_value = [] if qty is None else [MagicMock(symbol="AMD", qty=qty)]
+        return client
+
+    def test_read_error_keeps_the_record_and_retries(self):
+        with patch("ibkr.get_client", side_effect=RuntimeError("down")), \
+             patch("db.delete_position_stop") as delete, \
+             patch("tasks._schedule_backstop_retry") as retry, \
+             patch("ibkr.place_market_order") as order:
+            assert tasks._execute_backstop_sell("AMD", self._alert) is False
+        delete.assert_not_called(); order.assert_not_called(); retry.assert_called_once()
+
+    def test_confirmed_flat_drops_the_record(self):
+        with patch("ibkr.get_client", return_value=self._client(None)), \
+             patch("db.delete_position_stop") as delete, \
+             patch("ibkr.place_market_order") as order:
+            assert tasks._execute_backstop_sell("AMD", self._alert) is False
+        delete.assert_called_once_with("AMD"); order.assert_not_called()
+
+    def test_short_is_not_sold(self):
+        with patch("ibkr.get_client", return_value=self._client(-10)), \
+             patch("ibkr.place_market_order") as order, \
+             patch("alerts._send") as send:
+            assert tasks._execute_backstop_sell("AMD", self._alert) is False
+        order.assert_not_called()
+        assert "SHORT" in send.call_args[0][0]
+
+    def test_stuck_stop_shares_are_not_sold_again(self):
+        with patch("ibkr.get_client", return_value=self._client(10)), \
+             patch("tasks.manage_cancel_stop_orders_for"), \
+             patch("ibkr.get_open_orders", return_value=_orders(4)), \
+             patch("ibkr.place_market_order", return_value={"filled_qty": 6, "fill_price": 140.0}) as order, \
+             patch("db.log_trade"), patch("db.delete_position_stop") as delete, \
+             patch("db.close_trade_outcome") as close, patch("alerts._send"):
+            assert tasks._execute_backstop_sell("AMD", self._alert) is True
+        order.assert_called_once_with("AMD", "SELL", 6.0)
+        delete.assert_not_called(); close.assert_not_called()

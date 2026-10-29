@@ -885,8 +885,9 @@ class TestBackstopSellRetry:
              patch("market_data.is_market_hours", return_value=False), \
              patch("market_data.next_market_open") as mock_next_open, \
              patch("tasks.retry_backstop_sell") as mock_retry_task:
-            mock_get_client.return_value.get_open_position.return_value = MagicMock(qty=50.0)
-            result = tasks._execute_backstop_sell("AMD", alert)
+            mock_get_client.return_value.get_all_positions.return_value = [MagicMock(symbol="AMD", qty=50.0)]
+            with patch("ibkr.get_open_orders", return_value=[]):
+                result = tasks._execute_backstop_sell("AMD", alert)
 
         assert result is False
         mock_retry_task.apply_async.assert_called_once()
@@ -902,8 +903,9 @@ class TestBackstopSellRetry:
                    return_value={"filled_qty": 50.0, "fill_price": 424.0, "order_id": 1122}), \
              patch("db.log_trade"), patch("db.delete_position_stop"), patch("db.close_trade_outcome"), \
              patch("tasks.retry_backstop_sell") as mock_retry_task:
-            mock_get_client.return_value.get_open_position.return_value = MagicMock(qty=50.0)
-            result = tasks._execute_backstop_sell("AMD", alert)
+            mock_get_client.return_value.get_all_positions.return_value = [MagicMock(symbol="AMD", qty=50.0)]
+            with patch("ibkr.get_open_orders", return_value=[]):
+                result = tasks._execute_backstop_sell("AMD", alert)
 
         assert result is True
         mock_retry_task.apply_async.assert_not_called()

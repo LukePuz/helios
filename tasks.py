@@ -1569,17 +1569,52 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
         import ibkr
         import db
 
+        # get_open_position raises both for "not held" and for a failed
+        # read; only a successful read showing no position may drop the
+        # stop record (professor M61, the M22 pattern).
         try:
-            pos   = ibkr.get_client().get_open_position(ticker)
-            owned = round(abs(float(pos.qty)), 4)
-        except Exception:
-            owned = 0.0
+            positions = ibkr.get_client().get_all_positions()
+        except Exception as e:
+            log.error(f"[{ticker}] Backstop sell: position read failed ({e}); retrying later")
+            if not _is_retry:
+                _schedule_backstop_retry(ticker, alert)
+            return False
+        pos = next((p for p in positions if p.symbol == ticker), None)
+        qty = float(pos.qty) if pos else 0.0
+        if qty < 0:
+            log.error(f"[{ticker}] Backstop sell: broker shows a SHORT position ({qty:g}); "
+                      f"not selling")
+            try:
+                import alerts
+                alerts._send(f"🚨 SHORT POSITION — <b>{ticker}</b>\n{qty:g} shares at the broker. "
+                             f"The backstop did not sell. Check TWS now.")
+            except Exception:
+                pass
+            return False
+        owned = round(qty, 4)
         if owned <= 0:
             # Stale stop record for a position that no longer exists
             db.delete_position_stop(ticker)
             return False
 
         manage_cancel_stop_orders_for(ticker)  # belt-and-braces before selling
+        # A stop that wouldn't cancel still protects its shares, and selling
+        # those too would short once both fill (same rule as
+        # execute_approved, A2253-1): sell only the uncovered part.
+        resting = sum(float(o["qty"]) for o in _resting_sell_stops(ticker))
+        if resting > 0:
+            log.error(f"[{ticker}] Backstop: stops for {resting:g} of {owned:g} shares still "
+                      f"resting after the cancel; selling only the rest")
+            try:
+                import alerts
+                alerts._send(f"⚠️ BACKSTOP — <b>{ticker}</b>\nA stop for {resting:g} of "
+                             f"{owned:g} shares would not cancel; only the uncovered shares "
+                             f"are sold. Check TWS.")
+            except Exception:
+                pass
+            owned = round(owned - resting, 4)
+            if owned <= 0:
+                return False
         result = ibkr.place_market_order(ticker, "SELL", owned)
         filled = float(result.get("filled_qty") or 0)
         if filled <= 0:
@@ -1592,11 +1627,12 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
         db.log_trade(symbol=ticker, side="SELL", quantity=filled, price=fill_price,
                      reason=f"Backstop stop-breach sell (stop ${alert['stop_price']:.2f})"
                             + (" [retry]" if _is_retry else ""))
-        db.delete_position_stop(ticker)
-        try:
-            db.close_trade_outcome(ticker, exit_price=fill_price)
-        except Exception:
-            pass
+        if resting <= 0:  # shares under a stuck stop are still held
+            db.delete_position_stop(ticker)
+            try:
+                db.close_trade_outcome(ticker, exit_price=fill_price)
+            except Exception:
+                pass
         log.warning(f"[{ticker}] BACKSTOP SELL executed: {filled} shares @ ~${fill_price:.2f}")
         return True
     except Exception as e:

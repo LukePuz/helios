@@ -388,7 +388,7 @@ TIER_MIN_CONVICTION_TO_QUEUE  = {"standard": MIN_CONVICTION_TO_QUEUE, "reduced":
 # Moonshot's normal 2% cap is structurally too small to ever clear the
 # whole-share floor at Reduced/Micro balances — raised per-tier instead of
 # excluding the bucket outright. Confirmed intentional 2026-08-13 despite
-# being a 5-10x jump in single-bet risk: a $200 moonshot on a ~$1k (Micro) account
+# being a 5-10x jump in single-bet risk: a 20%-of-account moonshot at the Micro tier
 # vs. today's $20.
 TIER_MAX_POSITION_PCT_MOONSHOT = {"standard": MAX_POSITION_PCT_MOONSHOT, "reduced": 0.10, "micro": 0.20}
 # 2026-08-21: Compounder/Accelerator never got the same tier-scaling
@@ -407,8 +407,8 @@ TIER_MAX_POSITION_PCT_MOONSHOT = {"standard": MAX_POSITION_PCT_MOONSHOT, "reduce
 TIER_MAX_POSITION_PCT_COMPOUNDER  = {"standard": MAX_POSITION_PCT_COMPOUNDER,  "reduced": 0.28, "micro": 0.40}
 TIER_MAX_POSITION_PCT_ACCELERATOR = {"standard": MAX_POSITION_PCT_ACCELERATOR, "reduced": 0.20, "micro": 0.35}
 # No single share purchase may itself already represent more than this
-# fraction of portfolio value — guards against one expensive share (e.g. an
-# $800 stock on a ~$1k account) structurally dominating the position.
+# fraction of portfolio value — guards against one expensive share (e.g. a
+# high-priced stock on a micro-tier account) structurally dominating the position.
 # None at Standard (never binding there in practice; not worth the extra
 # code path at that scale).
 TIER_SINGLE_SHARE_CAP_PCT = {"standard": None, "reduced": 0.50, "micro": 0.50}

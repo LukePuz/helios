@@ -132,7 +132,7 @@ class TestMicroTierBandRescaling:
     """Incident 2026-08-21: Compounder/Accelerator never got the same
     tier-rescaling Moonshot got on 2026-08-13 — their BUCKET_SIZE_TABLE
     bands stayed at the values tuned for the ~$1M paper account at every
-    tier. On a micro-tier balance (~$2k),
+    tier. On a micro-tier balance,
     that meant every Accelerator ADD priced above roughly $45-70/share
     (NVDA, MSFT, GOOG, META, AVGO, ANET, NOW, CRWD, MRVL, TSLA, LRCX —
     real conviction-7/8 analyst output, dozens/day) computed a dollar
@@ -141,12 +141,12 @@ class TestMicroTierBandRescaling:
     3 existing Moonshot positions (all under $21/share, since Moonshot's
     bands *did* rescale) could ever size. The account went 4 days without
     a single trade as a result. This asserts a conviction-8 Accelerator
-    ADD on a ~$2k micro-tier account actually sizes to >=1 share of a
+    ADD on a micro-tier account actually sizes to >=1 share of a
     ~$217 stock (NVDA's real price that day) instead of silently
     returning 0."""
 
     def test_accelerator_add_sizes_on_micro_tier_account(self):
-        # ~$2k portfolio value -> "micro" tier (< config.ACCOUNT_TIER_REDUCED_MIN)
+        # micro-tier portfolio value (< config.ACCOUNT_TIER_REDUCED_MIN)
         client = _make_client(portfolio_value=1_990.26)
         with patch.object(risk_manager.RiskManager, "calculate_stop", return_value=(180.0, "mocked")), \
              patch("risk_manager.TRADING_ENV", "live"), \

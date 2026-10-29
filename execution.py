@@ -103,6 +103,10 @@ def _remaining_after_sell(ticker: str, owned: float, filled_qty: float) -> float
     return min(round(abs(float(held.qty)), 4), expected)
 
 
+# Order states after which nothing can fill (ib_async OrderStatus).
+_DEAD_ORDER_STATUSES = ("Cancelled", "ApiCancelled", "Inactive")
+
+
 def _restore_stop_after_failed_sell(ticker: str) -> None:
     """A TRIM/EXIT cancels the broker stop before its market SELL. If the
     order then fails to go in, put the stop back for what's held (limitations
@@ -323,6 +327,24 @@ def execute_approved(
                 log.error(f"[{ticker}] {action} requested but no position found")
                 return _outcome("failed: no position to sell")
             shares = owned if action == "EXIT" else min(shares, owned)
+            # Outside regular hours ibkr.place_market_order cancels the DAY
+            # order anyway, but the stop was already gone and was never put
+            # back, so the position sat unprotected into the open (limitations
+            # audit 20:53, A2053-3). Don't touch the stop or send the order:
+            # same outcome for the sale, stop kept.
+            from market_data import is_market_hours
+            if not is_market_hours():
+                log.warning(f"[{ticker}] {action} not sent: market closed; stop left in place")
+                try:
+                    alert_module._send(
+                        f"⏸️ {action} NOT SENT — <b>{ticker}</b>\n"
+                        f"The market is closed, so the sell order would be cancelled unfilled. "
+                        f"The protective stop is unchanged; the next analysis during market "
+                        f"hours can repeat the {action}."
+                    )
+                except Exception:
+                    pass
+                return _outcome("skipped: market closed, sell not sent (stop kept)")
             # NOTE: broker stops are cancelled AFTER the drift check below —
             # cancelling first meant a drift abort left the position both
             # unsold and unprotected.
@@ -601,6 +623,14 @@ def execute_approved(
 
         if not bracket_used:
             filled_qty = float(order_result.get("filled_qty") or 0)
+            if filled_qty <= 0 and side == "SELL" and \
+                    order_result.get("status") in _DEAD_ORDER_STATUSES:
+                # Definitely not working at the broker, so no late fill can
+                # come: put the stop back now (A2053-3).
+                log.error(f"[{ticker}] SELL came back {order_result.get('status')} unfilled; "
+                          f"restoring the stop")
+                _restore_stop_after_failed_sell(ticker)
+                return _outcome(f"skipped: sell {order_result.get('status')} unfilled, stop restored")
             if filled_qty <= 0:
                 # Nothing confirmably filled within the wait window. Never
                 # fabricate a fill — a phantom trade row plus a stop for
@@ -881,6 +911,12 @@ def execute_manual(
             return {"success": False, "filled_qty": 0, "fill_price": None, "stop_price": None,
                     "message": f"No position in {ticker} — nothing to sell."}
         qty = min(qty, owned)
+        from market_data import is_market_hours
+        if not is_market_hours():
+            # Would be cancelled unfilled after the stop was removed (A2053-3).
+            return {"success": False, "filled_qty": 0, "fill_price": None, "stop_price": None,
+                    "message": f"Market is closed: SELL {ticker} not sent, stop left in place. "
+                               f"Send it again during market hours."}
         # Cancel existing stops first so the fill can't race the stop and
         # leave an order that would short the account.
         try:
@@ -901,6 +937,11 @@ def execute_manual(
                 "message": f"Order submission failed: {e}"}
 
     filled_qty = float(order_result.get("filled_qty") or 0)
+    if filled_qty <= 0 and side == "SELL" and order_result.get("status") in _DEAD_ORDER_STATUSES:
+        _restore_stop_after_failed_sell(ticker)
+        return {"success": False, "filled_qty": 0, "fill_price": None, "stop_price": None,
+                "message": f"SELL {ticker} came back {order_result.get('status')} unfilled; "
+                           f"the stop was restored."}
     if filled_qty <= 0:
         # No confirmed fill — never fabricate one; a phantom trade row plus
         # a stop for shares that may not exist would diverge DB state from

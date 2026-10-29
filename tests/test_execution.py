@@ -11,6 +11,13 @@ import execution
 
 
 @pytest.fixture(autouse=True)
+def _regular_hours():
+    """Default to regular hours; tests about closed markets patch it themselves."""
+    with patch("market_data.is_market_hours", return_value=True):
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _no_prior_stop():
     """BUY fills look up the existing stop to decide whether this is an ADD
     (execution._whole_position_stop). Default: a fresh position."""
@@ -204,27 +211,43 @@ class TestMarketHoursGate:
             args=[approval["id"]], eta=fake_eta, queue="ops",
         )
 
-    def test_sell_not_blocked_when_market_closed(self):
-        """TRIM/EXIT must still be allowed to proceed even when closed —
-        blocking a risk-reducing sell outright would contradict the "never
-        abort a risk-reducing order" principle used for the drift guard."""
+    def test_sell_not_sent_when_market_closed_and_stop_kept(self):
+        """Limitations audit 20:53 A2053-3: outside regular hours the broker
+        call cancels a DAY market SELL anyway, but the stop had already been
+        cancelled and was never put back. Now the order isn't sent and the
+        stop isn't touched (same outcome for the sale, stop kept)."""
         approval = _approval(action="EXIT", shares_initial=100)
 
         with patch("ibkr.get_ib"), \
              patch("ibkr.get_client") as mock_client, \
              patch("ibkr.place_market_order") as mock_order, \
-             patch("ibkr.cancel_stop_orders_for", return_value=0), \
+             patch("tasks.manage_cancel_stop_orders_for") as cancel, \
+             patch("market_data.is_market_hours", return_value=False), \
+             patch("alerts._send") as send:
+            mock_client.return_value.get_open_position.return_value = MagicMock(qty=100)
+            assert execution.execute_approved(approval) is False
+
+        mock_order.assert_not_called()
+        cancel.assert_not_called()
+        assert "market closed" in execution.last_outcome_reason()
+        assert "NOT SENT" in send.call_args[0][0]
+
+    def test_sell_cancelled_unfilled_restores_stop(self):
+        approval = _approval(action="TRIM", shares_initial=40)
+        with patch("ibkr.get_ib"), \
+             patch("ibkr.get_client") as mock_client, \
+             patch("ibkr.place_market_order",
+                   return_value={"order_id": 9, "filled_qty": 0, "fill_price": None,
+                                 "status": "Cancelled"}), \
+             patch("tasks.manage_cancel_stop_orders_for", return_value=1), \
              patch("ibkr.get_latest_price", return_value=100.0), \
              patch("market_data.get_priced_quote", return_value=None), \
-             patch("market_data.is_market_hours", return_value=False), \
-             patch("db.log_trade"), patch("db.log_order"), patch("db.delete_position_stop"), \
-             patch("db.log_trade_outcome"), patch("db.close_trade_outcome"), \
-             patch("alerts._send"):
+             patch("execution._restore_stop_after_failed_sell") as restore, \
+             patch("db.log_order"), patch("alerts._send"):
             mock_client.return_value.get_open_position.return_value = MagicMock(qty=100)
-            mock_order.return_value = {"order_id": 56, "fill_price": 100.0, "filled_qty": 100.0}
-            execution.execute_approved(approval)
-
-        mock_order.assert_called_once()
+            assert execution.execute_approved(approval) is False
+        restore.assert_called_once_with(approval["ticker"])
+        assert "stop restored" in execution.last_outcome_reason()
 
 
 class TestStalePriceBuyGuard:
@@ -699,3 +722,15 @@ def test_log_signal_writes_env_model_and_provenance():
     sql, params = cur.execute.call_args[0]
     assert "trading_env, model, provenance" in sql
     assert params[4] == db.TRADING_ENV and params[5] == "m"
+
+
+def test_manual_sell_not_sent_when_market_closed():
+    with patch("ibkr.get_ib"), patch("ibkr.get_client") as client, \
+         patch("ibkr.place_market_order") as order, \
+         patch("tasks.manage_cancel_stop_orders_for") as cancel, \
+         patch("db.get_state", return_value=None), \
+         patch("market_data.is_market_hours", return_value=False):
+        client.return_value.get_open_position.return_value = MagicMock(qty=5)
+        r = execution.execute_manual("NVDA", "SELL", 5, "test")
+    assert r["success"] is False and "Market is closed" in r["message"]
+    order.assert_not_called(); cancel.assert_not_called()

@@ -2230,7 +2230,14 @@ def _get_stale_ingestion_sources() -> list[str]:
     # so off-hours and Monday checks reported them stale every week.
     from zoneinfo import ZoneInfo
     et = datetime.now(ZoneInfo("America/New_York"))
-    rth = et.weekday() < 5 and (9, 45) <= (et.hour, et.minute) < (16, 0)
+    try:
+        # Holidays and early closes too (A0853-7); 15 min after the open so
+        # the first poll has had its chance.
+        import market_data
+        rth = (market_data.is_market_hours(datetime.now(timezone.utc))
+               and (et.hour, et.minute) >= (9, 45))
+    except Exception:
+        rth = et.weekday() < 5 and (9, 45) <= (et.hour, et.minute) < (16, 0)
     rth_only = {"options_flow"}
     weekday_daily = {"fundamentals", "price_history", "arxiv"}
 

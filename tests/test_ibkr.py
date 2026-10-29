@@ -410,3 +410,10 @@ def test_sell_above_the_long_position_is_refused_after_a_fresh_read():
         # cache lags after a fill, fresh read shows the shares: allowed
         fake_ib.positions.return_value, fake_ib.reqPositions.return_value = pos(0), pos(3)
         ibkr._refuse_sell_on_short(fake_ib, "AMD", 3)
+
+
+def test_unset_price_fields_read_as_no_price():
+    """A0853-4: ib_async UNSET_DOUBLE must not become a stop price."""
+    assert ibkr._price_or_none(1.7976931348623157e308) is None
+    assert ibkr._price_or_none(0) is None and ibkr._price_or_none(None) is None
+    assert ibkr._price_or_none(185.5) == 185.5

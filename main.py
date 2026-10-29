@@ -124,7 +124,15 @@ def _adopt_position(client, rm, symbol, qty, manage_stop_place, resting_sell_sto
     need = round(abs(qty) - resting, 4)
     pos = client.get_open_position(symbol)
     entry_price = float(pos.avg_entry_price)
-    resting_px = [float(o["stop_price"]) for o in stops if o.get("stop_price")]
+    try:
+        import ibkr
+        last = float(ibkr.get_latest_price(symbol) or 0)
+    except Exception:
+        last = 0.0
+    # A resting level counts only if it is a plausible stop below the price
+    # (an unset or misread field must not become the recorded stop, A0853-4).
+    resting_px = [float(o["stop_price"]) for o in stops
+                  if o.get("stop_price") and (not last or float(o["stop_price"]) < last)]
     if resting_px:
         # Record the stop that is actually working (maybe set by hand in
         # TWS), so later re-places don't loosen it (audit 04:53, A0453-5).
@@ -138,11 +146,6 @@ def _adopt_position(client, rm, symbol, qty, manage_stop_place, resting_sell_sto
     )
     if need <= 0:
         return f"{symbol} ({qty} shares, record only: existing stops cover {resting:g})"
-    try:
-        import ibkr
-        last = float(ibkr.get_latest_price(symbol) or 0)
-    except Exception:
-        last = 0.0
     if not last or stop_price >= last:
         # An underwater adopted position would sell at the open (professor M72).
         return (f"{symbol} ({need:g} shares unprotected: stop ${stop_price:.2f} not below the "

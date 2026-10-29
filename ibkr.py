@@ -595,6 +595,16 @@ def cancel_order(order_id: int, _poll_seconds: int = 5) -> bool:
     return False
 
 
+def _price_or_none(v) -> float | None:
+    """ib_async decodes an empty price field to UNSET_DOUBLE (~1.8e308), not
+    0; treat that, 0 and None as "no price" (audit 08:53, A0853-4)."""
+    try:
+        f = float(v or 0)
+    except (TypeError, ValueError):
+        return None
+    return f if 0 < f < 1e300 else None
+
+
 def get_open_orders() -> list[dict]:
     """
     Returns all open orders as dicts:
@@ -623,9 +633,9 @@ def get_open_orders() -> list[dict]:
             "qty":        float(o.totalQuantity),
             # For a TRAIL, auxPrice is the trailing distance, not a price; its
             # current trigger is trailStopPrice (audit 06:53, A0653-4).
-            "stop_price": (float(getattr(o, "trailStopPrice", 0) or 0) or None
-                           if o.orderType == "TRAIL"
-                           else float(getattr(o, "auxPrice", 0) or 0) or None),
+            "stop_price": _price_or_none(getattr(o, "trailStopPrice", None)
+                                         if o.orderType == "TRAIL"
+                                         else getattr(o, "auxPrice", None)),
             "status":     trade.orderStatus.status,
             # Unfilled part; totalQuantity alone overstates a part-filled
             # stop's coverage (professor M64).

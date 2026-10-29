@@ -99,4 +99,30 @@ def refresh_all_earnings() -> int:
 
     log.info(f"Earnings calendar refreshed: {count}/{len(tickers)} tickers updated"
              + (f"; no upcoming date for {', '.join(no_date)}" if no_date else ""))
+    _warn_catalyst_duplicates()
     return count
+
+
+def _warn_catalyst_duplicates() -> list[str]:
+    """Log tickers with more than one future earnings row in the catalyst
+    calendar the analyst's brief reads (SQLite). A moved date adds a row
+    there and the old one stays (audit 16:53, A1653-1); deduping it changes
+    the brief, so that's Luke's call. Log-only."""
+    try:
+        from catalyst_service.storage import get_conn
+        conn = get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT ticker, group_concat(event_date) FROM (SELECT * FROM catalyst_events ORDER BY event_date) "
+                "WHERE event_type='earnings' AND event_date >= date('now') "
+                "AND superseded_by IS NULL GROUP BY ticker HAVING count(*) > 1").fetchall()
+        finally:
+            conn.close()
+    except Exception as e:
+        log.warning(f"catalyst calendar duplicate check failed: {e}")
+        return []
+    dups = [f"{t} ({d})" for t, d in rows]
+    if dups:
+        log.warning(f"Catalyst calendar has {len(dups)} ticker(s) with two or more future "
+                    f"earnings dates (shown to the analyst): {'; '.join(dups)}")
+    return dups

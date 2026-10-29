@@ -779,7 +779,13 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
                     pass
                 return
         except Exception as e:
-            log.warning(f"[{ticker}] Catalyst gate skipped: {e}")
+            # Still fails open (making it fail closed is a gate change, Luke's
+            # call), but leaves a countable record (audit 16:53, A1653-1).
+            log.error(f"[{ticker}] Catalyst gate skipped after an error: {e}")
+            try:
+                db.log_signal(ticker, "CATALYST_GATE_ERROR", 0.0, str(e)[:500])
+            except Exception:
+                pass
 
         # Earnings blackout (2026-10-27, limitations audit). With 1-share buys
         # live, a stop 1.75x ATR away is no protection against an earnings

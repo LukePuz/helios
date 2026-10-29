@@ -1422,3 +1422,21 @@ def test_flat_buy_item_never_clears_on_flat_and_empty_reads_clear_after_four():
             tasks._review_manual_actions()
     items = json.loads(state["manual_actions"])
     assert "AMD" in items and "PLTR" not in items
+
+
+def test_catalyst_duplicate_earnings_rows_are_logged(tmp_path, monkeypatch):
+    """A1653-1: two future earnings rows for a ticker in the SQLite calendar
+    are named in a warning (log-only)."""
+    import sqlite3
+    from ingestion import earnings_calendar as ec
+    db_file = tmp_path / "cat.db"
+    c = sqlite3.connect(db_file)
+    c.execute("CREATE TABLE catalyst_events (ticker TEXT, event_type TEXT, event_date TEXT, superseded_by TEXT)")
+    c.executemany("INSERT INTO catalyst_events VALUES (?,?,?,NULL)",
+                  [("NET", "earnings", "2099-10-29"), ("NET", "earnings", "2099-11-05"),
+                   ("PLTR", "earnings", "2099-11-02")])
+    c.commit(); c.close()
+    monkeypatch.setattr("catalyst_service.storage.get_conn", lambda: sqlite3.connect(db_file))
+    with patch.object(ec.log, "warning") as warn:
+        assert ec._warn_catalyst_duplicates() == ["NET (2099-10-29,2099-11-05)"]
+    assert "NET" in warn.call_args[0][0] and "PLTR" not in warn.call_args[0][0]

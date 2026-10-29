@@ -117,3 +117,23 @@ def test_knowledge_coverage_lists_cut_headings_and_matches_the_prompt_caps():
     cov = analyst._knowledge_coverage("ZZZZ", "## T\nshort", philosophy)
     assert cov["philosophy"]["cut_headings"] == ["When to Exit"]
     assert cov["philosophy"]["kept"] == 2000 and cov["thesis"]["cut_headings"] == []
+
+
+def test_fundamentals_history_keeps_revision_fields_and_falls_back():
+    """A1253-3: the new columns are written; before migration 60 the old
+    insert still runs."""
+    from unittest.mock import MagicMock, patch
+    import db
+    metrics = {"forward_pe": 30.0, "forward_eps": 12.5, "target_mean_price": 600.0,
+               "shares_outstanding": 7.4e9, "net_cash": 5e10}
+    cur = MagicMock()
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
+        db.log_fundamentals_history("MSFT", metrics)
+    sql, params = cur.execute.call_args[0]
+    assert "target_mean_price" in sql and 600.0 in params and 12.5 in params
+    cur.execute.side_effect = [Exception("column does not exist"), None]
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
+        db.log_fundamentals_history("MSFT", metrics)
+    assert "target_mean_price" not in cur.execute.call_args[0][0]

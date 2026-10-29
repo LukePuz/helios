@@ -699,6 +699,15 @@ _MIGRATIONS: list[tuple[int, str]] = [
     # fill can be finished the way its own path would have (professor M-3,
     # 2026-10-28). NULL on older rows.
     (59, "ALTER TABLE orders ADD COLUMN IF NOT EXISTS intent TEXT;"),
+    # Estimate/target revisions and dilution need these over time; the nightly
+    # refresh already fetches them (audit 12:53, A1253-3). NULL before 10-30.
+    (60, "ALTER TABLE fundamentals_history ADD COLUMN IF NOT EXISTS forward_eps DECIMAL, "
+         "ADD COLUMN IF NOT EXISTS target_mean_price DECIMAL, "
+         "ADD COLUMN IF NOT EXISTS target_low_price DECIMAL, "
+         "ADD COLUMN IF NOT EXISTS target_high_price DECIMAL, "
+         "ADD COLUMN IF NOT EXISTS shares_outstanding DECIMAL, "
+         "ADD COLUMN IF NOT EXISTS net_cash DECIMAL, "
+         "ADD COLUMN IF NOT EXISTS market_cap DECIMAL;"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -2405,20 +2414,26 @@ def log_fundamentals_history(ticker: str, metrics: dict) -> None:
     real time series starts accumulating now; failures here are logged,
     not raised, since losing one night's history snapshot should never
     block the (more important) latest-snapshot upsert."""
+    cols = ["price_to_sales", "ev_to_ebitda", "forward_pe", "revenue_growth_yoy",
+            "fcf_margin", "net_profit_margin", "return_on_equity"]
+    # Migration 60's columns (A1253-3); dropped if the migration hasn't run.
+    extra = ["forward_eps", "target_mean_price", "target_low_price", "target_high_price",
+             "shares_outstanding", "net_cash", "market_cap"]
     conn = _get_conn()
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO fundamentals_history "
-                "(ticker, price_to_sales, ev_to_ebitda, forward_pe, revenue_growth_yoy, "
-                "fcf_margin, net_profit_margin, return_on_equity) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                (
-                    ticker, metrics.get("price_to_sales"), metrics.get("ev_to_ebitda"),
-                    metrics.get("forward_pe"), metrics.get("revenue_growth_yoy"),
-                    metrics.get("fcf_margin"), metrics.get("net_profit_margin"),
-                    metrics.get("return_on_equity"),
-                ),
-            )
+        for use in (cols + extra, cols):
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"INSERT INTO fundamentals_history (ticker, {', '.join(use)}) "
+                        f"VALUES ({', '.join(['%s'] * (len(use) + 1))})",
+                        (ticker, *(metrics.get(c) for c in use)),
+                    )
+                break
+            except Exception:
+                conn.rollback()
+                if use is cols:
+                    raise
         conn.commit()
     except Exception as e:
         conn.rollback()

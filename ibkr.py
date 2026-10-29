@@ -534,12 +534,11 @@ def cancel_order(order_id: int, _poll_seconds: int = 5) -> bool:
     isn't practical here (this runs inline in time-sensitive execution
     paths), so this now polls for up to _poll_seconds for the status to
     reach an actually-terminal state instead of trusting the first read.
-    This doesn't fully close the gap -- a rejection slower than the poll
-    window still reads as "confirmed" -- but it converts the common case
-    (a real same-clientId cancel usually resolves within a second or two)
-    into a real confirmation instead of guessing from an intermediate
-    state, and callers should still treat "True" here as "very likely",
-    not "certain", for a stop they didn't place themselves.
+    A cancel still unresolved after the poll window returns False (not
+    confirmed), even if it later lands; callers treat that stop as still
+    resting (A0253-1). A real same-clientId cancel usually resolves within a
+    second or two. Treat "True" as "very likely", not "certain", for a stop
+    this client didn't place.
     """
     ib = get_ib()
     for trade in ib.openTrades():

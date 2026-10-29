@@ -1148,7 +1148,7 @@ def _retry_pending_reprotects() -> None:
         return
     left = {}
     for ticker, rec in pending.items():
-        result = _reprotect_after_late_sell(ticker, rec, rec.get("fill_price"))
+        result = _reprotect_after_late_sell(ticker, rec, rec.get("fill_price"), from_queue=True)
         if result is False:
             left[ticker] = rec
         else:
@@ -1158,7 +1158,8 @@ def _retry_pending_reprotects() -> None:
 
 @locked_by_ticker(lambda ticker, *a, **k: ticker, on_busy=False)
 def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
-                               fill_price: float | None = None) -> bool | None:
+                               fill_price: float | None = None,
+                               from_queue: bool = False) -> bool | None:
     """After a late SELL fill, finish what the selling path would have done
     (professor M-3, 2026-10-28):
     - nothing left: delete the stop record and close the outcome at the fill
@@ -1177,6 +1178,20 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
     except Exception as e:
         log.error(f"[{ticker}] reconcile: could not read the position after a late sell: {e}")
         return False
+    if remaining <= 0 and not from_queue:
+        # One cached read can show a false flat (07-29 KLAC): confirm once.
+        import time
+        time.sleep(3)
+        try:
+            pos = next((p for p in ibkr.get_client().get_all_positions() if p.symbol == ticker), None)
+            remaining = round(abs(float(pos.qty)), 4) if pos else 0.0
+        except Exception:
+            return False
+    if remaining <= 0 and from_queue:
+        # A queued retry carries an old fill price, and the rest may have
+        # exited since by its stop: leave the close to reconcile_stop_orders'
+        # stale-stop branch, which logs the real exit (A2253-2).
+        return None
     if remaining <= 0:
         if db.get_position_stop(ticker):
             db.delete_position_stop(ticker)

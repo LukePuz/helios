@@ -86,3 +86,14 @@ def _spill_to_tmp(tmp_path, monkeypatch):
     import db
     monkeypatch.setattr(db, "_SPILL_PATH", tmp_path / "db_write_spill.jsonl")
     monkeypatch.setattr(db, "_LAST_WRITE_ALERT", {})
+
+
+@pytest.fixture(autouse=True)
+def _no_live_ibkr(monkeypatch):
+    """Like the DB guard: an unmocked broker call fails fast instead of
+    trying to reach a real gateway (one test spent 9 s retrying, 10-28)."""
+    import ibkr
+
+    def _blocked(*a, **k):
+        raise RuntimeError("tests must not connect to IBKR; mock the ibkr.* call")
+    monkeypatch.setattr(ibkr, "get_ib", _blocked)

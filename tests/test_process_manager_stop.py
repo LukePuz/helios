@@ -79,3 +79,13 @@ def test_stop_all_stops_beat_first_and_waits_in_parallel(procs):
     assert set(results.values()) == {"ok"}
     # each waited against its own deadline from the same start, not one after another
     assert llm.waited == 420 and ops.waited == 60
+
+
+def test_orders_worker_stops_after_the_other_workers(procs):
+    order = []
+    procs["celery_orders_worker"] = o = _Proc(20)
+    procs["celery_llm_worker"] = l = _Proc(21)
+    o.terminate = lambda: order.append("orders")
+    l.terminate = lambda: order.append("llm")
+    pm.stop_all()
+    assert order == ["llm", "orders"]

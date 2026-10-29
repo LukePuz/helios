@@ -734,3 +734,35 @@ def test_manual_sell_not_sent_when_market_closed():
         r = execution.execute_manual("NVDA", "SELL", 5, "test")
     assert r["success"] is False and "Market is closed" in r["message"]
     order.assert_not_called(); cancel.assert_not_called()
+
+
+def test_exit_not_sent_while_a_stop_is_still_resting():
+    """Limitations audit 22:53 A2253-1: selling on top of a stop that could
+    not be cancelled can short the account after an EXIT."""
+    approval = _approval(action="EXIT", shares_initial=100)
+    resting = [{"order_id": 4, "ticker": approval["ticker"], "action": "SELL",
+                "order_type": "STP", "qty": 100.0, "stop_price": 90.0, "status": "Submitted"}]
+    with patch("ibkr.get_ib"), patch("ibkr.get_client") as client, \
+         patch("ibkr.place_market_order") as order, \
+         patch("tasks.manage_cancel_stop_orders_for", side_effect=RuntimeError("stuck")), \
+         patch("ibkr.get_open_orders", return_value=resting), \
+         patch("ibkr.get_latest_price", return_value=100.0), \
+         patch("market_data.get_priced_quote", return_value=None), \
+         patch("alerts._send"):
+        client.return_value.get_open_position.return_value = MagicMock(qty=100)
+        assert execution.execute_approved(approval) is False
+    order.assert_not_called()
+    assert "stop still resting" in execution.last_outcome_reason()
+
+
+def test_restore_covers_only_shares_without_a_resting_stop():
+    resting = [{"order_id": 4, "ticker": "AMD", "action": "SELL", "order_type": "STP",
+                "qty": 60.0, "stop_price": 90.0, "status": "Submitted"}]
+    with patch("db.get_position_stop", return_value={"stop_price": 90.0}), \
+         patch("ibkr.get_client") as client, \
+         patch("ibkr.get_open_orders", return_value=resting), \
+         patch("tasks.manage_stop_place", return_value={"order_id": 9}) as place, \
+         patch("db.set_stop_broker_order_id"):
+        client.return_value.get_open_position.return_value = MagicMock(qty=100)
+        execution._restore_stop_after_failed_sell("AMD")
+    place.assert_called_once_with("AMD", 40.0, 90.0)

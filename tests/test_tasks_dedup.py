@@ -461,7 +461,7 @@ class TestReconcileUnconfirmedOrders:
              patch("db.delete_position_stop") as delete, \
              patch("db.close_trade_outcome") as close, \
              patch("db.mark_profit_target_taken") as taken, \
-             patch("tasks._queue_reprotect") as queued, \
+             patch("tasks._queue_reprotect") as queued, patch("time.sleep"), \
              patch("tasks._retry_pending_reprotects"), \
              patch("alerts._send") as send:
             tasks.reconcile_unconfirmed_orders.run()
@@ -939,6 +939,19 @@ def test_pending_reprotects_retry_until_done():
     results = {"AMD": True, "NVDA": False}
     with patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
          patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
-         patch("tasks._reprotect_after_late_sell", side_effect=lambda t, *a: results[t]):
+         patch("tasks._reprotect_after_late_sell", side_effect=lambda t, *a, **k: results[t]):
         tasks._retry_pending_reprotects()
     assert set(json.loads(state["reprotect_pending"])) == {"NVDA"}
+
+
+def test_queued_reprotect_finding_flat_leaves_close_to_reconcile():
+    """A2253-2: a queued retry must not close the outcome at its old price."""
+    from unittest.mock import MagicMock
+    client = MagicMock()
+    client.get_all_positions.return_value = []
+    with patch("ibkr.get_client", return_value=client), \
+         patch("db.get_position_stop", return_value={"stop_price": 90.0}), \
+         patch("db.delete_position_stop") as delete, \
+         patch("db.close_trade_outcome") as close:
+        assert tasks._reprotect_after_late_sell("AMD", {}, 100.0, from_queue=True) is None
+    delete.assert_not_called(); close.assert_not_called()

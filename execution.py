@@ -103,6 +103,19 @@ def _remaining_after_sell(ticker: str, owned: float, filled_qty: float) -> float
     return min(round(abs(float(held.qty)), 4), expected)
 
 
+def _stops_still_resting(ticker: str) -> float | None:
+    """Total quantity of SELL stops still working at the broker for ticker,
+    or None if it can't be read. A sell must not go out on top of a resting
+    stop: after an EXIT that stop would short the account (limitations audit
+    22:53, A2253-1)."""
+    import tasks
+    try:
+        return sum(float(o["qty"]) for o in tasks._resting_sell_stops(ticker))
+    except Exception as e:
+        log.warning(f"[{ticker}] could not re-read resting stops: {e}")
+        return None
+
+
 # Order states after which nothing can fill (ib_async OrderStatus).
 _DEAD_ORDER_STATUSES = ("Cancelled", "ApiCancelled", "Inactive")
 
@@ -120,7 +133,11 @@ def _restore_stop_after_failed_sell(ticker: str) -> None:
     if not stop_rec or not stop_rec.get("stop_price"):
         return
     try:
-        qty = round(abs(float(ibkr.get_client().get_open_position(ticker).qty)), 4)
+        held = round(abs(float(ibkr.get_client().get_open_position(ticker).qty)), 4)
+        # Only the part not already covered by a stop that never got
+        # cancelled, or the two together would oversell (A2253-1).
+        covered = _stops_still_resting(ticker) or 0.0
+        qty = round(held - covered, 4)
         if qty <= 0:
             return
         result = tasks.manage_stop_place(ticker, qty, float(stop_rec["stop_price"]))
@@ -581,12 +598,26 @@ def execute_approved(
             # Cancel the existing broker stop only now that the sell is
             # definitely going ahead, so the fill can't race the stop and
             # leave an order that would short the account.
+            cancel_ok = True
             try:
                 cancelled = tasks.manage_cancel_stop_orders_for(ticker)
                 if cancelled:
                     log.info(f"[{ticker}] Cancelled {cancelled} stop order(s) before {action}")
             except Exception as e:
+                cancel_ok = False
                 log.warning(f"[{ticker}] Could not cancel existing stops before {action}: {e}")
+            resting = _stops_still_resting(ticker)
+            if resting or (resting is None and not cancel_ok):
+                log.error(f"[{ticker}] {action} not sent: stop(s) for {resting} shares still resting")
+                try:
+                    alert_module._send(
+                        f"⚠️ {action} NOT SENT — <b>{ticker}</b>\n"
+                        f"An existing stop could not be cancelled, and selling on top of it "
+                        f"could short the account. Check the stop orders in TWS."
+                    )
+                except Exception:
+                    pass
+                return _outcome("skipped: stop still resting, sell not sent")
 
         stop_price_for_entry = approval.get("stop_loss_price") or risk_json.get("stop_loss_price")
 
@@ -923,12 +954,19 @@ def execute_manual(
                                f"Send it again during market hours."}
         # Cancel existing stops first so the fill can't race the stop and
         # leave an order that would short the account.
+        cancel_ok = True
         try:
             cancelled = tasks.manage_cancel_stop_orders_for(ticker)
             if cancelled:
                 log.info(f"[{ticker}] Cancelled {cancelled} stop order(s) before manual SELL")
         except Exception as e:
+            cancel_ok = False
             log.warning(f"[{ticker}] Could not cancel existing stops before manual SELL: {e}")
+        resting = _stops_still_resting(ticker)
+        if resting or (resting is None and not cancel_ok):
+            return {"success": False, "filled_qty": 0, "fill_price": None, "stop_price": None,
+                    "message": f"SELL {ticker} not sent: an existing stop could not be "
+                               f"cancelled (selling on top of it could short). Check TWS."}
 
     try:
         order_result = ibkr.place_market_order(ticker, side, qty)

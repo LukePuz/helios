@@ -414,7 +414,9 @@ def stop_all() -> dict[str, str]:
         results["celery_beat"] = stop("celery_beat")
     pending = {}
     for name in SERVICES:
-        if name in results or name not in _load():
+        # The orders worker goes last: the other workers' running tasks
+        # dispatch stop orders to it during their grace (professor M57).
+        if name in results or name not in _load() or name == "celery_orders_worker":
             continue
         try:
             pending[name] = (_request_stop(name), time.monotonic() + _grace(name))
@@ -422,6 +424,8 @@ def stop_all() -> dict[str, str]:
             results[name] = str(e)
     for name, (proc, deadline) in pending.items():
         results[name] = _finish_stop(name, proc, deadline)
+    if "celery_orders_worker" in _load():
+        results["celery_orders_worker"] = stop("celery_orders_worker")
     pids = _load()
     for name in results:
         pids.pop(name, None)

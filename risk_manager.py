@@ -1385,6 +1385,12 @@ class RiskManager:
                                                  f"after the failed TRAIL conversion")
                                     except Exception as e2:
                                         log.error(f"[{ticker}] Stop restore after TRAIL failure failed: {e2}")
+                                        try:
+                                            # The stops are cancelled: hand the
+                                            # restore to the retry queue (m39).
+                                            tasks._queue_reprotect(ticker, {"intent": "RESTORE"}, None)
+                                        except Exception as e3:
+                                            log.error(f"[{ticker}] Could not queue the stop restore: {e3}")
                                         alerts.append({
                                             "ticker":        ticker,
                                             "action":        "FIX_STOP",

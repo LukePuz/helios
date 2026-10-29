@@ -47,7 +47,12 @@ class LockLost(Exception):
 
 def assert_held(ticker: str) -> None:
     """Raise LockLost if this thread holds ticker's lock but it has lapsed.
-    No-op when the thread isn't inside ticker_lock for it."""
+    No-op when the thread isn't inside ticker_lock for it.
+
+    This is check-then-act: it can't catch a lapse during a broker call that
+    is already in flight (up to ~150 s). A call sent just before a lapse can
+    overlap another process's stop change; reconcile_stop_orders' over-stop
+    and naked checks are the backstop for that window (professor m40)."""
     ev = getattr(_local, "lost", {}).get(ticker)
     if ev is not None and ev.is_set():
         raise LockLost(ticker)

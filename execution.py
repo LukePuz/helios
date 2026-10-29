@@ -845,10 +845,18 @@ def execute_approved(
                         log.info(f"[{ticker}] Stop re-placed for remaining {remaining} shares")
                     except Exception as e:
                         log.error(f"[{ticker}] Failed to re-place stop after TRIM: {e}")
+                        queued = False
+                        try:
+                            tasks._queue_reprotect(ticker, {"intent": "RESTORE"}, None)  # m39
+                            queued = True
+                        except Exception as e2:
+                            log.error(f"[{ticker}] Could not queue the stop restore: {e2}")
                         alert_module._send(
                             f"🚨 UNPROTECTED POSITION — {ticker}\n"
                             f"TRIM filled but stop re-placement failed. "
-                            f"Place stop @ ${stop_rec['stop_price']:.2f} for {remaining} shares manually."
+                            + ("It is queued and retried every reconcile cycle; " if queued else "")
+                            + f"place stop @ ${stop_rec['stop_price']:.2f} for {remaining} shares "
+                            f"manually if it isn't back within ~15 min."
                         )
                 elif remaining <= 0:
                     # A TRIM that sold the last share closes the position:
@@ -918,9 +926,11 @@ def execute_approved(
                         _alert_stop_unknown(ticker, stop_qty, float(stop_price))
                         stop_placed = True  # not "failed": unknown, alerted above
                         break
-                    if isinstance(e, tasks.OrdersCallExpired):
-                        # The orders worker is busy or stuck; retrying here
-                        # only queues behind it again (A0453-3).
+                    if isinstance(e, tasks.OrdersCallExpired) or type(e).__name__ == "LockLost":
+                        # The orders worker is busy or stuck, or our ticker lock
+                        # lapsed (another process may be changing stops);
+                        # retrying here only repeats that. The queue re-reads
+                        # coverage under a fresh lock (A0453-3, m39).
                         _queue_stop_for_retry(ticker, stop_qty, float(stop_price))
                         stop_placed = True  # handed to the retry queue, alerted
                         break
@@ -929,12 +939,19 @@ def execute_approved(
                         _time.sleep(2 * stop_attempt)
             if not stop_placed:
                 log.error(f"[{ticker}] CRITICAL — stop order failed after 3 attempts. Position is UNPROTECTED.")
+                queued = False
+                try:
+                    tasks._queue_reprotect(ticker, {"intent": "BUY"}, None)  # m39
+                    queued = True
+                except Exception as e:
+                    log.error(f"[{ticker}] Could not queue the stop retry: {e}")
                 try:
                     alert_module._send(
                         f"🚨 UNPROTECTED POSITION — ACTION REQUIRED\n"
                         f"<b>{ticker}</b>: entry order was filled but stop order failed after 3 attempts.\n"
                         f"Stop target: <b>${float(stop_price):.2f}</b> for {stop_qty} shares.\n"
-                        f"Place stop manually in TWS immediately."
+                        + ("It is queued and retried every reconcile cycle, but " if queued else "")
+                        + "place the stop manually in TWS now."
                     )
                 except Exception:
                     pass

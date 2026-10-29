@@ -2163,6 +2163,11 @@ def _get_stale_ingestion_sources() -> list[str]:
     return stale
 
 
+import time as _time_mod
+_PROCESS_START = _time_mod.time()   # this worker's start (prefork children inherit it)
+_INGESTION_GRACE_S = 1800
+
+
 @app.task(name="tasks.check_ingestion_health", bind=True, max_retries=1)
 def check_ingestion_health(self):
     """Alerts when an ingestion source hasn't succeeded within its expected
@@ -2173,7 +2178,14 @@ def check_ingestion_health(self):
     a genuinely new/different issue still alerts promptly."""
     try:
         import alerts
+        import time
 
+        # Pollers can't have run while the stack was down, so every source
+        # reads stale on the first checks after a start: an alert every
+        # morning that teaches the reader to ignore it (audit 04:53, A0453-7).
+        if time.time() - _PROCESS_START < _INGESTION_GRACE_S:
+            log.info("check_ingestion_health: within the post-start grace period, skipped")
+            return
         stale = _get_stale_ingestion_sources()
         if stale:
             log.warning("Ingestion health issues: " + " | ".join(stale))

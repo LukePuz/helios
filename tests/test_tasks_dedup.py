@@ -247,6 +247,7 @@ class TestReconciliationAlertThrottle:
             state[key] = value
 
         with patch("tasks._get_stale_ingestion_sources", return_value=["news: never succeeded"]), \
+             patch("tasks._PROCESS_START", 0), \
              patch("db.get_state", side_effect=fake_get_state), \
              patch("db.set_state", side_effect=fake_set_state), \
              patch("alerts._send") as mock_alert:
@@ -254,6 +255,16 @@ class TestReconciliationAlertThrottle:
             tasks.check_ingestion_health.run()
 
         assert mock_alert.call_count == 1
+
+
+def test_ingestion_health_skipped_right_after_a_start():
+    """A0453-7: every poller reads stale after the overnight stop."""
+    import time
+    with patch("tasks._PROCESS_START", time.time()), \
+         patch("tasks._get_stale_ingestion_sources") as stale, \
+         patch("alerts._send") as send:
+        tasks.check_ingestion_health.run()
+    stale.assert_not_called(); send.assert_not_called()
 
 
 class TestRetryDeferredEntry:

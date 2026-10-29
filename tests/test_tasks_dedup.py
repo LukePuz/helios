@@ -1032,6 +1032,15 @@ def test_reconcile_skips_while_a_previous_run_holds_the_lock():
     load.assert_not_called()
 
 
+def test_reconcile_skips_when_redis_is_unavailable():
+    """A0053-6: no run lock, no run (it used to continue unguarded)."""
+    import stop_lock
+    with patch.object(stop_lock, "_redis", side_effect=ConnectionError("down")), \
+         patch("db.get_unconfirmed_orders") as load:
+        tasks.reconcile_unconfirmed_orders.run()
+    load.assert_not_called()
+
+
 def test_conditional_fill_update_reports_a_lost_race():
     from unittest.mock import MagicMock
     import db

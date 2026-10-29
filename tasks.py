@@ -1029,24 +1029,34 @@ def reconcile_unconfirmed_orders(self):
     # One run at a time: lock waits and broker calls can now make a run
     # outlast the 300 s schedule, and two runs would book the same fill
     # (audit 22:53, A2253-5). The key expires on its own if a run dies.
+    # Renewed while the run lasts, like the stop lock; without Redis the run
+    # is skipped rather than run unguarded (Celery itself needs Redis, and
+    # the retry queue's read-modify-write relies on one run at a time)
+    # (audit 00:53, A0053-6).
+    import threading
     import stop_lock
     try:
         run_lock = stop_lock._redis().lock("helios:task:reconcile_unconfirmed_orders",
-                                           timeout=900, blocking_timeout=0)
+                                           timeout=stop_lock.LOCK_TTL_S, blocking_timeout=0,
+                                           thread_local=False)
         if not run_lock.acquire():
             log.info("reconcile_unconfirmed_orders: previous run still going, skipping")
             return
     except Exception as e:
-        log.warning(f"reconcile_unconfirmed_orders: run lock unavailable ({e}); continuing")
-        run_lock = None
+        log.error(f"reconcile_unconfirmed_orders: run lock unavailable ({e}); skipping this run")
+        return
+    done = threading.Event()
+    threading.Thread(target=stop_lock._keep_renewed,
+                     args=(run_lock, "reconcile_unconfirmed_orders", done),
+                     daemon=True).start()
     try:
         _reconcile_unconfirmed_orders_locked(self)
     finally:
-        if run_lock is not None:
-            try:
-                run_lock.release()
-            except Exception:
-                pass
+        done.set()
+        try:
+            run_lock.release()
+        except Exception:
+            pass
 
 
 def _reconcile_unconfirmed_orders_locked(task):

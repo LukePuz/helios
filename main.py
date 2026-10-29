@@ -389,6 +389,13 @@ def _startup_reconcile() -> None:
             lock = None
             logging.warning("Open-order reconciliation: late-fill reconcile busy for 120 s; "
                             "running without its lock")
+            try:
+                import alerts
+                alerts._send("⚠️ <b>Startup order check ran without its lock</b>\n"
+                             "The late-fill reconcile was busy. If a stale BUY was cancelled "
+                             "while its fill was being booked, check that fill (professor M78).")
+            except Exception:
+                pass
     except Exception as e:
         lock = None
         logging.warning(f"Open-order reconciliation: run lock unavailable ({e})")

@@ -854,3 +854,29 @@ def test_expired_stop_request_is_queued_not_retried():
     assert place.call_count == 1
     queued.assert_called_once()
     assert any("STOP DELAYED" in c[0][0] for c in send.call_args_list)
+
+
+def test_refused_stop_is_not_retried():
+    """Professor run 11: a stop the broker layer refuses (short/flat) is
+    not retried and the alert says why."""
+    import db
+    import inspect
+    import tasks
+    approval = _approval(action="OPEN", shares_initial=10)
+    db_fns = {n: MagicMock(return_value=None) for n, f in vars(db).items()
+              if inspect.isfunction(f) and not n.startswith("_") and f.__module__ == "db"}
+    with patch.multiple("db", **db_fns), \
+         patch("ibkr.get_ib"), patch("ibkr.get_client") as client, \
+         patch("ibkr.place_market_order", return_value={"filled_qty": 10, "fill_price": 100.0,
+                                                        "order_id": 1, "status": "Filled"}), \
+         patch("ibkr.get_latest_price", return_value=100.0), \
+         patch("market_data.get_priced_quote", return_value=None), \
+         patch("tasks.manage_stop_place", side_effect=__import__("ibkr").SellExceedsPosition("NVDA: refused")) as place, \
+         patch("tasks._queue_reprotect") as queued, \
+         patch("alerts._send") as send:
+        client.return_value.get_open_position.side_effect = Exception("No open position")
+        client.return_value.get_all_positions.return_value = []
+        execution.execute_approved(approval)
+    assert place.call_count == 1
+    queued.assert_not_called()
+    assert any("STOP REFUSED" in c[0][0] for c in send.call_args_list)

@@ -383,10 +383,30 @@ def test_sell_orders_refused_on_a_short():
     import pytest
     fake_ib = MagicMock()
     fake_ib.positions.return_value = [MagicMock(contract=MagicMock(symbol="AMD"), position=-3)]
+    fake_ib.reqPositions.return_value = fake_ib.positions.return_value
     with patch.object(ibkr, "get_ib", return_value=fake_ib):
         for call in (lambda: ibkr.place_stop_order("AMD", 3, 90.0),
                      lambda: ibkr.place_trailing_stop_order("AMD", 3, trail_percent=8.0),
                      lambda: ibkr.place_market_order("AMD", "SELL", 3)):
-            with pytest.raises(RuntimeError, match="SHORT"):
+            with pytest.raises(ibkr.SellExceedsPosition):
                 call()
     fake_ib.placeOrder.assert_not_called()
+
+
+def test_sell_above_the_long_position_is_refused_after_a_fresh_read():
+    """Run 11 follow-up: flat or smaller long also opens a short; a lagging
+    cache is re-read before refusing."""
+    import pytest
+    pos = lambda q: [MagicMock(contract=MagicMock(symbol="AMD"), position=q)]
+    fake_ib = MagicMock()
+    fake_ib.positions.return_value = pos(2)
+    fake_ib.reqPositions.return_value = pos(2)
+    with patch.object(ibkr, "get_ib", return_value=fake_ib):
+        with pytest.raises(ibkr.SellExceedsPosition):
+            ibkr.place_stop_order("AMD", 3, 90.0)
+        fake_ib.positions.return_value, fake_ib.reqPositions.return_value = [], []
+        with pytest.raises(ibkr.SellExceedsPosition):
+            ibkr._refuse_sell_on_short(fake_ib, "AMD", 1)
+        # cache lags after a fill, fresh read shows the shares: allowed
+        fake_ib.positions.return_value, fake_ib.reqPositions.return_value = pos(0), pos(3)
+        ibkr._refuse_sell_on_short(fake_ib, "AMD", 3)

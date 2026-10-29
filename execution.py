@@ -134,6 +134,20 @@ def _alert_stop_unknown(ticker: str, qty: float, stop_price: float) -> None:
         pass
 
 
+def _alert_stop_refused(ticker: str, qty: float, err: Exception) -> None:
+    """The broker layer refused the stop: it shows fewer shares long than the
+    stop is for, so it would open or add to a short (professor run 11)."""
+    import alerts as alert_module
+    log.error(f"[{ticker}] Stop for {qty:g} refused: {err}")
+    try:
+        alert_module._send(
+            f"🚨 STOP REFUSED — {ticker}\n{err}. The fill and the broker's position "
+            f"disagree; check the position and stops in TWS."
+        )
+    except Exception:
+        pass
+
+
 def _queue_stop_for_retry(ticker: str, qty: float, stop_price: float) -> None:
     """A stop request never reached the orders worker (busy or stuck):
     nothing was sent. Hand it to the reconcile re-protect queue, which
@@ -886,6 +900,13 @@ def execute_approved(
                     break
                 except Exception as e:
                     log.warning(f"[{ticker}] Stop order attempt {stop_attempt}/3 failed: {e}")
+                    if type(e).__name__ == "SellExceedsPosition":
+                        # The broker shows fewer shares than the stop is for
+                        # (short or flat): retrying can't help, and "place it
+                        # manually" would be wrong advice (professor run 11).
+                        _alert_stop_refused(ticker, stop_qty, e)
+                        stop_placed = True
+                        break
                     if isinstance(e, tasks.OrdersCallUnknown):
                         # The stop may be resting already; a retry could stack
                         # a second one. Reconcile fixes coverage either way
@@ -1133,6 +1154,10 @@ def execute_manual(
                     break
                 except Exception as e:
                     log.warning(f"[{ticker}] Stop attempt {attempt}/3: {e}")
+                    if type(e).__name__ == "SellExceedsPosition":
+                        _alert_stop_refused(ticker, filled_qty, e)
+                        stop_placed = True
+                        break
                     if isinstance(e, tasks.OrdersCallUnknown):
                         _alert_stop_unknown(ticker, filled_qty, float(stop_price))  # C24
                         stop_placed = True

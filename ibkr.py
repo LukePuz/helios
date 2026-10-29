@@ -219,15 +219,34 @@ def get_historical_bars(
 # Order execution
 # ---------------------------------------------------------------------------
 
-def _refuse_sell_on_short(ib, ticker: str) -> None:
-    """Every SELL here (stop, trail, market) assumes a long position; on a
-    short it would add to it. Callers size from abs(qty) in many places, so
-    the check sits where all of them meet (professor M63 residual). Reads
-    ib_async's position cache, kept current by the subscription."""
-    for p in ib.positions():
-        if p.contract.symbol == ticker and float(p.position) < 0:
-            raise RuntimeError(f"{ticker}: broker shows a SHORT of {float(p.position):g}; "
-                               f"SELL order refused")
+class SellExceedsPosition(RuntimeError):
+    """A SELL for more shares than the broker shows long (including a short
+    or a flat position) would open or add to a short. Not retryable."""
+
+
+def _long_qty(positions, ticker: str) -> float:
+    return sum(float(p.position) for p in positions if p.contract.symbol == ticker)
+
+
+def _refuse_sell_on_short(ib, ticker: str, qty: float | None = None) -> None:
+    """Every SELL here (stop, trail, market) assumes a long position at least
+    as large as the order; otherwise it opens or adds to a short. Callers
+    size from abs(qty) in many places, so the check sits where all of them
+    meet (professor M63 residual, run 11 follow-up). The position cache can
+    lag right after a fill, so a shortfall is confirmed with a fresh
+    reqPositions() before refusing."""
+    def short_of(positions):
+        held = _long_qty(positions, ticker)
+        return held < 0 or (qty is not None and float(qty) > held + 1e-6), held
+    bad, held = short_of(ib.positions())
+    if bad:
+        try:
+            bad, held = short_of(ib.reqPositions())
+        except Exception:
+            pass
+    if bad:
+        raise SellExceedsPosition(f"{ticker}: SELL {qty if qty is not None else ''} refused; "
+                                  f"broker shows {held:g} shares")
 
 
 def place_market_order(ticker: str, side: str, qty: float, fill_timeout: float = 30.0) -> dict:
@@ -251,7 +270,7 @@ def place_market_order(ticker: str, side: str, qty: float, fill_timeout: float =
     """
     ib = get_ib()
     if side == "SELL":
-        _refuse_sell_on_short(ib, ticker)
+        _refuse_sell_on_short(ib, ticker, qty)
     contract = _stock(ib, ticker)
 
     # Subscribe to delayed data briefly to satisfy TWS precautionary check
@@ -500,7 +519,7 @@ def place_trailing_stop_order(
         raise ValueError("place_trailing_stop_order: give exactly one of trail_percent/trail_amount")
 
     ib = get_ib()
-    _refuse_sell_on_short(ib, ticker)
+    _refuse_sell_on_short(ib, ticker, qty)
     contract = _stock(ib, ticker)
     order_kwargs = {"trailingPercent": trail_percent} if trail_percent is not None else {"auxPrice": trail_amount}
     order = ibi.Order(
@@ -517,7 +536,7 @@ def place_trailing_stop_order(
 def place_stop_order(ticker: str, qty: float, stop_price: float) -> dict:
     """Place a GTC sell stop-loss order. Returns order_id for lifecycle tracking."""
     ib = get_ib()
-    _refuse_sell_on_short(ib, ticker)
+    _refuse_sell_on_short(ib, ticker, qty)
     contract = _stock(ib, ticker)
     order    = ibi.StopOrder("SELL", qty, stop_price, tif="GTC")
     trade    = ib.placeOrder(contract, order)

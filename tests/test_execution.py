@@ -654,6 +654,7 @@ class TestStopRestoredAfterFailedSell:
         with patch("db.get_position_stop", return_value={"stop_price": 90.0}), \
              patch("db.set_stop_broker_order_id") as set_id, \
              patch("ibkr.get_client", return_value=client), \
+             patch("ibkr.get_open_orders", return_value=[]), \
              patch("tasks.manage_stop_place", return_value={"order_id": 5}) as place, \
              patch("alerts._send") as send:
             execution._restore_stop_after_failed_sell("NVDA")
@@ -766,3 +767,38 @@ def test_restore_covers_only_shares_without_a_resting_stop():
         client.return_value.get_open_position.return_value = MagicMock(qty=100)
         execution._restore_stop_after_failed_sell("AMD")
     place.assert_called_once_with("AMD", 40.0, 90.0)
+
+
+def test_restore_places_nothing_when_resting_stops_cannot_be_read():
+    """A0053-2: unknown coverage used to count as 0 and stack a full stop."""
+    with patch("db.get_position_stop", return_value={"stop_price": 90.0}), \
+         patch("ibkr.get_client") as client, \
+         patch("ibkr.get_open_orders", side_effect=RuntimeError("down")), \
+         patch("tasks.manage_stop_place") as place, \
+         patch("alerts._send") as send:
+        client.return_value.get_open_position.return_value = MagicMock(qty=100)
+        execution._restore_stop_after_failed_sell("AMD")
+    place.assert_not_called()
+    assert "CHECK STOPS" in send.call_args[0][0]
+
+
+def test_skipped_exit_restores_stops_the_cancel_already_took():
+    """A0053-2: two stops, one cancelled and one stuck; the skipped EXIT
+    puts the cancelled shares back under a stop."""
+    approval = _approval(action="EXIT", shares_initial=100)
+    stuck = [{"order_id": 4, "ticker": approval["ticker"], "action": "SELL",
+              "order_type": "STP", "qty": 60.0, "stop_price": 90.0, "status": "Submitted"}]
+    with patch("ibkr.get_ib"), patch("ibkr.get_client") as client, \
+         patch("ibkr.place_market_order") as order, \
+         patch("tasks.manage_cancel_stop_orders_for", return_value=1), \
+         patch("ibkr.get_open_orders", return_value=stuck), \
+         patch("ibkr.get_latest_price", return_value=100.0), \
+         patch("market_data.get_priced_quote", return_value=None), \
+         patch("db.get_position_stop", return_value={"stop_price": 90.0}), \
+         patch("db.set_stop_broker_order_id"), \
+         patch("tasks.manage_stop_place", return_value={"order_id": 9}) as place, \
+         patch("alerts._send"):
+        client.return_value.get_open_position.return_value = MagicMock(qty=100)
+        assert execution.execute_approved(approval) is False
+    order.assert_not_called()
+    place.assert_called_once_with(approval["ticker"], 40.0, 90.0)

@@ -347,3 +347,19 @@ class TestGetFillForOrderMatching:
         assert self._lookup(recs, ticker="CRWD", side="BUY", placed_at=placed) is None
         recs = [_FakeFillRecord("CRWD", 764, 144.0, 181.3, "BOT", time=placed + timedelta(seconds=40))]
         assert self._lookup(recs, ticker="CRWD", side="BUY", placed_at=placed)["filled_qty"] == 144.0
+
+
+class TestGetOpenOrdersSnapshot:
+    """A0053-1: a stop the orders worker cancelled stays in another
+    process's openTrades() cache; only the fresh snapshot counts."""
+
+    def test_cancelled_stop_in_stale_cache_is_not_reported(self):
+        live = _FakeStopTrade("PLTR", 1)
+        ghost = _FakeStopTrade("PLTR", 2)  # cancelled by another client
+        fake_ib = MagicMock()
+        fake_ib.openTrades.return_value = [live, ghost]
+        fake_ib.reqAllOpenOrders.return_value = [live, live]
+        with patch.object(ibkr, "get_ib", return_value=fake_ib):
+            orders = ibkr.get_open_orders()
+        assert [o["order_id"] for o in orders] == [1]
+        fake_ib.openTrades.assert_not_called()

@@ -136,7 +136,21 @@ def _restore_stop_after_failed_sell(ticker: str) -> None:
         held = round(abs(float(ibkr.get_client().get_open_position(ticker).qty)), 4)
         # Only the part not already covered by a stop that never got
         # cancelled, or the two together would oversell (A2253-1).
-        covered = _stops_still_resting(ticker) or 0.0
+        covered = _stops_still_resting(ticker)
+        if covered is None:
+            # Unknown coverage: a full stop on top of one that is still
+            # working would oversell, so place nothing and say so (A0053-2).
+            log.error(f"[{ticker}] Stop restore skipped: resting stops could not be read")
+            try:
+                alert_module._send(
+                    f"⚠️ CHECK STOPS — {ticker}\n"
+                    f"A sell did not go through and the resting stops could not be read, "
+                    f"so no stop was restored. Check TWS; recorded stop "
+                    f"${float(stop_rec['stop_price']):.2f}."
+                )
+            except Exception:
+                pass
+            return
         qty = round(held - covered, 4)
         if qty <= 0:
             return
@@ -617,6 +631,9 @@ def execute_approved(
                     )
                 except Exception:
                     pass
+                # The cancel may have taken some stops before one stuck;
+                # put back what is now uncovered (A0053-2).
+                _restore_stop_after_failed_sell(ticker)
                 return _outcome("skipped: stop still resting, sell not sent")
 
         stop_price_for_entry = approval.get("stop_loss_price") or risk_json.get("stop_loss_price")
@@ -964,6 +981,7 @@ def execute_manual(
             log.warning(f"[{ticker}] Could not cancel existing stops before manual SELL: {e}")
         resting = _stops_still_resting(ticker)
         if resting or (resting is None and not cancel_ok):
+            _restore_stop_after_failed_sell(ticker)  # A0053-2
             return {"success": False, "filled_qty": 0, "fill_price": None, "stop_price": None,
                     "message": f"SELL {ticker} not sent: an existing stop could not be "
                                f"cancelled (selling on top of it could short). Check TWS."}

@@ -568,11 +568,20 @@ def get_open_orders() -> list[dict]:
     {order_id, ticker, action, order_type, qty, stop_price, status}
     """
     ib = get_ib()
-    ib.reqAllOpenOrders()
+    # Build from the snapshot reqAllOpenOrders() returns, not openTrades():
+    # this process's cache is never pruned for orders another client
+    # (the orders worker) cancels, so a cancelled stop would still read as
+    # resting here (audit 00:53 A0053-1).
+    trades = ib.reqAllOpenOrders()
     ib.sleep(1)
     results = []
-    for trade in ib.openTrades():
+    seen = set()
+    for trade in trades:
         o = trade.order
+        key = (getattr(o, "permId", 0) or None, getattr(o, "clientId", None), o.orderId)
+        if key in seen:
+            continue
+        seen.add(key)
         results.append({
             "order_id":   o.orderId,
             "ticker":     trade.contract.symbol,

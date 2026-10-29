@@ -1708,6 +1708,27 @@ def _schedule_backstop_retry(ticker: str, alert: dict) -> None:
 
 
 @locked_by_ticker(lambda ticker, *a, **k: ticker, on_busy=False)
+def _split_ratio(ticker: str, pos) -> float | None:
+    """The split ratio (e.g. 4.0, or 0.1 for 1:10) if the recorded entry and
+    the broker's average cost differ by a near-whole factor of 2 or more. The
+    broker adjusts its average cost on a split; the stop record doesn't. An
+    ADD's blending never moves them that far apart. None if no split is
+    suspected or it can't be read."""
+    import db
+    try:
+        entry = float((db.get_position_stop(ticker) or {}).get("entry_price") or 0)
+        avg = float(getattr(pos, "avg_entry_price", 0) or 0)
+    except Exception:
+        return None
+    if entry <= 0 or avg <= 0:
+        return None
+    r = entry / avg
+    for c in (r, 1 / r):
+        if c >= 1.9 and abs(c - round(c)) / c < 0.04:
+            return round(r, 4)
+    return None
+
+
 def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) -> bool:
     """Market-sell the full position when its stop level is breached and no
     protective stop exists at the broker. This monitor is the last line of
@@ -1752,6 +1773,23 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
         if owned <= 0:
             # Stale stop record for a position that no longer exists
             db.delete_position_stop(ticker)
+            return False
+
+        ratio = _split_ratio(ticker, pos)
+        if ratio:
+            # After a split the price sits far below the recorded stop and
+            # the broker stop no longer matches the shares, so this path
+            # would sell the whole position at market (audit 14:53, A1453-1).
+            log.error(f"[{ticker}] Backstop sell blocked: recorded entry vs broker average cost "
+                      f"suggests a {ratio:g}:1 split; stop levels need rescaling")
+            try:
+                import alerts
+                alerts._send(f"⚠️ POSSIBLE SPLIT — <b>{ticker}</b>\nThe recorded entry is about "
+                             f"{ratio:g}× the broker's average cost, so the stop check thinks the "
+                             f"stop was hit. The backstop sell was blocked. Check the position and "
+                             f"stops in TWS; the stop record needs rescaling.")
+            except Exception:
+                pass
             return False
 
         manage_cancel_stop_orders_for(ticker)  # belt-and-braces before selling

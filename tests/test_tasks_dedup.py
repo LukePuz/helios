@@ -1296,3 +1296,27 @@ def test_flat_buy_hands_off_after_about_30_minutes():
         tasks._retry_pending_reprotects()
     assert json.loads(state["reprotect_pending"]) == {}
     assert "STOP NOT PLACED" in send.call_args[0][0]
+
+
+def test_backstop_does_not_sell_after_a_split():
+    """A1453-1: a 4:1 split (broker avg cost a quarter of the recorded entry)
+    blocks the market sell and alerts."""
+    import tasks
+    pos = _Pos("NVDA", 4.0)
+    pos.avg_entry_price = 45.0
+    with patch("ibkr.get_client") as client, \
+         patch("db.get_position_stop", return_value={"entry_price": 180.0, "stop_price": 160.0}), \
+         patch("tasks.manage_cancel_stop_orders_for") as cancel, \
+         patch("ibkr.place_market_order") as sell, \
+         patch("alerts._send") as send:
+        client.return_value.get_all_positions.return_value = [pos]
+        assert tasks._execute_backstop_sell("NVDA", {"stop_price": 160.0}) is False
+    cancel.assert_not_called(); sell.assert_not_called()
+    assert "POSSIBLE SPLIT" in send.call_args[0][0]
+    # No split: entry and avg cost close, so no ratio.
+    pos.avg_entry_price = 172.0
+    with patch("db.get_position_stop", return_value={"entry_price": 180.0}):
+        assert tasks._split_ratio("NVDA", pos) is None
+    pos.avg_entry_price = 1800.0  # 1:10 reverse split
+    with patch("db.get_position_stop", return_value={"entry_price": 180.0}):
+        assert tasks._split_ratio("NVDA", pos) == 0.1

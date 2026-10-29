@@ -291,6 +291,47 @@ def _start_dashboard() -> subprocess.Popen:
     return proc
 
 
+_ORDERS_WORKER_WAIT_S = 180
+
+
+def _orders_worker_ready(wait_s: float = _ORDERS_WORKER_WAIT_S) -> bool:
+    """Poll until the orders worker answers a Celery ping."""
+    import socket
+    from tasks import app
+    dest = [f"orders@{socket.gethostname()}"]
+    deadline = time.monotonic() + wait_s
+    while time.monotonic() < deadline:
+        try:
+            if app.control.ping(destination=dest, timeout=2):
+                return True
+        except Exception as e:
+            logging.debug(f"orders worker ping failed: {e}")
+        time.sleep(3)
+    return False
+
+
+def _startup_reconcile() -> None:
+    """Startup position/order reconciliation. Both place or cancel orders
+    through the orders queue, so they wait for the orders worker: run before
+    it existed, an orphan market BUY couldn't be cancelled and would fill at
+    the open with no stop (audit 00:53, A0053-3)."""
+    if not _orders_worker_ready():
+        logging.error("Startup reconciliation skipped: orders worker did not answer "
+                      f"within {_ORDERS_WORKER_WAIT_S}s")
+        try:
+            import alerts
+            alerts._send(
+                "⚠️ <b>Startup reconciliation skipped</b>\n"
+                "The orders worker didn't come up, so stale market BUYs were not "
+                "cancelled and unstopped positions were not adopted. Check TWS."
+            )
+        except Exception:
+            pass
+        return
+    _reconcile_positions()
+    _reconcile_open_orders()
+
+
 def _auto_start_services() -> None:
     """Start Celery Worker, Celery Beat, and Catalyst Service after a short delay."""
     def _start():
@@ -304,6 +345,7 @@ def _auto_start_services() -> None:
                 logging.info(f"{pm.SERVICES[name]['label']} already running.")
             else:
                 logging.warning(f"Could not start {pm.SERVICES[name]['label']}: {result}")
+        _startup_reconcile()
 
     t = threading.Thread(target=_start, daemon=True, name="service-autostart")
     t.start()
@@ -338,14 +380,8 @@ def main() -> None:
     print("  [5/6] Starting Telegram bot...")
     _start_telegram_bot()
 
-    # 5b. Position reconciliation (non-fatal — warns if DB and IBKR disagree)
-    print("  [5b] Reconciling positions with IBKR...")
-    _reconcile_positions()
-
-    # 5c. Open-order reconciliation — cancels stale market BUY orders left
-    # over from a previous session (see _reconcile_open_orders docstring).
-    print("  [5c] Reconciling open orders with IBKR...")
-    _reconcile_open_orders()
+    # 5b/5c. Position and open-order reconciliation run once the orders
+    # worker is up (see _startup_reconcile).
 
     # 6. Dashboard
     print("  [6/6] Starting dashboard + services...")

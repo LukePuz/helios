@@ -2320,6 +2320,37 @@ def check_portfolio_drawdown(self):
         raise self.retry(exc=e, countdown=60)
 
 
+@locked_by_ticker(lambda ticker: ticker,
+                  on_busy=lambda: "over-stop fix skipped: ticker busy (next cycle)")
+def _fix_overstop(ticker: str) -> str:
+    """Re-read under the lock; if resting SELL stops still exceed the
+    position, cancel them all and place one for the held quantity at the
+    recorded stop. Returns a line for the reconcile log/alert."""
+    import db
+    import ibkr
+    try:
+        pos = next((p for p in ibkr.get_client().get_all_positions() if p.symbol == ticker), None)
+        held = round(abs(float(pos.qty)), 4) if pos else 0.0
+        resting = sum(float(o["qty"]) for o in _resting_sell_stops(ticker))
+    except Exception as e:
+        return f"⚠️ {ticker}: over-stop re-check failed ({e}); check TWS"
+    if resting <= held + 1e-6:
+        return f"{ticker}: over-stop cleared on re-check ({resting:g} <= {held:g})"
+    stop_price = (db.get_position_stop(ticker) or {}).get("stop_price")
+    if not stop_price or held <= 0:
+        return (f"🚨 {ticker}: resting stops for {resting:g} shares but {held:g} held and no "
+                f"recorded stop to rebuild from — cancel the extra stop in TWS")
+    try:
+        manage_cancel_stop_orders_for(ticker)
+        result = manage_stop_place(ticker, held, float(stop_price))
+        db.set_stop_broker_order_id(ticker, result["order_id"])
+    except Exception as e:
+        return (f"🚨 {ticker}: stops covered {resting:g} > held {held:g}; rebuild failed ({e}) "
+                f"— check TWS now")
+    return (f"🔧 {ticker}: stops covered {resting:g} shares but {held:g} held; replaced with one "
+            f"stop for {held:g} @ ${float(stop_price):.2f}")
+
+
 def _reconcile_alert_due(issue_key: str) -> bool:
     """Gate re-alerting the same unresolved reconciliation issue. A standing
     condition (e.g. one position missing a stop) used to re-fire every
@@ -2532,6 +2563,34 @@ def reconcile_stop_orders(self):
                             log.error(f"[{ticker}] Could not send unreconciled-exit alert: {e}")
 
                 db.delete_position_stop(ticker)
+
+        # 2b. Resting SELL stops for more shares than held (professor M54,
+        # 2026-10-28): the one check that catches every stacked-stop race
+        # (a late stop after a lost reply, two paths interleaving). If both
+        # trigger they oversell into a short. Two consecutive cycles, like
+        # the orphan check, then fix under the ticker lock.
+        stop_qty: dict[str, float] = {}
+        for o in stops:
+            stop_qty[o["ticker"]] = stop_qty.get(o["ticker"], 0.0) + float(o["qty"])
+        for ticker, qty in held.items():
+            pending_key = f"overstop_pending_{ticker}"
+            if stop_qty.get(ticker, 0.0) <= qty + 1e-6:
+                db.set_state(pending_key, "")
+                continue
+            if not db.get_state(pending_key):
+                db.set_state(pending_key, datetime.now(timezone.utc).isoformat())
+                log.warning(f"[{ticker}] resting stops cover {stop_qty[ticker]:g} > held {qty:g}; "
+                            f"confirming next cycle")
+                continue
+            db.set_state(pending_key, "")
+            msg = _fix_overstop(ticker)
+            all_actions.append(msg)
+            new_actions.append(msg)
+            try:
+                import alerts
+                alerts._send(f"STOP RECONCILE — {msg}")
+            except Exception:
+                pass
 
         # 3. Positions with no protective stop at the broker → alert, and
         # escalate to Telegram once it's been genuinely sustained.

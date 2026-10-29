@@ -671,3 +671,15 @@ def test_no_earnings_blackout_by_default():
     near.assert_not_called()
     mock_rm_cls.return_value.size_position.assert_called_once()
     assert all(c[0][1] != "EARNINGS_BLOCKED" for c in log_signal.call_args_list)
+
+
+def test_rule_shadow_logs_a_moonshot_average_down():
+    """A1453-5: logged, not enforced."""
+    from unittest.mock import patch
+    from agents import crew
+    with patch("db.get_position_stop", return_value={"entry_price": 20.0}), \
+         patch("agents.crew._get_price", return_value=15.0), \
+         patch.object(crew.log, "warning") as warn:
+        crew._rule_shadow_average_down("RGTI", "Moonshot", None)
+        crew._rule_shadow_average_down("NVDA", "Compounder", None)
+    assert warn.call_count == 1 and "never average down" in warn.call_args[0][0]

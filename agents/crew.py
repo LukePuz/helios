@@ -638,6 +638,23 @@ def process_candidates(candidates: list[dict], max_per_run: int = 5) -> list[dic
 # Risk sizing + approval queue
 # ---------------------------------------------------------------------------
 
+def _rule_shadow_average_down(ticker: str, bucket: str, trading_client) -> None:
+    """Shadow check of a written rule nothing enforces: "Moonshots: never
+    average down" (portfolio_philosophy.md). Logged only (audit 14:53,
+    A1453-5); whether it becomes a gate is Luke's decision."""
+    if bucket != "Moonshot":
+        return
+    try:
+        import db
+        entry = float((db.get_position_stop(ticker) or {}).get("entry_price") or 0)
+        price = float(_get_price(ticker, trading_client) or 0)
+    except Exception:
+        return
+    if entry and price and price < entry:
+        log.warning(f"[{ticker}] rule shadow (Moonshots: never average down): ADD at "
+                    f"${price:.2f} below entry ${entry:.2f}; not enforced")
+
+
 def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
     """
     Run risk sizing on an analyst recommendation and auto-execute it (paper
@@ -668,6 +685,8 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
         pass
 
     action = result["action"]
+    if action == "ADD":
+        _rule_shadow_average_down(ticker, bucket, trading_client)
 
     if action in ("OPEN", "ADD"):
         try:

@@ -513,7 +513,18 @@ def _call_ollama(prompt: str, num_ctx: int = _NUM_CTX) -> str | None:
         )
         resp.raise_for_status()
         _LAST_CALL_FAILURE["kind"] = None
-        return resp.json().get("response", "")
+        body = resp.json()
+        # What Ollama actually did with the prompt (professor C26): if
+        # prompt_eval_count reaches num_ctx, the head of the prompt (the
+        # instructions and schema) was silently dropped.
+        _LAST_CALL_STATS.clear()
+        _LAST_CALL_STATS.update({k: body.get(k) for k in (
+            "prompt_eval_count", "eval_count", "done_reason", "total_duration")})
+        _LAST_CALL_STATS["num_ctx"] = num_ctx
+        if (body.get("prompt_eval_count") or 0) >= num_ctx - 8:
+            log.warning(f"Ollama prompt filled the context ({body.get('prompt_eval_count')} of "
+                        f"{num_ctx} tokens); its start may have been cut")
+        return body.get("response", "")
     except requests.exceptions.Timeout:
         # Was reported as "unreachable" (limitations audit 12:53, #8).
         _LAST_CALL_FAILURE["kind"] = "timeout"
@@ -531,6 +542,8 @@ def _call_ollama(prompt: str, num_ctx: int = _NUM_CTX) -> str | None:
 
 # Why the last _call_ollama returned None, for the stub's reason text.
 _LAST_CALL_FAILURE: dict = {"kind": None}
+# Token counts from the last successful call, recorded in provenance (C26).
+_LAST_CALL_STATS: dict = {}
 _STUB_REASONS = {"timeout": "Ollama timed out", "unreachable": "Ollama unreachable",
                  "error": "Ollama call failed"}
 
@@ -1255,6 +1268,7 @@ def analyze(
     except Exception as e:
         log.debug(f"[{ticker}] knowledge coverage record failed: {e}")
     provenance.update(_decision_inputs_record(ticker, regime_packet))
+    provenance["llm_call"] = {**_LAST_CALL_STATS, "prompt_tokens_est": _estimate_tokens(prompt)}
     try:
         import db
         db.log_signal(

@@ -155,3 +155,18 @@ def test_decision_inputs_record_regime_row_and_implied_growth():
                                   "timestamp": "2026-10-29 13:31:18", "last_bar_date": "2026-10-29"}
     assert rec["implied_growth"]["implied_growth_rate"] == 0.18
     assert rec["implied_growth"]["as_of"] == "2026-10-28 22:00"
+
+
+def test_ollama_call_keeps_token_counts():
+    """C26: prompt_eval_count etc. are kept for provenance; a full context warns."""
+    from unittest.mock import MagicMock, patch
+    from agents import analyst
+    resp = MagicMock()
+    resp.json.return_value = {"response": "{}", "prompt_eval_count": 8190, "eval_count": 900,
+                              "done_reason": "stop", "total_duration": 9.1e10}
+    with patch("agents.analyst.requests.post", return_value=resp), \
+         patch.object(analyst.log, "warning") as warn:
+        assert analyst._call_ollama("p", num_ctx=8192) == "{}"
+    assert analyst._LAST_CALL_STATS["prompt_eval_count"] == 8190
+    assert analyst._LAST_CALL_STATS["num_ctx"] == 8192
+    assert "filled the context" in warn.call_args[0][0]

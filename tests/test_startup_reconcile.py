@@ -47,7 +47,7 @@ def test_orders_worker_starts_before_reconcile_and_the_rest_after():
 
     with patch("process_manager.SERVICES", services), \
          patch("process_manager.start", side_effect=lambda n: calls.append(n) or "ok"), \
-         patch("main._startup_reconcile", side_effect=lambda: calls.append("reconcile")), \
+         patch("main._bounded_startup_reconcile", side_effect=lambda: calls.append("reconcile")), \
          patch("main.time.sleep"), patch("main.threading.Thread", fake_thread):
         main._auto_start_services()
     assert calls[:2] == ["celery_orders_worker", "reconcile"]
@@ -87,3 +87,14 @@ def test_short_is_not_adopted():
         msg = main._adopt_position(MagicMock(), MagicMock(), "AMD", -5.0, place, lambda t: [])
     place.assert_not_called(); up.assert_not_called()
     assert "SHORT" in msg
+
+
+def test_hung_reconcile_does_not_block_the_rest():
+    """A0453-1: a hang releases the startup after the limit, with an alert."""
+    import threading
+    gate = threading.Event()
+    with patch("main._startup_reconcile", side_effect=lambda: gate.wait(5)), \
+         patch("alerts._send") as send:
+        main._bounded_startup_reconcile(limit_s=0.05)
+    gate.set()
+    assert "slow" in send.call_args[0][0]

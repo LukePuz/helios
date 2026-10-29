@@ -355,6 +355,32 @@ def _startup_reconcile() -> None:
     _reconcile_open_orders()
 
 
+_STARTUP_RECONCILE_LIMIT_S = 300
+
+
+def _bounded_startup_reconcile(limit_s: float = _STARTUP_RECONCILE_LIMIT_S) -> None:
+    """Run _startup_reconcile but never let it hold back the other services:
+    an IBKR call can hang with no timeout, and with beat and the workers
+    waiting on it the whole stack would stay down silently (audit 04:53,
+    A0453-1). After limit_s it keeps running in the background and the rest
+    start anyway, with an alert."""
+    t = threading.Thread(target=_startup_reconcile, daemon=True, name="startup-reconcile")
+    t.start()
+    t.join(limit_s)
+    if t.is_alive():
+        logging.error(f"Startup reconciliation still running after {limit_s:.0f}s; "
+                      f"starting the other services anyway")
+        try:
+            import alerts
+            alerts._send(
+                "⚠️ <b>Startup reconciliation slow</b>\n"
+                f"It hasn't finished after {limit_s / 60:.0f} min (likely a hung broker call). "
+                "The other services are starting anyway; check TWS and the orders worker."
+            )
+        except Exception:
+            pass
+
+
 def _auto_start_services() -> None:
     """Start Celery Worker, Celery Beat, and Catalyst Service after a short delay."""
     def _start():
@@ -376,7 +402,7 @@ def _auto_start_services() -> None:
         # cancelled as "stale" (audit 02:53, A0253-5).
         if "celery_orders_worker" in pm.SERVICES:
             _start_one("celery_orders_worker")
-        _startup_reconcile()
+        _bounded_startup_reconcile()
         for name in pm.SERVICES:
             if name != "celery_orders_worker":
                 _start_one(name)

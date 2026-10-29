@@ -3620,6 +3620,7 @@ def upsert_earnings_date(ticker: str, earnings_date, confirmed: bool = False,
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
+            history_ok = True
             if replace_future:
                 try:
                     cur.execute("SAVEPOINT hist")
@@ -3627,8 +3628,12 @@ def upsert_earnings_date(ticker: str, earnings_date, confirmed: bool = False,
                         "INSERT INTO earnings_calendar_history (ticker, earnings_date, confirmed) "
                         "VALUES (%s,%s,%s)", (ticker, earnings_date, confirmed))
                     cur.execute("RELEASE SAVEPOINT hist")
-                except Exception:
-                    cur.execute("ROLLBACK TO SAVEPOINT hist")  # migration 62 not run yet
+                except Exception as e:
+                    cur.execute("ROLLBACK TO SAVEPOINT hist")
+                    history_ok = False
+                    logging.warning(f"[{ticker}] earnings history write failed ({e}); "
+                                    f"old dates kept this time")
+            if replace_future and history_ok:
                 cur.execute(
                     "DELETE FROM earnings_calendar WHERE ticker=%s AND earnings_date >= CURRENT_DATE "
                     "AND earnings_date <> %s RETURNING earnings_date",
@@ -3786,8 +3791,10 @@ def log_scanner_candidate(
                 cur.execute(base.format(extra=", regime_detail", ph=",%s"),
                             values + (psycopg2.extras.Json(regime_detail)
                                       if regime_detail is not None else None,))
-        except Exception:
-            # Migration 61 not applied yet: log the row without it.
+        except Exception as e:
+            # Usually migration 61 not applied yet: log the row without it,
+            # and say why (professor m59).
+            logging.warning(f"[{ticker}] scanner row without regime_detail: {e}")
             conn.rollback()
             with conn.cursor() as cur:
                 cur.execute(base.format(extra="", ph=""), values)

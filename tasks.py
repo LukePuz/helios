@@ -1336,19 +1336,29 @@ def _review_manual_actions() -> None:
     if not items:
         return
     try:
-        held = {p.symbol: abs(float(p.qty)) for p in ibkr.get_client().get_all_positions()}
+        positions = ibkr.get_client().get_all_positions()
     except Exception as e:
         log.warning(f"manual-action review: position read failed ({e})")
         return
+    if not positions:
+        # An empty read right after a reconnect looks flat for everything;
+        # never clear on it (professor C28).
+        return
+    held = {p.symbol: abs(float(p.qty)) for p in positions}
     now = time.time()
-    cleared, realert = [], []
+    cleared, realert, flat_once = [], [], []
     for ticker, rec in items.items():
         qty = held.get(ticker, 0.0)
         covered = execution._stops_still_resting(ticker) if qty > 0 else None
-        if qty <= 0 or (covered is not None and covered >= qty):
+        if qty > 0 and covered is not None and covered >= qty:
             cleared.append(ticker)
-        elif now - float(rec.get("last_alert", 0)) >= _MANUAL_REALERT_S:
-            realert.append(ticker)
+        elif qty <= 0 and int(rec.get("flat_reads", 0)) >= 1:
+            cleared.append(ticker)  # flat on two cycles in a row (C28)
+        else:
+            if qty <= 0:
+                flat_once.append(ticker)
+            if now - float(rec.get("last_alert", 0)) >= _MANUAL_REALERT_S:
+                realert.append(ticker)
     for ticker in realert:
         rec = items[ticker]
         mins = int((now - float(rec.get("first_seen", now))) / 60)
@@ -1367,9 +1377,13 @@ def _review_manual_actions() -> None:
         for t in realert:
             if t in current:
                 current[t]["last_alert"] = now
+        for t in current:
+            if t in flat_once:
+                current[t]["flat_reads"] = int(current[t].get("flat_reads", 0)) + 1
+            elif t not in cleared:
+                current[t]["flat_reads"] = 0
         return current
-    if cleared or realert:
-        _manual_actions_edit(apply)
+    _manual_actions_edit(apply)
 
 
 _REPROTECT_MAX_TRIES = 4  # reconcile_stop_orders cycles, 15 min apart (~1 h)

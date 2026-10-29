@@ -1375,3 +1375,26 @@ def test_manual_actions_clear_when_covered_and_realert_when_not():
     items = json.loads(state["manual_actions"])
     assert "NVDA" not in items and "AMD" in items
     assert "STILL OPEN" in send.call_args[0][0] and "AMD" in send.call_args[0][0]
+
+
+def test_manual_action_needs_two_flat_reads_and_ignores_an_empty_read():
+    """C28: one flat read doesn't clear an item; two in a row do; an empty
+    position list (reconnect) clears nothing."""
+    import json
+    import time
+    import tasks
+    state = {"manual_actions": json.dumps({"AMD": {"what": "x", "first_seen": time.time(),
+                                                   "last_alert": time.time()}})}
+    with patch("db.get_state", side_effect=lambda k: state.get(k)), \
+         patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+         patch("ibkr.get_client") as client, \
+         patch("execution._stops_still_resting", return_value=0.0), \
+         patch("alerts._send"):
+        client.return_value.get_all_positions.return_value = []
+        tasks._review_manual_actions()
+        assert "AMD" in json.loads(state["manual_actions"])
+        client.return_value.get_all_positions.return_value = [_Pos("NVDA", 1.0)]
+        tasks._review_manual_actions()
+        assert json.loads(state["manual_actions"])["AMD"]["flat_reads"] == 1
+        tasks._review_manual_actions()
+        assert "AMD" not in json.loads(state["manual_actions"])

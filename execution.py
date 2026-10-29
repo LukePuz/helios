@@ -1160,6 +1160,21 @@ def execute_manual(
                     db.set_stop_broker_order_id(ticker, new_stop["order_id"])
                 except Exception as e:
                     log.error(f"[{ticker}] Failed to re-place stop after manual sell: {e}")
+                    # Queue and track it like the other failed re-places (M87).
+                    try:
+                        tasks._queue_reprotect(ticker, {"intent": "RESTORE"}, None)
+                    except Exception as e2:
+                        log.error(f"[{ticker}] Could not queue the stop restore: {e2}")
+                    try:
+                        alert_module._send(
+                            f"🚨 UNPROTECTED POSITION — {ticker}\nA manual sell filled but the stop "
+                            f"for the remaining {remaining:g} shares failed. It is queued and retried "
+                            f"every reconcile cycle; place stop @ ${float(stop_rec['stop_price']):.2f} "
+                            f"manually if it isn't back within ~15 min.")
+                    except Exception:
+                        pass
+                    tasks.open_manual_action(ticker, f"re-place the stop @ "
+                                                     f"${float(stop_rec['stop_price']):.2f} after a manual sell")
     else:  # BUY — place an ATR stop and make the position visible to the monitor
         try:
             stop_price, stop_method = rm.calculate_stop(ticker, fill_price, bucket)
@@ -1199,12 +1214,18 @@ def execute_manual(
                         _time.sleep(2 * attempt)
             if not stop_placed:
                 try:
+                    tasks._queue_reprotect(ticker, {"intent": "BUY"}, None)  # M87
+                except Exception as e:
+                    log.error(f"[{ticker}] Could not queue the stop retry: {e}")
+                try:
                     alert_module._send(
                         f"🚨 UNPROTECTED POSITION — {ticker}\n"
-                        f"Manual order filled but stop failed. Place stop @ ${stop_price:.2f} manually."
+                        f"Manual order filled but stop failed. It is queued and retried every "
+                        f"reconcile cycle, but place stop @ ${stop_price:.2f} manually now."
                     )
                 except Exception:
                     pass
+                tasks.open_manual_action(ticker, f"place a stop @ ${float(stop_price):.2f} after a manual BUY")
 
     return {
         "success": True,

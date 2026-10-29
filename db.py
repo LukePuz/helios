@@ -1510,6 +1510,13 @@ def upsert_position_stop(
                     trail_distance_pct= EXCLUDED.trail_distance_pct,
                     trailing_active   = FALSE,
                     trailing_high     = NULL,
+                    -- Every caller writes this for a BUY (new, ADD, late fill,
+                    -- re-entry, adopted): the fixed stop replaces any trail, so
+                    -- its params go too, and the larger position gets its
+                    -- profit target back (audit 16:53, A1653-4).
+                    trail_amount      = NULL,
+                    trail_percent     = NULL,
+                    profit_target_taken = FALSE,
                     updated_at        = NOW()
                 """,
                 (ticker, TRADING_ENV, entry_price, stop_price, stop_method, bucket, conviction, trail_distance_pct),

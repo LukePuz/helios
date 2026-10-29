@@ -252,3 +252,18 @@ def test_trigger_record_and_every_analyze_call_passes_one():
         src = inspect.getsource(mod)
         calls = re.findall(r"\banalyze\(candidate[^)]*\)", src, re.S)
         assert calls and all("trigger=" in c for c in calls), mod.__name__
+
+
+def test_buy_stop_record_clears_trail_params_and_target_flag():
+    """A1653-4: an ADD (or re-entry) replaces a trail with a fixed stop; the
+    record must not keep stale trail params or a taken profit target."""
+    from unittest.mock import MagicMock, patch
+    import db
+    cur = MagicMock()
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
+        db.upsert_position_stop("NVDA", 180.0, 160.0, "atr", "Accelerator", 7)
+    sql = cur.execute.call_args[0][0]
+    for frag in ("trail_amount      = NULL", "trail_percent     = NULL", "profit_target_taken = FALSE"):
+        assert frag in sql

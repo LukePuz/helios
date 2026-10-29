@@ -234,3 +234,21 @@ def test_stored_prompt_has_no_account_dollars():
     assert "1,234" not in out and "1,000.00" not in out and "2,000" not in out and "Value: $195" not in out
     assert "Entry: $180.10" in out and "Current: $195.44" in out
     assert out.count("$[REDACTED]") == 4
+
+
+def test_trigger_record_and_every_analyze_call_passes_one():
+    """A1653-2: each verdict records what triggered it; every analyze() call
+    site passes a trigger (log-only, never in the prompt)."""
+    import inspect
+    import re
+    from agents import analyst, crew
+    rec = analyst.trigger_record("event", {"source": "analyst_ratings", "type": "pt_raise",
+                                           "title": "Stifel raises MSFT", "url": "u",
+                                           "timestamp": "2026-10-29T11:02"})
+    assert rec == {"path": "event", "source": "analyst_ratings", "type": "pt_raise",
+                   "title": "Stifel raises MSFT", "url": "u", "published_at": "2026-10-29T11:02"}
+    assert "trigger" not in inspect.getsource(analyst._build_prompt)
+    for mod in (analyst, crew):
+        src = inspect.getsource(mod)
+        calls = re.findall(r"\banalyze\(candidate[^)]*\)", src, re.S)
+        assert calls and all("trigger=" in c for c in calls), mod.__name__

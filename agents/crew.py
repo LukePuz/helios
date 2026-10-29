@@ -152,7 +152,9 @@ def deep_analyze(event: dict, screening: dict | None = None) -> dict:
     # ── Analyze ────────────────────────────────────────────────────────────────
     regime = get_cached_regime()
     try:
-        result = analyze(candidate, situation_brief=brief, regime_packet=regime)
+        from agents.analyst import trigger_record
+        result = analyze(candidate, situation_brief=brief, regime_packet=regime,
+                         trigger=trigger_record("event", event))
     except Exception as exc:
         log.error(f"[{ticker}] analyze() raised an unhandled exception: {exc}", exc_info=True)
         result = {
@@ -233,7 +235,7 @@ def _earnings_review_event(ticker: str, earnings_date, today=None) -> dict:
 
 
 def _analyze_held_position(ticker: str, client, positions: dict, regime: dict,
-                           event: dict | None = None) -> dict:
+                           event: dict | None = None, path: str | None = None) -> dict:
     """The brief-assembly + analyze() core shared by review_held_position
     and backfill_catalyst_tracking (2026-08-30) -- extracted so the
     backfill can get the same real catalyst/expected-return read every
@@ -260,8 +262,11 @@ def _analyze_held_position(ticker: str, client, positions: dict, regime: dict,
         "composite_score": 60,
     }
 
+    from agents.analyst import trigger_record
+    path = path or ("earnings_review" if event.get("type") == "earnings review" else "scheduled_review")
     try:
-        return analyze(candidate, situation_brief=brief, regime_packet=regime)
+        return analyze(candidate, situation_brief=brief, regime_packet=regime,
+                       trigger=trigger_record(path, event))
     except Exception as exc:
         log.error(f"[{ticker}] analyze() raised: {exc}", exc_info=True)
         return {
@@ -460,7 +465,7 @@ def backfill_catalyst_tracking(max_per_run: int = 10) -> list[dict]:
 
     results = []
     for ticker in missing:
-        result = _analyze_held_position(ticker, client, positions, regime)
+        result = _analyze_held_position(ticker, client, positions, regime, path="backfill")
         if result.get("action") == "SKIP":
             results.append({"ticker": ticker, "action": "SKIPPED", "reason": result.get("reasoning")})
             continue
@@ -549,7 +554,9 @@ def research_ticker(ticker: str) -> dict:
 
     regime = get_cached_regime()
     try:
-        result = analyze(candidate, situation_brief=brief, regime_packet=regime)
+        from agents.analyst import trigger_record
+        result = analyze(candidate, situation_brief=brief, regime_packet=regime,
+                         trigger=trigger_record("chat", {"source": "chat", "title": f"research {ticker}"}))
     except Exception as exc:
         log.error(f"[{ticker}] research_ticker analyze() raised: {exc}", exc_info=True)
         result = {

@@ -912,10 +912,20 @@ def _stub_recommendation(candidate: dict, reason: str) -> dict:
 # Main analyst function
 # ---------------------------------------------------------------------------
 
+def trigger_record(path: str, event: dict | None = None) -> dict:
+    """What started this analysis, for the verdict's provenance (audit 16:53,
+    A1653-2). Log-only: never passed to the prompt."""
+    e = event or {}
+    return {"path": path, "source": e.get("source"), "type": e.get("type"),
+            "title": (e.get("title") or "")[:200] or None, "url": e.get("url"),
+            "published_at": str(e.get("timestamp") or e.get("published_at") or "") or None}
+
+
 def analyze(
     candidate: dict,
     situation_brief: str = "",
     regime_packet: dict | None = None,
+    trigger: dict | None = None,
 ) -> dict:
     """
     Evaluate a scanner candidate and produce an investment recommendation.
@@ -1294,6 +1304,7 @@ def analyze(
     except Exception as e:
         log.debug(f"[{ticker}] knowledge coverage record failed: {e}")
     provenance.update(_decision_inputs_record(ticker, regime_packet))
+    provenance["trigger"] = trigger
     est = _estimate_tokens(prompt)
     llm = {**_LAST_CALL_STATS, "prompt_tokens_est": est}
     # Ollama may cut the prompt's head below num_ctx to keep room for the
@@ -1430,7 +1441,8 @@ def analyze_batch(
             log.warning(f"[{ticker}] Scan brief build failed, analyzing without it: {e}")
 
         try:
-            result = analyze(candidate, situation_brief=brief, regime_packet=regime_packet)
+            result = analyze(candidate, situation_brief=brief, regime_packet=regime_packet,
+                             trigger=trigger_record("daily_scan", {"source": "scanner"}))
             results.append(result)
         except Exception as e:
             log.error(f"[{ticker}] Analyze failed: {e}")

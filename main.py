@@ -358,8 +358,9 @@ def main() -> None:
         logging.info("Shutdown signal received — stopping all services.")
         try:
             import process_manager as pm
-            for name in pm.SERVICES:
-                pm.stop(name)
+            for name, result in pm.stop_all().items():
+                if result != "ok":
+                    logging.warning(f"Shutdown: {name}: {result}")
         except Exception:
             pass
         try:

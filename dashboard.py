@@ -223,8 +223,7 @@ with st.sidebar:
         st.toast("All services started.")
         st.rerun()
     if col_all2.button("⏹ Stop All", use_container_width=True):
-        for _name in pm.SERVICES:
-            pm.stop(_name)
+        pm.stop_all()
         st.toast("All services stopped.")
         st.rerun()
 

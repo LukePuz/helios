@@ -322,30 +322,108 @@ def start(name: str) -> str:
         return str(e)
 
 
+# Warm shutdown for Celery workers (limitations audit 18:53, #7). terminate()
+# on every pool child killed whatever task was running (21 WorkerLostError on
+# 10-28, all at restarts). SIGTERM to the worker's main process alone makes
+# Celery stop taking tasks and wait for the running ones; after the grace
+# period the rest is killed. The LLM worker gets the 72B timeout (400 s) plus
+# margin; the others' tasks are short, except the ingestion worker's ~2.5 h
+# S&P refresh, which still gets cut off (it needs to be resumable instead).
+_CELERY_GRACE_S = {"celery_llm_worker": 420}
+_DEFAULT_CELERY_GRACE_S = 60
+_OTHER_GRACE_S = 5
+
+
+def _is_celery_worker(name: str) -> bool:
+    cmd = SERVICES.get(name, {}).get("cmd", [])
+    return "worker" in cmd and "-A" in cmd
+
+
+def _grace(name: str) -> int:
+    if _is_celery_worker(name):
+        return _CELERY_GRACE_S.get(name, _DEFAULT_CELERY_GRACE_S)
+    return _OTHER_GRACE_S
+
+
+def _request_stop(name: str):
+    """Ask one service to stop without waiting. Returns its psutil.Process
+    (or None if it isn't running)."""
+    import psutil
+    pid = (_load().get(name) or {}).get("pid")
+    if pid is None or not psutil.pid_exists(pid):
+        return None
+    proc = psutil.Process(pid)
+    if not _is_celery_worker(name):
+        for child in proc.children(recursive=True):
+            child.terminate()
+    proc.terminate()
+    return proc
+
+
+def _finish_stop(name: str, proc, deadline: float) -> str:
+    """Wait for a requested stop until deadline, then kill what's left."""
+    import time
+    import psutil
+    result = "ok"
+    try:
+        if proc is not None:
+            children = proc.children(recursive=True)
+            try:
+                proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except psutil.TimeoutExpired:
+                result = f"killed after {_grace(name)}s grace"
+                proc.kill()
+            for child in children:
+                try:
+                    child.kill()
+                except psutil.NoSuchProcess:
+                    pass
+    except Exception as e:
+        result = str(e)
+    return result
+
+
 def stop(name: str) -> str:
     """Stop a service. Returns 'ok' or an error string."""
+    import time
     pids = _load()
     if name not in pids:
         return "ok"
-    pid = pids[name].get("pid")
-    result = "ok"
     try:
-        import psutil
-        if pid is not None and psutil.pid_exists(pid):
-            proc = psutil.Process(pid)
-            for child in proc.children(recursive=True):
-                child.terminate()
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except psutil.TimeoutExpired:
-                proc.kill()
+        proc = _request_stop(name)
+        result = _finish_stop(name, proc, time.monotonic() + _grace(name))
     except Exception as e:
         # Still drop the PID entry below — a service that failed to
         # terminate cleanly shouldn't leave a stale "running" record that
         # makes a later start() think it's already up.
         result = str(e)
     finally:
+        pids = _load()
         pids.pop(name, None)
         _save(pids)
     return result
+
+
+def stop_all() -> dict[str, str]:
+    """Stop every service: beat first (no new tasks), then everything else
+    asked at once and waited on in parallel, so the whole stop takes about
+    the longest grace period rather than the sum."""
+    import time
+    results = {}
+    if "celery_beat" in _load():
+        results["celery_beat"] = stop("celery_beat")
+    pending = {}
+    for name in SERVICES:
+        if name in results or name not in _load():
+            continue
+        try:
+            pending[name] = (_request_stop(name), time.monotonic() + _grace(name))
+        except Exception as e:
+            results[name] = str(e)
+    for name, (proc, deadline) in pending.items():
+        results[name] = _finish_stop(name, proc, deadline)
+    pids = _load()
+    for name in results:
+        pids.pop(name, None)
+    _save(pids)
+    return results

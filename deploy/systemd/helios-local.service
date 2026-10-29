@@ -49,6 +49,13 @@ ExecStartPre=-/home/YOUR_USER/Desktop/trading_bot/deploy/systemd/wait-for-ibkr.s
 ExecStart=/home/YOUR_USER/Desktop/trading_bot/venv/bin/python /home/YOUR_USER/Desktop/trading_bot/main.py
 Restart=on-failure
 RestartSec=30
+# Stop gently (limitations audit 2026-10-28 18:53, #7): SIGTERM goes to
+# main.py only, which warm-stops each Celery worker so a running task
+# (a 72B analysis takes up to 400 s) finishes instead of dying with
+# WorkerLostError; whatever is left is killed when the timeout runs out.
+# The default (control-group) SIGTERMed every pool child at once.
+KillMode=mixed
+TimeoutStopSec=480
 
 StandardOutput=append:/home/YOUR_USER/Desktop/trading_bot/helios-systemd.log
 StandardError=append:/home/YOUR_USER/Desktop/trading_bot/helios-systemd.log

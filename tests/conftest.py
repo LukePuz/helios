@@ -51,9 +51,12 @@ def _static_provenance(monkeypatch):
 
 class _FakeLock:
     """In-process stand-in for a redis-py Lock: tests never touch the live
-    Redis, where a test ticker's lock could block the running bot."""
+    Redis, where a test ticker's lock could block the running bot.
+    _FakeLock.expire(name) simulates the TTL running out: the holder's
+    renew and release then fail as redis-py's do (C23)."""
     held: set = set()
     renewed: list = []
+    owner: dict = {}
 
     def __init__(self, name, **_):
         self.name = name
@@ -62,13 +65,28 @@ class _FakeLock:
         if self.name in _FakeLock.held:
             return False
         _FakeLock.held.add(self.name)
+        _FakeLock.owner[self.name] = self
         return True
 
+    def _check_owned(self):
+        if self.name in _FakeLock.owner and _FakeLock.owner[self.name] is not self:
+            raise RuntimeError(f"LockNotOwnedError: {self.name}")
+        if self.name not in _FakeLock.held:
+            raise RuntimeError(f"LockNotOwnedError: {self.name} expired")
+
     def release(self):
+        self._check_owned()
         _FakeLock.held.discard(self.name)
+        _FakeLock.owner.pop(self.name, None)
 
     def reacquire(self):
+        self._check_owned()
         _FakeLock.renewed.append(self.name)
+
+    @classmethod
+    def expire(cls, name):
+        cls.held.discard(name)
+        cls.owner.pop(name, None)
 
 
 class _FakeRedis:
@@ -89,6 +107,7 @@ def _no_live_redis(monkeypatch):
     import stop_lock
     _FakeLock.held = set()
     _FakeLock.renewed = []
+    _FakeLock.owner = {}
     _FakeRedis.store = {}
     monkeypatch.setattr(stop_lock, "_redis", lambda: _FakeRedis())
 

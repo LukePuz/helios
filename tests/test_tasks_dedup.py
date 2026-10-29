@@ -1163,3 +1163,52 @@ def test_identical_requeue_during_retry_pass_survives():
         with patch("tasks._reprotect_after_late_sell", side_effect=work):
             tasks._retry_pending_reprotects()
     assert "AMD" in json.loads(state["reprotect_pending"])
+
+
+class _Pos:
+    def __init__(self, symbol, qty):
+        self.symbol, self.qty = symbol, qty
+
+
+def _queue_harness(place_effect):
+    """Real queue + retry + _reprotect_after_late_sell; broker and DB faked."""
+    import json
+    import tasks
+    state = {}
+    placed = []
+
+    def place(ticker, qty, price):
+        if place_effect is not None:
+            raise place_effect
+        placed.append((ticker, qty, price))
+        return {"order_id": 7}
+    with patch("db.get_state", side_effect=lambda k: state.get(k)), \
+         patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+         patch("db.get_position_stop", return_value={"stop_price": 90.0}), \
+         patch("db.set_stop_broker_order_id"), \
+         patch("ibkr.get_client") as client, \
+         patch("tasks.manage_cancel_stop_orders_for"), \
+         patch("tasks.manage_stop_place", side_effect=place):
+        client.return_value.get_all_positions.return_value = [_Pos("AMD", 5.0)]
+        tasks._queue_reprotect("AMD", {"intent": "BUY"}, None)
+        tasks._retry_pending_reprotects()
+    return json.loads(state["reprotect_pending"]), placed
+
+
+def test_queue_retry_places_the_recorded_stop_end_to_end():
+    """C23: a queued stop is placed on the next pass for the held shares at the
+    recorded price, and leaves the queue."""
+    pending, placed = _queue_harness(None)
+    assert placed == [("AMD", 5.0, 90.0)]
+    assert pending == {}
+
+
+def test_queue_retry_keeps_the_entry_on_each_broker_failure():
+    """C23 per-caller matrix, retry path: Unknown, Expired, LockLost and a
+    plain error all keep the entry for the next cycle, with tries counted."""
+    import stop_lock
+    import tasks
+    for err in (tasks.OrdersCallUnknown("x"), tasks.OrdersCallExpired("x"),
+                stop_lock.LockLost("AMD"), RuntimeError("boom")):
+        pending, placed = _queue_harness(err)
+        assert placed == [] and pending["AMD"]["tries"] == 1, err

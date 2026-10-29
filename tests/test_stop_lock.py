@@ -106,3 +106,21 @@ def test_lost_lock_stops_further_broker_calls(monkeypatch):
 
 def test_assert_held_is_a_no_op_outside_the_lock():
     stop_lock.assert_held("AMD")
+
+
+def test_expired_lock_is_detected_and_taken_by_another(monkeypatch):
+    """C23: when the TTL runs out mid-section, the renew fails, assert_held
+    raises LockLost, and another process can take the ticker."""
+    import time
+    import pytest
+    monkeypatch.setattr(stop_lock, "LOCK_RENEW_S", 0.02)
+    with stop_lock.ticker_lock("AMD"):
+        stop_lock.assert_held("AMD")
+        _FakeLock.expire("helios:stop_lock:AMD")
+        time.sleep(0.1)
+        with pytest.raises(stop_lock.LockLost):
+            stop_lock.assert_held("AMD")
+        other = _FakeLock("helios:stop_lock:AMD")
+        assert other.acquire()
+    # Our release fails (logged) and leaves the other holder's lock alone.
+    assert "helios:stop_lock:AMD" in _FakeLock.held

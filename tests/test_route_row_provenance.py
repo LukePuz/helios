@@ -103,3 +103,17 @@ def test_latest_regime_reports_its_source():
         conn.cursor.return_value.__enter__.return_value = cur
         with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
             assert db.get_latest_regime()["regime_source"] == want
+
+
+def test_knowledge_coverage_lists_cut_headings_and_matches_the_prompt_caps():
+    """A1053-1: record which headings the prefix cut drops; the caps must stay
+    equal to the slices in _build_prompt."""
+    import inspect
+    from agents import analyst
+    src = inspect.getsource(analyst._build_prompt)
+    assert f"thesis_text[:{analyst._THESIS_CAP}]" in src
+    assert f"philosophy_text[:{analyst._PHILOSOPHY_CAP}]" in src
+    philosophy = "# P\n" + "x" * 2100 + "\n### When to Exit\nrules\n"
+    cov = analyst._knowledge_coverage("ZZZZ", "## T\nshort", philosophy)
+    assert cov["philosophy"]["cut_headings"] == ["When to Exit"]
+    assert cov["philosophy"]["kept"] == 2000 and cov["thesis"]["cut_headings"] == []

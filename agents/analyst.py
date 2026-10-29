@@ -226,6 +226,31 @@ def _provenance(prompt: str) -> dict:
             "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:12]}
 
 
+# The prefix caps in _build_prompt (kept out of it: its source is hashed into
+# prompt_template_sha). Keep these equal to the slices there.
+_THESIS_CAP, _PHILOSOPHY_CAP = 6000, 2000
+
+
+def _knowledge_coverage(ticker: str, thesis_text: str, philosophy_text: str) -> dict:
+    """Log-only record of how much of each knowledge file the prompt kept
+    and which headings the prefix cut dropped (audit 10:53, A1053-1). The
+    later token-budget trim can cut more; this records the fixed caps only."""
+    import re
+
+    def one(text, cap):
+        heads = [(m.start(), m.group(1).strip()) for m in re.finditer(r"^#{1,4}\s+(.+)$", text, re.M)]
+        return {"chars": len(text), "kept": min(len(text), cap),
+                "cut_headings": [h for pos, h in heads if pos >= cap]}
+    try:
+        from knowledge_loader import load_watchlist
+        entry = load_watchlist().get(ticker.upper())
+        thesis_file = entry["thesis_file"] if entry else "ai_infrastructure.md (fallback)"
+    except Exception:
+        thesis_file = None
+    return {"thesis_file": thesis_file, "thesis": one(thesis_text, _THESIS_CAP),
+            "philosophy": one(philosophy_text, _PHILOSOPHY_CAP)}
+
+
 def _build_prompt(
     candidate: dict,
     situation_brief: str,
@@ -1199,6 +1224,10 @@ def analyze(
             parsed["reasoning"] = parsed.get("reasoning", "") + f" [{sell_note}]"
 
     provenance = _provenance(prompt)
+    try:
+        provenance["knowledge_coverage"] = _knowledge_coverage(ticker, thesis_text, philosophy_text)
+    except Exception as e:
+        log.debug(f"[{ticker}] knowledge coverage record failed: {e}")
     try:
         import db
         db.log_signal(

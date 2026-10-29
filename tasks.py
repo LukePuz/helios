@@ -2449,8 +2449,10 @@ def _fix_overstop(ticker: str) -> str:
     """Re-read under the lock and make resting SELL stops cover exactly the
     position at the recorded stop. Over-covered: cancel, re-read what is
     still resting (a cross-client stop may refuse to cancel, A2253-6) and
-    place stops only for what is left uncovered. Under-covered (A2253-4):
-    add a stop for the uncovered shares. Returns a line for log/alert."""
+    place stops only for what is left uncovered. Under-covered (A2253-4),
+    including no stop at all (A0053-2): add a stop for the uncovered shares.
+    Never places a stop at or above the last price, which would sell at
+    once. Returns a line for log/alert."""
     import db
     import ibkr
     try:
@@ -2459,12 +2461,21 @@ def _fix_overstop(ticker: str) -> str:
         resting = sum(float(o["qty"]) for o in _resting_sell_stops(ticker))
     except Exception as e:
         return f"⚠️ {ticker}: stop-coverage re-check failed ({e}); check TWS"
-    if abs(resting - held) <= 1e-6 or resting <= 0:
+    if abs(resting - held) <= 1e-6:
         return f"{ticker}: stop coverage fine on re-check ({resting:g} vs {held:g})"
     stop_price = (db.get_position_stop(ticker) or {}).get("stop_price")
     if not stop_price or held <= 0:
         return (f"🚨 {ticker}: resting stops for {resting:g} shares but {held:g} held and no "
                 f"recorded stop to rebuild from — fix the stops in TWS")
+    try:
+        last = float(ibkr.get_latest_price(ticker) or 0)
+    except Exception:
+        last = 0.0
+    if not last or float(stop_price) >= last:
+        return (f"🚨 {ticker}: stops cover {resting:g} of {held:g} shares; recorded stop "
+                f"${float(stop_price):.2f} is not below the last price "
+                f"({'unknown' if not last else f'${last:.2f}'}), so nothing was placed — "
+                f"set the stop in TWS")
     try:
         if resting > held:
             manage_cancel_stop_orders_for(ticker)
@@ -2765,6 +2776,18 @@ def reconcile_stop_orders(self):
                 if not since:
                     db.set_state(since_key, datetime.now(timezone.utc).isoformat())
                 else:
+                    # Naked on two consecutive cycles: put a stop on at the
+                    # recorded level instead of only alerting (A0053-2).
+                    fix = _fix_overstop(ticker)
+                    all_actions.append(fix)
+                    new_actions.append(fix)
+                    if fix.startswith("🔧"):
+                        try:
+                            import alerts
+                            alerts._send(f"STOP RECONCILE — {fix}")
+                        except Exception:
+                            pass
+                        continue
                     elapsed_min = (datetime.now(timezone.utc)
                                    - datetime.fromisoformat(since)).total_seconds() / 60
                     if elapsed_min >= 45 and _reconcile_alert_due(f"no_stop_telegram_{ticker}"):

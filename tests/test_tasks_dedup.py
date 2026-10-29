@@ -701,7 +701,7 @@ class TestNoStopTelegramEscalation:
     position briefly unstopped for one ordinary cycle), throttled after
     that on the normal RECONCILE_ALERT_THROTTLE_HOURS cadence."""
 
-    def _run(self, state, held_qty=50.0):
+    def _run(self, state, held_qty=50.0, record=None, place=None):
         client = MagicMock()
         client.get_all_positions.return_value = [MagicMock(symbol="AMD", qty=held_qty)]
 
@@ -716,9 +716,22 @@ class TestNoStopTelegramEscalation:
              patch("db.get_all_position_stops", return_value=[]), \
              patch("db.get_state", side_effect=fake_get_state), \
              patch("db.set_state", side_effect=fake_set_state), \
+             patch("db.get_position_stop", return_value=record), \
+             patch("db.set_stop_broker_order_id"), \
+             patch("ibkr.get_latest_price", return_value=200.0), \
+             patch("tasks.manage_stop_place", place or MagicMock(side_effect=AssertionError)), \
              patch("alerts._send") as mock_alert:
             tasks.reconcile_stop_orders.run()
         return mock_alert
+
+    def test_second_naked_cycle_places_the_recorded_stop(self):
+        """A0053-2: confirmed naked with a recorded stop -> stop placed."""
+        from datetime import datetime, timedelta, timezone
+        state = {"no_stop_since_AMD": (datetime.now(timezone.utc) - timedelta(minutes=16)).isoformat()}
+        place = MagicMock(return_value={"order_id": 9})
+        mock_alert = self._run(state, record={"stop_price": 150.0}, place=place)
+        place.assert_called_once_with("AMD", 50.0, 150.0)
+        assert "UNPROTECTED" not in mock_alert.call_args[0][0]
 
     def test_first_sighting_does_not_alert_telegram(self):
         state = {}

@@ -254,9 +254,16 @@ def _resting_sell_stops(ticker: str, types=("STP", "STP LMT", "TRAIL")) -> list[
     (professor M64: totalQuantity counted part-filled, cancelling and
     inactive stops as coverage)."""
     import ibkr
+    return [o for o in _working_sell_stops(ibkr.get_open_orders(), types) if o["ticker"] == ticker]
+
+
+def _working_sell_stops(open_orders: list[dict], types=("STP", "STP LMT", "TRAIL")) -> list[dict]:
+    """The one coverage definition: SELL stops not in a dead state, with
+    qty = the unfilled remainder. Shared by _resting_sell_stops and
+    reconcile_stop_orders sections 2b and 3 (audit 02:53, A0253-6)."""
     out = []
-    for o in ibkr.get_open_orders():
-        if (o["ticker"] != ticker or o["action"] != "SELL" or o["order_type"] not in types
+    for o in open_orders:
+        if (o["action"] != "SELL" or o["order_type"] not in types
                 or o.get("status") in _NOT_WORKING):
             continue
         rem = o.get("remaining")
@@ -2539,7 +2546,13 @@ def _fix_overstop(ticker: str) -> str:
     try:
         if resting > held:
             manage_cancel_stop_orders_for(ticker)
-            stuck = [o for o in _resting_sell_stops(ticker)]
+            stuck = _resting_sell_stops(ticker)
+            if any(o.get("status") == "PendingCancel" for o in stuck):
+                # A slow cancel often lands within seconds; one more look
+                # before treating it as stuck (professor note on A0253-1).
+                import time
+                time.sleep(5)
+                stuck = _resting_sell_stops(ticker)
             stuck_qty = sum(float(o["qty"]) for o in stuck)
             if stuck_qty > held + 1e-6:
                 ids = ", ".join(str(o["order_id"]) for o in stuck)
@@ -2633,8 +2646,11 @@ def reconcile_stop_orders(self):
         held      = {p.symbol: round(abs(float(p.qty)), 4)
                      for p in client.get_all_positions()}
         open_ords = ibkr.get_open_orders()
+        # Section 1 (orphans) cancels any stop order; coverage (2b, 3) counts
+        # only working stops by their remainder, as _fix_overstop does.
         stops     = [o for o in open_ords
                      if o["action"] == "SELL" and o["order_type"] in ("STP", "STP LMT", "TRAIL")]
+        working   = _working_sell_stops(open_ords)
         all_actions: list[str] = []   # every cycle, for the debug log
         new_actions: list[str] = []   # unthrottled — logged as warning + alerted
 
@@ -2785,7 +2801,7 @@ def reconcile_stop_orders(self):
         # trigger they oversell into a short. Two consecutive cycles, like
         # the orphan check, then fix under the ticker lock.
         stop_qty: dict[str, float] = {}
-        for o in stops:
+        for o in working:
             stop_qty[o["ticker"]] = stop_qty.get(o["ticker"], 0.0) + float(o["qty"])
         # A partly covered position (some stop, but for fewer shares than
         # held) is fixed the same way (audit 22:53, A2253-4); no stop at all
@@ -2829,7 +2845,7 @@ def reconcile_stop_orders(self):
         # consecutive cycles (~45 min) does it escalate, and then on the
         # normal RECONCILE_ALERT_THROTTLE_HOURS cadence after that so it
         # doesn't spam every 15 minutes for a known, ongoing issue either.
-        stopped_tickers = {o["ticker"] for o in stops}
+        stopped_tickers = {o["ticker"] for o in working}
         for ticker in stopped_tickers:
             db.set_state(f"no_stop_since_{ticker}", "")  # has a stop again -- reset
         for ticker, qty in held.items():

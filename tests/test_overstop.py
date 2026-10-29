@@ -166,3 +166,39 @@ def test_cancel_failure_in_overcover_returns_a_line_not_a_crash():
          patch("tasks.manage_cancel_stop_orders_for", side_effect=tasks.OrdersCallUnknown("x")):
         msg = tasks._fix_overstop("AMD")
     assert "fix failed" in msg
+
+
+def test_inactive_stop_is_not_protection_in_reconcile():
+    """A0253-6: section 3 used raw status, so an Inactive stop hid a naked
+    position."""
+    from datetime import datetime, timedelta, timezone
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="AMD", qty=10)]
+    inactive = [{**_orders(10)[0], "status": "Inactive"}]
+    t = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()
+    state = {"no_stop_since_AMD": t, "no_stop_seen_AMD": t}
+    with patch("ibkr.get_client", return_value=client), \
+         patch("ibkr.get_open_orders", return_value=inactive), \
+         patch("db.get_all_position_stops", return_value=[]), \
+         patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
+         patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+         patch("tasks._fix_overstop_safe", return_value="🚨 AMD: x") as fix, \
+         patch("alerts._send"):
+        tasks.reconcile_stop_orders.run()
+    fix.assert_called_once_with("AMD")
+
+
+def test_slow_cancel_gets_a_second_look():
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="AMD", qty=10)]
+    pending = [{**o, "status": "PendingCancel"} for o in _orders(10)]
+    with patch("ibkr.get_client", return_value=client), \
+         patch("ibkr.get_open_orders", side_effect=[_orders(10, 10), pending, []]), \
+         patch("db.get_position_stop", return_value={"stop_price": 150.0}), \
+         patch("ibkr.get_latest_price", return_value=200.0), \
+         patch("tasks.manage_cancel_stop_orders_for"), \
+         patch("time.sleep"), \
+         patch("tasks.manage_stop_place", return_value={"order_id": 9}) as place, \
+         patch("db.set_stop_broker_order_id"):
+        tasks._fix_overstop("AMD")
+    place.assert_called_once_with("AMD", 10.0, 150.0)

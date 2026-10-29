@@ -1393,8 +1393,32 @@ def test_manual_action_needs_two_flat_reads_and_ignores_an_empty_read():
         client.return_value.get_all_positions.return_value = []
         tasks._review_manual_actions()
         assert "AMD" in json.loads(state["manual_actions"])
+        state["manual_actions"] = json.dumps({"AMD": {"what": "x", "first_seen": time.time(),
+                                                      "last_alert": time.time()}})
         client.return_value.get_all_positions.return_value = [_Pos("NVDA", 1.0)]
         tasks._review_manual_actions()
         assert json.loads(state["manual_actions"])["AMD"]["flat_reads"] == 1
         tasks._review_manual_actions()
         assert "AMD" not in json.loads(state["manual_actions"])
+
+
+def test_flat_buy_item_never_clears_on_flat_and_empty_reads_clear_after_four():
+    """C28a: a 'position reads flat' item clears only when covered. C28b: four
+    empty reads in a row clear an ordinary item."""
+    import json
+    import time
+    import tasks
+    now = time.time()
+    state = {"manual_actions": json.dumps({
+        "AMD": {"what": "x", "first_seen": now, "last_alert": now, "clear_on_flat": False},
+        "PLTR": {"what": "y", "first_seen": now, "last_alert": now}})}
+    with patch("db.get_state", side_effect=lambda k: state.get(k)), \
+         patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+         patch("ibkr.get_client") as client, \
+         patch("execution._stops_still_resting", return_value=0.0), \
+         patch("alerts._send"):
+        client.return_value.get_all_positions.return_value = []
+        for _ in range(4):
+            tasks._review_manual_actions()
+    items = json.loads(state["manual_actions"])
+    assert "AMD" in items and "PLTR" not in items

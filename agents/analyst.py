@@ -780,7 +780,7 @@ def _stub_recommendation(candidate: dict, reason: str) -> dict:
     log.warning(f"[{ticker}] Stub recommendation — {reason}")
     try:
         from feed import emit
-        emit("analyst", ticker, f"Model unavailable ({reason}) — skipping", "neutral")
+        emit("analyst", ticker, f"No verdict ({reason}) — skipping", "neutral")
     except Exception:
         pass
     # This used to be a WARNING-level log line and nothing else — a real
@@ -891,7 +891,7 @@ def _stub_recommendation(candidate: dict, reason: str) -> dict:
             "bull_case_target": "Unknown", "downside_scenario": "Unknown",
         },
         "upside_downside_ratio": 0.0,
-        "key_risks":       [f"Model unavailable: {reason}"],
+        "key_risks":       [f"No verdict: {reason}"],
         "sources": [],
         "source_count": 0,
         "expected_return_pct": None,

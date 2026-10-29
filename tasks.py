@@ -1304,7 +1304,7 @@ def _manual_actions_edit(fn) -> None:
                 pass
 
 
-def open_manual_action(ticker: str, what: str) -> None:
+def open_manual_action(ticker: str, what: str, clear_on_flat: bool = True) -> None:
     """Record that an alert asked Luke to fix a stop by hand. The stop check
     clears it once the position is covered or flat, and re-alerts hourly
     until then; one Telegram send used to be the only trace (audit 14:53,
@@ -1314,7 +1314,9 @@ def open_manual_action(ticker: str, what: str) -> None:
     def add(items):
         now = time.time()
         rec = items.get(ticker) or {"first_seen": now}
-        items[ticker] = {**rec, "what": what, "last_alert": now}
+        # clear_on_flat=False when the problem itself is a position that
+        # reads flat: then flat is no evidence it's closed (professor C28a).
+        items[ticker] = {**rec, "what": what, "last_alert": now, "clear_on_flat": clear_on_flat}
         return items
     try:
         _manual_actions_edit(add)
@@ -1340,20 +1342,22 @@ def _review_manual_actions() -> None:
     except Exception as e:
         log.warning(f"manual-action review: position read failed ({e})")
         return
-    if not positions:
-        # An empty read right after a reconnect looks flat for everything;
-        # never clear on it (professor C28).
-        return
+    # An empty read right after a reconnect looks flat for everything, so it
+    # counts only after 4 in a row (~1 h); a real last position closing reads
+    # empty too and must clear eventually (professor C28, C28b).
+    empty = not positions
     held = {p.symbol: abs(float(p.qty)) for p in positions}
     now = time.time()
     cleared, realert, flat_once = [], [], []
     for ticker, rec in items.items():
         qty = held.get(ticker, 0.0)
         covered = execution._stops_still_resting(ticker) if qty > 0 else None
+        need = 3 if empty else 1  # earlier flat reads needed, besides this one
         if qty > 0 and covered is not None and covered >= qty:
             cleared.append(ticker)
-        elif qty <= 0 and int(rec.get("flat_reads", 0)) >= 1:
-            cleared.append(ticker)  # flat on two cycles in a row (C28)
+        elif (qty <= 0 and rec.get("clear_on_flat", True)
+              and int(rec.get("flat_reads", 0)) >= need):
+            cleared.append(ticker)  # flat on 2 cycles in a row, or 4 if the reads are empty (C28)
         else:
             if qty <= 0:
                 flat_once.append(ticker)
@@ -1420,7 +1424,7 @@ def _retry_pending_reprotects() -> None:
                              f"shares are there, place the stop by hand.")
             except Exception:
                 pass
-            open_manual_action(ticker, "the stop after a BUY was never placed")
+            open_manual_action(ticker, "the stop after a BUY was never placed", clear_on_flat=False)
             outcome[ticker] = (rec, None)
         elif result is False and tries >= _REPROTECT_MAX_TRIES:
             # ~1 h of failures: stop retrying (each try cancels and re-places)

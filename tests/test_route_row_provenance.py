@@ -164,9 +164,24 @@ def test_ollama_call_keeps_token_counts():
     resp = MagicMock()
     resp.json.return_value = {"response": "{}", "prompt_eval_count": 8190, "eval_count": 900,
                               "done_reason": "stop", "total_duration": 9.1e10}
+    resp.json.return_value["done_reason"] = "length"
     with patch("agents.analyst.requests.post", return_value=resp), \
          patch.object(analyst.log, "warning") as warn:
         assert analyst._call_ollama("p", num_ctx=8192) == "{}"
     assert analyst._LAST_CALL_STATS["prompt_eval_count"] == 8190
     assert analyst._LAST_CALL_STATS["num_ctx"] == 8192
-    assert "filled the context" in warn.call_args[0][0]
+    assert "num_predict" in warn.call_args[0][0]
+    # A failed call clears the previous counts.
+    import requests
+    with patch("agents.analyst.requests.post", side_effect=requests.exceptions.Timeout()):
+        assert analyst._call_ollama("p") is None
+    assert analyst._LAST_CALL_STATS == {}
+
+
+def test_knowledge_coverage_from_the_final_prompt():
+    """M82: a heading trimmed after the cap (absent from the prompt) counts as cut."""
+    from agents import analyst
+    philosophy = "# P\nintro\n## Compounders\nx\n"
+    cov = analyst._knowledge_coverage("ZZZZ", "## T\nshort", philosophy, prompt="# P\nintro\n## T")
+    assert cov["philosophy"]["cut_headings"] == ["Compounders"]
+    assert cov["thesis"]["cut_headings"] == []

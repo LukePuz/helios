@@ -231,16 +231,21 @@ def _provenance(prompt: str) -> dict:
 _THESIS_CAP, _PHILOSOPHY_CAP = 6000, 2000
 
 
-def _knowledge_coverage(ticker: str, thesis_text: str, philosophy_text: str) -> dict:
+def _knowledge_coverage(ticker: str, thesis_text: str, philosophy_text: str,
+                        prompt: str | None = None) -> dict:
     """Log-only record of how much of each knowledge file the prompt kept
-    and which headings the prefix cut dropped (audit 10:53, A1053-1). The
-    later token-budget trim can cut more; this records the fixed caps only."""
+    and which headings the prefix cut dropped (audit 10:53, A1053-1). With
+    the final prompt, a heading counts as cut if it isn't in the prompt, so
+    the later token-budget trim is covered too (professor M82)."""
     import re
 
     def one(text, cap):
-        heads = [(m.start(), m.group(1).strip()) for m in re.finditer(r"^#{1,4}\s+(.+)$", text, re.M)]
-        return {"chars": len(text), "kept": min(len(text), cap),
-                "cut_headings": [h for pos, h in heads if pos >= cap]}
+        heads = [(m.start(), m.group(0).strip()) for m in re.finditer(r"^#{1,4}\s+(.+)$", text, re.M)]
+        if prompt is not None:
+            cut = [h.lstrip("#").strip() for _, h in heads if h not in prompt]
+        else:
+            cut = [h.lstrip("#").strip() for pos, h in heads if pos >= cap]
+        return {"chars": len(text), "kept": min(len(text), cap), "cut_headings": cut}
     try:
         from knowledge_loader import load_watchlist
         entry = load_watchlist().get(ticker.upper())
@@ -486,6 +491,7 @@ Rules:
 # ---------------------------------------------------------------------------
 
 def _call_ollama(prompt: str, num_ctx: int = _NUM_CTX) -> str | None:
+    _LAST_CALL_STATS.clear()  # a failed call must not inherit the last one's counts
     payload = {
         "model":   ANALYST_MODEL,
         "prompt":  prompt,
@@ -517,13 +523,11 @@ def _call_ollama(prompt: str, num_ctx: int = _NUM_CTX) -> str | None:
         # What Ollama actually did with the prompt (professor C26): if
         # prompt_eval_count reaches num_ctx, the head of the prompt (the
         # instructions and schema) was silently dropped.
-        _LAST_CALL_STATS.clear()
         _LAST_CALL_STATS.update({k: body.get(k) for k in (
             "prompt_eval_count", "eval_count", "done_reason", "total_duration")})
         _LAST_CALL_STATS["num_ctx"] = num_ctx
-        if (body.get("prompt_eval_count") or 0) >= num_ctx - 8:
-            log.warning(f"Ollama prompt filled the context ({body.get('prompt_eval_count')} of "
-                        f"{num_ctx} tokens); its start may have been cut")
+        if body.get("done_reason") == "length":
+            log.warning(f"Ollama reply hit num_predict ({_NUM_PREDICT}); the JSON may be cut off")
         return body.get("response", "")
     except requests.exceptions.Timeout:
         # Was reported as "unreachable" (limitations audit 12:53, #8).
@@ -1264,11 +1268,23 @@ def analyze(
 
     provenance = _provenance(prompt)
     try:
-        provenance["knowledge_coverage"] = _knowledge_coverage(ticker, thesis_text, philosophy_text)
+        provenance["knowledge_coverage"] = _knowledge_coverage(ticker, thesis_text, philosophy_text,
+                                                               prompt)
     except Exception as e:
         log.debug(f"[{ticker}] knowledge coverage record failed: {e}")
     provenance.update(_decision_inputs_record(ticker, regime_packet))
-    provenance["llm_call"] = {**_LAST_CALL_STATS, "prompt_tokens_est": _estimate_tokens(prompt)}
+    est = _estimate_tokens(prompt)
+    llm = {**_LAST_CALL_STATS, "prompt_tokens_est": est}
+    # Ollama may cut the prompt's head below num_ctx to keep room for the
+    # reply, so compare what it read with our crude estimate: a flag, not
+    # proof (professor C26 residual).
+    if llm.get("prompt_eval_count") and est:
+        llm["truncation_suspect"] = llm["prompt_eval_count"] / est < 0.8
+        if llm["truncation_suspect"]:
+            log.warning(f"[{ticker}] Ollama read {llm['prompt_eval_count']} prompt tokens vs "
+                        f"~{est} estimated; the prompt's start may have been cut")
+    llm["reply_cut"] = llm.get("done_reason") == "length"
+    provenance["llm_call"] = llm
     try:
         import db
         db.log_signal(

@@ -22,9 +22,12 @@ from contextlib import contextmanager
 
 log = logging.getLogger(__name__)
 
-# Longest locked section: a market sell's fill wait (30 s) plus a cancel and
-# a place through the orders queue (30 s each), with margin.
-LOCK_TTL_S = 180
+# A locked section can make several orders-queue calls of up to 150 s each,
+# so the key is renewed every LOCK_RENEW_S while its holder runs instead of
+# relying on one fixed TTL (professor M49). LOCK_TTL_S is how long a killed
+# holder keeps the ticker.
+LOCK_TTL_S = 90
+LOCK_RENEW_S = 30
 DEFAULT_WAIT_S = 120
 
 _local = threading.local()
@@ -58,8 +61,10 @@ def ticker_lock(ticker: str, wait: float | None = None):
 
     lock = None
     try:
+        # thread_local=False so the renew thread can use the token.
         lock = _redis().lock(f"helios:stop_lock:{ticker}", timeout=LOCK_TTL_S,
-                             blocking_timeout=DEFAULT_WAIT_S if wait is None else wait)
+                             blocking_timeout=DEFAULT_WAIT_S if wait is None else wait,
+                             thread_local=False)
         acquired = lock.acquire()
     except Exception as e:
         log.warning(f"[{ticker}] stop lock unavailable, continuing unlocked: {e}")
@@ -68,16 +73,30 @@ def ticker_lock(ticker: str, wait: float | None = None):
         raise TickerBusy(ticker)
 
     held[ticker] = 1
+    done = threading.Event()
+    if lock is not None:
+        threading.Thread(target=_keep_renewed, args=(lock, ticker, done),
+                         daemon=True, name=f"stop-lock-{ticker}").start()
     try:
         yield
     finally:
+        done.set()
         held.pop(ticker, None)
         if lock is not None:
             try:
                 lock.release()
             except Exception as e:
-                # Expired (section ran past LOCK_TTL_S) or Redis went away.
+                # Lost (a renew failed) or Redis went away.
                 log.warning(f"[{ticker}] stop lock release failed: {e}")
+
+
+def _keep_renewed(lock, ticker: str, done: threading.Event) -> None:
+    while not done.wait(LOCK_RENEW_S):
+        try:
+            lock.reacquire()
+        except Exception as e:
+            log.error(f"[{ticker}] stop lock renew failed (another stop change may get in): {e}")
+            return
 
 
 def locked_by_ticker(ticker_of, on_busy=None):

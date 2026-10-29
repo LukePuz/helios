@@ -53,6 +53,7 @@ class _FakeLock:
     """In-process stand-in for a redis-py Lock: tests never touch the live
     Redis, where a test ticker's lock could block the running bot."""
     held: set = set()
+    renewed: list = []
 
     def __init__(self, name, **_):
         self.name = name
@@ -66,6 +67,9 @@ class _FakeLock:
     def release(self):
         _FakeLock.held.discard(self.name)
 
+    def reacquire(self):
+        _FakeLock.renewed.append(self.name)
+
 
 class _FakeRedis:
     def lock(self, name, **kw):
@@ -76,6 +80,7 @@ class _FakeRedis:
 def _no_live_redis(monkeypatch):
     import stop_lock
     _FakeLock.held = set()
+    _FakeLock.renewed = []
     monkeypatch.setattr(stop_lock, "_redis", lambda: _FakeRedis())
 
 

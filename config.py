@@ -372,7 +372,7 @@ MIN_COMPOSITE_SCORE_MEDIUM = 50    # scanner score threshold for MEDIUM priority
 # intraday margin monitoring (FINRA Notice 26-10; SR-FINRA-2025-017). IBKR
 # specifically now applies the standard Reg T $2,000 minimum for margin/
 # short-sale trading instead of the old $25k PDT floor. Below that $2,000
-# Reg T line (which covers the live account's current [balance redacted] balance), the
+# Reg T line (which covers a micro-tier live balance), the
 # account effectively can't use margin regardless of this tiering.
 #
 # Evaluated live off actual portfolio value via get_active_limits(balance)
@@ -388,13 +388,13 @@ TIER_MIN_CONVICTION_TO_QUEUE  = {"standard": MIN_CONVICTION_TO_QUEUE, "reduced":
 # Moonshot's normal 2% cap is structurally too small to ever clear the
 # whole-share floor at Reduced/Micro balances — raised per-tier instead of
 # excluding the bucket outright. Confirmed intentional 2026-08-13 despite
-# being a 5-10x jump in single-bet risk: a $202 moonshot at [balance redacted] (Micro)
+# being a 5-10x jump in single-bet risk: a $200 moonshot on a ~$1k (Micro) account
 # vs. today's $20.
 TIER_MAX_POSITION_PCT_MOONSHOT = {"standard": MAX_POSITION_PCT_MOONSHOT, "reduced": 0.10, "micro": 0.20}
 # 2026-08-21: Compounder/Accelerator never got the same tier-scaling
 # Moonshot did above — their BUCKET_SIZE_TABLE bands and hard caps stayed
 # at the values tuned for the ~$1M paper account at every tier. On the
-# live account's actual [balance redacted] (Micro), that meant every ADD priced above
+# micro-tier account, that meant every ADD priced above
 # roughly $45-70/share (NVDA, MSFT, GOOG, META, AVGO, ANET, NOW, CRWD,
 # MRVL, TSLA, LRCX — dozens/day, real conviction-7/8 analyst output)
 # computed a dollar allocation too small to clear the whole-share floor
@@ -408,7 +408,7 @@ TIER_MAX_POSITION_PCT_COMPOUNDER  = {"standard": MAX_POSITION_PCT_COMPOUNDER,  "
 TIER_MAX_POSITION_PCT_ACCELERATOR = {"standard": MAX_POSITION_PCT_ACCELERATOR, "reduced": 0.20, "micro": 0.35}
 # No single share purchase may itself already represent more than this
 # fraction of portfolio value — guards against one expensive share (e.g. an
-# $800 stock on a [balance redacted] account) structurally dominating the position.
+# $800 stock on a ~$1k account) structurally dominating the position.
 # None at Standard (never binding there in practice; not worth the extra
 # code path at that scale).
 TIER_SINGLE_SHARE_CAP_PCT = {"standard": None, "reduced": 0.50, "micro": 0.50}

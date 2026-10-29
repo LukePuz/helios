@@ -1,4 +1,6 @@
 .env
+.env.*
+!.env.example
 *.log
 *.log.*
 logs/
@@ -35,3 +37,15 @@ CLAUDE.md
 # stays local because prompts can contain pasted command output.
 !.claude/CLAUDE.md
 research-log/raw-prompts.jsonl
+
+# Data, backups and raw AI transcripts never go in the repo (public-repo prep,
+# 2026-10-28). Transcripts are archived outside git; the manifest of their
+# hashes (research-log/transcripts-manifest.csv) is the committed record.
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+*.bak
+*.jsonl
+backups/
+research-log/transcripts/

@@ -162,6 +162,38 @@ def _broker_cancel_order(self, order_id: int) -> bool:
     return ibkr.cancel_order(order_id)
 
 
+def _orders_call(task, args, kwargs=None, timeout: int = 30):
+    """Run a broker task on the orders worker and wait for it. The request
+    expires when the caller stops waiting, and is revoked on a timeout, so a
+    stop or cancel that sat queued can't run later outside the caller's
+    ticker lock (professor C17, 2026-10-28: a timed-out STP stayed queued and
+    the caller's retry placed another)."""
+    from celery.result import allow_join_result
+    with allow_join_result():
+        res = task.apply_async(args=args, kwargs=kwargs or {}, queue=ORDERS_QUEUE,
+                               expires=timeout)
+        try:
+            return res.get(timeout=timeout)
+        except Exception:
+            try:
+                res.revoke()
+            except Exception:
+                pass
+            raise
+
+
+def _resting_stop_matching(ticker: str, qty: float, stop_price: float) -> dict | None:
+    """A working SELL stop for ticker with this qty and price, if the broker
+    has one: the result of a placement whose reply we stopped waiting for."""
+    import ibkr
+    for o in ibkr.get_open_orders():
+        if (o["ticker"] == ticker and o["action"] == "SELL" and o["order_type"] == "STP"
+                and abs(o["qty"] - float(qty)) < 1e-6
+                and o.get("stop_price") and abs(o["stop_price"] - float(stop_price)) < 0.006):
+            return {"order_id": o["order_id"], "stop_price": o["stop_price"]}
+    return None
+
+
 def manage_stop_place(ticker: str, qty: float, stop_price: float, timeout: int = 30) -> dict:
     """Place a protective stop — see the module-level comment above for why
     this exists instead of calling ibkr.place_stop_order directly. Every
@@ -181,11 +213,23 @@ def manage_stop_place(ticker: str, qty: float, stop_price: float, timeout: int =
         import ibkr
         result = ibkr.place_stop_order(ticker, qty, stop_price)
     else:
-        from celery.result import allow_join_result
-        with allow_join_result():
-            result = _broker_place_stop_order.apply_async(
-                args=[ticker, qty, stop_price], queue=ORDERS_QUEUE,
-            ).get(timeout=timeout)
+        try:
+            result = _orders_call(_broker_place_stop_order, [ticker, qty, stop_price],
+                                  timeout=timeout)
+        except Exception as e:
+            # The placement may have reached the broker after we stopped
+            # waiting: adopt that stop rather than let a retry add a second.
+            import time
+            time.sleep(5)
+            try:
+                found = _resting_stop_matching(ticker, qty, stop_price)
+            except Exception:
+                found = None
+            if not found:
+                raise
+            log.warning(f"[{ticker}] stop placement reply lost ({e}); adopting resting "
+                        f"stop {found['order_id']} @ ${found['stop_price']:.2f}")
+            result = found
     try:
         import db
         db.clear_trailing_active(ticker)
@@ -199,11 +243,7 @@ def manage_cancel_stop_orders_for(ticker: str, timeout: int = 30) -> int:
     if _is_orders_worker():
         import ibkr
         return ibkr.cancel_stop_orders_for(ticker)
-    from celery.result import allow_join_result
-    with allow_join_result():
-        return _broker_cancel_stop_orders_for.apply_async(
-            args=[ticker], queue=ORDERS_QUEUE,
-        ).get(timeout=timeout)
+    return _orders_call(_broker_cancel_stop_orders_for, [ticker], timeout=timeout)
 
 
 @app.task(name="tasks._broker_place_trailing_stop_order", bind=True, max_retries=1)
@@ -224,12 +264,9 @@ def manage_place_trailing_stop(ticker: str, qty: float, trail_amount: float | No
         import ibkr
         return ibkr.place_trailing_stop_order(ticker, qty, trail_amount=trail_amount,
                                                trail_percent=trail_percent)
-    from celery.result import allow_join_result
-    with allow_join_result():
-        return _broker_place_trailing_stop_order.apply_async(
-            args=[ticker, qty], kwargs={"trail_amount": trail_amount, "trail_percent": trail_percent},
-            queue=ORDERS_QUEUE,
-        ).get(timeout=timeout)
+    return _orders_call(_broker_place_trailing_stop_order, [ticker, qty],
+                        {"trail_amount": trail_amount, "trail_percent": trail_percent},
+                        timeout=timeout)
 
 
 def manage_cancel_order(order_id: int, timeout: int = 30) -> bool:
@@ -239,11 +276,7 @@ def manage_cancel_order(order_id: int, timeout: int = 30) -> bool:
     if _is_orders_worker():
         import ibkr
         return ibkr.cancel_order(order_id)
-    from celery.result import allow_join_result
-    with allow_join_result():
-        return _broker_cancel_order.apply_async(
-            args=[order_id], queue=ORDERS_QUEUE,
-        ).get(timeout=timeout)
+    return _orders_call(_broker_cancel_order, [order_id], timeout=timeout)
 
 
 # ── Periodic schedule ─────────────────────────────────────────────────────────

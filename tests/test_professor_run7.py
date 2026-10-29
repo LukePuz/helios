@@ -23,6 +23,7 @@ def _failed_conversion(place_side_effect):
     rec = {"ticker": "NVDA", "stop_price": 112.0, "thesis_bucket": "Accelerator",
            "entry_price": 100.0, "trailing_active": False, "trailing_high": 130.0}
     with patch("db.get_all_position_stops", return_value=[rec]), \
+         patch("db.get_position_stop", return_value=rec), \
          patch("risk_manager.SETUP_GATES_ENABLED", False), \
          patch.object(risk_manager.RiskManager, "get_atr", return_value=4.0), \
          patch("tasks.manage_cancel_stop_orders_for"), \
@@ -73,3 +74,41 @@ def test_partial_sale_never_places_a_stop_above_the_price(monkeypatch):
             "NVDA", 100, 30, 100.0, decision_price=126.0)
     place.assert_called_once_with("NVDA", 70.0, 100.0)
     assert result["new_stop"] == 100.0
+
+
+def test_failed_cancel_does_not_stack_a_restored_stop():
+    """Professor C19: the restore assumed the cancel worked; if the cancel
+    itself failed the old stop is still resting."""
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="NVDA", qty=7, current_price=126.0)]
+    rm = object.__new__(risk_manager.RiskManager)
+    rm._client = client
+    rec = {"ticker": "NVDA", "stop_price": 112.0, "thesis_bucket": "Accelerator",
+           "entry_price": 100.0, "trailing_active": False, "trailing_high": 130.0}
+    with patch("db.get_all_position_stops", return_value=[rec]), \
+         patch("db.get_position_stop", return_value=rec), \
+         patch("risk_manager.SETUP_GATES_ENABLED", False), \
+         patch.object(risk_manager.RiskManager, "get_atr", return_value=4.0), \
+         patch("tasks.manage_cancel_stop_orders_for", side_effect=RuntimeError("cancel timeout")), \
+         patch("tasks.manage_place_trailing_stop") as trail, \
+         patch("tasks.manage_stop_place") as place:
+        rm.check_trailing_stops()
+    trail.assert_not_called()
+    place.assert_not_called()
+
+
+def test_conversion_skipped_when_stop_moved_while_waiting():
+    """Professor C18: state read before the lock must be re-checked inside it."""
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="NVDA", qty=7, current_price=126.0)]
+    rm = object.__new__(risk_manager.RiskManager)
+    rm._client = client
+    rec = {"ticker": "NVDA", "stop_price": 112.0, "thesis_bucket": "Accelerator",
+           "entry_price": 100.0, "trailing_active": False, "trailing_high": 130.0}
+    with patch("db.get_all_position_stops", return_value=[rec]), \
+         patch("db.get_position_stop", return_value={**rec, "stop_price": 118.0}), \
+         patch("risk_manager.SETUP_GATES_ENABLED", False), \
+         patch.object(risk_manager.RiskManager, "get_atr", return_value=4.0), \
+         patch("tasks.manage_cancel_stop_orders_for") as cancel:
+        rm.check_trailing_stops()
+    cancel.assert_not_called()

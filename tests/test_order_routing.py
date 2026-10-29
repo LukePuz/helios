@@ -18,6 +18,7 @@ functions decide whether the CURRENT process already IS that one process
 (direct call -- cheap, no Celery round-trip) or needs to ask it to do the
 work (dispatch a task to the "orders" queue and wait for the result).
 """
+import pytest
 from unittest.mock import MagicMock, patch
 
 import tasks
@@ -65,7 +66,8 @@ class TestManageStopPlace:
              patch("ibkr.place_stop_order") as mock_direct:
             result = tasks.manage_stop_place("NVDA", 10, 180.0)
 
-        mock_dispatch.assert_called_once_with(args=["NVDA", 10, 180.0], queue="orders")
+        mock_dispatch.assert_called_once_with(args=["NVDA", 10, 180.0], kwargs={}, queue="orders",
+                                              expires=30)
         fake_result.get.assert_called_once_with(timeout=30)
         mock_direct.assert_not_called()
         assert result == {"order_id": 99}
@@ -89,7 +91,7 @@ class TestManageCancelStopOrdersFor:
                            return_value=fake_result) as mock_dispatch:
             result = tasks.manage_cancel_stop_orders_for("DDOG")
 
-        mock_dispatch.assert_called_once_with(args=["DDOG"], queue="orders")
+        mock_dispatch.assert_called_once_with(args=["DDOG"], kwargs={}, queue="orders", expires=30)
         assert result == 2
 
 
@@ -113,7 +115,7 @@ class TestManageCancelOrder:
                            return_value=fake_result) as mock_dispatch:
             result = tasks.manage_cancel_order(11)
 
-        mock_dispatch.assert_called_once_with(args=[11], queue="orders")
+        mock_dispatch.assert_called_once_with(args=[11], kwargs={}, queue="orders", expires=30)
         assert result is False
 
 
@@ -144,6 +146,40 @@ class TestManagePlaceTrailingStop:
 
         mock_dispatch.assert_called_once_with(
             args=["SNOW", 91], kwargs={"trail_amount": None, "trail_percent": 8.0},
-            queue="orders",
+            queue="orders", expires=30,
         )
         assert result == {"order_id": 55}
+
+
+class TestTimedOutDispatch:
+    """Professor C17 (2026-10-28): a timed-out request stayed queued and ran
+    later outside the lock, and a retry could stack a second stop."""
+
+    def test_timeout_revokes_the_request(self, monkeypatch):
+        monkeypatch.setenv("IB_CLIENT_ID", "20")
+        fake = MagicMock()
+        fake.get.side_effect = TimeoutError("no reply")
+        with patch.object(tasks._broker_cancel_stop_orders_for, "apply_async", return_value=fake):
+            with pytest.raises(TimeoutError):
+                tasks.manage_cancel_stop_orders_for("NVDA")
+        fake.revoke.assert_called_once()
+
+    def test_lost_stop_reply_adopts_the_resting_stop(self, monkeypatch):
+        monkeypatch.setenv("IB_CLIENT_ID", "20")
+        fake = MagicMock()
+        fake.get.side_effect = TimeoutError("no reply")
+        resting = [{"order_id": 77, "ticker": "NVDA", "action": "SELL", "order_type": "STP",
+                    "qty": 10.0, "stop_price": 180.0, "status": "Submitted"}]
+        with patch.object(tasks._broker_place_stop_order, "apply_async", return_value=fake), \
+             patch("ibkr.get_open_orders", return_value=resting), \
+             patch("time.sleep"), patch("db.clear_trailing_active"):
+            assert tasks.manage_stop_place("NVDA", 10, 180.0) == {"order_id": 77, "stop_price": 180.0}
+
+    def test_lost_stop_reply_with_nothing_resting_raises(self, monkeypatch):
+        monkeypatch.setenv("IB_CLIENT_ID", "20")
+        fake = MagicMock()
+        fake.get.side_effect = TimeoutError("no reply")
+        with patch.object(tasks._broker_place_stop_order, "apply_async", return_value=fake), \
+             patch("ibkr.get_open_orders", return_value=[]), patch("time.sleep"):
+            with pytest.raises(TimeoutError):
+                tasks.manage_stop_place("NVDA", 10, 180.0)

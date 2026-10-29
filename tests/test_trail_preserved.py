@@ -63,6 +63,7 @@ def _trail_check(stop_price, atr):
     rec = {"ticker": "NVDA", "stop_price": stop_price, "thesis_bucket": "Accelerator",
            "entry_price": 100.0, "trailing_active": False, "trailing_high": 126.0}
     with patch("db.get_all_position_stops", return_value=[rec]), \
+         patch("db.get_position_stop", return_value=rec), \
          patch("risk_manager.SETUP_GATES_ENABLED", False), \
          patch.object(risk_manager.RiskManager, "get_atr", return_value=atr), \
          patch("tasks.manage_cancel_stop_orders_for") as cancel, \
@@ -97,6 +98,7 @@ def _already_trailing(rec_extra, current):
     rec = {"ticker": "NVDA", "stop_price": 112.0, "thesis_bucket": "Accelerator",
            "entry_price": 100.0, "trailing_active": True, "trailing_high": 126.0, **rec_extra}
     with patch("db.get_all_position_stops", return_value=[rec]), \
+         patch("db.get_position_stop", return_value=rec), \
          patch("risk_manager.SETUP_GATES_ENABLED", False), \
          patch("db.update_trailing_stop") as upd:
         rm.check_trailing_stops()

@@ -1212,6 +1212,28 @@ class RiskManager:
     # Trailing stop monitor
     # ------------------------------------------------------------------
 
+    def _changed_while_waiting(self, ticker: str, qty: float | None = None,
+                               stop_px: float | None = None) -> str | None:
+        """Called once a ticker's stop lock is held. The caller read the
+        position and stop before taking the lock; if another stop change ran
+        in between (a partial sale, TRIM, restore), acting on that snapshot
+        could cancel the new stop and place one for the old quantity
+        (professor C18, 2026-10-28). Returns why to skip, or None."""
+        import db
+        if stop_px is not None:
+            now = (db.get_position_stop(ticker) or {}).get("stop_price")
+            if now is None or abs(float(now) - float(stop_px)) > 1e-6:
+                return f"recorded stop moved {stop_px} -> {now}"
+        if qty is not None:
+            try:
+                pos = next((p for p in self._client.get_all_positions() if p.symbol == ticker), None)
+                live = round(abs(float(pos.qty)), 4) if pos is not None else 0.0
+            except Exception:
+                return None  # can't tell: don't block a protective change on a read error
+            if abs(live - float(qty)) > 1e-6:
+                return f"position changed {qty} -> {live}"
+        return None
+
     def check_trailing_stops(self) -> list[dict]:
         """
         Review all open positions against their logged stops.
@@ -1307,10 +1329,17 @@ class RiskManager:
                     try:
                         # One stop change per ticker at a time (stop_lock).
                         with ticker_lock(ticker):
+                          changed = self._changed_while_waiting(
+                              ticker, qty=round(abs(float(pos.qty)), 4), stop_px=stop_px)
+                          if changed:
+                            log.info(f"[{ticker}] TRAIL conversion skipped this run: {changed}")
+                          else:
+                            cancelled = False
                             try:
                                 import tasks
                                 qty = round(abs(float(pos.qty)), 4)
                                 tasks.manage_cancel_stop_orders_for(ticker)
+                                cancelled = True
                                 if trail_amount is not None:
                                     result = tasks.manage_place_trailing_stop(ticker, qty, trail_amount=trail_amount)
                                 else:
@@ -1324,7 +1353,13 @@ class RiskManager:
                                 log.error(f"[{ticker}] Native TRAIL conversion failed — falling back to "
                                          f"one-shot cancel/replace: {e}")
                                 prev_high = stop_record.get("trailing_high") or entry
-                                if not (current > prev_high and new_stop > stop_px):
+                                if not cancelled:
+                                    # The cancel itself failed: the old stop is
+                                    # still resting, so placing another would
+                                    # stack two (professor C19).
+                                    log.error(f"[{ticker}] Stop cancel failed before the TRAIL "
+                                              f"conversion; existing stop left in place")
+                                elif not (current > prev_high and new_stop > stop_px):
                                     # The stops were already cancelled above: put the
                                     # fixed stop back rather than leave it unprotected
                                     # (professor C16, 2026-10-28).
@@ -1406,6 +1441,10 @@ class RiskManager:
         candidate rung below the existing stop is simply ignored).
         """
         import db
+        changed = self._changed_while_waiting(ticker, stop_px=stop_px)
+        if changed:
+            log.info(f"[{ticker}] Ladder ratchet skipped this run: {changed}")
+            return
         ladder = db.get_trade_ladder(ticker)
         if not ladder:
             return
@@ -1451,6 +1490,11 @@ class RiskManager:
         import alerts
         import db
         import tasks
+
+        changed = self._changed_while_waiting(ticker, qty=qty)
+        if changed:
+            log.info(f"[{ticker}] Breakeven move skipped this run: {changed}")
+            return False
 
         stop_rec = db.get_position_stop(ticker) or {}
         old_stop = stop_rec.get("stop_price")
@@ -1512,6 +1556,10 @@ class RiskManager:
         import market_data
         if not market_data.is_market_hours():
             log.info(f"[{ticker}] Profit target reached outside regular hours: sale deferred to RTH")
+            return None
+        changed = self._changed_while_waiting(ticker, qty=qty)
+        if changed:
+            log.info(f"[{ticker}] Profit-target sale skipped this run: {changed}")
             return None
 
         stop_rec = db.get_position_stop(ticker) or {}

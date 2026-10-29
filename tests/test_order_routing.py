@@ -206,8 +206,11 @@ class TestOrdersCallResult:
             {"order_id": 1, "ticker": "AMD", "action": "SELL", "order_type": "STP", "qty": 10.0,
              "stop_price": 90.0, "status": "Submitted", "remaining": 4.0},
             {"order_id": 2, "ticker": "AMD", "action": "SELL", "order_type": "STP", "qty": 10.0,
+             "stop_price": 90.0, "status": "Inactive", "remaining": 10.0},
+            {"order_id": 3, "ticker": "AMD", "action": "SELL", "order_type": "STP", "qty": 10.0,
              "stop_price": 90.0, "status": "PendingCancel", "remaining": 10.0},
         ]
         with patch("ibkr.get_open_orders", return_value=orders):
             rs = tasks._resting_sell_stops("AMD")
-        assert [(o["order_id"], o["qty"]) for o in rs] == [(1, 4.0)]
+        # A0253-1: a cancel can still be rejected, so PendingCancel covers
+        assert [(o["order_id"], o["qty"]) for o in rs] == [(1, 4.0), (3, 10.0)]

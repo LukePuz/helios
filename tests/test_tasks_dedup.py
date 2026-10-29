@@ -727,7 +727,8 @@ class TestNoStopTelegramEscalation:
     def test_second_naked_cycle_places_the_recorded_stop(self):
         """A0053-2: confirmed naked with a recorded stop -> stop placed."""
         from datetime import datetime, timedelta, timezone
-        state = {"no_stop_since_AMD": (datetime.now(timezone.utc) - timedelta(minutes=16)).isoformat()}
+        state = {"no_stop_since_AMD": (datetime.now(timezone.utc) - timedelta(minutes=16)).isoformat(),
+                 "no_stop_seen_AMD": (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()}
         place = MagicMock(return_value={"order_id": 9})
         mock_alert = self._run(state, record={"stop_price": 150.0}, place=place)
         place.assert_called_once_with("AMD", 50.0, 150.0)
@@ -740,9 +741,19 @@ class TestNoStopTelegramEscalation:
         mock_alert.assert_not_called()
         assert state.get("no_stop_since_AMD")  # marker armed for next cycle
 
+    def test_stale_marker_from_a_closed_position_restarts_the_count(self):
+        """A0253-8: a marker not refreshed within two cycles is not 'the
+        previous cycle'."""
+        from datetime import datetime, timedelta, timezone
+        state = {"no_stop_since_AMD": (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()}
+        mock_alert = self._run(state, record={"stop_price": 150.0})  # place would raise
+        mock_alert.assert_not_called()
+        assert datetime.fromisoformat(state["no_stop_since_AMD"]) > datetime.now(timezone.utc) - timedelta(minutes=1)
+
     def test_sustained_45_minutes_escalates_to_telegram(self):
         from datetime import datetime, timedelta, timezone
-        state = {"no_stop_since_AMD": (datetime.now(timezone.utc) - timedelta(minutes=50)).isoformat()}
+        state = {"no_stop_since_AMD": (datetime.now(timezone.utc) - timedelta(minutes=50)).isoformat(),
+                 "no_stop_seen_AMD": (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()}
 
         mock_alert = self._run(state)
 

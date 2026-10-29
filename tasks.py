@@ -242,7 +242,11 @@ def _orders_call(task, args, kwargs=None, timeout: int = 30):
 
 
 # Order states that are no longer protecting anything (ib_async OrderStatus).
-_NOT_WORKING = {"PendingCancel", "Cancelled", "ApiCancelled", "Inactive", "Filled"}
+# PendingCancel is NOT one of them: IBKR can reject the cancel and the stop
+# reverts to working minutes later (MRVL 08-04, ibkr.cancel_order), so it
+# still counts as resting for every "safe to sell / place?" check (audit
+# 02:53, A0253-1).
+_NOT_WORKING = {"Cancelled", "ApiCancelled", "Inactive", "Filled"}
 
 
 def _resting_sell_stops(ticker: str, types=("STP", "STP LMT", "TRAIL")) -> list[dict]:
@@ -2522,6 +2526,8 @@ def _fix_overstop(ticker: str) -> str:
                 f"${float(stop_price):.2f} is not below the last price "
                 f"({'unknown' if not last else f'${last:.2f}'}), so nothing was placed — "
                 f"set the stop in TWS")
+    label = (f"stops covered {resting:g} shares but {held:g} held" if resting > held
+             else f"stops covered only {resting:g} of {held:g} shares")
     try:
         if resting > held:
             manage_cancel_stop_orders_for(ticker)
@@ -2532,16 +2538,24 @@ def _fix_overstop(ticker: str) -> str:
                 return (f"🚨 {ticker}: stop order(s) {ids} for {stuck_qty:g} shares won't cancel "
                         f"and exceed the {held:g} held — cancel them in TWS")
             need = round(held - stuck_qty, 4)
-            label = f"stops covered {resting:g} shares but {held:g} held"
         else:
             need = round(held - resting, 4)
-            label = f"stops covered only {resting:g} of {held:g} shares"
         if need > 0:
             result = manage_stop_place(ticker, need, float(stop_price))
             db.set_stop_broker_order_id(ticker, result["order_id"])
     except Exception as e:
         return f"🚨 {ticker}: {label}; fix failed ({e}) — check TWS now"
     return f"🔧 {ticker}: {label}; placed a stop for {need:g} @ ${float(stop_price):.2f}"
+
+
+def _fix_overstop_safe(ticker: str) -> str:
+    """_fix_overstop for the reconcile loops: one ticker's failure must not
+    skip the remaining tickers and section 3 (audit 02:53, A0253-7)."""
+    try:
+        return _fix_overstop(ticker)
+    except Exception as e:
+        log.error(f"[{ticker}] stop coverage fix crashed: {e}")
+        return f"🚨 {ticker}: stop coverage fix failed ({e}) — check TWS"
 
 
 def _reconcile_alert_due(issue_key: str) -> bool:
@@ -2780,7 +2794,7 @@ def reconcile_stop_orders(self):
                             f"confirming next cycle")
                 continue
             db.set_state(pending_key, "")
-            msg = _fix_overstop(ticker)
+            msg = _fix_overstop_safe(ticker)
             all_actions.append(msg)
             new_actions.append(msg)
             try:
@@ -2819,12 +2833,26 @@ def reconcile_stop_orders(self):
 
                 since_key = f"no_stop_since_{ticker}"
                 since = db.get_state(since_key)
+                # A marker left by a position that closed while naked isn't
+                # "the previous cycle": restart the count if this ticker
+                # wasn't seen naked within two cycles (audit 02:53, A0253-8).
+                seen_key = f"no_stop_seen_{ticker}"
+                seen = db.get_state(seen_key)
+                now_iso = datetime.now(timezone.utc).isoformat()
+                db.set_state(seen_key, now_iso)
+                try:
+                    stale = not seen or (datetime.now(timezone.utc)
+                                         - datetime.fromisoformat(seen)).total_seconds() > 2400
+                except ValueError:
+                    stale = True
+                if since and stale:
+                    since = None
                 if not since:
                     db.set_state(since_key, datetime.now(timezone.utc).isoformat())
                 else:
                     # Naked on two consecutive cycles: put a stop on at the
                     # recorded level instead of only alerting (A0053-2).
-                    fix = _fix_overstop(ticker)
+                    fix = _fix_overstop_safe(ticker)
                     all_actions.append(fix)
                     new_actions.append(fix)
                     if fix.startswith("🔧"):

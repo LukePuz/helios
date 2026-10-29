@@ -153,3 +153,16 @@ class TestBackstopSellReads:
             assert tasks._execute_backstop_sell("AMD", self._alert) is True
         order.assert_called_once_with("AMD", "SELL", 6.0)
         delete.assert_not_called(); close.assert_not_called()
+
+
+def test_cancel_failure_in_overcover_returns_a_line_not_a_crash():
+    """A0253-7: label was unbound when the cancel raised."""
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="AMD", qty=10)]
+    with patch("ibkr.get_client", return_value=client), \
+         patch("ibkr.get_open_orders", return_value=_orders(10, 10)), \
+         patch("db.get_position_stop", return_value={"stop_price": 150.0}), \
+         patch("ibkr.get_latest_price", return_value=200.0), \
+         patch("tasks.manage_cancel_stop_orders_for", side_effect=tasks.OrdersCallUnknown("x")):
+        msg = tasks._fix_overstop("AMD")
+    assert "fix failed" in msg

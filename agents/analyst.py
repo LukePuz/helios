@@ -245,7 +245,7 @@ def _knowledge_coverage(ticker: str, thesis_text: str, philosophy_text: str,
             cut = [h.lstrip("#").strip() for _, h in heads if h not in prompt]
         else:
             cut = [h.lstrip("#").strip() for pos, h in heads if pos >= cap]
-        return {"chars": len(text), "kept": min(len(text), cap), "cut_headings": cut}
+        return {"chars": len(text), "cap_kept": min(len(text), cap), "cut_headings": cut}
     try:
         from knowledge_loader import load_watchlist
         entry = load_watchlist().get(ticker.upper())

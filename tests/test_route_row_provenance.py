@@ -116,7 +116,7 @@ def test_knowledge_coverage_lists_cut_headings_and_matches_the_prompt_caps():
     philosophy = "# P\n" + "x" * 2100 + "\n### When to Exit\nrules\n"
     cov = analyst._knowledge_coverage("ZZZZ", "## T\nshort", philosophy)
     assert cov["philosophy"]["cut_headings"] == ["When to Exit"]
-    assert cov["philosophy"]["kept"] == 2000 and cov["thesis"]["cut_headings"] == []
+    assert cov["philosophy"]["cap_kept"] == 2000 and cov["thesis"]["cut_headings"] == []
 
 
 def test_fundamentals_history_keeps_revision_fields_and_falls_back():

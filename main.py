@@ -119,11 +119,18 @@ def _adopt_position(client, rm, symbol, qty, manage_stop_place, resting_sell_sto
     if qty < 0:
         # A SELL stop would add to a short (professor M63).
         return f"{symbol} ({qty:g} shares SHORT, not adopted, no stop placed — check TWS)"
-    resting = sum(float(o["qty"]) for o in resting_sell_stops(symbol))
+    stops = resting_sell_stops(symbol)
+    resting = sum(float(o["qty"]) for o in stops)
     need = round(abs(qty) - resting, 4)
     pos = client.get_open_position(symbol)
     entry_price = float(pos.avg_entry_price)
-    stop_price, stop_method = rm.calculate_stop(symbol, entry_price, "Accelerator")
+    resting_px = [float(o["stop_price"]) for o in stops if o.get("stop_price")]
+    if resting_px:
+        # Record the stop that is actually working (maybe set by hand in
+        # TWS), so later re-places don't loosen it (audit 04:53, A0453-5).
+        stop_price, stop_method = max(resting_px), "resting stop"
+    else:
+        stop_price, stop_method = rm.calculate_stop(symbol, entry_price, "Accelerator")
     db.upsert_position_stop(
         ticker=symbol, entry_price=entry_price, stop_price=stop_price,
         stop_method=f"AUTO-ADOPTED ({stop_method}) — verify bucket/stop manually",
@@ -131,6 +138,16 @@ def _adopt_position(client, rm, symbol, qty, manage_stop_place, resting_sell_sto
     )
     if need <= 0:
         return f"{symbol} ({qty} shares, record only: existing stops cover {resting:g})"
+    try:
+        import ibkr
+        last = float(ibkr.get_latest_price(symbol) or 0)
+    except Exception:
+        last = 0.0
+    if not last or stop_price >= last:
+        # An underwater adopted position would sell at the open (professor M72).
+        return (f"{symbol} ({need:g} shares unprotected: stop ${stop_price:.2f} not below the "
+                f"last price ({'unknown' if not last else f'${last:.2f}'}), nothing placed — "
+                f"set a stop in TWS)")
     try:
         stop_result = manage_stop_place(symbol, need, stop_price)
         db.set_stop_broker_order_id(symbol, stop_result["order_id"])

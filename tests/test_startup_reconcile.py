@@ -54,7 +54,7 @@ def test_orders_worker_starts_before_reconcile_and_the_rest_after():
     assert set(calls[2:]) == {"celery_beat", "celery_worker"}
 
 
-def _adopt(record=None, resting=()):
+def _adopt(record=None, resting=(), last=200.0):
     from unittest.mock import MagicMock
     client = MagicMock()
     client.get_open_position.return_value = MagicMock(avg_entry_price=100.0)
@@ -62,6 +62,7 @@ def _adopt(record=None, resting=()):
     rm.calculate_stop.return_value = (90.0, "ATR")
     place = MagicMock(return_value={"order_id": 7})
     with patch("db.get_position_stop", return_value=record), \
+         patch("ibkr.get_latest_price", return_value=last), \
          patch("db.upsert_position_stop") as upsert, patch("db.set_stop_broker_order_id"):
         msg = main._adopt_position(client, rm, "AMD", 10.0, place, lambda t: list(resting))
     return msg, place, upsert
@@ -76,6 +77,9 @@ def test_adoption_skips_a_position_recorded_meanwhile():
 def test_adoption_stops_only_the_uncovered_shares():
     msg, place, _ = _adopt(resting=[{"qty": 4.0}])
     place.assert_called_once_with("AMD", 6.0, 90.0)
+    msg, place, upsert = _adopt(resting=[{"qty": 4.0, "stop_price": 95.0}])
+    place.assert_called_once_with("AMD", 6.0, 95.0)  # A0453-5: the resting level
+    assert upsert.call_args.kwargs["stop_price"] == 95.0
     msg, place, upsert = _adopt(resting=[{"qty": 10.0}])
     place.assert_not_called(); upsert.assert_called_once()
 
@@ -98,3 +102,11 @@ def test_hung_reconcile_does_not_block_the_rest():
         main._bounded_startup_reconcile(limit_s=0.05)
     gate.set()
     assert "slow" in send.call_args[0][0]
+
+
+def test_adoption_places_nothing_at_or_above_the_last_price():
+    """Professor M72: an underwater adopted position would sell at the open."""
+    for last in (85.0, None):
+        msg, place, upsert = _adopt(last=last)
+        place.assert_not_called(); upsert.assert_called_once()
+        assert "nothing placed" in msg

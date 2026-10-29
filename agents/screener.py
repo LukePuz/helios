@@ -249,6 +249,23 @@ def _screener_digest() -> str | None:
         _DIGEST_CACHE["d"] = digest[:12] if digest else None
     return _DIGEST_CACHE["d"]
 
+# Crude keyword tone of a headline, log-only (audit A1853-1): the screener
+# passed price-target raises 93/171 and cuts 3/105, so its pass rate is
+# tracked by tone. It never feeds the screener prompt or any gate.
+_TONE_POS = re.compile(
+    r"\b(beats?|soars?|surges?|jumps?|rall(?:y|ies)|raises?|upgrades?|tops|climbs?|"
+    r"gains?|record high|outperforms?|boosts?|wins?)\b", re.I)
+_TONE_NEG = re.compile(
+    r"\b(falls?|plunges?|drops?|slumps?|tumbles?|sinks?|slides?|cuts?|lowers?|"
+    r"misses?|downgrades?|warns?|lawsuit|probe|halts?|crash(?:es)?|why is .* falling)\b", re.I)
+
+
+def title_tone(title: str) -> str:
+    """'pos', 'neg', 'mixed' (both word lists hit) or 'neutral'."""
+    pos, neg = bool(_TONE_POS.search(title or "")), bool(_TONE_NEG.search(title or ""))
+    return "mixed" if pos and neg else "pos" if pos else "neg" if neg else "neutral"
+
+
 def screen(event: dict) -> dict:
     """
     Main entry point. Returns screening result dict.
@@ -306,13 +323,14 @@ def screen(event: dict) -> dict:
             "model_digest": _screener_digest() if result.get("model_used") else None,
             "prompt_template_sha": hashlib.sha256(_SCREENER_PROMPT.encode()).hexdigest()[:12],
             "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:12],
+            "title_tone": title_tone(title),
         }
     except Exception as e:
         log.warning(f"screener provenance failed: {e}")
 
     log.info(
         f"Screened [{source}] {ticker}: "
-        f"relevant={result['relevant']} urgency={result['urgency']} "
+        f"relevant={result['relevant']} urgency={result['urgency']} tone={title_tone(title)} "
         f"tickers={result.get('affected_tickers',[])} "
         f"model={result.get('model_used','?')}"
     )

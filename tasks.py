@@ -1868,15 +1868,17 @@ def _heartbeat_fail(source: str, error: str) -> None:
 
 @app.task(name="tasks.poll_edgar", bind=True, max_retries=3)
 def poll_edgar(self):
-    """Polls SEC EDGAR for new filings and routes through agent pipeline."""
+    """Polls SEC EDGAR for new filings and routes through agent pipeline.
+    One run at a time: a pass takes ~11 min on a 10 min schedule, and
+    overlapping runs doubled the request rate against SEC's limit (A1053-4)."""
     try:
         from ingestion.edgar import poll_once
 
-        filings = poll_once()
-        log.info(f"EDGAR: {len(filings)} new filing(s)")
-        for filing in filings:
-            _dispatch_event(filing, seen_source="edgar")
-        _heartbeat_ok("edgar", len(filings))
+        def run():
+            filings = poll_once(on_filing=lambda f: _dispatch_event(f, seen_source="edgar"))
+            log.info(f"EDGAR: {len(filings)} new filing(s)")
+            _heartbeat_ok("edgar", len(filings))
+        _run_singleton("poll_edgar", run, max_hold_s=1200)
     except Exception as e:
         log.error(f"poll_edgar failed: {e}")
         _heartbeat_fail("edgar", str(e))

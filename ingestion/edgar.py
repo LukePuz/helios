@@ -350,10 +350,14 @@ def _get_recent_filings(ticker: str, cik: str, form: str) -> list[dict]:
     return filings
 
 
-def poll_once() -> list[dict]:
+def poll_once(on_filing=None) -> list[dict]:
     """
     Checks all tickers for new filings. Returns list of new filing dicts.
     Call this on a schedule (every 10 minutes is plenty).
+    With on_filing, each filing is handed over as soon as it is found: a
+    full pass takes ~11 min, and an 8-K on the first ticker used to wait for
+    the whole loop (audit 10:53, A1053-4). A callback failure is logged and
+    the filing stays unseen, so the next poll picks it up again.
     """
     new_filings = []
     for ticker, cik in TICKER_TO_CIK.items():
@@ -362,6 +366,11 @@ def poll_once() -> list[dict]:
             if filings:
                 log.info(f"New {form} filing(s) for {ticker}: {len(filings)}")
                 new_filings.extend(filings)
+                for filing in filings if on_filing else ():
+                    try:
+                        on_filing(filing)
+                    except Exception as e:
+                        log.error(f"EDGAR: dispatch failed for {ticker} {form}: {e}")
             time.sleep(0.12)  # stay under 10 req/sec SEC limit
     return new_filings
 

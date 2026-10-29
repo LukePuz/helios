@@ -1212,3 +1212,28 @@ def test_queue_retry_keeps_the_entry_on_each_broker_failure():
                 stop_lock.LockLost("AMD"), RuntimeError("boom")):
         pending, placed = _queue_harness(err)
         assert placed == [] and pending["AMD"]["tries"] == 1, err
+
+
+def test_edgar_dispatches_each_filing_as_found_and_skips_overlap():
+    """A1053-4: filings go out during the pass, not after it; a second run
+    while one holds the lock does nothing; a failed dispatch doesn't stop it."""
+    import tasks
+    from ingestion import edgar
+    from conftest import _FakeLock
+    order = []
+    with patch.object(edgar, "TICKER_TO_CIK", {"AAA": "1", "BBB": "2"}), \
+         patch.object(edgar, "FILING_FORMS", ["8-K"]), \
+         patch.object(edgar.time, "sleep"), \
+         patch.object(edgar, "_get_recent_filings",
+                      side_effect=lambda t, c, f: (order.append(("fetch", t)) or [{"ticker": t}])), \
+         patch("tasks._dispatch_event",
+               side_effect=lambda f, **k: (order.append(("dispatch", f["ticker"])),
+                                           f["ticker"] == "AAA" and (_ for _ in ()).throw(RuntimeError("x")))), \
+         patch("tasks._heartbeat_ok") as hb:
+        tasks.poll_edgar.run()
+        assert order == [("fetch", "AAA"), ("dispatch", "AAA"), ("fetch", "BBB"), ("dispatch", "BBB")]
+        hb.assert_called_once_with("edgar", 2)
+        _FakeLock.held.add("helios:task:poll_edgar")
+        order.clear()
+        tasks.poll_edgar.run()
+        assert order == []

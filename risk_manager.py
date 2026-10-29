@@ -1365,6 +1365,13 @@ class RiskManager:
                                     # (professor C24).
                                     log.error(f"[{ticker}] TRAIL placement result unknown; no "
                                               f"fallback stop placed, reconcile will fix coverage")
+                                    # The old stop is cancelled, so say so (m38).
+                                    try:
+                                        import execution
+                                        execution._alert_stop_unknown(
+                                            ticker, round(abs(float(pos.qty)), 4), float(new_stop))
+                                    except Exception:
+                                        pass
                                 elif not (current > prev_high and new_stop > stop_px):
                                     # The stops were already cancelled above: put the
                                     # fixed stop back rather than leave it unprotected

@@ -1227,15 +1227,17 @@ def _reprotect_queue_edit(fn) -> None:
     """Apply fn(pending) -> pending to the queue under a short Redis lock.
     Writers now include the LLM worker and the Telegram bot as well as the
     reconcile run, so an unlocked read-modify-write could drop an entry
-    added in between (audit 06:53, A0653-2). Without Redis the edit still
-    runs: losing the queue entry is worse than a rare race."""
+    added in between (audit 06:53, A0653-2). A busy lock is waited out past
+    its 30 s TTL, so a crashed holder can't force an unlocked edit (m37).
+    Without Redis the edit still runs: losing the queue entry is worse than
+    a rare race."""
     import db
     lock = None
     try:
-        lock = stop_lock._redis().lock("helios:reprotect_queue", timeout=30, blocking_timeout=10)
+        lock = stop_lock._redis().lock("helios:reprotect_queue", timeout=30, blocking_timeout=35)
         if not lock.acquire():
             lock = None
-            log.warning("reprotect queue lock busy; editing without it")
+            log.error("reprotect queue lock still busy after 35 s; editing without it")
     except Exception as e:
         lock = None
         log.warning(f"reprotect queue lock unavailable ({e}); editing without it")
@@ -1254,8 +1256,11 @@ def _reprotect_queue_edit(fn) -> None:
 
 
 def _queue_reprotect(ticker: str, order: dict, fill_price: float | None) -> None:
+    import uuid
+    # The nonce makes a re-queue with the same fields a different entry, so a
+    # retry pass running meanwhile can't pop it as the one it saw (m36).
     entry = {"intent": order.get("intent"), "stop_price": order.get("stop_price"),
-             "fill_price": fill_price}
+             "fill_price": fill_price, "nonce": uuid.uuid4().hex}
 
     def add(pending):
         pending[ticker] = entry

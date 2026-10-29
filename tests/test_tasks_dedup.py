@@ -1144,3 +1144,22 @@ def test_ingestion_staleness_is_calendar_aware():
     assert "options_flow" not in mon and "price_history" not in mon
     tue = stale_at(datetime(2026, 11, 3, 11, 0, tzinfo=ny))   # Tuesday in RTH
     assert "options_flow" in tue and "price_history" in tue
+
+
+def test_identical_requeue_during_retry_pass_survives():
+    """m36: a re-queue with the same fields while the retry pass works on the
+    ticker must not be popped as the entry the pass saw."""
+    import json
+    import tasks
+    state = {}
+    with patch("db.get_state", side_effect=lambda k: state.get(k)), \
+         patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+         patch("stop_lock._redis", side_effect=RuntimeError("no redis")):
+        tasks._queue_reprotect("AMD", {"intent": "RESTORE", "stop_price": 90.0}, 100.0)
+
+        def work(ticker, rec, fill, from_queue=False):
+            tasks._queue_reprotect("AMD", {"intent": "RESTORE", "stop_price": 90.0}, 100.0)
+            return True
+        with patch("tasks._reprotect_after_late_sell", side_effect=work):
+            tasks._retry_pending_reprotects()
+    assert "AMD" in json.loads(state["reprotect_pending"])

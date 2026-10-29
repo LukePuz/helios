@@ -185,3 +185,24 @@ def test_knowledge_coverage_from_the_final_prompt():
     cov = analyst._knowledge_coverage("ZZZZ", "## T\nshort", philosophy, prompt="# P\nintro\n## T")
     assert cov["philosophy"]["cut_headings"] == ["Compounders"]
     assert cov["thesis"]["cut_headings"] == []
+
+
+def test_scanner_candidate_row_carries_regime_detail_with_fallback():
+    """C25 part 2: the row records the regime row used; before migration 61
+    the old insert still runs."""
+    from unittest.mock import MagicMock, patch
+    import db
+    cur = MagicMock()
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    kw = dict(ticker="MSFT", scan_type="daily", composite_score=65, technical_score=25,
+              momentum_score=15, catalyst_score=0, thesis_alignment_score=25, priority="LOW",
+              catalyst_detail="", passed_to_analyst=False, regime_at_scan="Risk-Off",
+              regime_detail={"source": "gics_sector:XLK", "threshold": 80})
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
+        db.log_scanner_candidate(**kw)
+    assert "regime_detail" in cur.execute.call_args[0][0]
+    cur.execute.side_effect = [Exception("column does not exist"), None]
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
+        db.log_scanner_candidate(**kw)
+    assert "regime_detail" not in cur.execute.call_args[0][0]

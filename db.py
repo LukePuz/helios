@@ -708,6 +708,9 @@ _MIGRATIONS: list[tuple[int, str]] = [
          "ADD COLUMN IF NOT EXISTS shares_outstanding DECIMAL, "
          "ADD COLUMN IF NOT EXISTS net_cash DECIMAL, "
          "ADD COLUMN IF NOT EXISTS market_cap DECIMAL;"),
+    # Which regime row a scan used: score, overall/sector source, row time,
+    # last bar date (professor C25). NULL before 10-30.
+    (61, "ALTER TABLE scanner_candidates ADD COLUMN IF NOT EXISTS regime_detail JSONB;"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -3733,23 +3736,33 @@ def log_scanner_candidate(
     setup_category: str | None = None,
     setup_triggered: bool | None = None,
     setup_gates_detail: dict | None = None,
+    regime_detail: dict | None = None,
 ) -> None:
+    base = (
+        "INSERT INTO scanner_candidates "
+        "(ticker, scan_type, composite_score, technical_score, momentum_score, "
+        "catalyst_score, thesis_alignment_score, priority, catalyst_detail, "
+        "passed_to_analyst, regime_at_scan, setup_category, setup_triggered, setup_gates_detail{extra}) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s{ph})"
+    )
+    values = (
+        ticker, scan_type, composite_score, technical_score, momentum_score,
+        catalyst_score, thesis_alignment_score, priority, catalyst_detail,
+        passed_to_analyst, regime_at_scan, setup_category, setup_triggered,
+        psycopg2.extras.Json(setup_gates_detail) if setup_gates_detail is not None else None,
+    )
     conn = _get_conn()
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO scanner_candidates "
-                "(ticker, scan_type, composite_score, technical_score, momentum_score, "
-                "catalyst_score, thesis_alignment_score, priority, catalyst_detail, "
-                "passed_to_analyst, regime_at_scan, setup_category, setup_triggered, setup_gates_detail) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                (
-                    ticker, scan_type, composite_score, technical_score, momentum_score,
-                    catalyst_score, thesis_alignment_score, priority, catalyst_detail,
-                    passed_to_analyst, regime_at_scan, setup_category, setup_triggered,
-                    psycopg2.extras.Json(setup_gates_detail) if setup_gates_detail is not None else None,
-                ),
-            )
+        try:
+            with conn.cursor() as cur:
+                cur.execute(base.format(extra=", regime_detail", ph=",%s"),
+                            values + (psycopg2.extras.Json(regime_detail)
+                                      if regime_detail is not None else None,))
+        except Exception:
+            # Migration 61 not applied yet: log the row without it.
+            conn.rollback()
+            with conn.cursor() as cur:
+                cur.execute(base.format(extra="", ph=""), values)
         conn.commit()
     except Exception as e:
         conn.rollback()

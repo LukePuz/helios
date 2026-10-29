@@ -390,6 +390,14 @@ def run_scan(regime_packet: dict | None = None) -> dict:
             regime_packet = {"regime": "Neutral", "score": 50}
 
     regime = regime_packet.get("regime", "Neutral")
+    # Logged on each candidate row: which regime row this scan used (C25).
+    regime_detail = {
+        "score": regime_packet.get("score"),
+        "source": regime_packet.get("regime_source") or ("fresh" if regime_packet.get("agent") else None),
+        "timestamp": str(regime_packet.get("timestamp")) if regime_packet.get("timestamp") else None,
+        "last_bar_date": (regime_packet.get("signals") or {}).get("last_bar_date"),
+        "threshold": _regime_threshold(regime),
+    }
     log.info(f"Running scanner in {regime} regime...")
 
     # Strong Risk-Off: don't surface new positions
@@ -538,6 +546,7 @@ def run_scan(regime_packet: dict | None = None) -> dict:
                 setup_category=candidate.get("setup_category"),
                 setup_triggered=candidate.get("setup_triggered"),
                 setup_gates_detail=candidate.get("setup_gates_shadow"),
+                regime_detail=regime_detail,
             )
         except Exception as e:
             log.debug(f"Scanner DB log failed for {ticker}: {e}")

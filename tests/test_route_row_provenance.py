@@ -206,3 +206,19 @@ def test_scanner_candidate_row_carries_regime_detail_with_fallback():
     with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
         db.log_scanner_candidate(**kw)
     assert "regime_detail" not in cur.execute.call_args[0][0]
+
+
+def test_salvaged_action_is_not_routed():
+    """A1453-6: an EXIT regex-pulled from broken JSON becomes a stub."""
+    from unittest.mock import patch
+    from agents import analyst
+    broken = '{"action": "EXIT", "conviction": 2, "reasoning": "x" oops'
+    assert analyst._extract_json(broken)["_salvaged"] is True
+    with patch("agents.analyst._call_ollama", return_value=broken), \
+         patch("agents.analyst._stub_recommendation", return_value={"stub": True}) as stub, \
+         patch("knowledge_loader.load_thesis", return_value=""), \
+         patch("knowledge_loader.load_philosophy", return_value=""):
+        out = analyst.analyze({"ticker": "NVDA"}, situation_brief="b",
+                              regime_packet={"regime": "Neutral", "score": 50, "reasoning": ""})
+    assert out == {"stub": True}
+    assert "salvaged" in stub.call_args[0][1]

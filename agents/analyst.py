@@ -715,6 +715,8 @@ def _extract_json(raw: str) -> dict | None:
             else:
                 extracted[field] = val
 
+    if extracted:
+        extracted["_salvaged"] = True  # see analyze(): never routes an action
     return extracted if extracted else None
 
 
@@ -950,6 +952,13 @@ def analyze(
     if not parsed:
         log.warning(f"[{ticker}] Could not parse model response")
         return _stub_recommendation(candidate, "JSON parse failed")
+    if parsed.pop("_salvaged", False) and str(parsed.get("action", "")).upper() in (
+            "OPEN", "ADD", "TRIM", "EXIT"):
+        # Fields regex-pulled from broken JSON carry no reasoning, sources or
+        # risks; a sell gate that ignores pass_to_risk could still act on
+        # them (audit 14:53, A1453-6). Never route one.
+        log.warning(f"[{ticker}] Salvaged {parsed.get('action')} from malformed JSON; not routed")
+        return _stub_recommendation(candidate, "JSON parse failed (fields salvaged, not routed)")
 
     action     = str(parsed.get("action", "WATCH")).upper()
     conviction = max(1, min(10, int(parsed.get("conviction", 1) or 1)))

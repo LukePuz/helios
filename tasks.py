@@ -1412,7 +1412,15 @@ def _retry_pending_reprotects() -> None:
         return
     outcome = {}  # ticker -> (entry seen, entry to keep or None)
     for ticker, rec in pending.items():
-        result = _reprotect_after_late_sell(ticker, rec, rec.get("fill_price"), from_queue=True)
+        # Take the ticker lock here so a busy ticker can be told apart from a
+        # failed placement: busy is not a try (pre-pull review #5, 10-29).
+        try:
+            with stop_lock.ticker_lock(ticker):
+                fn = getattr(_reprotect_after_late_sell, "__wrapped__", _reprotect_after_late_sell)
+                result = fn(ticker, rec, rec.get("fill_price"), from_queue=True)
+        except stop_lock.TickerBusy:
+            log.info(f"[{ticker}] reconcile: queued re-protect skipped, ticker busy; not counted")
+            continue
         tries = int(rec.get("tries", 0)) + 1
         # A BUY that still reads flat is retried for 2 cycles (~30 min; they
         # are 15 min apart, so the old 6 was ~90 min, professor m55), then

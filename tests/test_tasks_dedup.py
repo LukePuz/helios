@@ -1440,3 +1440,20 @@ def test_catalyst_duplicate_earnings_rows_are_logged(tmp_path, monkeypatch):
     with patch.object(ec.log, "warning") as warn:
         assert ec._warn_catalyst_duplicates() == ["NET (2099-10-29,2099-11-05)"]
     assert "NET" in warn.call_args[0][0] and "PLTR" not in warn.call_args[0][0]
+
+
+def test_busy_ticker_is_not_counted_as_a_reprotect_try(monkeypatch):
+    """Review #5: a busy ticker lock leaves the queued entry untouched."""
+    import json
+    import stop_lock
+    import tasks
+    from conftest import _FakeLock
+    monkeypatch.setattr(stop_lock, "DEFAULT_WAIT_S", 0)
+    _FakeLock.held.add("helios:stop_lock:AMD")
+    state = {"reprotect_pending": json.dumps({"AMD": {"intent": "RESTORE", "tries": 3, "nonce": "n"}})}
+    with patch("db.get_state", side_effect=lambda k: state.get(k)), \
+         patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+         patch("alerts._send") as send:
+        tasks._retry_pending_reprotects()
+    assert json.loads(state["reprotect_pending"])["AMD"]["tries"] == 3
+    send.assert_not_called()

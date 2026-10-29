@@ -256,6 +256,18 @@ def _knowledge_coverage(ticker: str, thesis_text: str, philosophy_text: str,
             "philosophy": one(philosophy_text, _PHILOSOPHY_CAP)}
 
 
+_ACCOUNT_FIGURE_RE = re.compile(
+    r"((?:Portfolio Value|Cash Available|Buying Power):\s*|\| Value: )\$[\d,]+(?:\.\d+)?")
+
+
+def redact_account_figures(prompt: str) -> str:
+    """The stored copy of a prompt goes into research data: drop the account's
+    dollar figures (portfolio value, cash, buying power, position values).
+    prompt_sha is still taken from the unredacted prompt (audit 14:53,
+    A1453-3). The model itself still sees them."""
+    return _ACCOUNT_FIGURE_RE.sub(r"\1$[REDACTED]", prompt or "")
+
+
 def _decision_inputs_record(ticker: str, regime_packet: dict | None) -> dict:
     """Log-only, after the model call: which regime row this verdict used
     (professor C25; a sector row here is A0853-1) and the nightly reverse-DCF
@@ -1312,7 +1324,7 @@ def analyze(
                 "catalyst_check": _catalyst_check(ticker, parsed),
                 "prior_verdicts_72h": _prior_verdicts(ticker) if action in ("OPEN", "ADD") else None,
             },
-            prompt=prompt,
+            prompt=redact_account_figures(prompt),
         )
     except Exception as e:
         log.warning(f"[{ticker}] Signal log failed: {e}")

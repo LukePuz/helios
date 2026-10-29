@@ -222,3 +222,15 @@ def test_salvaged_action_is_not_routed():
                               regime_packet={"regime": "Neutral", "score": 50, "reasoning": ""})
     assert out == {"stub": True}
     assert "salvaged" in stub.call_args[0][1]
+
+
+def test_stored_prompt_has_no_account_dollars():
+    """A1453-3: account dollar figures are redacted in the stored copy; prices stay."""
+    from agents import analyst
+    p = ("=== CURRENT PORTFOLIO ===\n  NVDA        1 shares | Entry: $180.10 | Current: $195.44 | "
+         "P&L: +8.5% | Value: $195\n=== ACCOUNT STATE ===\nPortfolio Value: $1,234.56\n"
+         "Cash Available:  $1,000.00\nBuying Power:    $2,000.00")
+    out = analyst.redact_account_figures(p)
+    assert "1,234" not in out and "1,000.00" not in out and "2,000" not in out and "Value: $195" not in out
+    assert "Entry: $180.10" in out and "Current: $195.44" in out
+    assert out.count("$[REDACTED]") == 4

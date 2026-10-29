@@ -369,7 +369,29 @@ def _startup_reconcile() -> None:
             pass
         return
     _reconcile_positions()
-    _reconcile_open_orders()
+    # Under the late-fill reconcile's run lock: if this pass overran and beat
+    # has started, the stale-BUY cancel mustn't overlap that task booking the
+    # same order's fill (A0653-7). Waits up to 120 s for it.
+    lock = None
+    try:
+        import stop_lock
+        lock = stop_lock._redis().lock("helios:task:reconcile_unconfirmed_orders",
+                                       timeout=stop_lock.LOCK_TTL_S, blocking_timeout=120)
+        if not lock.acquire():
+            lock = None
+            logging.warning("Open-order reconciliation: late-fill reconcile busy for 120 s; "
+                            "running without its lock")
+    except Exception as e:
+        lock = None
+        logging.warning(f"Open-order reconciliation: run lock unavailable ({e})")
+    try:
+        _reconcile_open_orders()
+    finally:
+        if lock is not None:
+            try:
+                lock.release()
+            except Exception:
+                pass
 
 
 _STARTUP_RECONCILE_LIMIT_S = 300
@@ -381,7 +403,31 @@ def _bounded_startup_reconcile(limit_s: float = _STARTUP_RECONCILE_LIMIT_S) -> N
     waiting on it the whole stack would stay down silently (audit 04:53,
     A0453-1). After limit_s it keeps running in the background and the rest
     start anyway, with an alert."""
-    t = threading.Thread(target=_startup_reconcile, daemon=True, name="startup-reconcile")
+    started = time.monotonic()
+    outcome: dict = {}
+
+    def _run():
+        try:
+            _startup_reconcile()
+            outcome["ok"] = True
+        except Exception as e:
+            outcome["error"] = e
+            logging.error(f"Startup reconciliation failed: {e}")
+        finally:
+            elapsed = time.monotonic() - started
+            if elapsed > limit_s:
+                # It overran, so the services already started; say how it
+                # ended (audit 06:53, A0653-7).
+                msg = (f"finished after {elapsed:.0f}s" if outcome.get("ok")
+                       else f"failed after {elapsed:.0f}s: {outcome.get('error')}")
+                logging.warning(f"Startup reconciliation {msg}")
+                try:
+                    import alerts
+                    alerts._send(f"ℹ️ <b>Startup reconciliation</b> {msg}.")
+                except Exception:
+                    pass
+
+    t = threading.Thread(target=_run, daemon=True, name="startup-reconcile")
     t.start()
     t.join(limit_s)
     if t.is_alive():

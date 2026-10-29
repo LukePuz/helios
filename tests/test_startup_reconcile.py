@@ -110,3 +110,14 @@ def test_adoption_places_nothing_at_or_above_the_last_price():
         msg, place, upsert = _adopt(last=last)
         place.assert_not_called(); upsert.assert_called_once()
         assert "nothing placed" in msg
+
+
+def test_overrun_reconcile_reports_how_it_ended():
+    """A0653-7: after the 'slow' alert, a second alert says it finished."""
+    import time as _t
+    with patch("main._startup_reconcile", side_effect=lambda: _t.sleep(0.15)), \
+         patch("alerts._send") as send:
+        main._bounded_startup_reconcile(limit_s=0.05)
+        _t.sleep(0.3)
+    texts = [c[0][0] for c in send.call_args_list]
+    assert any("slow" in x for x in texts) and any("finished after" in x for x in texts)

@@ -153,6 +153,25 @@ def _git_code_sha() -> dict:
 
 
 _CODE_SHA = _git_code_sha()
+_DISK_CHECK: dict = {"at": 0.0, "value": None}
+
+
+def _code_mixed_check() -> dict:
+    """HEAD on disk now vs the HEAD this process read at import. Modules
+    imported later come from the files on disk, so a difference means this
+    process may be running a mix of commits (professor M75, 2026-10-29: a
+    pull without a restart). Cached 60 s; one git call per minute at most."""
+    import time
+    now = time.monotonic()
+    if _DISK_CHECK["value"] is None or now - _DISK_CHECK["at"] > 60:
+        disk = _git_code_sha().get("head_sha")
+        boot = _CODE_SHA.get("head_sha")
+        strip = lambda x: (x or "").replace("-dirty", "")
+        _DISK_CHECK.update(at=now, value={
+            "disk_head_sha": disk,
+            "code_mixed": bool(disk and boot and strip(disk) != strip(boot)),
+        })
+    return _DISK_CHECK["value"]
 
 
 def _treatment_config() -> dict:
@@ -191,7 +210,8 @@ def _provenance(prompt: str) -> dict:
                 inspect.getsource(_build_prompt).encode()).hexdigest()[:12],
         }
     import hashlib
-    return {**_PROVENANCE_STATIC, "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:12]}
+    return {**_PROVENANCE_STATIC, **_code_mixed_check(),
+            "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:12]}
 
 
 def _build_prompt(

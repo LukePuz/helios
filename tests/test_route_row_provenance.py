@@ -20,3 +20,19 @@ def test_route_exit_without_provenance_still_logs():
     with patch("db.log_signal") as log_signal:
         crew._log_route_exit("META", "ROUTE_NO_PRICE", {"conviction": 7}, "no price")
     assert log_signal.call_args.kwargs["provenance"] is None
+
+
+def test_code_mixed_flags_a_pull_without_restart():
+    """Professor M75: HEAD on disk differs from the HEAD read at import."""
+    from unittest.mock import patch
+    from agents import analyst
+    analyst._DISK_CHECK.update(at=0.0, value=None)
+    with patch.dict(analyst._CODE_SHA, {"head_sha": "aaa111"}), \
+         patch.object(analyst, "_git_code_sha", return_value={"head_sha": "bbb222-dirty"}):
+        v = analyst._code_mixed_check()
+    assert v == {"disk_head_sha": "bbb222-dirty", "code_mixed": True}
+    analyst._DISK_CHECK.update(at=0.0, value=None)
+    with patch.dict(analyst._CODE_SHA, {"head_sha": "aaa111"}), \
+         patch.object(analyst, "_git_code_sha", return_value={"head_sha": "aaa111-dirty"}):
+        assert analyst._code_mixed_check()["code_mixed"] is False
+    analyst._DISK_CHECK.update(at=0.0, value=None)

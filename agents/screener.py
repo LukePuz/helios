@@ -297,10 +297,11 @@ def screen(event: dict) -> dict:
     # be tied to what made them.
     try:
         import hashlib
-        from agents.analyst import _CODE_SHA
+        from agents.analyst import _CODE_SHA, _code_mixed_check
         result["provenance"] = {
             "code_sha": _CODE_SHA["code_sha"],
             "head_sha": _CODE_SHA["head_sha"],
+            **_code_mixed_check(),  # professor M75
             "model": result.get("model_used") or "keyword_fallback",
             "model_digest": _screener_digest() if result.get("model_used") else None,
             "prompt_template_sha": hashlib.sha256(_SCREENER_PROMPT.encode()).hexdigest()[:12],

@@ -181,7 +181,7 @@ def _treatment_config() -> dict:
     return {k: getattr(config, k, None) for k in (
         "EARNINGS_ENTRY_BLACKOUT_DAYS", "ALLOW_ONE_SHARE_ABOVE_ALLOCATION", "SETUP_GATES_ENABLED",
         "ANALYST_MODEL", "SCREENER_MODEL", "MIN_EXPECTED_RETURN_PCT_PER_WEEK",
-        "BRIEF_PRICE_STRUCTURE", "BRIEF_POSITION_CONTEXT")}
+        "BRIEF_PRICE_STRUCTURE", "BRIEF_POSITION_CONTEXT", "REGIME_OVERALL_ONLY")}
 
 
 def _provenance(prompt: str) -> dict:

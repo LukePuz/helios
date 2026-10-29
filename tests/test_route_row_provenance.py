@@ -61,3 +61,19 @@ def test_missing_model_digest_is_retried():
             assert analyst._provenance("p")["model_digest"] == "abcdef123456"
     finally:
         analyst._PROVENANCE_STATIC = saved
+
+
+def test_regime_fallback_filter_follows_the_flag(monkeypatch):
+    """A0853-1: default unchanged; with REGIME_OVERALL_ONLY only overall rows."""
+    from unittest.mock import MagicMock, patch
+    import config
+    import db
+    for flag, expect in ((False, False), (True, True)):
+        monkeypatch.setattr(config, "REGIME_OVERALL_ONLY", flag)
+        cur = MagicMock()
+        cur.fetchone.return_value = None
+        conn = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = cur
+        with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
+            db.get_latest_regime()
+        assert ("regime_type = 'overall'" in cur.execute.call_args[0][0]) is expect

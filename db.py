@@ -1083,12 +1083,19 @@ def log_regime(
 
 
 def get_latest_regime() -> dict | None:
+    """Newest regime row. Sector rows share the table, so with
+    REGIME_OVERALL_ONLY set only overall-market rows (or legacy NULL ones)
+    count; without it the newest row of any type wins (default, unchanged
+    until Luke decides; A2053-1 / A0853-1)."""
+    from config import REGIME_OVERALL_ONLY
+    where = ("WHERE regime_type = 'overall' OR regime_type IS NULL "
+             if REGIME_OVERALL_ONLY else "")
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT regime, score, confidence, signals_json, portfolio_impact_json, reasoning, timestamp "
-                "FROM market_regime_log ORDER BY timestamp DESC LIMIT 1"
+                f"FROM market_regime_log {where}ORDER BY timestamp DESC LIMIT 1"
             )
             row = cur.fetchone()
         if not row:

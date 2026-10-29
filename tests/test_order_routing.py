@@ -159,7 +159,10 @@ class TestTimedOutDispatch:
         monkeypatch.setenv("IB_CLIENT_ID", "20")
         fake = MagicMock()
         fake.get.side_effect = TimeoutError("no reply")
-        with patch.object(tasks._broker_cancel_stop_orders_for, "apply_async", return_value=fake):
+        still = [{"order_id": 5, "ticker": "NVDA", "action": "SELL", "order_type": "STP",
+                  "qty": 10.0, "stop_price": 150.0, "status": "Submitted"}]
+        with patch.object(tasks._broker_cancel_stop_orders_for, "apply_async", return_value=fake), \
+             patch("ibkr.get_open_orders", return_value=still), patch("time.sleep"):
             with pytest.raises(TimeoutError):
                 tasks.manage_cancel_stop_orders_for("NVDA")
         fake.revoke.assert_called_once()
@@ -183,3 +186,21 @@ class TestTimedOutDispatch:
              patch("ibkr.get_open_orders", return_value=[]), patch("time.sleep"):
             with pytest.raises(TimeoutError):
                 tasks.manage_stop_place("NVDA", 10, 180.0)
+
+    def test_lost_cancel_reply_with_no_stops_resting_counts_as_done(self, monkeypatch):
+        monkeypatch.setenv("IB_CLIENT_ID", "20")
+        fake = MagicMock()
+        fake.get.side_effect = TimeoutError("no reply")
+        with patch.object(tasks._broker_cancel_stop_orders_for, "apply_async", return_value=fake), \
+             patch("ibkr.get_open_orders", return_value=[]), patch("time.sleep"):
+            assert tasks.manage_cancel_stop_orders_for("NVDA") == 0
+
+    def test_lost_trail_reply_adopts_the_resting_trail(self, monkeypatch):
+        monkeypatch.setenv("IB_CLIENT_ID", "20")
+        fake = MagicMock()
+        fake.get.side_effect = TimeoutError("no reply")
+        resting = [{"order_id": 88, "ticker": "SNOW", "action": "SELL", "order_type": "TRAIL",
+                    "qty": 91.0, "stop_price": None, "status": "Submitted"}]
+        with patch.object(tasks._broker_place_trailing_stop_order, "apply_async", return_value=fake), \
+             patch("ibkr.get_open_orders", return_value=resting), patch("time.sleep"):
+            assert tasks.manage_place_trailing_stop("SNOW", 91, trail_percent=8.0) == {"order_id": 88}

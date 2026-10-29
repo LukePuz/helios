@@ -194,6 +194,12 @@ def _resting_stop_matching(ticker: str, qty: float, stop_price: float) -> dict |
     return None
 
 
+def _resting_sell_stops(ticker: str, types=("STP", "STP LMT", "TRAIL")) -> list[dict]:
+    import ibkr
+    return [o for o in ibkr.get_open_orders()
+            if o["ticker"] == ticker and o["action"] == "SELL" and o["order_type"] in types]
+
+
 def manage_stop_place(ticker: str, qty: float, stop_price: float, timeout: int = 30) -> dict:
     """Place a protective stop — see the module-level comment above for why
     this exists instead of calling ibkr.place_stop_order directly. Every
@@ -243,7 +249,21 @@ def manage_cancel_stop_orders_for(ticker: str, timeout: int = 30) -> int:
     if _is_orders_worker():
         import ibkr
         return ibkr.cancel_stop_orders_for(ticker)
-    return _orders_call(_broker_cancel_stop_orders_for, [ticker], timeout=timeout)
+    try:
+        return _orders_call(_broker_cancel_stop_orders_for, [ticker], timeout=timeout)
+    except Exception as e:
+        # revoke() can't stop a cancel already running at the broker: judge
+        # by what is resting now, not by the exception (professor C17).
+        import time
+        time.sleep(5)
+        try:
+            resting = _resting_sell_stops(ticker)
+        except Exception:
+            raise e
+        if resting:
+            raise
+        log.warning(f"[{ticker}] stop cancel reply lost ({e}); broker shows no resting stops")
+        return 0
 
 
 @app.task(name="tasks._broker_place_trailing_stop_order", bind=True, max_retries=1)
@@ -264,9 +284,25 @@ def manage_place_trailing_stop(ticker: str, qty: float, trail_amount: float | No
         import ibkr
         return ibkr.place_trailing_stop_order(ticker, qty, trail_amount=trail_amount,
                                                trail_percent=trail_percent)
-    return _orders_call(_broker_place_trailing_stop_order, [ticker, qty],
-                        {"trail_amount": trail_amount, "trail_percent": trail_percent},
-                        timeout=timeout)
+    try:
+        return _orders_call(_broker_place_trailing_stop_order, [ticker, qty],
+                            {"trail_amount": trail_amount, "trail_percent": trail_percent},
+                            timeout=timeout)
+    except Exception as e:
+        # Same as manage_stop_place: adopt a TRAIL that landed after we
+        # stopped waiting rather than let the caller add a fixed stop too.
+        import time
+        time.sleep(5)
+        try:
+            found = next((o for o in _resting_sell_stops(ticker, ("TRAIL",))
+                          if abs(o["qty"] - float(qty)) < 1e-6), None)
+        except Exception:
+            found = None
+        if not found:
+            raise
+        log.warning(f"[{ticker}] TRAIL placement reply lost ({e}); adopting resting "
+                    f"TRAIL {found['order_id']}")
+        return {"order_id": found["order_id"]}
 
 
 def manage_cancel_order(order_id: int, timeout: int = 30) -> bool:

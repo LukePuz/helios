@@ -1082,20 +1082,27 @@ def reconcile_unconfirmed_orders(self):
             risk_json = approval.get("risk_json") or {}
             stop_price = approval.get("stop_loss_price") or risk_json.get("stop_loss_price")
             if stop_price:
+                # One stop for the whole position at the recorded level (the
+                # existing one for an ADD, never loosened), the record written
+                # before placing, and a retry if placement fails or the ticker
+                # is busy. A stop for only the late shares used to sit beside
+                # the first tranche's, and upsert could loosen the recorded
+                # stop (audit 22:53, A2253-3).
                 try:
-                    with ticker_lock(ticker):
-                        stop_result = manage_stop_place(ticker, fill_qty, float(stop_price))
-                    db.upsert_position_stop(
-                        ticker=ticker, entry_price=total_avg, stop_price=float(stop_price),
-                        stop_method=risk_json.get("stop_method", ""),
-                        bucket=approval.get("thesis_bucket", "Accelerator"),
-                        conviction=approval.get("conviction", 5),
-                        trail_distance_pct=risk_json.get("trailing_stop_distance_pct"),
-                    )
-                    db.set_stop_broker_order_id(ticker, stop_result["order_id"])
-                    stop_placed = True
+                    if not db.get_position_stop(ticker):
+                        db.upsert_position_stop(
+                            ticker=ticker, entry_price=total_avg, stop_price=float(stop_price),
+                            stop_method=risk_json.get("stop_method", ""),
+                            bucket=approval.get("thesis_bucket", "Accelerator"),
+                            conviction=approval.get("conviction", 5),
+                            trail_distance_pct=risk_json.get("trailing_stop_distance_pct"),
+                        )
+                    stop_placed = _reprotect_after_late_sell(ticker, {}, None, from_queue=True)
                 except Exception as e:
                     log.error(f"[{ticker}] reconcile_unconfirmed_orders: stop placement failed: {e}")
+                    stop_placed = False
+                if stop_placed is False:
+                    _queue_reprotect(ticker, {"intent": "BUY"}, None)
             if approval.get("status") == "FAILED":
                 db.update_approval_status(order["approval_id"], "APPROVED")
         elif order["side"] == "SELL":

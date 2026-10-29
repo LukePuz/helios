@@ -365,6 +365,13 @@ class TestReconcileUnconfirmedOrders:
                 "broker_order_id": broker_order_id, "decision_price": 180.1,
                 "approval_id": approval_id}
 
+    @staticmethod
+    def _client(held):
+        from unittest.mock import MagicMock
+        c = MagicMock()
+        c.get_all_positions.return_value = [MagicMock(symbol="CRWD", qty=held)]
+        return c
+
     def _approval(self, status="FAILED"):
         return {
             "id": 59, "ticker": "CRWD", "status": status,
@@ -384,8 +391,12 @@ class TestReconcileUnconfirmedOrders:
              patch("db.log_trade") as mock_log_trade, \
              patch("db.update_order_fill") as mock_update_fill, \
              patch("db.get_approval_by_id", return_value=self._approval()), \
-             patch("ibkr.place_stop_order",
+             patch("tasks.manage_stop_place",
                    return_value={"order_id": 900, "stop_price": 153.61}) as mock_stop, \
+             patch("tasks.manage_cancel_stop_orders_for"), \
+             patch("ibkr.get_client", return_value=self._client(144)), \
+             patch("db.get_position_stop", side_effect=[None, {"stop_price": 153.61}]), \
+             patch("tasks._retry_pending_reprotects"), \
              patch("db.upsert_position_stop") as mock_upsert_stop, \
              patch("db.set_stop_broker_order_id") as mock_set_stop_id, \
              patch("db.update_approval_status") as mock_update_approval, \
@@ -401,6 +412,24 @@ class TestReconcileUnconfirmedOrders:
         mock_set_stop_id.assert_called_once_with("CRWD", 900)
         mock_update_approval.assert_called_once_with(59, "APPROVED")
         mock_alert.assert_called_once()
+
+    def test_late_buy_keeps_existing_stop_record_and_queues_on_failure(self):
+        """A2253-3: an ADD's late fill must not overwrite (loosen) the
+        recorded stop, and a failed placement is retried."""
+        with patch("db.get_unconfirmed_orders", return_value=[self._order()]), \
+             patch("ibkr.get_fill_for_order",
+                   return_value={"filled_qty": 144.0, "fill_price": 181.3}), \
+             patch("db.log_trade"), patch("db.update_order_fill"), \
+             patch("db.get_approval_by_id", return_value=self._approval()), \
+             patch("db.get_position_stop", return_value={"stop_price": 160.0}), \
+             patch("db.upsert_position_stop") as upsert, \
+             patch("tasks._reprotect_after_late_sell", return_value=False), \
+             patch("tasks._queue_reprotect") as queued, \
+             patch("tasks._retry_pending_reprotects"), \
+             patch("db.update_approval_status"), patch("alerts._send"):
+            tasks.reconcile_unconfirmed_orders.run()
+        upsert.assert_not_called()
+        queued.assert_called_once()
 
     def test_still_unfilled_order_is_left_alone(self):
         """No execution found at the broker -- genuinely never filled (or
@@ -491,6 +520,9 @@ class TestReconcileUnconfirmedOrders:
              patch("db.update_order_fill") as update_fill, \
              patch("db.get_approval_by_id", return_value=self._approval()), \
              patch("tasks.manage_stop_place", return_value={"order_id": 9}) as place, \
+             patch("tasks.manage_cancel_stop_orders_for"), patch("tasks._retry_pending_reprotects"), \
+             patch("db.get_position_stop", return_value={"stop_price": 153.61}), \
+             patch("ibkr.get_client", return_value=self._client(100)), \
              patch("db.upsert_position_stop"), patch("db.set_stop_broker_order_id"), \
              patch("db.update_approval_status"), patch("alerts._send"):
             tasks.reconcile_unconfirmed_orders.run()
@@ -507,6 +539,9 @@ class TestReconcileUnconfirmedOrders:
              patch("db.update_order_fill") as update_fill, \
              patch("db.get_approval_by_id", return_value=self._approval()), \
              patch("tasks.manage_stop_place", return_value={"order_id": 9}) as place, \
+             patch("tasks.manage_cancel_stop_orders_for"), patch("tasks._retry_pending_reprotects"), \
+             patch("db.get_position_stop", return_value={"stop_price": 153.61}), \
+             patch("ibkr.get_client", return_value=self._client(144)), \
              patch("db.upsert_position_stop"), patch("db.set_stop_broker_order_id"), \
              patch("db.update_approval_status"), patch("alerts._send"):
             tasks.reconcile_unconfirmed_orders.run()
@@ -514,7 +549,7 @@ class TestReconcileUnconfirmedOrders:
         assert kw["quantity"] == 44.0
         assert abs(kw["price"] - (144 * 182.0 - 100 * 181.0) / 44) < 1e-9
         update_fill.assert_called_once_with(44, fill_price=182.0, filled_qty=144.0, status="filled")
-        place.assert_called_once_with("CRWD", 44.0, 153.61)
+        place.assert_called_once_with("CRWD", 144.0, 153.61)  # whole position (A2253-3)
 
     def test_no_new_shares_on_partial_order_does_nothing(self):
         order = {**self._order(), "filled_qty": 100.0, "fill_price": 181.0}

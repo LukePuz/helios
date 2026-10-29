@@ -857,8 +857,8 @@ def test_expired_stop_request_is_queued_not_retried():
 
 
 def test_refused_stop_is_not_retried():
-    """Professor run 11: a stop the broker layer refuses (short/flat) is
-    not retried and the alert says why."""
+    """Professor run 11: a stop the broker layer refuses (short/flat, or
+    position lag after the fill) isn't retried inline; it is queued."""
     import db
     import inspect
     import tasks
@@ -878,5 +878,5 @@ def test_refused_stop_is_not_retried():
         client.return_value.get_all_positions.return_value = []
         execution.execute_approved(approval)
     assert place.call_count == 1
-    queued.assert_not_called()
+    queued.assert_called_once()
     assert any("STOP REFUSED" in c[0][0] for c in send.call_args_list)

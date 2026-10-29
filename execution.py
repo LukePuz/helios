@@ -141,8 +141,9 @@ def _alert_stop_refused(ticker: str, qty: float, err: Exception) -> None:
     log.error(f"[{ticker}] Stop for {qty:g} refused: {err}")
     try:
         alert_module._send(
-            f"🚨 STOP REFUSED — {ticker}\n{err}. The fill and the broker's position "
-            f"disagree; check the position and stops in TWS."
+            f"⚠️ STOP REFUSED — {ticker}\n{err}. Usually the broker's position hasn't caught "
+            f"up with the fill yet; the stop is queued and retried each reconcile cycle. If "
+            f"this repeats, check the position and stops in TWS."
         )
     except Exception:
         pass
@@ -901,10 +902,13 @@ def execute_approved(
                 except Exception as e:
                     log.warning(f"[{ticker}] Stop order attempt {stop_attempt}/3 failed: {e}")
                     if type(e).__name__ == "SellExceedsPosition":
-                        # The broker shows fewer shares than the stop is for
-                        # (short or flat): retrying can't help, and "place it
-                        # manually" would be wrong advice (professor run 11).
+                        # The broker shows fewer shares than the stop is for.
+                        # Right after a fill that is usually position lag, so
+                        # hand it to the retry queue (re-reads every cycle; a
+                        # real short just fails again) rather than drop it or
+                        # retry inline (professor run 11 follow-up).
                         _alert_stop_refused(ticker, stop_qty, e)
+                        _queue_stop_for_retry(ticker, stop_qty, float(stop_price))
                         stop_placed = True
                         break
                     if isinstance(e, tasks.OrdersCallUnknown):
@@ -1156,6 +1160,7 @@ def execute_manual(
                     log.warning(f"[{ticker}] Stop attempt {attempt}/3: {e}")
                     if type(e).__name__ == "SellExceedsPosition":
                         _alert_stop_refused(ticker, filled_qty, e)
+                        _queue_stop_for_retry(ticker, filled_qty, float(stop_price))
                         stop_placed = True
                         break
                     if isinstance(e, tasks.OrdersCallUnknown):

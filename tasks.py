@@ -1051,7 +1051,7 @@ def reconcile_unconfirmed_orders(self):
         return
     done = threading.Event()
     threading.Thread(target=stop_lock._keep_renewed,
-                     args=(run_lock, "reconcile_unconfirmed_orders", done),
+                     args=(run_lock, "reconcile_unconfirmed_orders", done, 1800),
                      daemon=True).start()
     try:
         _reconcile_unconfirmed_orders_locked(self)
@@ -1138,7 +1138,8 @@ def _reconcile_unconfirmed_orders_locked(task):
                 # the first tranche's, and upsert could loosen the recorded
                 # stop (audit 22:53, A2253-3).
                 try:
-                    if not db.get_position_stop(ticker) or not _held_before_fill(ticker, fill_qty):
+                    if not db.get_position_stop(ticker) or not _held_before_fill(
+                            ticker, fill_qty, approval.get("action")):
                         # No record, or the record is a closed position's
                         # leftover (kept up to 2 reconcile cycles): a re-entry
                         # must not inherit that old level (audit 00:53 A0053-5).
@@ -1220,16 +1221,23 @@ def _retry_pending_reprotects() -> None:
     db.set_state(_REPROTECT_STATE_KEY, json.dumps(left))
 
 
-def _held_before_fill(ticker: str, fill_qty: float) -> bool:
-    """True if shares were held before this late BUY fill, i.e. the fill was
-    an ADD. A failed read returns True so an existing record is kept."""
+def _held_before_fill(ticker: str, fill_qty: float, action: str | None = None) -> bool:
+    """True if this late BUY added to a position (keep its stop record),
+    False if it opened one (an existing record is a closed position's
+    leftover). The approval's action decides; the broker cache can read
+    flat or count the new shares right after a fill (audit 02:53, A0253-4).
+    Without an action, falls back to the position read; a failed read keeps
+    the record."""
+    if action in ("ADD", "OPEN"):
+        return action == "ADD"
     import ibkr
     try:
-        pos = ibkr.get_client().get_open_position(ticker)
-        held = float(pos.qty) if pos else 0.0
+        positions = ibkr.get_client().get_all_positions()
     except Exception as e:
         log.warning(f"[{ticker}] could not read position to check the stop record: {e}")
         return True
+    pos = next((p for p in positions if p.symbol == ticker), None)
+    held = float(pos.qty) if pos else 0.0
     return round(held - float(fill_qty), 4) > 0
 
 

@@ -28,6 +28,7 @@ log = logging.getLogger(__name__)
 # holder keeps the ticker.
 LOCK_TTL_S = 90
 LOCK_RENEW_S = 30
+MAX_HOLD_S = 900  # cap on renewal, see _keep_renewed
 DEFAULT_WAIT_S = 120
 
 _local = threading.local()
@@ -90,8 +91,25 @@ def ticker_lock(ticker: str, wait: float | None = None):
                 log.warning(f"[{ticker}] stop lock release failed: {e}")
 
 
-def _keep_renewed(lock, ticker: str, done: threading.Event) -> None:
+def _keep_renewed(lock, ticker: str, done: threading.Event,
+                  max_hold_s: float | None = None) -> None:
+    """Renew until done, but never past max_hold_s: an IBKR call can hang
+    with no timeout, and a lock renewed forever would freeze every stop
+    change on the ticker until a restart (audit 02:53, A0253-2)."""
+    import time
+    limit = time.monotonic() + (MAX_HOLD_S if max_hold_s is None else max_hold_s)
     while not done.wait(LOCK_RENEW_S):
+        if time.monotonic() > limit:
+            log.error(f"[{ticker}] lock held past {max_hold_s or MAX_HOLD_S:.0f}s; no longer "
+                      f"renewing (it expires in {LOCK_TTL_S}s)")
+            try:
+                import alerts
+                alerts._send(f"⚠️ <b>{ticker}</b>: a stop change has been running for over "
+                             f"{(max_hold_s or MAX_HOLD_S) / 60:.0f} min (likely a hung broker "
+                             f"call). Its lock is being released; check the orders worker.")
+            except Exception:
+                pass
+            return
         try:
             lock.reacquire()
         except Exception as e:

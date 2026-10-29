@@ -1064,3 +1064,18 @@ def test_conditional_fill_update_reports_a_lost_race():
     with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
         assert db.update_order_fill(44, 181.0, 144.0, "filled", expect_filled_qty=0.0) is False
     assert "AND status IN ('unconfirmed', 'partial')" in cur.execute.call_args[0][0]
+
+
+def test_held_before_fill_follows_the_approval_action():
+    """A0253-4: the action decides, not a lagging broker cache."""
+    with patch("ibkr.get_client", side_effect=AssertionError("must not read")):
+        assert tasks._held_before_fill("AMD", 1, "ADD") is True
+        assert tasks._held_before_fill("AMD", 1, "OPEN") is False
+
+
+def test_held_before_fill_reads_flat_as_not_held():
+    from unittest.mock import MagicMock
+    client = MagicMock()
+    client.get_all_positions.return_value = []
+    with patch("ibkr.get_client", return_value=client):
+        assert tasks._held_before_fill("AMD", 1) is False

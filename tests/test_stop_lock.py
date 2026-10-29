@@ -71,3 +71,18 @@ def test_lock_is_renewed_while_a_long_section_runs(monkeypatch):
     assert n >= 3 and set(_FakeLock.renewed) == {"helios:stop_lock:AMD"}
     time.sleep(0.1)
     assert len(_FakeLock.renewed) == n  # renewing stops once released
+
+
+def test_renewal_stops_after_the_hold_cap(monkeypatch):
+    """A0253-2: a hung holder must not keep the ticker forever."""
+    import threading
+    import time
+    from unittest.mock import MagicMock, patch
+    monkeypatch.setattr(stop_lock, "LOCK_RENEW_S", 0.01)
+    lock, done = MagicMock(), threading.Event()
+    with patch("alerts._send") as send:
+        t = threading.Thread(target=stop_lock._keep_renewed, args=(lock, "AMD", done, 0.05))
+        t.start(); t.join(1.0)
+    assert not t.is_alive()  # gave up on its own, done never set
+    assert lock.reacquire.call_count >= 1
+    send.assert_called_once()

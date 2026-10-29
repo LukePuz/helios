@@ -1124,7 +1124,10 @@ def _reconcile_unconfirmed_orders_locked(task):
                 # the first tranche's, and upsert could loosen the recorded
                 # stop (audit 22:53, A2253-3).
                 try:
-                    if not db.get_position_stop(ticker):
+                    if not db.get_position_stop(ticker) or not _held_before_fill(ticker, fill_qty):
+                        # No record, or the record is a closed position's
+                        # leftover (kept up to 2 reconcile cycles): a re-entry
+                        # must not inherit that old level (audit 00:53 A0053-5).
                         db.upsert_position_stop(
                             ticker=ticker, entry_price=total_avg, stop_price=float(stop_price),
                             stop_method=risk_json.get("stop_method", ""),
@@ -1201,6 +1204,19 @@ def _retry_pending_reprotects() -> None:
         else:
             log.info(f"[{ticker}] reconcile: queued re-protect done ({result})")
     db.set_state(_REPROTECT_STATE_KEY, json.dumps(left))
+
+
+def _held_before_fill(ticker: str, fill_qty: float) -> bool:
+    """True if shares were held before this late BUY fill, i.e. the fill was
+    an ADD. A failed read returns True so an existing record is kept."""
+    import ibkr
+    try:
+        pos = ibkr.get_client().get_open_position(ticker)
+        held = float(pos.qty) if pos else 0.0
+    except Exception as e:
+        log.warning(f"[{ticker}] could not read position to check the stop record: {e}")
+        return True
+    return round(held - float(fill_qty), 4) > 0
 
 
 @locked_by_ticker(lambda ticker, *a, **k: ticker, on_busy=False)

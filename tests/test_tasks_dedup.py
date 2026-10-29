@@ -431,6 +431,24 @@ class TestReconcileUnconfirmedOrders:
         upsert.assert_not_called()
         queued.assert_called_once()
 
+    def test_late_buy_replaces_a_closed_positions_leftover_record(self):
+        """A0053-5: nothing held before this fill, so an existing record is a
+        closed position's leftover and must not set the new stop."""
+        with patch("db.get_unconfirmed_orders", return_value=[self._order()]), \
+             patch("ibkr.get_fill_for_order",
+                   return_value={"filled_qty": 144.0, "fill_price": 181.3}), \
+             patch("db.log_trade"), patch("db.update_order_fill"), \
+             patch("db.get_approval_by_id", return_value=self._approval()), \
+             patch("ibkr.get_client", return_value=self._client(144)), \
+             patch("db.get_position_stop", return_value={"stop_price": 200.0}), \
+             patch("db.upsert_position_stop") as upsert, \
+             patch("tasks._reprotect_after_late_sell", return_value=True), \
+             patch("tasks._retry_pending_reprotects"), \
+             patch("db.update_approval_status"), patch("alerts._send"):
+            tasks.reconcile_unconfirmed_orders.run()
+        upsert.assert_called_once()
+        assert upsert.call_args.kwargs["stop_price"] == 153.61
+
     def test_still_unfilled_order_is_left_alone(self):
         """No execution found at the broker -- genuinely never filled (or
         was cancelled/rejected). Must not fabricate anything."""

@@ -665,9 +665,11 @@ class TestStopRestoredAfterFailedSell:
     def test_alert_when_restore_fails(self):
         with patch("db.get_position_stop", return_value={"stop_price": 90.0}), \
              patch("ibkr.get_client", side_effect=RuntimeError("down")), \
+             patch("tasks._queue_reprotect") as queued, \
              patch("alerts._send") as send:
             execution._restore_stop_after_failed_sell("NVDA")
         assert "UNPROTECTED" in send.call_args[0][0]
+        queued.assert_called_once()  # A0653-5: retried, not left to a manual step
 
 
 def test_log_trade_outcome_skips_a_second_row_for_the_same_approval():

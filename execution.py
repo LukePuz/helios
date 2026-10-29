@@ -201,11 +201,23 @@ def _restore_stop_after_failed_sell(ticker: str) -> None:
         log.info(f"[{ticker}] Sell failed; stop restored @ ${float(stop_rec['stop_price']):.2f} for {qty} shares")
     except Exception as e:
         log.error(f"[{ticker}] Sell failed and the stop could not be restored: {e}")
+        # Hand it to the reconcile retry queue, which re-reads coverage under
+        # the lock and places the recorded stop: a lapsed lock (LockLost) or a
+        # busy worker shouldn't leave recovery to a manual step (A0653-5).
+        queued = False
+        try:
+            tasks._queue_reprotect(ticker, {"intent": "RESTORE"}, None)
+            queued = True
+        except Exception as e2:
+            log.error(f"[{ticker}] Could not queue the stop restore: {e2}")
         try:
             alert_module._send(
                 f"🚨 UNPROTECTED POSITION — {ticker}\n"
                 f"A sell failed after its stop was cancelled, and the stop could not be "
-                f"restored. Place stop @ ${float(stop_rec['stop_price']):.2f} manually."
+                f"restored. "
+                + ("It is queued and retried every reconcile cycle; " if queued else "")
+                + f"place stop @ ${float(stop_rec['stop_price']):.2f} manually if it isn't back "
+                f"within ~15 min."
             )
         except Exception:
             pass

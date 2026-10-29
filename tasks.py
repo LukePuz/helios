@@ -2390,9 +2390,11 @@ def check_portfolio_drawdown(self):
 @locked_by_ticker(lambda ticker: ticker,
                   on_busy=lambda: "over-stop fix skipped: ticker busy (next cycle)")
 def _fix_overstop(ticker: str) -> str:
-    """Re-read under the lock; if resting SELL stops still exceed the
-    position, cancel them all and place one for the held quantity at the
-    recorded stop. Returns a line for the reconcile log/alert."""
+    """Re-read under the lock and make resting SELL stops cover exactly the
+    position at the recorded stop. Over-covered: cancel, re-read what is
+    still resting (a cross-client stop may refuse to cancel, A2253-6) and
+    place stops only for what is left uncovered. Under-covered (A2253-4):
+    add a stop for the uncovered shares. Returns a line for log/alert."""
     import db
     import ibkr
     try:
@@ -2400,22 +2402,33 @@ def _fix_overstop(ticker: str) -> str:
         held = round(abs(float(pos.qty)), 4) if pos else 0.0
         resting = sum(float(o["qty"]) for o in _resting_sell_stops(ticker))
     except Exception as e:
-        return f"⚠️ {ticker}: over-stop re-check failed ({e}); check TWS"
-    if resting <= held + 1e-6:
-        return f"{ticker}: over-stop cleared on re-check ({resting:g} <= {held:g})"
+        return f"⚠️ {ticker}: stop-coverage re-check failed ({e}); check TWS"
+    if abs(resting - held) <= 1e-6 or resting <= 0:
+        return f"{ticker}: stop coverage fine on re-check ({resting:g} vs {held:g})"
     stop_price = (db.get_position_stop(ticker) or {}).get("stop_price")
     if not stop_price or held <= 0:
         return (f"🚨 {ticker}: resting stops for {resting:g} shares but {held:g} held and no "
-                f"recorded stop to rebuild from — cancel the extra stop in TWS")
+                f"recorded stop to rebuild from — fix the stops in TWS")
     try:
-        manage_cancel_stop_orders_for(ticker)
-        result = manage_stop_place(ticker, held, float(stop_price))
-        db.set_stop_broker_order_id(ticker, result["order_id"])
+        if resting > held:
+            manage_cancel_stop_orders_for(ticker)
+            stuck = [o for o in _resting_sell_stops(ticker)]
+            stuck_qty = sum(float(o["qty"]) for o in stuck)
+            if stuck_qty > held + 1e-6:
+                ids = ", ".join(str(o["order_id"]) for o in stuck)
+                return (f"🚨 {ticker}: stop order(s) {ids} for {stuck_qty:g} shares won't cancel "
+                        f"and exceed the {held:g} held — cancel them in TWS")
+            need = round(held - stuck_qty, 4)
+            label = f"stops covered {resting:g} shares but {held:g} held"
+        else:
+            need = round(held - resting, 4)
+            label = f"stops covered only {resting:g} of {held:g} shares"
+        if need > 0:
+            result = manage_stop_place(ticker, need, float(stop_price))
+            db.set_stop_broker_order_id(ticker, result["order_id"])
     except Exception as e:
-        return (f"🚨 {ticker}: stops covered {resting:g} > held {held:g}; rebuild failed ({e}) "
-                f"— check TWS now")
-    return (f"🔧 {ticker}: stops covered {resting:g} shares but {held:g} held; replaced with one "
-            f"stop for {held:g} @ ${float(stop_price):.2f}")
+        return f"🚨 {ticker}: {label}; fix failed ({e}) — check TWS now"
+    return f"🔧 {ticker}: {label}; placed a stop for {need:g} @ ${float(stop_price):.2f}"
 
 
 def _reconcile_alert_due(issue_key: str) -> bool:
@@ -2639,14 +2652,18 @@ def reconcile_stop_orders(self):
         stop_qty: dict[str, float] = {}
         for o in stops:
             stop_qty[o["ticker"]] = stop_qty.get(o["ticker"], 0.0) + float(o["qty"])
+        # A partly covered position (some stop, but for fewer shares than
+        # held) is fixed the same way (audit 22:53, A2253-4); no stop at all
+        # is section 3's alert.
         for ticker, qty in held.items():
             pending_key = f"overstop_pending_{ticker}"
-            if stop_qty.get(ticker, 0.0) <= qty + 1e-6:
+            covered = stop_qty.get(ticker, 0.0)
+            if covered <= 0 or abs(covered - qty) <= 1e-6:
                 db.set_state(pending_key, "")
                 continue
             if not db.get_state(pending_key):
                 db.set_state(pending_key, datetime.now(timezone.utc).isoformat())
-                log.warning(f"[{ticker}] resting stops cover {stop_qty[ticker]:g} > held {qty:g}; "
+                log.warning(f"[{ticker}] resting stops cover {covered:g} vs held {qty:g}; "
                             f"confirming next cycle")
                 continue
             db.set_state(pending_key, "")

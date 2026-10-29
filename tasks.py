@@ -1542,7 +1542,10 @@ def _scan_summary(regime: dict, candidates: list[dict]) -> str:
     return (f"Scan summary: regime {name} score {regime.get('score')} -> threshold "
             f"{_regime_threshold(name)}; HIGH {counts.get('HIGH', 0)} MEDIUM {counts.get('MEDIUM', 0)} "
             f"LOW {counts.get('LOW', 0)} PASS {counts.get('PASS', 0)}; top scores {top}"
-            + (f"; regime inputs unavailable: {', '.join(missing)}" if missing else ""))
+            + (f"; regime inputs unavailable: {', '.join(missing)}" if missing else "")
+            # Which row and which bars (A0853-1, A1053-2).
+            + f"; regime source {regime.get('regime_source') or 'fresh'} @ {regime.get('timestamp')}"
+            + f", last bar {(regime.get('signals') or {}).get('last_bar_date')}")
 
 
 @app.task(name="tasks.review_positions", bind=True, max_retries=2)

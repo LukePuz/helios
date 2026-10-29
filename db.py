@@ -1094,7 +1094,8 @@ def get_latest_regime() -> dict | None:
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT regime, score, confidence, signals_json, portfolio_impact_json, reasoning, timestamp "
+                "SELECT regime, score, confidence, signals_json, portfolio_impact_json, reasoning, timestamp, "
+                "regime_type, sector_etf "
                 f"FROM market_regime_log {where}ORDER BY timestamp DESC LIMIT 1"
             )
             row = cur.fetchone()
@@ -1108,6 +1109,8 @@ def get_latest_regime() -> dict | None:
             "portfolio_impact_json": row[4],
             "reasoning": row[5],
             "timestamp": row[6],
+            # "overall" or e.g. "gics_sector:XLK" (log-only, A0853-1).
+            "regime_source": ":".join(filter(None, (row[7] or "overall", row[8]))),
         }
     except Exception as e:
         logging.error(f"get_latest_regime failed: {e}")

@@ -742,6 +742,9 @@ def assess_regime() -> dict:
         "missing_inputs": missing_inputs,
         "signals": {
             "missing_inputs": missing_inputs,
+            # Log-only: today's date here means an in-progress bar was scored
+            # (audit 10:53, A1053-2).
+            "last_bar_date": spy_bars[-1].get("date") if spy_bars else None,
             "trend":      {"score": trend_raw,      "notes": trend_notes},
             "trade_style": {"label": trade_style, "efficiency_ratio": efficiency_ratio,
                              "notes": trade_style_notes},
@@ -964,6 +967,7 @@ def assess_sector_regime(
         "trade_style": trade_style,
         "signals": {
             **{name: {"score": raw, "notes": notes} for name, (raw, notes) in scores_map.items()},
+            "last_bar_date": sector_bars[-1].get("date") if sector_bars else None,  # A1053-2
             "trade_style": {"label": trade_style, "efficiency_ratio": efficiency_ratio,
                              "notes": trade_style_notes},
         },
@@ -1111,6 +1115,8 @@ def get_cached_regime() -> dict:
                         "portfolio_impact": db_regime.get("portfolio_impact_json") or {},
                         "reasoning":  db_regime["reasoning"],
                         "timestamp":  str(ts),
+                        # Which row this is: a sector row here is A0853-1.
+                        "regime_source": db_regime.get("regime_source"),
                     }
                     _cache_ts = time.monotonic()
                     return _regime_cache

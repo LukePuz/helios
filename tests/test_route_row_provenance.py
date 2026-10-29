@@ -77,3 +77,29 @@ def test_regime_fallback_filter_follows_the_flag(monkeypatch):
         with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
             db.get_latest_regime()
         assert ("regime_type = 'overall'" in cur.execute.call_args[0][0]) is expect
+
+
+def test_scan_summary_names_the_regime_row_and_last_bar():
+    """A0853-1 / A1053-2: the scan line says which regime row it used and
+    which day's bar was last scored."""
+    import tasks
+    line = tasks._scan_summary({"regime": "Risk-Off", "score": 36.0,
+                                "regime_source": "gics_sector:XLK",
+                                "timestamp": "2026-10-29 13:31:18",
+                                "signals": {"last_bar_date": "2026-10-29"}}, [])
+    assert "regime source gics_sector:XLK @ 2026-10-29 13:31:18" in line
+    assert "last bar 2026-10-29" in line
+
+
+def test_latest_regime_reports_its_source():
+    from datetime import datetime
+    from unittest.mock import MagicMock, patch
+    import db
+    for typ, etf, want in (("gics_sector", "XLK", "gics_sector:XLK"), (None, None, "overall"),
+                           ("overall", None, "overall")):
+        cur = MagicMock()
+        cur.fetchone.return_value = ("Risk-Off", 36, 0.6, {}, {}, "r", datetime(2026, 10, 29), typ, etf)
+        conn = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = cur
+        with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
+            assert db.get_latest_regime()["regime_source"] == want

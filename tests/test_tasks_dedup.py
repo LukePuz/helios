@@ -406,7 +406,7 @@ class TestReconcileUnconfirmedOrders:
         mock_log_trade.assert_called_once()
         assert mock_log_trade.call_args.kwargs["quantity"] == 144.0
         assert mock_log_trade.call_args.kwargs["price"] == 181.3
-        mock_update_fill.assert_called_once_with(44, fill_price=181.3, filled_qty=144.0, status="filled")
+        mock_update_fill.assert_called_once_with(44, fill_price=181.3, filled_qty=144.0, status="filled", expect_filled_qty=0.0)
         mock_stop.assert_called_once_with("CRWD", 144.0, 153.61)
         mock_upsert_stop.assert_called_once()
         mock_set_stop_id.assert_called_once_with("CRWD", 900)
@@ -526,7 +526,7 @@ class TestReconcileUnconfirmedOrders:
              patch("db.upsert_position_stop"), patch("db.set_stop_broker_order_id"), \
              patch("db.update_approval_status"), patch("alerts._send"):
             tasks.reconcile_unconfirmed_orders.run()
-        update_fill.assert_called_once_with(44, fill_price=181.0, filled_qty=100.0, status="partial")
+        update_fill.assert_called_once_with(44, fill_price=181.0, filled_qty=100.0, status="partial", expect_filled_qty=0.0)
         assert log_trade.call_args.kwargs["quantity"] == 100.0
         place.assert_called_once_with("CRWD", 100.0, 153.61)
 
@@ -548,7 +548,7 @@ class TestReconcileUnconfirmedOrders:
         kw = log_trade.call_args.kwargs
         assert kw["quantity"] == 44.0
         assert abs(kw["price"] - (144 * 182.0 - 100 * 181.0) / 44) < 1e-9
-        update_fill.assert_called_once_with(44, fill_price=182.0, filled_qty=144.0, status="filled")
+        update_fill.assert_called_once_with(44, fill_price=182.0, filled_qty=144.0, status="filled", expect_filled_qty=100.0)
         place.assert_called_once_with("CRWD", 144.0, 153.61)  # whole position (A2253-3)
 
     def test_no_new_shares_on_partial_order_does_nothing(self):
@@ -990,3 +990,24 @@ def test_queued_reprotect_finding_flat_leaves_close_to_reconcile():
          patch("db.close_trade_outcome") as close:
         assert tasks._reprotect_after_late_sell("AMD", {}, 100.0, from_queue=True) is None
     delete.assert_not_called(); close.assert_not_called()
+
+
+def test_reconcile_skips_while_a_previous_run_holds_the_lock():
+    """A2253-5: two overlapping runs would book the same fill."""
+    from conftest import _FakeLock
+    _FakeLock.held.add("helios:task:reconcile_unconfirmed_orders")
+    with patch("db.get_unconfirmed_orders") as load:
+        tasks.reconcile_unconfirmed_orders.run()
+    load.assert_not_called()
+
+
+def test_conditional_fill_update_reports_a_lost_race():
+    from unittest.mock import MagicMock
+    import db
+    conn = MagicMock()
+    cur = conn.cursor.return_value.__enter__.return_value
+    cur.fetchone.return_value = (180.0, "BUY")
+    cur.rowcount = 0
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
+        assert db.update_order_fill(44, 181.0, 144.0, "filled", expect_filled_qty=0.0) is False
+    assert "AND status IN ('unconfirmed', 'partial')" in cur.execute.call_args[0][0]

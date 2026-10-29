@@ -1021,11 +1021,40 @@ def reconcile_unconfirmed_orders(self):
     import alerts
     from datetime import timedelta
 
+    # One run at a time: lock waits and broker calls can now make a run
+    # outlast the 300 s schedule, and two runs would book the same fill
+    # (audit 22:53, A2253-5). The key expires on its own if a run dies.
+    import stop_lock
+    try:
+        run_lock = stop_lock._redis().lock("helios:task:reconcile_unconfirmed_orders",
+                                           timeout=900, blocking_timeout=0)
+        if not run_lock.acquire():
+            log.info("reconcile_unconfirmed_orders: previous run still going, skipping")
+            return
+    except Exception as e:
+        log.warning(f"reconcile_unconfirmed_orders: run lock unavailable ({e}); continuing")
+        run_lock = None
+    try:
+        _reconcile_unconfirmed_orders_locked(self)
+    finally:
+        if run_lock is not None:
+            try:
+                run_lock.release()
+            except Exception:
+                pass
+
+
+def _reconcile_unconfirmed_orders_locked(task):
+    import db
+    import ibkr
+    import alerts
+    from datetime import timedelta
+
     try:
         pending = db.get_unconfirmed_orders(max_age_hours=24 * 30)
     except Exception as e:
         log.error(f"reconcile_unconfirmed_orders: could not load unconfirmed orders: {e}")
-        raise self.retry(exc=e, countdown=120)
+        raise task.retry(exc=e, countdown=120)
 
     _retry_pending_reprotects()
 
@@ -1066,7 +1095,8 @@ def reconcile_unconfirmed_orders(self):
         # cycle would log the same trade again and re-place a BUY stop
         # (professor M51). A failed log_trade after this is spilled.
         if db.update_order_fill(order["id"], fill_price=total_avg, filled_qty=total_qty,
-                                status="filled" if complete else "partial") is False:
+                                status="filled" if complete else "partial",
+                                expect_filled_qty=prev_qty) is False:
             log.error(f"[{ticker}] reconcile: could not mark order {order['id']} filled; "
                       f"trade not logged this cycle")
             continue

@@ -2647,9 +2647,13 @@ def compute_slippage_pct(decision_price: float | None, fill_price: float | None,
     return raw if side == "BUY" else -raw
 
 
-def update_order_fill(order_id: int, fill_price: float, filled_qty: float, status: str) -> bool:
+def update_order_fill(order_id: int, fill_price: float, filled_qty: float, status: str,
+                      expect_filled_qty: float | None = None) -> bool:
     """Records the fill and computes slippage_pct vs decision_price if one was logged.
-    Returns False if the write failed (reconcile relies on it, professor M51)."""
+    Returns False if the write failed (reconcile relies on it, professor M51).
+    With expect_filled_qty, the update applies only while the row is still
+    unconfirmed/partial with that filled_qty, and returns False if another
+    run got there first (audit 22:53, A2253-5)."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
@@ -2660,13 +2664,17 @@ def update_order_fill(order_id: int, fill_price: float, filled_qty: float, statu
                 decision_price = float(row[0]) if row[0] else None
                 slippage_pct = compute_slippage_pct(decision_price, fill_price, row[1])
 
-            cur.execute(
-                "UPDATE orders SET fill_price=%s, filled_qty=%s, status=%s, "
-                "slippage_pct=%s, updated_at=NOW() WHERE id=%s",
-                (fill_price, filled_qty, status, slippage_pct, order_id),
-            )
+            sql = ("UPDATE orders SET fill_price=%s, filled_qty=%s, status=%s, "
+                   "slippage_pct=%s, updated_at=NOW() WHERE id=%s")
+            params = [fill_price, filled_qty, status, slippage_pct, order_id]
+            if expect_filled_qty is not None:
+                sql += (" AND status IN ('unconfirmed', 'partial') "
+                        "AND ABS(COALESCE(filled_qty, 0) - %s) < 0.0001")
+                params.append(expect_filled_qty)
+            cur.execute(sql, params)
+            updated = cur.rowcount
         conn.commit()
-        return True
+        return expect_filled_qty is None or updated > 0
     except Exception as e:
         conn.rollback()
         logging.error(f"update_order_fill failed: {e}")

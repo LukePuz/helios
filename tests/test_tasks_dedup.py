@@ -1237,3 +1237,47 @@ def test_edgar_dispatches_each_filing_as_found_and_skips_overlap():
         order.clear()
         tasks.poll_edgar.run()
         assert order == []
+
+
+def test_covered_position_is_not_cancelled_by_the_queue():
+    """M79: a stop already covering the shares (e.g. placed by hand) is left
+    alone; the entry completes."""
+    import tasks
+    with patch("execution._stops_still_resting", return_value=5.0), \
+         patch("tasks.manage_cancel_stop_orders_for") as cancel:
+        with patch("db.get_state", return_value=None), patch("db.set_state"), \
+             patch("db.get_position_stop", return_value={"stop_price": 90.0}), \
+             patch("ibkr.get_client") as client, \
+             patch("tasks.manage_stop_place") as place:
+            client.return_value.get_all_positions.return_value = [_Pos("AMD", 5.0)]
+            assert tasks._reprotect_after_late_sell("AMD", {"intent": "RESTORE"}, None,
+                                                    from_queue=True) is True
+    cancel.assert_not_called(); place.assert_not_called()
+
+
+def test_queue_gives_up_after_the_try_cap():
+    """M79: retries are capped; the last failure alerts and drops the entry."""
+    import json
+    import tasks
+    state = {"reprotect_pending": json.dumps(
+        {"AMD": {"intent": "RESTORE", "tries": tasks._REPROTECT_MAX_TRIES - 1, "nonce": "n"}})}
+    with patch("db.get_state", side_effect=lambda k: state.get(k)), \
+         patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+         patch("tasks._reprotect_after_late_sell", return_value=False), \
+         patch("alerts._send") as send:
+        tasks._retry_pending_reprotects()
+    assert json.loads(state["reprotect_pending"]) == {}
+    assert "STOP NOT RESTORED" in send.call_args[0][0]
+
+
+def test_restore_does_not_overwrite_a_queued_profit_target():
+    """M80: the profit target's raised stop survives a later RESTORE request."""
+    import json
+    import tasks
+    state = {}
+    with patch("db.get_state", side_effect=lambda k: state.get(k)), \
+         patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)):
+        tasks._queue_reprotect("AMD", {"intent": "PROFIT_TARGET", "stop_price": 101.0}, 120.0)
+        tasks._queue_reprotect("AMD", {"intent": "RESTORE"}, None)
+    rec = json.loads(state["reprotect_pending"])["AMD"]
+    assert rec["intent"] == "PROFIT_TARGET" and rec["stop_price"] == 101.0

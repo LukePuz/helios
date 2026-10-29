@@ -1263,9 +1263,20 @@ def _queue_reprotect(ticker: str, order: dict, fill_price: float | None) -> None
              "fill_price": fill_price, "nonce": uuid.uuid4().hex}
 
     def add(pending):
-        pending[ticker] = entry
+        old = pending.get(ticker) or {}
+        if old.get("intent") == "PROFIT_TARGET" and entry["intent"] != "PROFIT_TARGET":
+            # Keep the target sale's breakeven-or-higher stop and its
+            # target-taken step; a later RESTORE/BUY must not replace them
+            # with the lower stop on record (professor M80).
+            pending[ticker] = {**{k: v for k, v in old.items() if k != "tries"},
+                               "nonce": entry["nonce"]}
+        else:
+            pending[ticker] = entry
         return pending
     _reprotect_queue_edit(add)
+
+
+_REPROTECT_MAX_TRIES = 4  # reconcile_stop_orders cycles, 15 min apart (~1 h)
 
 
 def _retry_pending_reprotects() -> None:
@@ -1287,7 +1298,19 @@ def _retry_pending_reprotects() -> None:
         tries = int(rec.get("tries", 0)) + 1
         # A BUY that still reads flat is retried for ~30 min (6 cycles)
         # before giving up to the no-stop alert (professor M60).
-        if result is False or (result is None and rec.get("intent") == "BUY" and tries < 6):
+        if result is False and tries >= _REPROTECT_MAX_TRIES:
+            # ~1 h of failures: stop retrying (each try cancels and re-places)
+            # and hand it to Luke (professor M79).
+            log.error(f"[{ticker}] reconcile: queued re-protect failed {tries} times; giving up")
+            try:
+                import alerts
+                alerts._send(f"🚨 STOP NOT RESTORED — <b>{ticker}</b>\nThe automatic stop retry "
+                             f"failed {tries} times (~1 h) and has stopped. Check the position and "
+                             f"place a stop in TWS; the stop check keeps flagging it until covered.")
+            except Exception:
+                pass
+            outcome[ticker] = (rec, None)
+        elif result is False or (result is None and rec.get("intent") == "BUY" and tries < 6):
             outcome[ticker] = (rec, {**rec, "tries": tries})
         else:
             log.info(f"[{ticker}] reconcile: queued re-protect done ({result})")
@@ -1388,6 +1411,17 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
     if not stop_price:
         log.error(f"[{ticker}] reconcile: {remaining} shares left after a late sell, no stop on record")
         return False
+    if order.get("intent") != "PROFIT_TARGET":
+        # Already covered (e.g. a stop Luke placed after a "place manually"
+        # alert, or an earlier try that did land): cancelling it to re-place
+        # ours would leave a gap each cycle (professor M79). A profit-target
+        # entry still re-places, since it raises the stop.
+        import execution
+        covered = execution._stops_still_resting(ticker)
+        if covered is not None and covered >= remaining:
+            log.info(f"[{ticker}] reconcile: {remaining} shares already covered by resting stops "
+                     f"({covered:g}); nothing cancelled")
+            return True
     try:
         manage_cancel_stop_orders_for(ticker)
         result = manage_stop_place(ticker, remaining, float(stop_price))

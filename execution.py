@@ -116,6 +116,24 @@ def _stops_still_resting(ticker: str) -> float | None:
         return None
 
 
+def _alert_stop_unknown(ticker: str, qty: float, stop_price: float) -> None:
+    """A stop placement got no reply: it may or may not be resting. Say so
+    instead of retrying (professor C24); reconcile_stop_orders confirms over
+    two cycles and fixes the coverage either way."""
+    import alerts as alert_module
+    log.error(f"[{ticker}] Stop placement result unknown ({qty:g} @ ${stop_price:.2f}); "
+              f"not retrying, reconcile will fix coverage")
+    try:
+        alert_module._send(
+            f"⚠️ STOP STATUS UNKNOWN — {ticker}\n"
+            f"A stop for {qty:g} shares @ ${stop_price:.2f} got no reply from the broker. "
+            f"Not retried (it may be resting); the stop check fixes coverage within ~30 min. "
+            f"Check TWS if this repeats."
+        )
+    except Exception:
+        pass
+
+
 # Order states after which nothing can fill (ib_async OrderStatus).
 _DEAD_ORDER_STATUSES = ("Cancelled", "ApiCancelled", "Inactive")
 
@@ -830,6 +848,13 @@ def execute_approved(
                     break
                 except Exception as e:
                     log.warning(f"[{ticker}] Stop order attempt {stop_attempt}/3 failed: {e}")
+                    if isinstance(e, tasks.OrdersCallUnknown):
+                        # The stop may be resting already; a retry could stack
+                        # a second one. Reconcile fixes coverage either way
+                        # within two cycles (professor C24).
+                        _alert_stop_unknown(ticker, stop_qty, float(stop_price))
+                        stop_placed = True  # not "failed": unknown, alerted above
+                        break
                     if stop_attempt < 3:
                         import time as _time
                         _time.sleep(2 * stop_attempt)
@@ -1062,6 +1087,10 @@ def execute_manual(
                     break
                 except Exception as e:
                     log.warning(f"[{ticker}] Stop attempt {attempt}/3: {e}")
+                    if isinstance(e, tasks.OrdersCallUnknown):
+                        _alert_stop_unknown(ticker, filled_qty, float(stop_price))  # C24
+                        stop_placed = True
+                        break
                     if attempt < 3:
                         import time as _time
                         _time.sleep(2 * attempt)

@@ -202,3 +202,15 @@ def test_slow_cancel_gets_a_second_look():
          patch("db.set_stop_broker_order_id"):
         tasks._fix_overstop("AMD")
     place.assert_called_once_with("AMD", 10.0, 150.0)
+
+
+def test_short_position_gets_no_sell_stop():
+    """Professor M63: a SELL stop on a short adds to it."""
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="AMD", qty=-10)]
+    with patch("ibkr.get_client", return_value=client), \
+         patch("ibkr.get_open_orders", return_value=[]), \
+         patch("tasks.manage_stop_place") as place:
+        msg = tasks._fix_overstop("AMD")
+    place.assert_not_called()
+    assert "SHORT" in msg

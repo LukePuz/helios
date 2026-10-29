@@ -78,3 +78,12 @@ def test_adoption_stops_only_the_uncovered_shares():
     place.assert_called_once_with("AMD", 6.0, 90.0)
     msg, place, upsert = _adopt(resting=[{"qty": 10.0}])
     place.assert_not_called(); upsert.assert_called_once()
+
+
+def test_short_is_not_adopted():
+    from unittest.mock import MagicMock
+    place = MagicMock()
+    with patch("db.get_position_stop", return_value=None), patch("db.upsert_position_stop") as up:
+        msg = main._adopt_position(MagicMock(), MagicMock(), "AMD", -5.0, place, lambda t: [])
+    place.assert_not_called(); up.assert_not_called()
+    assert "SHORT" in msg

@@ -1359,6 +1359,12 @@ class RiskManager:
                                     # stack two (professor C19).
                                     log.error(f"[{ticker}] Stop cancel failed before the TRAIL "
                                               f"conversion; existing stop left in place")
+                                elif isinstance(e, tasks.OrdersCallUnknown):
+                                    # The TRAIL may be resting; a fixed stop on
+                                    # top would stack. Reconcile fixes coverage
+                                    # (professor C24).
+                                    log.error(f"[{ticker}] TRAIL placement result unknown; no "
+                                              f"fallback stop placed, reconcile will fix coverage")
                                 elif not (current > prev_high and new_stop > stop_px):
                                     # The stops were already cancelled above: put the
                                     # fixed stop back rather than leave it unprotected
@@ -1511,6 +1517,13 @@ class RiskManager:
         except Exception as e:
             log.error(f"[{ticker}] Breakeven stop placement failed: {e}")
             restored = False
+            if isinstance(e, tasks.OrdersCallUnknown):
+                # The new stop may be resting; restoring the old one would
+                # stack two. Reconcile fixes coverage (professor C24).
+                alerts._send(f"⚠️ STOP STATUS UNKNOWN — {ticker}\nThe breakeven stop got no "
+                             f"reply; not restoring the old one. The stop check fixes coverage "
+                             f"within ~30 min.")
+                return False
             if old_stop:
                 try:
                     result = tasks.manage_stop_place(ticker, round(qty, 4), float(old_stop))

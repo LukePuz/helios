@@ -116,6 +116,9 @@ def _adopt_position(client, rm, symbol, qty, manage_stop_place, resting_sell_sto
     import db
     if db.get_position_stop(symbol):
         return None
+    if qty < 0:
+        # A SELL stop would add to a short (professor M63).
+        return f"{symbol} ({qty:g} shares SHORT, not adopted, no stop placed — check TWS)"
     resting = sum(float(o["qty"]) for o in resting_sell_stops(symbol))
     need = round(abs(qty) - resting, 4)
     pos = client.get_open_position(symbol)

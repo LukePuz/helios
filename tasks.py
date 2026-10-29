@@ -172,15 +172,19 @@ def _past(deadline) -> bool:
 _STARTED_KEY = "helios:orders:started:{}"
 
 
-def _mark_started(task) -> None:
+def _mark_started(task) -> bool:
     """Record that the orders worker picked this request up. Written before
     the deadline check, so a missing marker after the deadline means the
-    worker never touched it and will refuse it when it does (A0253-9)."""
+    worker never touched it and will refuse it when it does (A0253-9).
+    Returns False if it can't be written; the task then refuses, since a
+    lost reply would otherwise read as "never started" (professor M68)."""
     try:
         import stop_lock
         stop_lock._redis().set(_STARTED_KEY.format(task.request.id), "1", ex=900)
+        return True
     except Exception as e:
-        log.warning(f"{task.name}: could not write started marker: {e}")
+        log.error(f"{task.name}: could not write started marker, refusing: {e}")
+        return False
 
 
 def _was_started(task_id: str) -> bool | None:
@@ -195,8 +199,7 @@ def _was_started(task_id: str) -> bool | None:
 @app.task(name="tasks._broker_place_stop_order", bind=True, max_retries=1)
 def _broker_place_stop_order(self, ticker: str, qty: float, stop_price: float,
                              deadline: float | None = None) -> dict:
-    _mark_started(self)
-    if _past(deadline):
+    if not _mark_started(self) or _past(deadline):
         return _EXPIRED
     import ibkr
     return ibkr.place_stop_order(ticker, qty, stop_price)
@@ -204,8 +207,7 @@ def _broker_place_stop_order(self, ticker: str, qty: float, stop_price: float,
 
 @app.task(name="tasks._broker_cancel_stop_orders_for", bind=True, max_retries=1)
 def _broker_cancel_stop_orders_for(self, ticker: str, deadline: float | None = None):
-    _mark_started(self)
-    if _past(deadline):
+    if not _mark_started(self) or _past(deadline):
         return _EXPIRED
     import ibkr
     return ibkr.cancel_stop_orders_for(ticker)
@@ -213,8 +215,7 @@ def _broker_cancel_stop_orders_for(self, ticker: str, deadline: float | None = N
 
 @app.task(name="tasks._broker_cancel_order", bind=True, max_retries=1)
 def _broker_cancel_order(self, order_id: int, deadline: float | None = None):
-    _mark_started(self)
-    if _past(deadline):
+    if not _mark_started(self) or _past(deadline):
         return _EXPIRED
     import ibkr
     return ibkr.cancel_order(order_id)
@@ -225,8 +226,7 @@ def _broker_place_trailing_stop_order(self, ticker: str, qty: float,
                                        trail_amount: float | None = None,
                                        trail_percent: float | None = None,
                                        deadline: float | None = None) -> dict:
-    _mark_started(self)
-    if _past(deadline):
+    if not _mark_started(self) or _past(deadline):
         return _EXPIRED
     import ibkr
     return ibkr.place_trailing_stop_order(ticker, qty, trail_amount=trail_amount,
@@ -263,7 +263,7 @@ def _orders_call(task, args, kwargs=None, timeout: int = 30):
         except CeleryTimeout as e:
             # Never picked up (the worker was busy) is not "maybe sent": it
             # will be refused when the worker reaches it (A0253-9).
-            if _was_started(res.id) is False:
+            if _was_started(res.id) is False and getattr(res, "state", None) == "PENDING":
                 raise OrdersCallExpired(f"{task.name} never started (orders worker busy); "
                                         f"nothing sent") from e
             raise OrdersCallUnknown(f"{task.name}: no result after "
@@ -2554,10 +2554,14 @@ def _fix_overstop(ticker: str) -> str:
     import ibkr
     try:
         pos = next((p for p in ibkr.get_client().get_all_positions() if p.symbol == ticker), None)
-        held = round(abs(float(pos.qty)), 4) if pos else 0.0
+        signed = float(pos.qty) if pos else 0.0
+        held = round(abs(signed), 4)
         resting = sum(float(o["qty"]) for o in _resting_sell_stops(ticker))
     except Exception as e:
         return f"⚠️ {ticker}: stop-coverage re-check failed ({e}); check TWS"
+    if signed < 0:
+        # A SELL stop on a short adds to it (professor M63).
+        return f"🚨 {ticker}: broker shows a SHORT of {signed:g}; no stop placed — check TWS now"
     if abs(resting - held) <= 1e-6:
         return f"{ticker}: stop coverage fine on re-check ({resting:g} vs {held:g})"
     stop_price = (db.get_position_stop(ticker) or {}).get("stop_price")

@@ -185,11 +185,31 @@ class TestOrdersCallResult:
         """A0253-9: a request stuck behind a busy worker was never sent."""
         from celery.exceptions import TimeoutError as CeleryTimeout
         monkeypatch.setenv("IB_CLIENT_ID", "20")
-        fake = MagicMock(id="t2")
+        fake = MagicMock(id="t2", state="PENDING")
         fake.get.side_effect = CeleryTimeout()
         with patch.object(tasks._broker_place_stop_order, "apply_async", return_value=fake):
             with pytest.raises(tasks.OrdersCallExpired):
                 tasks.manage_stop_place("NVDA", 10, 180.0)
+
+    def test_never_marked_but_celery_says_started_is_unknown(self, monkeypatch):
+        """M68: the Celery STARTED state backs up a missing marker."""
+        from celery.exceptions import TimeoutError as CeleryTimeout
+        monkeypatch.setenv("IB_CLIENT_ID", "20")
+        fake = MagicMock(id="t4", state="STARTED")
+        fake.get.side_effect = CeleryTimeout()
+        with patch.object(tasks._broker_place_stop_order, "apply_async", return_value=fake):
+            with pytest.raises(tasks.OrdersCallUnknown):
+                tasks.manage_stop_place("NVDA", 10, 180.0)
+
+    def test_broker_task_refuses_when_marker_cannot_be_written(self):
+        """M68: fail closed rather than act with no record of starting."""
+        import stop_lock
+        with patch.object(stop_lock, "_redis", side_effect=ConnectionError("down")), \
+             patch("ibkr.place_stop_order") as place:
+            r = tasks._broker_place_stop_order.apply(args=["NVDA", 10, 180.0],
+                                                     kwargs={"deadline": 9e12}).get()
+        assert r == tasks._EXPIRED
+        place.assert_not_called()
 
     def test_broker_task_marks_itself_started_even_when_refusing(self):
         from conftest import _FakeRedis

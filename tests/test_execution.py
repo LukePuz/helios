@@ -802,3 +802,27 @@ def test_skipped_exit_restores_stops_the_cancel_already_took():
         assert execution.execute_approved(approval) is False
     order.assert_not_called()
     place.assert_called_once_with(approval["ticker"], 40.0, 90.0)
+
+
+def test_unknown_stop_result_is_not_retried():
+    """Professor C24: a lost reply may mean the stop is resting; a retry
+    would stack a second one."""
+    import db
+    import inspect
+    import tasks
+    approval = _approval(action="OPEN", shares_initial=10)
+    db_fns = {n: MagicMock(return_value=None) for n, f in vars(db).items()
+              if inspect.isfunction(f) and not n.startswith("_") and f.__module__ == "db"}
+    with patch.multiple("db", **db_fns), \
+         patch("ibkr.get_ib"), patch("ibkr.get_client") as client, \
+         patch("ibkr.place_market_order", return_value={"filled_qty": 10, "fill_price": 100.0,
+                                                        "order_id": 1, "status": "Filled"}), \
+         patch("ibkr.get_latest_price", return_value=100.0), \
+         patch("market_data.get_priced_quote", return_value=None), \
+         patch("tasks.manage_stop_place", side_effect=tasks.OrdersCallUnknown("x")) as place, \
+         patch("alerts._send") as send:
+        client.return_value.get_open_position.side_effect = Exception("No open position")
+        client.return_value.get_all_positions.return_value = []
+        execution.execute_approved(approval)
+    assert place.call_count == 1
+    assert any("STOP STATUS UNKNOWN" in c[0][0] for c in send.call_args_list)

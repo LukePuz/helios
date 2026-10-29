@@ -251,6 +251,32 @@ def _knowledge_coverage(ticker: str, thesis_text: str, philosophy_text: str) -> 
             "philosophy": one(philosophy_text, _PHILOSOPHY_CAP)}
 
 
+def _decision_inputs_record(ticker: str, regime_packet: dict | None) -> dict:
+    """Log-only, after the model call: which regime row this verdict used
+    (professor C25; a sector row here is A0853-1) and the nightly reverse-DCF
+    numbers it was not shown, to compare with its own current_price_implies
+    text (audit 12:53, A1253-2)."""
+    out = {}
+    rp = regime_packet or {}
+    out["regime_used"] = {
+        "label": rp.get("regime"), "score": rp.get("score"),
+        "source": rp.get("regime_source") or ("fresh" if rp.get("agent") else None),
+        "timestamp": str(rp.get("timestamp")) if rp.get("timestamp") else None,
+        "last_bar_date": (rp.get("signals") or {}).get("last_bar_date"),
+    }
+    try:
+        import db
+        ladder = db.get_trade_ladder(ticker) or {}
+        out["implied_growth"] = {
+            k: ladder.get(k) for k in ("implied_growth_rate", "growth_gap_vs_actual",
+                                       "growth_assumption_flag")}
+        if ladder.get("computed_at"):
+            out["implied_growth"]["as_of"] = str(ladder["computed_at"])
+    except Exception as e:
+        log.debug(f"[{ticker}] implied growth record failed: {e}")
+    return out
+
+
 def _build_prompt(
     candidate: dict,
     situation_brief: str,
@@ -1228,6 +1254,7 @@ def analyze(
         provenance["knowledge_coverage"] = _knowledge_coverage(ticker, thesis_text, philosophy_text)
     except Exception as e:
         log.debug(f"[{ticker}] knowledge coverage record failed: {e}")
+    provenance.update(_decision_inputs_record(ticker, regime_packet))
     try:
         import db
         db.log_signal(

@@ -137,3 +137,21 @@ def test_fundamentals_history_keeps_revision_fields_and_falls_back():
     with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
         db.log_fundamentals_history("MSFT", metrics)
     assert "target_mean_price" not in cur.execute.call_args[0][0]
+
+
+def test_decision_inputs_record_regime_row_and_implied_growth():
+    """C25 / A1253-2: provenance names the regime row used and the reverse-DCF
+    numbers, after the call."""
+    from unittest.mock import patch
+    from agents import analyst
+    rp = {"regime": "Risk-Off", "score": 36.0, "regime_source": "gics_sector:XLK",
+          "timestamp": "2026-10-29 13:31:18", "signals": {"last_bar_date": "2026-10-29"}}
+    with patch("db.get_trade_ladder", return_value={"implied_growth_rate": 0.18,
+                                                    "growth_gap_vs_actual": 0.04,
+                                                    "growth_assumption_flag": "STRETCHED",
+                                                    "computed_at": "2026-10-28 22:00"}):
+        rec = analyst._decision_inputs_record("MSFT", rp)
+    assert rec["regime_used"] == {"label": "Risk-Off", "score": 36.0, "source": "gics_sector:XLK",
+                                  "timestamp": "2026-10-29 13:31:18", "last_bar_date": "2026-10-29"}
+    assert rec["implied_growth"]["implied_growth_rate"] == 0.18
+    assert rec["implied_growth"]["as_of"] == "2026-10-28 22:00"

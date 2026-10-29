@@ -363,3 +363,16 @@ class TestGetOpenOrdersSnapshot:
             orders = ibkr.get_open_orders()
         assert [o["order_id"] for o in orders] == [1]
         fake_ib.openTrades.assert_not_called()
+
+
+def test_trail_stop_price_is_the_trigger_not_the_distance():
+    """A0053-4/A0653-4: auxPrice on a trail_amount TRAIL is dollars of trail."""
+    trail = _FakeStopTrade("PLTR", 7)
+    trail.order.orderType = "TRAIL"
+    trail.order.auxPrice = 12.0
+    trail.order.trailStopPrice = 185.5
+    fake_ib = MagicMock()
+    fake_ib.reqAllOpenOrders.return_value = [trail]
+    with patch.object(ibkr, "get_ib", return_value=fake_ib):
+        [o] = ibkr.get_open_orders()
+    assert o["stop_price"] == 185.5

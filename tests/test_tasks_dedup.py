@@ -1034,6 +1034,23 @@ def test_pending_reprotects_retry_until_done():
     assert set(json.loads(state["reprotect_pending"])) == {"NVDA"}
 
 
+def test_entry_queued_during_a_retry_pass_survives():
+    """A0653-2: the LLM worker queues a stop while reconcile retries others;
+    the write-back must not drop it."""
+    import json
+    state = {"reprotect_pending": json.dumps({"AMD": {"intent": "TRIM", "stop_price": None,
+                                                     "fill_price": 100.0}})}
+
+    def retry(t, *a, **k):
+        tasks._queue_reprotect("NVDA", {"intent": "BUY"}, None)  # concurrent writer
+        return True
+    with patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
+         patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+         patch("tasks._reprotect_after_late_sell", side_effect=retry):
+        tasks._retry_pending_reprotects()
+    assert set(json.loads(state["reprotect_pending"])) == {"NVDA"}
+
+
 def test_queued_reprotect_finding_flat_leaves_close_to_reconcile():
     """A2253-2: a queued retry must not close the outcome at its old price."""
     from unittest.mock import MagicMock

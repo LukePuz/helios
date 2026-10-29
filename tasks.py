@@ -1208,18 +1208,52 @@ def _reconcile_unconfirmed_orders_locked(task):
 _REPROTECT_STATE_KEY = "reprotect_pending"
 
 
-def _queue_reprotect(ticker: str, order: dict, fill_price: float | None) -> None:
+def _reprotect_queue_edit(fn) -> None:
+    """Apply fn(pending) -> pending to the queue under a short Redis lock.
+    Writers now include the LLM worker and the Telegram bot as well as the
+    reconcile run, so an unlocked read-modify-write could drop an entry
+    added in between (audit 06:53, A0653-2). Without Redis the edit still
+    runs: losing the queue entry is worse than a rare race."""
     import db
-    pending = json.loads(db.get_state(_REPROTECT_STATE_KEY) or "{}")
-    pending[ticker] = {"intent": order.get("intent"), "stop_price": order.get("stop_price"),
-                       "fill_price": fill_price}
-    db.set_state(_REPROTECT_STATE_KEY, json.dumps(pending))
+    lock = None
+    try:
+        lock = stop_lock._redis().lock("helios:reprotect_queue", timeout=30, blocking_timeout=10)
+        if not lock.acquire():
+            lock = None
+            log.warning("reprotect queue lock busy; editing without it")
+    except Exception as e:
+        lock = None
+        log.warning(f"reprotect queue lock unavailable ({e}); editing without it")
+    try:
+        try:
+            pending = json.loads(db.get_state(_REPROTECT_STATE_KEY) or "{}")
+        except Exception:
+            pending = {}
+        db.set_state(_REPROTECT_STATE_KEY, json.dumps(fn(pending)))
+    finally:
+        if lock is not None:
+            try:
+                lock.release()
+            except Exception:
+                pass
+
+
+def _queue_reprotect(ticker: str, order: dict, fill_price: float | None) -> None:
+    entry = {"intent": order.get("intent"), "stop_price": order.get("stop_price"),
+             "fill_price": fill_price}
+
+    def add(pending):
+        pending[ticker] = entry
+        return pending
+    _reprotect_queue_edit(add)
 
 
 def _retry_pending_reprotects() -> None:
     """Re-protect after late SELL fills whose first attempt failed or found
     the ticker busy (professor M50). Runs every reconcile cycle until each
-    one places a stop or finds nothing held."""
+    one places a stop or finds nothing held. Works from a snapshot, then
+    updates only the tickers it processed, and only if their entry wasn't
+    replaced meanwhile (A0653-2)."""
     import db
     try:
         pending = json.loads(db.get_state(_REPROTECT_STATE_KEY) or "{}")
@@ -1227,17 +1261,28 @@ def _retry_pending_reprotects() -> None:
         pending = {}
     if not pending:
         return
-    left = {}
+    outcome = {}  # ticker -> (entry seen, entry to keep or None)
     for ticker, rec in pending.items():
         result = _reprotect_after_late_sell(ticker, rec, rec.get("fill_price"), from_queue=True)
         tries = int(rec.get("tries", 0)) + 1
         # A BUY that still reads flat is retried for ~30 min (6 cycles)
         # before giving up to the no-stop alert (professor M60).
         if result is False or (result is None and rec.get("intent") == "BUY" and tries < 6):
-            left[ticker] = {**rec, "tries": tries}
+            outcome[ticker] = (rec, {**rec, "tries": tries})
         else:
             log.info(f"[{ticker}] reconcile: queued re-protect done ({result})")
-    db.set_state(_REPROTECT_STATE_KEY, json.dumps(left))
+            outcome[ticker] = (rec, None)
+
+    def apply(current):
+        for ticker, (seen, keep) in outcome.items():
+            if current.get(ticker) != seen:
+                continue  # re-queued while we worked: the newer entry stays
+            if keep is None:
+                current.pop(ticker, None)
+            else:
+                current[ticker] = keep
+        return current
+    _reprotect_queue_edit(apply)
 
 
 def _held_before_fill(ticker: str, fill_qty: float, action: str | None = None) -> bool:

@@ -587,7 +587,11 @@ def get_open_orders() -> list[dict]:
             "action":     o.action,
             "order_type": o.orderType,
             "qty":        float(o.totalQuantity),
-            "stop_price": float(getattr(o, "auxPrice", 0) or 0) or None,
+            # For a TRAIL, auxPrice is the trailing distance, not a price; its
+            # current trigger is trailStopPrice (audit 06:53, A0653-4).
+            "stop_price": (float(getattr(o, "trailStopPrice", 0) or 0) or None
+                           if o.orderType == "TRAIL"
+                           else float(getattr(o, "auxPrice", 0) or 0) or None),
             "status":     trade.orderStatus.status,
             # Unfilled part; totalQuantity alone overstates a part-filled
             # stop's coverage (professor M64).

@@ -690,11 +690,15 @@ def execute_approved(
                 order_type="BRACKET" if bracket_used else "MARKET",
                 qty=shares, broker_order_id=order_result.get("order_id"),
                 decision_price=price_at_sizing, approval_id=approval["id"],
-                status="submitted",
+                status="submitted", intent=action,
             )
             if local_order_id > 0 and order_result.get("fill_price"):
+                # Part filled within the wait: the rest may still be working,
+                # so leave it 'partial' for reconcile_unconfirmed_orders to
+                # pick up the remainder (professor M53).
+                partial = not bracket_used and filled_qty < float(shares) - 1e-6
                 db.update_order_fill(local_order_id, order_result["fill_price"],
-                                     filled_qty, "filled")
+                                     filled_qty, "partial" if partial else "filled")
         except Exception as e:
             log.debug(f"[{ticker}] Order/slippage logging failed (non-critical): {e}")
 

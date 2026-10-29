@@ -94,3 +94,23 @@ def test_unconfirmed_partial_sale_is_logged_for_reconcile():
     kw = log_order.call_args.kwargs
     assert kw["status"] == "unconfirmed" and kw["broker_order_id"] == 7 and kw["side"] == "SELL"
     assert kw["intent"] == "PROFIT_TARGET" and kw["stop_price"] is not None
+
+
+def test_short_fill_is_left_partial_for_reconcile():
+    """Professor M53: 20 of 30 filled in the wait used to be stored as filled,
+    so the working remainder was never reconciled."""
+    client = MagicMock()
+    client.get_open_position.return_value = MagicMock(qty=80)
+    with patch("db.get_position_stop", return_value={"stop_price": 90.0}), \
+         patch("db.set_stop_broker_order_id"), \
+         patch("tasks.manage_cancel_stop_orders_for"), \
+         patch("ibkr.place_market_order",
+               return_value={"filled_qty": 20, "order_id": 7, "fill_price": 125.5}), \
+         patch("ibkr.get_client", return_value=client), \
+         patch("tasks.manage_stop_place", return_value={"order_id": 8}), \
+         patch("alerts._send"), patch("db.log_trade"), \
+         patch("db.log_order", return_value=11) as log_order, \
+         patch("db.update_order_fill") as fill:
+        _rm()._partial_sell_and_resize_stop("NVDA", 100, 30, 100.0, decision_price=126.0)
+    fill.assert_called_once_with(11, 125.5, 20.0, "partial")
+    assert log_order.call_args.kwargs["intent"] == "PROFIT_TARGET"

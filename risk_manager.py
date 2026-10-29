@@ -1628,9 +1628,12 @@ class RiskManager:
                          reason="Profit target partial sell")
             local_id = db.log_order(ticker=ticker, side="SELL", order_type="MARKET",
                                     qty=sell_qty, broker_order_id=order_result.get("order_id"),
-                                    decision_price=decision_price, status="submitted")
+                                    decision_price=decision_price, status="submitted",
+                                    intent="PROFIT_TARGET", stop_price=new_stop)
             if local_id and local_id > 0 and order_result.get("fill_price"):
-                db.update_order_fill(local_id, order_result["fill_price"], filled, "filled")
+                # A remainder may still fill: reconcile picks up 'partial' (M53).
+                db.update_order_fill(local_id, order_result["fill_price"], filled,
+                                     "filled" if filled >= float(sell_qty) - 1e-6 else "partial")
         except Exception as e:
             log.warning(f"[{ticker}] Profit-target sale logging failed: {e}")
 

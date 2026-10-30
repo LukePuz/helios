@@ -1080,3 +1080,19 @@ def test_manual_trade_records_quote_as_price_source():
         rm_cls.return_value.calculate_stop.return_value = (92.0, "ATR")
         execution.execute_manual("ZZZ", "BUY", 2, "test")
     assert log_trade.call_args.kwargs["price_source"] == "quote"
+
+
+def test_null_trade_price_reads_back_and_prints():
+    """Professor M116: a NULL price (73d8150) broke float() in
+    get_recent_trades, which blanked every trade on the dashboard and in chat."""
+    import db
+    import chat_assistant
+    cur = MagicMock()
+    cur.fetchall.return_value = [("ZZZ", "BUY", 2, None, "2026-10-30", "test")]
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
+        rows = db.get_recent_trades(5)
+    assert rows[0]["price"] is None
+    with patch("db.get_recent_trades", return_value=rows):
+        assert "price unknown" in chat_assistant._tool_get_trade_history({})

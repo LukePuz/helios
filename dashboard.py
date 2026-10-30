@@ -532,7 +532,8 @@ with tab_portfolio:
             else:
                 df_t = pd.DataFrame(trades)
                 df_t["timestamp"] = pd.to_datetime(df_t["timestamp"], utc=True).dt.strftime("%m/%d %H:%M")
-                df_t["price"] = df_t["price"].apply(lambda x: f"${x:.2f}")
+                df_t["price"] = df_t["price"].apply(
+                    lambda x: "unknown" if x is None or x != x else f"${x:.2f}")   # NULL price: M116
                 st.dataframe(df_t, use_container_width=True, hide_index=True)
         except Exception as e:
             st.warning(f"Could not load trades: {e}")

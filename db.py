@@ -972,8 +972,9 @@ def get_recent_trades(limit: int = 50) -> list[dict]:
                 (TRADING_ENV, limit),
             )
             return [
+                # price is NULL when no price was known (price_source 'none').
                 {"symbol": r[0], "side": r[1], "quantity": r[2],
-                 "price": float(r[3]), "timestamp": r[4], "reason": r[5]}
+                 "price": float(r[3]) if r[3] is not None else None, "timestamp": r[4], "reason": r[5]}
                 for r in cur.fetchall()
             ]
     except Exception as e:

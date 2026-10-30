@@ -190,7 +190,8 @@ def _tool_get_trade_history(args: dict) -> str:
         for t in trades:
             ts = str(t.get("timestamp", ""))[:10]
             lines.append(
-                f"{ts}: {t['side']} {t['quantity']} {t['symbol']} @ ${t['price']:.2f} "
+                f"{ts}: {t['side']} {t['quantity']} {t['symbol']} @ "
+                f"{'price unknown' if t['price'] is None else f'${t['price']:.2f}'} "
                 f"— {t.get('reason', '')}"
             )
         return "\n".join(lines)

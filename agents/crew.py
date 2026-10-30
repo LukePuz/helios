@@ -1173,6 +1173,15 @@ def _get_positions(client, strict: bool = False) -> dict | None:
 
 
 def _get_price(ticker: str, client) -> float | None:
+    # Outside regular hours, the last extended-hours trade (Luke D6, 10-29);
+    # the regular-hours quote below is the prior close all night.
+    try:
+        from market_data import get_session_quote
+        sq = get_session_quote(ticker)
+        if sq and sq.get("price"):
+            return float(sq["price"])
+    except Exception:
+        pass
     try:
         from ingestion.polygon_stream import get_snapshot
         snap = get_snapshot(ticker)

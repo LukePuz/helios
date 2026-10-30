@@ -222,6 +222,49 @@ def check_gap_confirmation(ticker: str) -> dict:
         return empty
 
 
+def get_session_quote(ticker: str, now_utc: datetime | None = None) -> dict | None:
+    """Outside regular hours: the last pre-market/after-hours trade, with its
+    time and the last regular-session close. None during regular hours or
+    when IBKR has no extended-hours bar. The regular-hours quote above is the
+    prior close all night, so a post-earnings morning priced the pre-print
+    close (audit A1853-4; Luke D6, 10-29)."""
+    now_utc = now_utc or datetime.now(timezone.utc)
+    if is_market_hours(now_utc):
+        return None
+    bars = get_historical_bars(ticker, duration="1 D", bar_size="1 min", use_rth=False)
+    rth = get_priced_quote(ticker)
+    if not bars or not rth:
+        return None
+    last = bars[-1]
+    try:
+        bar_time = datetime.fromisoformat(str(last["time"]))
+        if bar_time.tzinfo is None:
+            bar_time = bar_time.replace(tzinfo=_ET)
+    except ValueError:
+        return None
+    et = bar_time.astimezone(_ET)
+    if et.time() >= dtime(9, 30) and et.time() < dtime(16, 0):
+        return None   # the last trade is a regular-hours one: nothing newer
+    session = "pre-market" if et.time() < dtime(9, 30) else "after-hours"
+    return {"price": float(last["close"]), "bar_time": bar_time, "session": session,
+            "prior_close": float(rth["price"])}
+
+
+def session_price_label(ticker: str, price: float | None) -> str:
+    """' (pre-market, last trade 07:52 ET; prior close $X, +Y%)' for the
+    brief, or '' during regular hours / when unknown."""
+    try:
+        q = get_session_quote(ticker)
+        if not q or not price or abs(q["price"] - price) > 0.01 * price:
+            return ""
+        chg = (q["price"] - q["prior_close"]) / q["prior_close"] if q["prior_close"] else 0.0
+        return (f" ({q['session']}, last trade {q['bar_time'].astimezone(_ET):%H:%M} ET; "
+                f"prior close ${q['prior_close']:.2f}, {chg:+.1%})")
+    except Exception as e:
+        log.debug(f"[{ticker}] session price label unavailable: {e}")
+        return ""
+
+
 def get_latest_quotes(symbols: list[str]) -> dict[str, dict]:
     """
     Returns latest known price per symbol with staleness metadata.

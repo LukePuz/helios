@@ -269,6 +269,14 @@ Market cap: ${fund['market_cap']:,.0f}{pctile_note}"""
         return ""
 
 
+def _session_label(ticker: str, price: float | None) -> str:
+    try:
+        from market_data import session_price_label
+        return session_price_label(ticker, price)
+    except Exception:
+        return ""
+
+
 def _portfolio_value(trading_client) -> float | None:
     try:
         return float(trading_client.get_account().portfolio_value) if trading_client else None
@@ -323,7 +331,7 @@ def assemble_brief(
     sections = []
 
     price_line = (
-        f"Current Price: ${current_price:.2f}" if current_price
+        f"Current Price: ${current_price:.2f}{_session_label(ticker, current_price)}" if current_price
         else "Current Price: UNKNOWN — do not state a dollar price, multiple-implied "
              "price, or valuation target anywhere in your answer; describe valuation "
              "only in relative/qualitative terms instead."
@@ -479,7 +487,7 @@ def build_scan_brief(
     positions = positions or {}
     now = datetime.now(ET).strftime("%A %B %d, %Y %I:%M %p ET")
     price_line = (
-        f"Current Price: ${current_price:.2f}" if current_price
+        f"Current Price: ${current_price:.2f}{_session_label(ticker, current_price)}" if current_price
         else "Current Price: UNKNOWN — do not state a dollar price, multiple-implied "
              "price, or valuation target anywhere in your answer; describe valuation "
              "only in relative/qualitative terms instead."

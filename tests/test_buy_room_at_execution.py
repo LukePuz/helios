@@ -114,3 +114,24 @@ def test_caps_are_exact_and_only_price_drift_is_tolerated():
     assert _check(_rm(1_000.0), ticker="C", shares=2, price=109.0, sized_at=100.0)[0] == 1
     # One share: exactly 50% of cash, no 54%.
     assert _check(_rm(1_000.0), ticker="D", shares=1, price=520.0, sized_at=520.0)[0] == 0
+
+
+def test_manual_buy_uses_cash_net_of_buys_in_flight_and_reserves():
+    """Professor M99: dashboard / !urgent buys skipped the check and were invisible to it."""
+    with patch("ibkr.get_client"), patch("risk_manager.RiskManager", return_value=_rm(1_000.0)):
+        assert execution._manual_buy_room("M1", 6, 100.0) is None          # $600 of $1000, no per-trade cap
+        reason = execution._manual_buy_room("M2", 5, 100.0)               # $500 > $400 left
+    assert reason and "not enough cash" in reason
+    assert _check(_rm(1_000.0), ticker="A", shares=1, price=350.0)[0] == 0  # automated buy sees M1's $600
+    with patch("ibkr.get_client"), patch("risk_manager.RiskManager", return_value=_rm(1_000.0)):
+        assert "no price" in execution._manual_buy_room("M3", 1, None)
+
+
+def test_execute_manual_buy_blocked_without_cash():
+    with patch("ibkr.get_client"), patch("risk_manager.RiskManager") as rm_cls, \
+         patch("market_data.get_priced_quote", return_value={"price": 100.0}), \
+         patch("ibkr.place_market_order") as order:
+        rm_cls.return_value.is_halted.return_value = False
+        rm_cls.return_value.cash.return_value = 200.0
+        r = execution.execute_manual("ZZZ", "BUY", 5, "test")
+    assert r["success"] is False and "not enough cash" in r["message"] and not order.called

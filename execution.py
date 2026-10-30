@@ -423,6 +423,32 @@ def _buy_room_at_execution(ticker: str, action: str, shares: int, price: float |
         return 0, f"cash/position check failed at execution ({str(e)[:100]})"
 
 
+def _manual_buy_room(ticker: str, qty: float, price: float | None) -> str | None:
+    """Cash check for a manual BUY (dashboard, !urgent). The size is the
+    human's choice, so no per-trade cap; but it may not spend more than the
+    cash left after buys still in flight, and it reserves its cost so
+    automated buys sent meanwhile see it (professor M99). Returns a reason
+    to block, or None. Fails closed, including without Redis."""
+    if not price:
+        return "no price to check cash against"
+    try:
+        import ibkr
+        import stop_lock
+        from risk_manager import RiskManager
+        stop_lock._redis().ping()
+        with stop_lock.ticker_lock("__BUY_ROOM__", wait=60):
+            rm = RiskManager(ibkr.get_client())
+            cash_now = rm.cash()
+            cash = max(cash_now - _unreflected(_buy_reservations(), cash_now), 0)
+            if qty * price > cash:
+                return (f"not enough cash: {qty:g} x ${price:,.2f} is more than the cash left "
+                        f"after buys in flight")
+            _reserve_buy(ticker, qty * price, cash_now)
+            return None
+    except Exception as e:
+        return f"cash check failed ({str(e)[:100]})"
+
+
 _STOP_MIN_GAP_BELOW_FILL = 0.01
 
 
@@ -1274,19 +1300,42 @@ def execute_manual(
                     "message": f"SELL {ticker} not sent: an existing stop could not be "
                                f"cancelled (selling on top of it could short). Check TWS."}
 
+    if side == "BUY":
+        try:
+            import market_data
+            q = market_data.get_priced_quote(ticker)
+            quote_price = float(q["price"]) if q and q.get("price") else None
+        except Exception:
+            quote_price = None
+        block = _manual_buy_room(ticker, qty, quote_price)
+        if block:
+            return {"success": False, "filled_qty": 0, "fill_price": None, "stop_price": None,
+                    "message": f"BUY {ticker} not sent: {block}."}
+
     try:
         import stop_lock
         stop_lock.assert_held(ticker)  # professor M69
+    except Exception as e:
+        if side == "SELL":
+            _restore_stop_after_failed_sell(ticker)
+        else:
+            _release_buy(ticker)   # nothing was sent
+        return {"success": False, "filled_qty": 0, "fill_price": None, "stop_price": None,
+                "message": f"Order submission failed: {e}"}
+    try:
         order_result = ibkr.place_market_order(ticker, side, qty)
     except Exception as e:
         if side == "SELL":
             # Same as execute_approved: the stop was cancelled above, so put
             # it back (limitations audit 2026-10-28, finding 9).
             _restore_stop_after_failed_sell(ticker)
+        # A BUY keeps its reservation: the order may have gone out.
         return {"success": False, "filled_qty": 0, "fill_price": None, "stop_price": None,
                 "message": f"Order submission failed: {e}"}
 
     filled_qty = float(order_result.get("filled_qty") or 0)
+    if filled_qty <= 0 and side == "BUY" and order_result.get("status") in _DEAD_ORDER_STATUSES:
+        _release_buy(ticker)   # rejected/cancelled: no late fill can come
     if filled_qty <= 0 and side == "SELL" and order_result.get("status") in _DEAD_ORDER_STATUSES:
         _restore_stop_after_failed_sell(ticker)
         return {"success": False, "filled_qty": 0, "fill_price": None, "stop_price": None,

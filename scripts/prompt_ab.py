@@ -91,8 +91,8 @@ def summarize(runs: list[dict]) -> dict:
                   "c7_share_pct": round(100 * sum(c >= 7 for c in convs) / len(convs), 1) if convs else None}
     diffs = []
     for t in set(by["new"]) & set(by["old"]):
-        e = {v: [r["expected"] for r in by[v][t] if r["expected"] is not None and not r.get("salvaged")]
-             for v in ("new", "old")}
+        e = {v: [r["expected"] for r in by[v][t] if r["expected"] is not None
+                 and r["conviction"] is not None and not r.get("salvaged")] for v in ("new", "old")}
         if e["new"] and e["old"]:
             diffs.append(sum(e["old"]) / len(e["old"]) - sum(e["new"]) / len(e["new"]))
     out["paired_prompts"] = len(diffs)

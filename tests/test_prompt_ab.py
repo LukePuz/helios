@@ -69,3 +69,10 @@ def test_conviction_parse_survives_nan_and_text():
 
 def test_pilot_prompts_are_excluded_by_default():
     assert {79199, 79189, 79173, 79172, 79150, 79137} == set(ab.PILOT_SIGNAL_IDS)
+
+
+def test_a_run_without_conviction_is_out_of_the_paired_mean_too():
+    runs = [{"ticker": "A", "prompt_id": 0, "variant": "new", "conviction": 6, "expected": 6.0},
+            {"ticker": "A", "prompt_id": 0, "variant": "old", "conviction": None, "expected": 9.0},
+            {"ticker": "A", "prompt_id": 0, "variant": "old", "conviction": 7, "expected": 7.0}]
+    assert ab.summarize(runs)["paired_mean_expected_diff"] == 1.0

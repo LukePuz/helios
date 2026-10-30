@@ -333,6 +333,10 @@ EARNINGS_ENTRY_BLACKOUT_DAYS = int(os.getenv("EARNINGS_ENTRY_BLACKOUT_DAYS", "0"
 # When the first tranche buys less than 1 share, buy exactly 1 if that share
 # fits the hard per-position cap and the cash-reserve cap (risk_manager.size_position).
 ALLOW_ONE_SHARE_ABOVE_ALLOCATION = os.getenv("ALLOW_ONE_SHARE_ABOVE_ALLOCATION", "true").lower() == "true"
+# The one share may use up to this fraction of current cash (was the 20%
+# per-trade cash cap, which blocked every $400-600 share once most cash was
+# invested; Luke 10-29). Normal multi-share sizing keeps the 20% cap.
+ONE_SHARE_MAX_PCT_OF_CASH = float(os.getenv("ONE_SHARE_MAX_PCT_OF_CASH", "0.50"))
 # Brief sections that change what the analyst sees (professor M37-M39, Q35).
 # Off until Luke decides whether the model should see its own past verdicts
 # and the gate inputs before the call (2026-10-28).
@@ -387,7 +391,8 @@ ACCOUNT_TIER_STANDARD_MIN = 25_000.0   # >= this: today's rules, unchanged
 ACCOUNT_TIER_REDUCED_MIN  = 5_000.0    # >= this (and < standard): "reduced"
                                         # below this: "micro"
 
-TIER_MAX_CONCURRENT_POSITIONS = {"standard": None, "reduced": 6, "micro": 5}
+# micro/reduced were 5/6 until 10-30 (Luke 10-29: more options; cash caps still bind).
+TIER_MAX_CONCURRENT_POSITIONS = {"standard": None, "reduced": 8, "micro": 8}
 TIER_MIN_CONVICTION_TO_QUEUE  = {"standard": MIN_CONVICTION_TO_QUEUE, "reduced": 6, "micro": 7}
 # Moonshot's normal 2% cap is structurally too small to ever clear the
 # whole-share floor at Reduced/Micro balances — raised per-tier instead of

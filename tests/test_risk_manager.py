@@ -826,8 +826,10 @@ class TestOneShareAboveAllocation:
         assert self._size(8_000.0)["shares_initial"] == 0
 
     def test_no_share_when_one_share_exceeds_the_cash_cap(self):
-        # 20% of $10k cash = $2,000 < one $2,500 share
-        assert self._size(2_500.0, cash=10_000.0)["shares_initial"] == 0
+        # The one share may use up to 50% of cash (was 20%, Luke 10-29):
+        # $2,500 is 62% of $4k cash -> no; 25% of $10k -> yes.
+        assert self._size(2_500.0, cash=4_000.0)["shares_initial"] == 0
+        assert self._size(2_500.0, cash=10_000.0)["shares_initial"] == 1
 
     def test_held_value_counts_toward_the_cap_on_an_add(self):
         # Audit 2026-10-28 09:00 #5: $1,000 held + one $6,500 share = $7,500 > the

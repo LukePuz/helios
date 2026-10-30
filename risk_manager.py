@@ -53,9 +53,11 @@ try:
         CATEGORY_SOFT_CEILING_PCT,
         PORTFOLIO_HEAT_CAP_PCT,
         ALLOW_ONE_SHARE_ABOVE_ALLOCATION,
+        ONE_SHARE_MAX_PCT_OF_CASH,
     )
 except ImportError:
     ALLOW_ONE_SHARE_ABOVE_ALLOCATION = False
+    ONE_SHARE_MAX_PCT_OF_CASH = 0.20
     TRADING_ENV                   = "paper"
     DRAWDOWN_HALT_PCT             = 0.10
     BUCKET_SIZE_TABLE             = {
@@ -483,18 +485,20 @@ class RiskManager:
         # 55% first tranche is often smaller than one share of a $400-600
         # name, so every pass since Oct 13 sized to 0 and nothing traded.
         # Allow exactly 1 share when it still fits the hard per-position cap
-        # and the cash-reserve cap; the single-share cap above and the
+        # and ONE_SHARE_MAX_PCT_OF_CASH of cash (50% from 10-30; the 20%
+        # per-trade cap blocked every expensive share); the single-share cap above and the
         # per-trade risk cap below still apply. Decided by the lead session
         # after Luke delegated the call (Jarvis, bus #36).
         # Held value counts toward the cap: on an ADD, checking the new share
         # alone let the position reach target + one share, up to about twice
         # the hard cap (limitations audit 2026-10-28 09:00, finding 5).
         if (shares_initial < 1 and ALLOW_ONE_SHARE_ABOVE_ALLOCATION
-                and held + price <= pv * hard_cap and price <= cash_cap):
+                and held + price <= pv * hard_cap
+                and price <= max(cash_reserve, 0) * ONE_SHARE_MAX_PCT_OF_CASH):
             flags.append(
                 f"Allocation ${initial_dollar:,.2f} is under 1 share; buying 1 share "
                 f"(${price:,.2f} = {price / pv:.1%} of portfolio, within the "
-                f"{hard_cap:.0%} position cap)"
+                f"{hard_cap:.0%} position cap, {price / cash_reserve:.0%} of cash)"
             )
             shares_initial = 1
             initial_dollar = price

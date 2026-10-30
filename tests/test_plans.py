@@ -180,4 +180,4 @@ def test_watcher_says_when_price_checks_were_skipped(caplog):
          patch("tasks._held_prices", return_value={}), patch("db.log_signal"), \
          caplog.at_level(logging.WARNING, logger="tasks"):
         tasks.watch_plan_levels()
-    assert "price checks skipped for 1 plan" in caplog.text
+    assert "price checks skipped for 1 plan" in caplog.text and "no fresh held prices" in caplog.text

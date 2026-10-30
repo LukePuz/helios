@@ -988,3 +988,30 @@ def test_manual_buy_gets_a_fallback_stop_when_atr_fails():
         r = execution.execute_manual("ZZZ", "BUY", 2, "test")
     assert r["success"] and r["stop_price"] == 92.0
     assert upsert.call_args.kwargs["stop_price"] == 92.0 and alert.called
+
+
+def _manual_buy(fill_price, quote=100.0):
+    with patch("ibkr.get_client"), patch("risk_manager.RiskManager") as rm_cls, \
+         patch("market_data.get_priced_quote", return_value={"price": quote}), \
+         patch("ibkr.place_market_order", return_value={"order_id": 1, "fill_price": fill_price, "filled_qty": 2}), \
+         patch("ibkr.get_latest_price", return_value=None), \
+         patch("db.log_trade"), patch("db.upsert_position_stop") as upsert, \
+         patch("db.set_stop_broker_order_id"), patch("tasks.manage_stop_place", return_value={"order_id": 9}), \
+         patch("tasks.open_manual_action") as action, patch("alerts._send") as alert:
+        rm_cls.return_value.is_halted.return_value = False
+        rm_cls.return_value.calculate_stop.side_effect = RuntimeError("no bars")
+        try:
+            r = execution.execute_manual("ZZZ", "BUY", 2, "test")
+        except Exception:
+            r = None
+    return r, upsert, action, alert
+
+
+def test_manual_buy_nan_fill_alerts_unprotected_not_nan_stop():
+    r, upsert, action, alert = _manual_buy(float("nan"))
+    assert not upsert.called and action.called and alert.called
+
+
+def test_manual_buy_fallback_stop_never_above_the_quote():
+    r, upsert, action, alert = _manual_buy(120.0, quote=100.0)    # stale fill 20% above the quote
+    assert upsert.call_args.kwargs["stop_price"] == 92.0          # 8% under the quote, not 110.4

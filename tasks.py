@@ -2706,8 +2706,9 @@ def watch_plan_levels():
         plans_now = db.get_active_plans()
         if not held and plans_now:
             # Indistinguishable from "no level crossed" otherwise (SEF, 10-30).
-            log.warning(f"watch_plan_levels: portfolio snapshot stale or missing; price checks "
-                        f"skipped for {len(plans_now)} plan(s), date checks only")
+            log.warning(f"watch_plan_levels: no fresh held prices (snapshot stale or missing, or "
+                        f"nothing held); price checks skipped for {len(plans_now)} plan(s), "
+                        f"date checks only")
         logged = 0
         for plan in plans_now:
             price = held.get(plan["ticker"])

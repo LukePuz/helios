@@ -1402,10 +1402,18 @@ def execute_manual(
         except Exception as e:
             log.warning(f"[{ticker}] calculate_stop failed: {e}")
             stop_price, stop_method = None, ""
-        if not stop_price and fill_price:
+        import math
+        try:
+            fill_ok = float(fill_price) > 0 and math.isfinite(float(fill_price))
+        except (TypeError, ValueError):
+            fill_ok = False
+        if not stop_price and fill_ok:
             # Never leave a manual buy without a stop (professor M107): fall
-            # back to a flat stop below the fill and say so.
+            # back to a flat stop below the fill and say so, never above the
+            # last quote (a stale fill price could otherwise put it there).
             stop_price = round(float(fill_price) * (1 - _MANUAL_FALLBACK_STOP_PCT), 2)
+            if quote_price and stop_price >= quote_price:
+                stop_price = round(quote_price * (1 - _MANUAL_FALLBACK_STOP_PCT), 2)
             stop_method = f"fallback flat {_MANUAL_FALLBACK_STOP_PCT:.0%} (ATR stop failed)"
             log.error(f"[{ticker}] ATR stop unavailable for a manual BUY; using {stop_method} @ ${stop_price:.2f}")
             try:

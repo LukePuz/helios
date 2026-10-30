@@ -40,3 +40,30 @@ def test_screen_provenance_records_title_tone():
         result = screener.screen({"ticker": "NOW", "source": "analyst_ratings",
                                   "title": "price target lowers to $180", "text": "x"})
     assert result["provenance"]["title_tone"] == "neg"
+
+
+def _screen(title, source="analyst_ratings", held=True, reply='{"relevant": false, "urgency": "low", "reason": "no new fact"}'):
+    with patch("agents.screener._call_ollama", return_value=reply), patch("feed.emit"), \
+         patch("db.get_position_stop", return_value={"entry_price": 1.0} if held else None):
+        return screener.screen({"ticker": "NOW", "source": source, "title": title, "text": "x"})
+
+
+def test_held_rating_change_or_bad_news_overrides_once_per_cooldown():
+    """Luke D7: held names get analysed on PT cuts / bad news even when the 7B says no."""
+    r = _screen("BTIG main NOW: Buy, price target lowers to $180")
+    assert r["relevant"] and r["override"] == "held_negative_or_rating"
+    r2 = _screen("Barclays main NOW: price target lowers to $170")
+    assert not r2["relevant"] and r2["override_skipped"] == "cooldown"
+
+
+def test_no_override_for_unheld_or_neutral_news():
+    assert not _screen("BTIG main NOW: price target lowers to $180", held=False)["relevant"]
+    assert not _screen("ServiceNow to present at conference", source="news")["relevant"]
+
+
+def test_prompt_tells_the_screener_about_holdings_and_symmetry():
+    with patch("agents.screener._call_ollama", return_value='{"relevant": true, "urgency": "eod", "reason": "x"}') as call, \
+         patch("feed.emit"), patch("db.get_position_stop", return_value=None):
+        screener.screen({"ticker": "NOW", "source": "news", "title": "t", "text": "x"})
+    prompt = call.call_args.args[0]
+    assert "We currently hold this stock: no" in prompt and "price-target CUT" in prompt

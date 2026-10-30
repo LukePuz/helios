@@ -95,8 +95,11 @@ class _FakeRedis:
     def lock(self, name, **kw):
         return _FakeLock(name, **kw)
 
-    def set(self, key, value, ex=None):
+    def set(self, key, value, ex=None, nx=False):
+        if nx and key in _FakeRedis.store:
+            return None
         _FakeRedis.store[key] = value
+        return True
 
     def exists(self, key):
         return int(key in _FakeRedis.store)

@@ -51,6 +51,7 @@ EVENT TO SCREEN:
 Source: {source}
 Ticker: {ticker}
 Watchlist tier: {tier}
+We currently hold this stock: {held}
 Title: {title}
 Content (first 500 chars): {content}
 
@@ -61,6 +62,12 @@ Mark relevant ONLY if BOTH are true:
 2. It contains genuinely NEW, specific factual information that could change \
    a position or thesis (an earnings result, a filing, a contract, a guidance \
    change, a specific analyst price-target change with a stated reason).
+
+Treat bad news exactly like good news: an analyst price-target CUT or a \
+downgrade is as much new information as a raise or an upgrade, and a guidance \
+cut, lost contract, lawsuit or probe is as relevant as a win. For a stock we \
+HOLD, a specific negative development is relevant even if the headline is \
+phrased as a recap.
 
 Mark NOT relevant for: opinion/recap pieces ("Is X a buy?", "Why is X stock \
 falling/rising today?"), multi-stock roundup or "stocks that explain the \
@@ -266,6 +273,42 @@ def title_tone(title: str) -> str:
     return "mixed" if pos and neg else "pos" if pos else "neg" if neg else "neutral"
 
 
+_HELD_OVERRIDE_COOLDOWN_S = 4 * 3600
+
+
+def _is_held(ticker: str) -> bool:
+    try:
+        import db
+        return db.get_position_stop(ticker) is not None
+    except Exception:
+        return False
+
+
+def _held_negative_override(result: dict, ticker: str, source: str, title: str, held: bool) -> None:
+    """Held stock + analyst rating change or bad-news headline: send it to the
+    analyst even if the 7B said no (Luke D7, 10-29). The screener passed PT
+    raises 93/171 but cuts 3/105, so held names got no review on bad news.
+    One override per ticker per 4 h keeps recaps from flooding the 72B."""
+    if result.get("relevant") or not held:
+        return
+    tone = title_tone(title)
+    if source != "analyst_ratings" and tone not in ("neg", "mixed"):
+        return
+    try:
+        import stop_lock
+        if not stop_lock._redis().set(f"helios:held_override:{ticker}", "1",
+                                      nx=True, ex=_HELD_OVERRIDE_COOLDOWN_S):
+            result["override_skipped"] = "cooldown"
+            return
+    except Exception as e:
+        log.warning(f"[{ticker}] held-override cooldown unavailable, not overriding: {e}")
+        return
+    result.update(relevant=True, urgency="eod", override="held_negative_or_rating",
+                  reason=f"Held position: {'rating change' if source == 'analyst_ratings' else 'negative headline'} "
+                         f"(screener said: {str(result.get('reason', ''))[:120]})")
+    log.info(f"[{ticker}] Screener override: held position, {source}, tone={tone}")
+
+
 def screen(event: dict) -> dict:
     """
     Main entry point. Returns screening result dict.
@@ -285,11 +328,13 @@ def screen(event: dict) -> dict:
     except Exception:
         pass
 
+    held = _is_held(ticker)
     prompt = _SCREENER_PROMPT.format(
         symbols=", ".join(SYMBOLS),
         source=source,
         ticker=ticker,
         tier=tier,
+        held="yes" if held else "no",
         title=title,
         content=event.get("text", "")[:500],
     )
@@ -308,6 +353,8 @@ def screen(event: dict) -> dict:
         except (json.JSONDecodeError, AttributeError):
             log.warning("7B model returned invalid JSON — using fallback.")
             result = _keyword_fallback(event, tier=tier)
+
+    _held_negative_override(result, ticker, source, title, held)
 
     # Provenance for the SCREENED_OUT signal row (SEF run 7, 2026-10-28):
     # those rows had no model or code version, so screener rejections couldn't

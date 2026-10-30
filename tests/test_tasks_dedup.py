@@ -424,6 +424,27 @@ class TestReconcileUnconfirmedOrders:
         mock_update_approval.assert_called_once_with(59, "APPROVED")
         mock_alert.assert_called_once()
 
+    def test_late_buy_gets_an_outcome_row_only_when_nothing_was_recorded_at_the_fill(self):
+        """Professor M123: a BUY that filled after the wait window had no
+        trade_outcomes row. A part fill already logged one at the fill."""
+        for prev, expect in ((None, True), (40.0, False)):
+            order = {**self._order(), "filled_qty": prev, "fill_price": 180.0 if prev else None}
+            with patch("db.get_unconfirmed_orders", return_value=[order]), \
+                 patch("ibkr.get_fill_for_order",
+                       return_value={"filled_qty": 144.0, "fill_price": 181.3}), \
+                 patch("db.log_trade"), patch("db.update_order_fill"), \
+                 patch("db.get_approval_by_id", return_value={**self._approval(), "action": "OPEN"}), \
+                 patch("execution.log_buy_outcome") as outcome, \
+                 patch("db.get_position_stop", return_value={"stop_price": 160.0}), \
+                 patch("tasks._held_before_fill", return_value=True), \
+                 patch("tasks._reprotect_after_late_sell", return_value=True), \
+                 patch("tasks._retry_pending_reprotects"), \
+                 patch("db.update_approval_status"), patch("alerts._send"):
+                tasks.reconcile_unconfirmed_orders.run()
+            assert outcome.called is expect
+            if expect:
+                assert outcome.call_args.args[1:] == ("CRWD", "OPEN", 181.3)
+
     def test_late_buy_keeps_existing_stop_record_and_queues_on_failure(self):
         """A2253-3: an ADD's late fill must not overwrite (loosen) the
         recorded stop, and a failed placement is retried."""

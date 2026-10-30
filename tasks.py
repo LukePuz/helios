@@ -1237,6 +1237,14 @@ def _reconcile_unconfirmed_orders_locked(task):
 
         stop_placed: bool | None = False
         approval = db.get_approval_by_id(order["approval_id"]) if order["approval_id"] else None
+        if order["side"] == "BUY" and approval and not prev_qty:
+            # Nothing of this order was recorded at the fill, so neither was
+            # its outcome row (professor M123). A part fill already has one.
+            try:
+                from execution import log_buy_outcome
+                log_buy_outcome(approval, ticker, approval.get("action") or intent or "OPEN", total_avg)
+            except Exception as e:
+                log.error(f"[{ticker}] reconcile: could not log the late BUY's outcome row: {e}")
         if order["side"] == "BUY" and approval:
             risk_json = approval.get("risk_json") or {}
             stop_price = approval.get("stop_loss_price") or risk_json.get("stop_loss_price")

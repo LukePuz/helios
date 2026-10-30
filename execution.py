@@ -365,8 +365,8 @@ def _release_buy(ticker: str) -> None:
         log.warning(f"[{ticker}] buy reservation not released (expires in {_BUY_RESERVE_TTL_S}s): {e}")
 
 
-def _buy_room_at_execution(ticker: str, action: str, shares: int, price: float | None
-                           ) -> tuple[int, str | None]:
+def _buy_room_at_execution(ticker: str, action: str, shares: int, price: float | None,
+                           sized_at: float | None = None) -> tuple[int, str | None]:
     """Re-check cash and the position cap when a buy is actually sent.
 
     Sizing checks both, but a buy sized before the open runs later with its
@@ -400,9 +400,16 @@ def _buy_room_at_execution(ticker: str, action: str, shares: int, price: float |
                     return 0, f"position cap reached at execution ({len(taken)} of {cap} held or being bought)"
             cash_now = rm.cash()
             cash = max(cash_now - _unreflected(reserved, cash_now), 0)
-            affordable = int(cash * MAX_TRADE_PCT_OF_CASH_RESERVE * _SIZING_DRIFT_TOLERANCE / price)
+            # The caps are exact against today's cash. The drift tolerance
+            # applies to the price only: a buy sized at sized_at may still
+            # count its shares at that price if the price has moved up by no
+            # more than 8% since (professor M98: it used to widen the caps).
+            cap_price = (sized_at if sized_at and price <= sized_at * _SIZING_DRIFT_TOLERANCE
+                         else price)
+            cap_price = min(cap_price, price)
+            affordable = int(cash * MAX_TRADE_PCT_OF_CASH_RESERVE / cap_price)
             if (affordable < 1 and ALLOW_ONE_SHARE_ABOVE_ALLOCATION
-                    and price <= cash * ONE_SHARE_MAX_PCT_OF_CASH * _SIZING_DRIFT_TOLERANCE):
+                    and cap_price <= cash * ONE_SHARE_MAX_PCT_OF_CASH):
                 affordable = 1
             if affordable < 1:
                 return 0, "not enough cash at execution under the per-trade cash limits"
@@ -822,7 +829,7 @@ def execute_approved(
 
         if side == "BUY":
             shares, room_block = _buy_room_at_execution(
-                ticker, action, shares, current_price_pre or price_at_sizing)
+                ticker, action, shares, current_price_pre or price_at_sizing, price_at_sizing)
             if room_block:
                 log.error(f"[{ticker}] {action} not sent: {room_block}")
                 try:

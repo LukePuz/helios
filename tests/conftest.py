@@ -158,7 +158,7 @@ def _buy_room_passes(request, monkeypatch):
         return
     import execution
     monkeypatch.setattr(execution, "_buy_room_at_execution",
-                        lambda ticker, action, shares, price: (shares, None))
+                        lambda ticker, action, shares, price, sized_at=None: (shares, None))
 
 
 def pytest_configure(config):

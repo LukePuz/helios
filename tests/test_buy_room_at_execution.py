@@ -19,9 +19,9 @@ def _rm(cash, held=(), pv=10_000.0):
     return rm
 
 
-def _check(rm, action="OPEN", shares=1, price=1_400.0, ticker="AVGO"):
+def _check(rm, action="OPEN", shares=1, price=1_400.0, ticker="AVGO", sized_at=None):
     with patch("ibkr.get_client"), patch("risk_manager.RiskManager", return_value=rm):
-        return execution._buy_room_at_execution(ticker, action, shares, price)
+        return execution._buy_room_at_execution(ticker, action, shares, price, sized_at)
 
 
 def test_one_share_within_the_one_share_cash_limit():
@@ -45,7 +45,7 @@ def test_multi_share_buy_cut_to_the_per_trade_cash_limit():
 
 def test_small_uptick_does_not_trim_a_correctly_sized_buy():
     # 2 shares sized at $100 against $1000 (20%); price now $100.50.
-    assert _check(_rm(1_000.0), shares=2, price=100.5) == (2, None)
+    assert _check(_rm(1_000.0), shares=2, price=100.5, sized_at=100.0) == (2, None)
 
 
 def test_filled_buy_is_not_counted_twice_once_cash_shows_it():
@@ -92,9 +92,9 @@ def test_second_buy_of_the_same_name_counts_its_own_reservation():
     second AAA buy must still see BBB's pending $1000."""
     assert _check(_rm(10_000.0), ticker="AAA", shares=10, price=100.0) == (10, None)
     assert _check(_rm(10_000.0), ticker="BBB", shares=10, price=100.0) == (10, None)
-    # AAA filled (cash 10000 -> 9000), BBB still pending: 8000 x 20% x 1.08 buys 17
-    # (excluding AAA's own reservation read BBB as filled and allowed 19).
-    assert _check(_rm(9_000.0), ticker="AAA", shares=20, price=100.0) == (17, None)
+    # AAA filled (cash 10000 -> 9000), BBB still pending: 8000 x 20% buys 16
+    # (excluding AAA's own reservation read BBB as filled and allowed 18).
+    assert _check(_rm(9_000.0), ticker="AAA", shares=20, price=100.0) == (16, None)
 
 
 def test_release_frees_only_that_orders_reservation():
@@ -102,3 +102,15 @@ def test_release_frees_only_that_orders_reservation():
     assert _check(_rm(10_000.0), ticker="A", shares=10, price=100.0) == (10, None)
     execution._release_buy("A")                       # the second order died
     assert [r["ticker"] for r in execution._buy_reservations()] == ["A"]
+
+
+def test_caps_are_exact_and_only_price_drift_is_tolerated():
+    """Professor M98: the 8% tolerance covers price drift since sizing, not the caps."""
+    # No price change: exactly 20% of cash ($200) buys 2 at $100, not 2.16.
+    assert _check(_rm(1_000.0), shares=5, price=100.0, sized_at=100.0) == (2, None)
+    # Cash fell since sizing, price unchanged: the exact cap cuts (1 share), no 8% slack.
+    assert _check(_rm(900.0), ticker="B", shares=2, price=100.0, sized_at=100.0)[0] == 1
+    # Price rose 9% (beyond the tolerance): priced at today's $109, 200/109 = 1.
+    assert _check(_rm(1_000.0), ticker="C", shares=2, price=109.0, sized_at=100.0)[0] == 1
+    # One share: exactly 50% of cash, no 54%.
+    assert _check(_rm(1_000.0), ticker="D", shares=1, price=520.0, sized_at=520.0)[0] == 0

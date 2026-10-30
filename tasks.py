@@ -1662,7 +1662,8 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
             if fill_price:
                 try:
                     db.close_trade_outcome(ticker, exit_price=fill_price,
-                                           exit_source=f"late_{(order.get('intent') or 'sell').lower()}")
+                                           exit_source=f"late_{(order.get('intent') or 'sell').lower()}",
+                                           exit_price_source="fill")   # broker average fill
                 except Exception as e:
                     log.warning(f"[{ticker}] reconcile: close_trade_outcome failed: {e}")
         return None
@@ -2084,7 +2085,8 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
         if resting <= 0:  # shares under a stuck stop are still held
             db.delete_position_stop(ticker)
             try:
-                db.close_trade_outcome(ticker, exit_price=fill_price, exit_source="backstop_sell")
+                db.close_trade_outcome(ticker, exit_price=fill_price, exit_source="backstop_sell",
+                                       exit_price_source="fill" if result.get("fill_price") else "quote")
             except Exception:
                 pass
         log.warning(f"[{ticker}] BACKSTOP SELL executed: {filled} shares @ ~${fill_price:.2f}")
@@ -3367,7 +3369,8 @@ def _reconcile_stop_orders_body(self):
                         price_source="fill",
                     )
                     try:
-                        db.close_trade_outcome(ticker, exit_price=fill["fill_price"], exit_source="broker_exit")
+                        db.close_trade_outcome(ticker, exit_price=fill["fill_price"], exit_source="broker_exit",
+                                               exit_price_source="fill")
                     except Exception as e:
                         log.error(f"[{ticker}] close_trade_outcome failed after reconciling "
                                   f"exit: {e}")

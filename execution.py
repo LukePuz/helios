@@ -1056,7 +1056,8 @@ def execute_approved(
                 log.info(f"[{ticker}] Position closed — stop record deleted")
                 # Close the feedback-loop outcome record with the real fill price
                 try:
-                    db.close_trade_outcome(ticker, exit_price=current_price, exit_source="model_exit")
+                    db.close_trade_outcome(ticker, exit_price=current_price, exit_source="model_exit",
+                                          exit_price_source=price_source)
                 except Exception as e:
                     log.warning(f"[{ticker}] close_trade_outcome failed: {e}")
             else:  # TRIM — re-place stop at same price for remaining quantity
@@ -1093,7 +1094,8 @@ def execute_approved(
                     # EXIT closes it at that later price (professor C10).
                     db.delete_position_stop(ticker)
                     try:
-                        db.close_trade_outcome(ticker, exit_price=current_price, exit_source="model_trim_last")
+                        db.close_trade_outcome(ticker, exit_price=current_price, exit_source="model_trim_last",
+                                              exit_price_source=price_source)
                     except Exception as e:
                         log.warning(f"[{ticker}] close_trade_outcome failed: {e}")
 
@@ -1440,7 +1442,8 @@ def execute_manual(
         elif remaining <= 0:
             db.delete_position_stop(ticker)
             try:
-                db.close_trade_outcome(ticker, exit_price=fill_price, exit_source="manual_sell")
+                db.close_trade_outcome(ticker, exit_price=fill_price, exit_source="manual_sell",
+                                       exit_price_source="fill" if order_result.get("fill_price") else "quote")
             except Exception:
                 pass  # no open outcome row is expected for positions not opened via approval
         else:

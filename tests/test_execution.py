@@ -705,6 +705,21 @@ def test_close_trade_outcome_closes_every_open_row_for_the_ticker():
     assert updated_ids == [11, 10]
 
 
+def test_close_trade_outcome_records_the_exit_price_source():
+    """Professor M119: fill vs quote is stored next to exit_price."""
+    import db
+    cur = MagicMock()
+    cur.fetchall.return_value = [(11, 100.0, None)]
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"), \
+         patch("yfinance.Ticker"):
+        assert db.close_trade_outcome("NVDA", exit_price=110.0, exit_source="model_exit",
+                                      exit_price_source="quote") is True
+    upd = [c[0] for c in cur.execute.call_args_list if c[0][0].startswith("UPDATE")][0]
+    assert "exit_price_source=%s" in upd[0] and upd[1][-3:] == ("model_exit", "quote", 11)
+
+
 def test_backfill_never_overwrites_an_entry_time_snapshot():
     """Professor C6: the UPDATE only applies to rows with no catalyst snapshot."""
     import db

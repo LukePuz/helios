@@ -746,6 +746,10 @@ _MIGRATIONS: list[tuple[int, str]] = [
     # gone, no exit fill found) or refused_price (exit with an unusable price).
     # NULL before 10-30 (SEF data QA).
     (68, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS orphan_reason VARCHAR(20);"),
+    # Where exit_price came from, like trades.price_source: fill (the broker's
+    # average fill price) or quote (a fallback last price). NULL before 10-30
+    # and for callers that don't say (professor M119).
+    (69, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS exit_price_source VARCHAR(10);"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -3401,7 +3405,7 @@ def compute_outcome_metrics(
 
 
 def close_trade_outcome(ticker: str, exit_price: float, exit_date=None,
-                        exit_source: str | None = None) -> bool:
+                        exit_source: str | None = None, exit_price_source: str | None = None) -> bool:
     """
     Closes every still-open (exit_date IS NULL) trade_outcomes row for this
     ticker: computes outcome_pct, was_correct, and alpha vs. SPY over each
@@ -3468,9 +3472,9 @@ def close_trade_outcome(ticker: str, exit_price: float, exit_date=None,
                 cur.execute(
                     "UPDATE trade_outcomes SET exit_price=%s, exit_date=%s, outcome_pct=%s, "
                     "was_correct=%s, exit_benchmark_price=%s, benchmark_return_pct=%s, alpha_pct=%s, "
-                    "exit_source=%s WHERE id=%s",
+                    "exit_source=%s, exit_price_source=%s WHERE id=%s",
                     (exit_price, exit_date, outcome_pct, was_correct, exit_benchmark_price,
-                     benchmark_return_pct, alpha_pct, exit_source, outcome_id),
+                     benchmark_return_pct, alpha_pct, exit_source, exit_price_source, outcome_id),
                 )
         conn.commit()
         logging.info(

@@ -153,8 +153,8 @@ _WORDLIKE_TICKERS = {"NOW", "NET", "V", "MA", "ON", "ALL", "IT", "A", "DAVE", "O
 # "Sandisk", "D-Wave", "Google" were all dropped by the full-name match).
 _NAME_ALIASES = {
     "GOOG": ["Google", "GOOGL"], "QBTS": ["D-Wave"], "SMR": ["NuScale"], "RGTI": ["Rigetti"],
-    "PWR": ["Quanta"], "ANET": ["Arista"], "AUR": ["Aurora"], "CEG": ["Constellation"],
-    "KLIC": ["Kulicke"], "PANW": ["Palo Alto"], "GEV": ["Vernova"], "BWXT": ["BWX Technologies"],
+    "PWR": ["Quanta"], "ANET": ["Arista"], "AUR": ["Aurora"],
+    "KLIC": ["Kulicke"], "GEV": ["Vernova"], "BWXT": ["BWX Technologies"],
     "ASTS": ["AST"], "QTUM": ["Defiance"], "DRAM": ["Roundhill"], "AMD": ["AMD"],
 }
 # Names to use instead of the watchlist name, which matches generic headlines.
@@ -196,7 +196,13 @@ def mentions_company(ticker: str, company: str, text: str) -> bool:
         if re.search(rf"(?<![\w]){re.escape(name)}(?![\w])", text, flags):
             return True
     t = re.escape(ticker)
-    if re.search(rf"(\${t}\b|\({t}\)|\b(?:NYSE|NASDAQ|Nasdaq):\s*{t}\b|\b{t}\s+(?:[Ss]tock|[Ss]hares|STOCK)\b)", text):
+    if re.search(rf"(\${t}\b|\({t}\)|\b(?:NYSE|NASDAQ|Nasdaq):\s*{t}\b)", text):
+        return True
+    # "DAVE Stock" names the stock; a word-like ticker needs "Stock" right after
+    # it, and not in an all-caps headline ("BUY NOW STOCK...", review 5 #6).
+    if re.search(rf"\b{t}\s+(?:[Ss]tock|[Ss]hares)\b", text) and (
+            ticker not in _WORDLIKE_TICKERS
+            or (re.search(rf"\b{t}\s+Stock\b", text) and text != text.upper())):
         return True
     return ticker not in _WORDLIKE_TICKERS and bool(re.search(rf"\b{t}\b", text))
 

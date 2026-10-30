@@ -33,3 +33,14 @@ def test_last_bar_inside_rth_means_no_newer_trade():
     with patch("market_data.get_historical_bars", return_value=_bars("2026-10-28 15:59:00-04:00")), \
          patch("market_data.get_priced_quote", return_value={"price": 150.0}):
         assert market_data.get_session_quote("NOW", now_utc=PRE) is None
+
+
+def test_session_quote_is_cached_for_a_minute():
+    """Review 5 #2: the price and the brief label share one IBKR fetch."""
+    import market_data
+    market_data._SESSION_QUOTE_CACHE.clear()
+    with patch("market_data._session_quote_uncached", return_value={"price": 1.0}) as fetch:
+        market_data.get_session_quote("ZZZ")
+        market_data.get_session_quote("ZZZ")
+    assert fetch.call_count == 1
+    market_data._SESSION_QUOTE_CACHE.clear()

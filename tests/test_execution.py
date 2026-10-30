@@ -961,3 +961,13 @@ def test_buy_reservation_kept_when_the_order_call_raises():
         except ConnectionError:
             pass
     release.assert_not_called()
+
+
+def test_entry_stop_keeps_its_distance_below_a_lower_fill():
+    """Review 5 #1: sized at a $106 pre-market print with a $101 stop, filled at
+    $99.50: the stop must not sit above the fill."""
+    from execution import _stop_anchored_to_fill as anchor
+    assert anchor("X", 101.0, 106.0, 99.5) == round(99.5 * 101 / 106, 2) < 99.5
+    assert anchor("X", 95.0, 100.0, 100.2) == 95.0        # fill at or above sizing: unchanged
+    assert anchor("X", 95.0, 100.0, 99.8) == 95.0         # within 0.5%: unchanged
+    assert anchor("X", 95.0, None, 90.0) == 95.0          # unknown sizing price: unchanged

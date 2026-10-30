@@ -593,6 +593,8 @@ def _conviction_distribution(tokens) -> dict | None:
                 "p_ge7": round(sum(p for v, p in probs.items() if v >= 7) / total, 3),
                 "probs": {str(v): round(p / total, 3) for v, p in sorted(probs.items())},
                 "mass": round(total, 3),     # share of probability on 1-9 digits
+                # A 10 is two tokens; its "1" counts as 1 above (review 5 #3).
+                "first_digit_only": nxt.startswith("0"),
             }
         text += tok.get("token") or ""
     return None
@@ -638,7 +640,11 @@ def _call_ollama(prompt: str, num_ctx: int = _NUM_CTX) -> str | None:
         _LAST_CALL_STATS.update({k: body.get(k) for k in (
             "prompt_eval_count", "eval_count", "done_reason", "total_duration")})
         _LAST_CALL_STATS["num_ctx"] = num_ctx
-        _LAST_CALL_STATS["conviction_logprobs"] = _conviction_distribution(body.get("logprobs"))
+        try:   # log-only: must never fail a finished call (review 5 #3)
+            _LAST_CALL_STATS["conviction_logprobs"] = _conviction_distribution(body.get("logprobs"))
+        except Exception as e:
+            _LAST_CALL_STATS["conviction_logprobs"] = None
+            log.debug(f"conviction logprobs unreadable: {e}")
         if body.get("done_reason") == "length":
             log.warning(f"Ollama reply hit num_predict ({_NUM_PREDICT}); the JSON may be cut off")
         return body.get("response", "")

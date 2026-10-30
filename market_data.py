@@ -222,18 +222,34 @@ def check_gap_confirmation(ticker: str) -> dict:
         return empty
 
 
+_SESSION_QUOTE_CACHE: dict[str, tuple[float, dict | None]] = {}
+_SESSION_QUOTE_TTL_S = 60   # price and brief label share one fetch (review 5 #2)
+
+
 def get_session_quote(ticker: str, now_utc: datetime | None = None) -> dict | None:
     """Outside regular hours: the last pre-market/after-hours trade, with its
     time and the last regular-session close. None during regular hours or
     when IBKR has no extended-hours bar. The regular-hours quote above is the
     prior close all night, so a post-earnings morning priced the pre-print
     close (audit A1853-4; Luke D6, 10-29)."""
-    now_utc = now_utc or datetime.now(timezone.utc)
+    import time
+    cached = now_utc is None and _SESSION_QUOTE_CACHE.get(ticker)
+    if cached and time.monotonic() - cached[0] < _SESSION_QUOTE_TTL_S:
+        return cached[1]
+    q = _session_quote_uncached(ticker, now_utc or datetime.now(timezone.utc))
+    if now_utc is None:
+        _SESSION_QUOTE_CACHE[ticker] = (time.monotonic(), q)
+    return q
+
+
+def _session_quote_uncached(ticker: str, now_utc: datetime) -> dict | None:
     if is_market_hours(now_utc):
         return None
     bars = get_historical_bars(ticker, duration="1 D", bar_size="1 min", use_rth=False)
+    if not bars:
+        return None
     rth = get_priced_quote(ticker)
-    if not bars or not rth:
+    if not rth:
         return None
     last = bars[-1]
     try:
@@ -258,7 +274,10 @@ def session_price_label(ticker: str, price: float | None) -> str:
         if not q or not price or abs(q["price"] - price) > 0.01 * price:
             return ""
         chg = (q["price"] - q["prior_close"]) / q["prior_close"] if q["prior_close"] else 0.0
-        return (f" ({q['session']}, last trade {q['bar_time'].astimezone(_ET):%H:%M} ET; "
+        bar_et = q["bar_time"].astimezone(_ET)
+        when = (f"{bar_et:%H:%M}" if bar_et.date() == datetime.now(_ET).date()
+                else f"{bar_et:%b %d %H:%M}")
+        return (f" ({q['session']}, last trade {when} ET; "
                 f"prior close ${q['prior_close']:.2f}, {chg:+.1%})")
     except Exception as e:
         log.debug(f"[{ticker}] session price label unavailable: {e}")

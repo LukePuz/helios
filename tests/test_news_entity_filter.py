@@ -43,3 +43,13 @@ def test_ordinary_word_names_and_tickers_still_filtered():
     assert not m("QUBT", "Quantum Computing Inc.", "3 Quantum Computing Stocks to Buy Now")
     assert m("QUBT", "Quantum Computing Inc.", "QUBT jumps 12%")
     assert not m("AUR", "Aurora Innovation", "aurora borealis visible tonight")
+
+
+def test_aliases_that_name_other_companies_are_gone():
+    """Review 5 #6."""
+    from ingestion.news import mentions_company as m
+    assert not m("CEG", "Constellation Energy Corporation", "Constellation Brands plunges on beer sales")
+    assert m("CEG", "Constellation Energy Corporation", "Constellation Energy signs nuclear deal")
+    assert not m("PANW", "Palo Alto Networks, Inc.", "Palo Alto startup raises $50M")
+    assert not m("NOW", "ServiceNow, Inc.", "BUY NOW STOCK BEFORE IT'S TOO LATE")
+    assert not m("DRAM", "Roundhill Memory ETF", "DRAM shares of Samsung's output rise")

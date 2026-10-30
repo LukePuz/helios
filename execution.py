@@ -416,6 +416,19 @@ def _buy_room_at_execution(ticker: str, action: str, shares: int, price: float |
         return 0, f"cash/position check failed at execution ({str(e)[:100]})"
 
 
+def _stop_anchored_to_fill(ticker: str, stop: float, sized_at: float | None,
+                           fill: float | None) -> float:
+    """The stop was set from the sizing price. If the fill came in lower (a
+    pre-market price that faded by the open, review 5 #1), keep the planned
+    distance below the fill instead, so the stop never sits at or above it."""
+    if not (sized_at and fill and 0 < stop < sized_at) or fill >= sized_at * 0.995:
+        return stop
+    anchored = round(fill * stop / sized_at, 2)
+    log.warning(f"[{ticker}] Stop moved from ${stop:.2f} to ${anchored:.2f}: filled at "
+                f"${fill:.2f}, below the ${sized_at:.2f} sizing price")
+    return anchored
+
+
 # The whole execution holds the ticker's stop lock: a SELL cancels the stop,
 # sells and re-places it; a BUY places the first stop (stop_lock).
 @locked_by_ticker(lambda approval, *a, **k: approval["ticker"],
@@ -1034,6 +1047,7 @@ def execute_approved(
             _capture_original_thesis_if_new(ticker, approval)
             log.info(f"[{ticker}] Bracket stop recorded (orderId={bracket_result['stop_order_id']})")
         elif stop_price and side == "BUY":
+            stop_price = _stop_anchored_to_fill(ticker, float(stop_price), price_at_sizing, current_price)
             entry_for_stops, stop_qty = current_price, filled_qty
             stop_price, add_to_existing = _whole_position_stop(ticker, float(stop_price), filled_qty)
             if add_to_existing:

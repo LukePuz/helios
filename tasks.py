@@ -1246,6 +1246,28 @@ def _reconcile_unconfirmed_orders_locked(task):
                     _queue_reprotect(ticker, {"intent": "BUY"}, None)
             if approval.get("status") == "FAILED":
                 db.update_approval_status(order["approval_id"], "APPROVED")
+        elif order["side"] == "BUY" and (intent or "").startswith("MANUAL"):
+            # A manual BUY has no approval carrying a stop level: keep the
+            # position's stop if this added to it, else a flat fallback stop
+            # below the fill (professor M108).
+            import math
+            try:
+                if not db.get_position_stop(ticker) or not _held_before_fill(ticker, fill_qty):
+                    from execution import _MANUAL_FALLBACK_STOP_PCT as pct
+                    if not (math.isfinite(total_avg) and total_avg > 0):
+                        raise ValueError(f"unusable fill price {total_avg}")
+                    db.upsert_position_stop(
+                        ticker=ticker, entry_price=total_avg,
+                        stop_price=round(total_avg * (1 - pct), 2),
+                        stop_method=f"manual late fill, flat {pct:.0%}",
+                        bucket="Accelerator", conviction=5, trail_distance_pct=None,
+                    )
+                stop_placed = _reprotect_after_late_sell(ticker, {}, None, from_queue=True)
+            except Exception as e:
+                log.error(f"[{ticker}] reconcile_unconfirmed_orders: manual BUY stop failed: {e}")
+                stop_placed = False
+            if stop_placed is not True:
+                _queue_reprotect(ticker, {"intent": "BUY"}, None)
         elif order["side"] == "SELL":
             # A late SELL fill (partial sale or TRIM whose stop was cancelled
             # before the sale) leaves the rest without a stop. Re-protect it at

@@ -1347,17 +1347,37 @@ def execute_manual(
         # a stop for shares that may not exist would diverge DB state from
         # the broker.
         log.error(f"[{ticker}] No fill confirmed for manual {side} {qty} "
-                  f"(id={order_result.get('order_id')}) — nothing recorded")
+                  f"(id={order_result.get('order_id')}) — no trade recorded")
+        # An orders row lets reconcile_unconfirmed_orders book a late fill
+        # and protect it; without one a late manual fill stayed invisible
+        # (professor M108). No decision price: slippage stats stay
+        # approval-path only.
+        try:
+            db.log_order(ticker=ticker, side=side, order_type="MARKET", qty=qty,
+                         broker_order_id=order_result.get("order_id"),
+                         status="unconfirmed", intent=f"MANUAL_{side}")
+        except Exception as e:
+            log.warning(f"[{ticker}] Could not log the unconfirmed manual order: {e}")
         stop_note = (" The broker stop was cancelled before the sell and NOT re-placed "
                      "(a late fill plus a full-size stop could short); check it."
                      if side == "SELL" else "")
         return {"success": False, "filled_qty": 0, "fill_price": None, "stop_price": None,
                 "message": f"Order submitted (id {order_result.get('order_id')}) but no fill "
-                           f"confirmed within the wait window. Nothing recorded — check TWS."
-                           f"{stop_note}"}
+                           f"confirmed within the wait window. No trade recorded; a late fill "
+                           f"is reconciled automatically — check TWS.{stop_note}"}
 
     fill_price = order_result.get("fill_price") or ibkr.get_latest_price(ticker) or 0.0
     db.log_trade(symbol=ticker, side=side, quantity=filled_qty, price=fill_price, reason=reason)
+    try:
+        local_order_id = db.log_order(ticker=ticker, side=side, order_type="MARKET", qty=qty,
+                                      broker_order_id=order_result.get("order_id"),
+                                      status="submitted", intent=f"MANUAL_{side}")
+        if local_order_id > 0 and order_result.get("fill_price"):
+            # A part fill stays 'partial' so reconcile books the rest (M53).
+            db.update_order_fill(local_order_id, order_result["fill_price"], filled_qty,
+                                 "partial" if filled_qty < float(qty) - 1e-6 else "filled")
+    except Exception as e:
+        log.debug(f"[{ticker}] Manual order logging failed (non-critical): {e}")
 
     stop_price = None
     if side == "SELL":

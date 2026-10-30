@@ -1015,3 +1015,28 @@ def test_manual_buy_nan_fill_alerts_unprotected_not_nan_stop():
 def test_manual_buy_fallback_stop_never_above_the_quote():
     r, upsert, action, alert = _manual_buy(120.0, quote=100.0)    # stale fill 20% above the quote
     assert upsert.call_args.kwargs["stop_price"] == 92.0          # 8% under the quote, not 110.4
+
+
+def test_manual_orders_get_an_orders_row():
+    """Professor M108: an unfilled manual BUY wrote no orders row, so a late
+    fill was never reconciled; a part fill stays 'partial' for the rest."""
+    def run(result):
+        with patch("ibkr.get_client"), patch("risk_manager.RiskManager") as rm_cls, \
+             patch("market_data.get_priced_quote", return_value={"price": 100.0}), \
+             patch("ibkr.place_market_order", return_value=result), \
+             patch("db.log_trade"), patch("db.log_order", return_value=5) as log_order, \
+             patch("db.update_order_fill") as fill, patch("db.upsert_position_stop"), \
+             patch("db.set_stop_broker_order_id"), \
+             patch("tasks.manage_stop_place", return_value={"order_id": 9}), patch("alerts._send"):
+            rm_cls.return_value.is_halted.return_value = False
+            rm_cls.return_value.calculate_stop.return_value = (92.0, "ATR")
+            r = execution.execute_manual("ZZZ", "BUY", 3, "test")
+        return r, log_order, fill
+    r, log_order, fill = run({"order_id": 77, "filled_qty": 0, "status": "Submitted"})
+    assert not r["success"] and "reconciled automatically" in r["message"]
+    kw = log_order.call_args.kwargs
+    assert kw["status"] == "unconfirmed" and kw["intent"] == "MANUAL_BUY" and kw["broker_order_id"] == 77
+    assert kw.get("decision_price") is None and not fill.called
+    r, log_order, fill = run({"order_id": 78, "fill_price": 100.0, "filled_qty": 2})
+    assert r["success"] and log_order.call_args.kwargs["status"] == "submitted"
+    fill.assert_called_once_with(5, 100.0, 2.0, "partial")

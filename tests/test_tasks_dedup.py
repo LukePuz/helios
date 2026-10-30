@@ -499,6 +499,31 @@ class TestReconcileUnconfirmedOrders:
         mock_stop.assert_not_called()
         assert "check TWS" in mock_alert.call_args[0][0]
 
+    def _run_manual_buy(self, stop_rec):
+        order = {**self._order(approval_id=None), "intent": "MANUAL_BUY"}
+        with patch("db.get_unconfirmed_orders", return_value=[order]), \
+             patch("ibkr.get_fill_for_order",
+                   return_value={"filled_qty": 144.0, "fill_price": 181.3}), \
+             patch("db.log_trade"), patch("db.update_order_fill"), \
+             patch("ibkr.get_client", return_value=self._client(144)), \
+             patch("db.get_position_stop", return_value=stop_rec), \
+             patch("db.upsert_position_stop") as upsert, \
+             patch("tasks._reprotect_after_late_sell", return_value=True) as reprotect, \
+             patch("tasks._retry_pending_reprotects"), patch("alerts._send") as alert:
+            tasks.reconcile_unconfirmed_orders.run()
+        return upsert, reprotect, alert
+
+    def test_late_manual_buy_gets_a_fallback_stop(self):
+        """Professor M108: a late manual BUY fill is protected 8% below the fill."""
+        upsert, reprotect, alert = self._run_manual_buy(None)
+        assert upsert.call_args.kwargs["stop_price"] == round(181.3 * 0.92, 2)
+        reprotect.assert_called_once()
+        assert "Protective stop placed" in alert.call_args[0][0]
+
+    def test_late_manual_buy_closed_positions_leftover_record_is_replaced(self):
+        upsert, _, _ = self._run_manual_buy({"stop_price": 200.0})   # 144 held = all from this fill
+        assert upsert.call_args.kwargs["stop_price"] == round(181.3 * 0.92, 2)
+
     def _run_sell(self, positions, stop_rec={"stop_price": 150.0}, **order_extra):
         from unittest.mock import MagicMock
         order = {**self._order(side="SELL", qty=50.0), **order_extra}

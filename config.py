@@ -338,10 +338,10 @@ ALLOW_ONE_SHARE_ABOVE_ALLOCATION = os.getenv("ALLOW_ONE_SHARE_ABOVE_ALLOCATION",
 # invested; Luke 10-29). Normal multi-share sizing keeps the 20% cap.
 ONE_SHARE_MAX_PCT_OF_CASH = float(os.getenv("ONE_SHARE_MAX_PCT_OF_CASH", "0.50"))
 # Brief sections that change what the analyst sees (professor M37-M39, Q35).
-# Off until Luke decides whether the model should see its own past verdicts
-# and the gate inputs before the call (2026-10-28).
-BRIEF_PRICE_STRUCTURE = os.getenv("BRIEF_PRICE_STRUCTURE", "false").lower() == "true"
-BRIEF_POSITION_CONTEXT = os.getenv("BRIEF_POSITION_CONTEXT", "false").lower() == "true"
+# On from 10-30 (Luke D12, 10-29: needed for plan-following); false turns
+# either back off.
+BRIEF_PRICE_STRUCTURE = os.getenv("BRIEF_PRICE_STRUCTURE", "true").lower() == "true"
+BRIEF_POSITION_CONTEXT = os.getenv("BRIEF_POSITION_CONTEXT", "true").lower() == "true"
 # Market-regime fallback reads only overall-market rows (audit 20:53 A2053-1,
 # 08:53 A0853-1). On from 10-30 (Luke D3, 10-29); false restores sector-row reads.
 REGIME_OVERALL_ONLY = os.getenv("REGIME_OVERALL_ONLY", "true").lower() == "true"

@@ -2703,8 +2703,13 @@ def watch_plan_levels():
         today = datetime.now(ZoneInfo("America/New_York")).date()
         r = stop_lock._redis()
         held = _held_prices()
+        plans_now = db.get_active_plans()
+        if not held and plans_now:
+            # Indistinguishable from "no level crossed" otherwise (SEF, 10-30).
+            log.warning(f"watch_plan_levels: portfolio snapshot stale or missing; price checks "
+                        f"skipped for {len(plans_now)} plan(s), date checks only")
         logged = 0
-        for plan in db.get_active_plans():
+        for plan in plans_now:
             price = held.get(plan["ticker"])
             for kind, level in level_hits(plan, price, today):
                 if not r.set(f"helios:plan_hit:{plan['id']}:{kind}", "1", nx=True, ex=86400):

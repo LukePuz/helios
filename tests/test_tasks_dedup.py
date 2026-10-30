@@ -905,8 +905,10 @@ class TestStaleStopReconciliation:
     def test_no_fill_found_does_not_fabricate_a_trade_and_alerts_instead(self):
         state = {}
         self._run(state, fill_return=None)  # cycle 1: arms the marker
-        mock_fill, mock_log_trade, mock_close_outcome, mock_delete, mock_alert = \
-            self._run(state, fill_return=None)  # cycle 2: confirmed -> reconciles
+        with patch("db.flag_orphan_outcomes_for") as flag:
+            mock_fill, mock_log_trade, mock_close_outcome, mock_delete, mock_alert = \
+                self._run(state, fill_return=None)  # cycle 2: confirmed -> reconciles
+        flag.assert_called_once_with("DDOG")              # professor M120
 
         mock_log_trade.assert_not_called()
         mock_close_outcome.assert_not_called()
@@ -1522,7 +1524,7 @@ def test_orphan_outcome_flag_skips_an_empty_snapshot_and_passes_held_tickers():
     assert flag.call_args.args[0] == {"NVDA", "PLTR"}
 
 
-def test_flag_orphan_outcomes_sql_flags_unheld_and_unflags_held():
+def test_flag_orphan_outcomes_sql_flags_unheld_and_never_unflags():
     from unittest.mock import MagicMock
     import db
     cur = MagicMock()
@@ -1534,7 +1536,8 @@ def test_flag_orphan_outcomes_sql_flags_unheld_and_unflags_held():
         assert db.flag_orphan_outcomes({"nvda"}) == (3, 105)
     sqls = [c.args[0] for c in cur.execute.call_args_list]
     assert "orphaned_at = NOW()" in sqls[0] and "<> ALL" in sqls[0]
-    assert "orphaned_at = NULL" in sqls[1] and cur.execute.call_args_list[0].args[1][1] == ["NVDA"]
+    assert not any("orphaned_at = NULL" in q for q in sqls)            # professor M120
+    assert cur.execute.call_args_list[0].args[1][1] == ["NVDA"]
     assert "exit_date IS NULL" in sqls[0] and "UPDATE" in sqls[0] and "exit_price" not in sqls[0]
 
 
@@ -1548,3 +1551,22 @@ def test_routing_helper_is_not_shadowed():
     """Review of 352d290: a second _held_tickers replaced the LLM-routing one."""
     import inspect
     assert "max_age_min" not in inspect.signature(tasks._held_tickers).parameters
+
+
+def test_close_trade_outcome_refuses_an_unusable_price_and_skips_orphaned_rows():
+    """Professor M119/M120."""
+    from unittest.mock import MagicMock
+    import db
+    with patch("db._get_conn") as get_conn:
+        assert db.close_trade_outcome("NVDA", exit_price=0.0) is False
+        assert db.close_trade_outcome("NVDA", exit_price=float("nan")) is False
+        assert db.close_trade_outcome("NVDA", exit_price=None) is False
+    assert not get_conn.called
+    cur = MagicMock()
+    cur.fetchall.return_value = []
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
+        db.close_trade_outcome("NVDA", exit_price=100.0)
+    assert "orphaned_at IS NULL" in cur.execute.call_args_list[0].args[0]
+

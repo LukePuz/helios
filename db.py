@@ -3404,7 +3404,18 @@ def close_trade_outcome(ticker: str, exit_price: float, exit_date=None,
     row's holding window. Called after a confirmed full exit.
     Returns True if any row was closed.
     """
+    import math
     from datetime import datetime, timezone as _tz
+
+    try:
+        exit_ok = float(exit_price) > 0 and math.isfinite(float(exit_price))
+    except (TypeError, ValueError):
+        exit_ok = False
+    if not exit_ok:
+        # A 0.0 fallback price would record a -100% outcome (professor M119):
+        # leave the row open for a later close with a real price.
+        logging.error(f"close_trade_outcome: {ticker} exit price {exit_price!r} unusable; row left open")
+        return False
 
     exit_date = exit_date or datetime.now(_tz.utc)
 
@@ -3413,10 +3424,12 @@ def close_trade_outcome(ticker: str, exit_price: float, exit_date=None,
         with conn.cursor() as cur:
             # Every open row for the ticker: the position is gone, so an
             # OPEN followed by ADDs must close all of its rows, not just the
-            # newest (professor C5, 2026-10-28).
+            # newest (professor C5, 2026-10-28). Rows flagged orphaned belong
+            # to an earlier position that closed unrecorded; this exit's
+            # price isn't theirs (professor M120).
             cur.execute(
                 "SELECT id, entry_price, entry_benchmark_price FROM trade_outcomes "
-                "WHERE ticker=%s AND trading_env=%s AND exit_date IS NULL "
+                "WHERE ticker=%s AND trading_env=%s AND exit_date IS NULL AND orphaned_at IS NULL "
                 "ORDER BY entry_date DESC",
                 (ticker, TRADING_ENV),
             )
@@ -3894,11 +3907,35 @@ def upsert_earnings_date(ticker: str, earnings_date, confirmed: bool = False,
         _put_conn(conn)
 
 
+def flag_orphan_outcomes_for(ticker: str) -> int:
+    """Flags this ticker's open outcome rows orphaned now: its position
+    closed at the broker with no exit fill found (professor M120). Returns
+    the number flagged, -1 on error."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE trade_outcomes SET orphaned_at = NOW() WHERE ticker=%s AND trading_env=%s "
+                "AND exit_date IS NULL AND orphaned_at IS NULL", (ticker, TRADING_ENV),
+            )
+            n = cur.rowcount
+        conn.commit()
+        return n
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"flag_orphan_outcomes_for({ticker}) failed: {e}")
+        return -1
+    finally:
+        _put_conn(conn)
+
+
 def flag_orphan_outcomes(held: set[str]) -> tuple[int, int]:
     """Flags open trade_outcomes rows (exit_date NULL, this env) whose ticker
-    isn't in `held` by setting orphaned_at once; a row whose ticker is held
-    again is unflagged. Returns (newly flagged, total flagged open rows).
-    Never closes a row: no exit price is known (professor M111)."""
+    isn't in `held` by setting orphaned_at once. A flag is never cleared: a
+    later position in the same ticker is a new position, and
+    close_trade_outcome skips flagged rows (professor M120). Returns (newly
+    flagged, total flagged open rows). Never closes a row: no exit price is
+    known (professor M111)."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
@@ -3909,11 +3946,6 @@ def flag_orphan_outcomes(held: set[str]) -> tuple[int, int]:
                 (TRADING_ENV, held_list),
             )
             newly = cur.rowcount
-            cur.execute(
-                "UPDATE trade_outcomes SET orphaned_at = NULL WHERE trading_env=%s AND exit_date IS NULL "
-                "AND orphaned_at IS NOT NULL AND UPPER(ticker) = ANY(%s)",
-                (TRADING_ENV, held_list),
-            )
             cur.execute(
                 "SELECT COUNT(*) FROM trade_outcomes WHERE trading_env=%s AND exit_date IS NULL "
                 "AND orphaned_at IS NOT NULL", (TRADING_ENV,),

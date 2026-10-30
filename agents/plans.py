@@ -203,5 +203,5 @@ def observe(ticker: str, parsed: dict, action: str, conviction: int, brief: str,
             db.touch_plan(plan["id"], out["relation"])
         return out
     except Exception as e:
-        log.warning(f"[{ticker}] plan shadow failed: {e}")
+        log.error(f"[{ticker}] plan shadow failed: {e}")   # error level so the log monitor sees it
         return {"relation": "ERROR", "error": str(e)[:200]}

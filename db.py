@@ -742,6 +742,10 @@ _MIGRATIONS: list[tuple[int, str]] = [
     # Set when an open outcome row's ticker isn't held (a flag, not a close:
     # no exit price is known). NULL before 10-30 (professor M111).
     (67, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS orphaned_at TIMESTAMPTZ;"),
+    # Why orphaned_at was set: sweep (15:45, ticker not held), no_fill (position
+    # gone, no exit fill found) or refused_price (exit with an unusable price).
+    # NULL before 10-30 (SEF data QA).
+    (68, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS orphan_reason VARCHAR(20);"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -3415,7 +3419,7 @@ def close_trade_outcome(ticker: str, exit_price: float, exit_date=None,
         # A 0.0 fallback price would record a -100% outcome (professor M119).
         # Callers only get here after a confirmed full exit, so the rows are
         # flagged orphaned (no trustworthy exit) rather than left looking open.
-        n = flag_orphan_outcomes_for(ticker)
+        n = flag_orphan_outcomes_for(ticker, "refused_price")
         logging.error(f"close_trade_outcome: {ticker} exit price {exit_price!r} unusable; "
                       f"{n} open row(s) flagged orphaned, not closed")
         return False
@@ -3910,16 +3914,17 @@ def upsert_earnings_date(ticker: str, earnings_date, confirmed: bool = False,
         _put_conn(conn)
 
 
-def flag_orphan_outcomes_for(ticker: str) -> int:
-    """Flags this ticker's open outcome rows orphaned now: its position
-    closed at the broker with no exit fill found (professor M120). Returns
-    the number flagged, -1 on error."""
+def flag_orphan_outcomes_for(ticker: str, reason: str) -> int:
+    """Flags this ticker's open outcome rows orphaned now, recording `reason`
+    (no_fill: position closed at the broker with no exit fill found,
+    professor M120; refused_price: exit with an unusable price). Returns the
+    number flagged, -1 on error."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE trade_outcomes SET orphaned_at = NOW() WHERE ticker=%s AND trading_env=%s "
-                "AND exit_date IS NULL AND orphaned_at IS NULL", (ticker, TRADING_ENV),
+                "UPDATE trade_outcomes SET orphaned_at = NOW(), orphan_reason = %s WHERE ticker=%s "
+                "AND trading_env=%s AND exit_date IS NULL AND orphaned_at IS NULL", (reason, ticker, TRADING_ENV),
             )
             n = cur.rowcount
         conn.commit()
@@ -3949,7 +3954,8 @@ def flag_orphan_outcomes(held: set[str]) -> tuple[int, int]:
         with conn.cursor() as cur:
             held_list = sorted(t.upper() for t in held) or [""]
             cur.execute(
-                "UPDATE trade_outcomes SET orphaned_at = NOW() WHERE trading_env=%s AND exit_date IS NULL "
+                "UPDATE trade_outcomes SET orphaned_at = NOW(), orphan_reason = 'sweep' "
+                "WHERE trading_env=%s AND exit_date IS NULL "
                 "AND orphaned_at IS NULL AND entry_date < NOW() - INTERVAL '30 minutes' "
                 "AND UPPER(ticker) <> ALL(%s) AND NOT EXISTS ("
                 "SELECT 1 FROM position_stops ps WHERE UPPER(ps.ticker) = UPPER(trade_outcomes.ticker) "

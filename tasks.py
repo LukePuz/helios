@@ -3383,7 +3383,7 @@ def _reconcile_stop_orders_body(self):
                     new_actions.append(msg)
                     log.error(f"[{ticker}] {msg}")
                     try:
-                        db.flag_orphan_outcomes_for(ticker)   # professor M120
+                        db.flag_orphan_outcomes_for(ticker, "no_fill")   # professor M120
                     except Exception as e:
                         log.error(f"[{ticker}] could not flag the open outcome orphaned: {e}")
                     if _reconcile_alert_due(f"unreconciled_exit_{ticker}"):

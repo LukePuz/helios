@@ -908,7 +908,7 @@ class TestStaleStopReconciliation:
         with patch("db.flag_orphan_outcomes_for") as flag:
             mock_fill, mock_log_trade, mock_close_outcome, mock_delete, mock_alert = \
                 self._run(state, fill_return=None)  # cycle 2: confirmed -> reconciles
-        flag.assert_called_once_with("DDOG")              # professor M120
+        flag.assert_called_once_with("DDOG", "no_fill")   # professor M120
 
         mock_log_trade.assert_not_called()
         mock_close_outcome.assert_not_called()
@@ -1535,7 +1535,7 @@ def test_flag_orphan_outcomes_sql_flags_unheld_and_never_unflags():
     with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
         assert db.flag_orphan_outcomes({"nvda"}) == (3, 105)
     sqls = [c.args[0] for c in cur.execute.call_args_list]
-    assert "orphaned_at = NOW()" in sqls[0] and "<> ALL" in sqls[0]
+    assert "orphaned_at = NOW(), orphan_reason = 'sweep'" in sqls[0] and "<> ALL" in sqls[0]
     assert "NOT EXISTS" in sqls[0] and "position_stops" in sqls[0]     # cache-lag guard
     assert "entry_date < NOW() - INTERVAL '30 minutes'" in sqls[0]
     assert not any("orphaned_at = NULL" in q for q in sqls)            # professor M120
@@ -1564,7 +1564,7 @@ def test_close_trade_outcome_refuses_an_unusable_price_and_skips_orphaned_rows()
         assert db.close_trade_outcome("NVDA", exit_price=float("nan")) is False
         assert db.close_trade_outcome("NVDA", exit_price=None) is False
     assert not get_conn.called                       # nothing closed
-    assert [c.args for c in flag.call_args_list] == [("NVDA",)] * 3
+    assert [c.args for c in flag.call_args_list] == [("NVDA", "refused_price")] * 3
     cur = MagicMock()
     cur.fetchall.return_value = []
     conn = MagicMock()

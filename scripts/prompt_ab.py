@@ -16,31 +16,48 @@ isolates the reorder. Also gives test-retest spread (limitations audit 09:00
 second newest, and so on round-robin (15 tickers had stored prompts on
 10-30). Results pair by prompt. The two variants alternate run by run, and
 which goes first flips by prompt. Each run also records the logprob
-expected conviction. The summary applies the conviction-gate rule fixed in
-the research log on 10-30 before any run (old c7+ share at least 15 points
-higher AND paired mean expected conviction at least 0.5 higher).
+expected conviction. The summary applies the conviction-gate rule in the
+research log of 10-30 07:02 (old c7+ share at least 15 points higher AND
+paired mean expected conviction at least 0.5 higher). That rule was set
+after the 10-28 6-prompt pilot (prompt-ab-pilot-2026-10-28.md), so the
+pilot's prompts are excluded by default (--include-pilot keeps them).
+Runs with no parseable conviction, a regex-salvaged reply or no logprobs
+are counted per arm and left out of the rule.
+
+The new arm tests 31d52f8 as shipped: the reorder plus its 3-line "fill the
+fields in the order shown" instruction, not the reorder alone.
 
 Refuses to run while helios-local is active (the 72B is shared with the
-live analyst) unless --force. Prints and optionally writes prompt_id,
-signal_id (signals.id of the stored prompt), ticker, variant, run, action,
-conviction, expected, p_ge7. No portfolio values: prompts are
-read from the DB and never written out.
+live analyst) unless --force. Prints and, with --out, writes row by row
+(flushed) prompt_id, signal_id (signals.id of the stored prompt), ticker,
+variant, run, action, conviction, salvaged, expected, p_ge7, plus
+OUT.provenance.json (commits, schema-block hashes, model, sample, times) and
+OUT.old_schema.txt (the old block, so a rerun works without git history:
+--old-schema FILE). No portfolio values: prompts are read from the DB and
+never written out.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
+import math
 import os
 import subprocess
 import sys
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 _START = "Then output ONLY valid JSON"
 _END = "\nRules:"
 OLD_COMMIT = "31d52f8^"
-RULE_SHARE_PTS = 15.0     # fixed in the research log 10-30 07:02, before any run
+RULE_SHARE_PTS = 15.0     # research log 10-30 07:02 (set after the 10-28 pilot)
 RULE_EXPECTED = 0.5
+# The 10-28 pilot's prompts (TER, META, MSFT x2, KLAC, ORCL; checked against
+# the DB 10-30): the rule was set after seeing them.
+PILOT_SIGNAL_IDS = frozenset({79199, 79189, 79173, 79172, 79150, 79137})
 
 
 def schema_block(source: str) -> str:
@@ -65,12 +82,17 @@ def summarize(runs: list[dict]) -> dict:
         by[r["variant"]][r.get("prompt_id", r["ticker"])].append(r)
     out = {}
     for v in ("new", "old"):
-        convs = [r["conviction"] for t in by[v].values() for r in t if r["conviction"] is not None]
+        rows = [r for t in by[v].values() for r in t]
+        convs = [r["conviction"] for r in rows if r["conviction"] is not None and not r.get("salvaged")]
         out[v] = {"runs": len(convs), "counts": dict(sorted(Counter(convs).items())),
+                  "no_conviction": sum(r["conviction"] is None for r in rows),
+                  "salvaged": sum(bool(r.get("salvaged")) for r in rows),
+                  "no_logprobs": sum(r["expected"] is None for r in rows),
                   "c7_share_pct": round(100 * sum(c >= 7 for c in convs) / len(convs), 1) if convs else None}
     diffs = []
     for t in set(by["new"]) & set(by["old"]):
-        e = {v: [r["expected"] for r in by[v][t] if r["expected"] is not None] for v in ("new", "old")}
+        e = {v: [r["expected"] for r in by[v][t] if r["expected"] is not None and not r.get("salvaged")]
+             for v in ("new", "old")}
         if e["new"] and e["old"]:
             diffs.append(sum(e["old"]) / len(e["old"]) - sum(e["new"]) / len(e["new"]))
     out["paired_prompts"] = len(diffs)
@@ -100,7 +122,15 @@ def _round_robin(rows: list[tuple], n: int) -> list[tuple]:
     return out[:n]
 
 
-def _stored_prompts(n: int) -> list[tuple[str, str]]:
+def _conviction(v) -> int | None:
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    return int(v) if math.isfinite(v) else None
+
+
+def _stored_prompts(n: int, exclude: frozenset = frozenset()) -> list[tuple]:
     import db
     conn = db._get_conn()
     try:
@@ -108,7 +138,7 @@ def _stored_prompts(n: int) -> list[tuple[str, str]]:
             # Same environment only (professor C13, 2026-10-28).
             cur.execute("SELECT symbol, prompt, timestamp, id FROM signals "
                         "WHERE prompt IS NOT NULL AND trading_env=%s", (db.TRADING_ENV,))
-            rows = cur.fetchall()
+            rows = [r for r in cur.fetchall() if r[3] not in exclude]
     finally:
         db._put_conn(conn)
     return _round_robin(rows, n)
@@ -120,6 +150,8 @@ def main():
     ap.add_argument("--k", type=int, default=3)
     ap.add_argument("--out", default=None)
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--include-pilot", action="store_true")
+    ap.add_argument("--old-schema", default=None, help="file with the old schema block (instead of git)")
     args = ap.parse_args()
 
     live = subprocess.run(["systemctl", "is-active", "helios-local"], capture_output=True, text=True).stdout.strip()
@@ -130,19 +162,43 @@ def main():
     load_dotenv(os.path.join(REPO, ".env"))
     from agents import analyst
 
-    old_src = subprocess.run(["git", "-C", REPO, "show", f"{OLD_COMMIT}:agents/analyst.py"],
-                             capture_output=True, text=True, check=True).stdout
+    if args.old_schema:
+        with open(args.old_schema) as f:
+            old_block, old_commit = f.read(), f"file {args.old_schema}"
+    else:
+        old_src = subprocess.run(["git", "-C", REPO, "show", f"{OLD_COMMIT}:agents/analyst.py"],
+                                 capture_output=True, text=True, check=True).stdout
+        old_block = schema_block(old_src)
+        old_commit = subprocess.run(["git", "-C", REPO, "rev-parse", OLD_COMMIT],
+                                    capture_output=True, text=True).stdout.strip()
     with open(os.path.join(REPO, "agents", "analyst.py")) as f:
         new_block = schema_block(f.read())
-    old_block = schema_block(old_src)
 
-    rows = _stored_prompts(args.n)
+    exclude = frozenset() if args.include_pilot else PILOT_SIGNAL_IDS
+    rows = _stored_prompts(args.n, exclude)
     if not rows:
         sys.exit("no stored prompts yet (signals.prompt is recorded from 10-28 16:05)")
 
-    header = "prompt_id,signal_id,ticker,variant,run,action,conviction,expected,p_ge7"
+    sha = lambda t: hashlib.sha256(t.encode()).hexdigest()[:12]
+    meta = {"started": datetime.now(timezone.utc).isoformat(), "n": args.n, "k": args.k,
+            "head": subprocess.run(["git", "-C", REPO, "rev-parse", "HEAD"],
+                                   capture_output=True, text=True).stdout.strip(),
+            "old_schema_from": old_commit, "old_block_sha": sha(old_block), "new_block_sha": sha(new_block),
+            "model": analyst.ANALYST_MODEL, "excluded_signal_ids": sorted(exclude),
+            "signal_ids": [r[2] for r in rows],
+            "rule": {"share_pts": RULE_SHARE_PTS, "expected": RULE_EXPECTED}}
+    out = None
+    if args.out:
+        with open(args.out + ".old_schema.txt", "w") as f:
+            f.write(old_block)
+        out = open(args.out, "w")
+
+    header = "prompt_id,signal_id,ticker,variant,run,action,conviction,salvaged,expected,p_ge7"
     lines, runs = [header], []
     print(header, flush=True)
+    if out:
+        out.write(header + "\n")
+        out.flush()
     for i, (ticker, prompt, signal_id) in enumerate(rows):
         try:
             variants = {"new": prompt, "old": old_variant(prompt, new_block, old_block)}
@@ -156,19 +212,25 @@ def main():
                 parsed = analyst._extract_json(raw) if raw else None
                 dist = analyst._LAST_CALL_STATS.get("conviction_logprobs") or {}
                 action = str((parsed or {}).get("action", "ERR")).upper()
-                c = (parsed or {}).get("conviction")
-                c = int(c) if isinstance(c, (int, float)) else None
+                c = _conviction((parsed or {}).get("conviction"))
+                salvaged = bool((parsed or {}).get("_salvaged"))
                 runs.append({"ticker": ticker, "prompt_id": i, "variant": name, "conviction": c,
-                             "expected": dist.get("expected")})
-                lines.append(f"{i},{signal_id},{ticker},{name},{run},{action},{c},"
+                             "salvaged": salvaged, "expected": dist.get("expected")})
+                lines.append(f"{i},{signal_id},{ticker},{name},{run},{action},{c},{int(salvaged)},"
                              f"{dist.get('expected')},{dist.get('p_ge7')}")
                 print(lines[-1], flush=True)
+                if out:
+                    out.write(lines[-1] + "\n")
+                    out.flush()
     summary = summarize(runs)
     print("summary:", summary)
-    if args.out:
-        with open(args.out, "w") as f:
-            f.write("\n".join(lines) + "\n")
-            f.write(f"# summary: {summary}\n")
+    if out:
+        out.write(f"# summary: {json.dumps(summary)}\n")
+        out.close()
+        meta["finished"] = datetime.now(timezone.utc).isoformat()
+        meta["summary"] = summary
+        with open(args.out + ".provenance.json", "w") as f:
+            json.dump(meta, f, indent=2)
 
 
 if __name__ == "__main__":

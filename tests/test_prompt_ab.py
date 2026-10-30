@@ -50,3 +50,22 @@ def test_missing_logprobs_or_unparsed_runs_are_skipped():
 def test_round_robin_takes_newest_per_ticker_first():
     rows = [("A", "a1", 5, 11), ("A", "a2", 4, 12), ("A", "a3", 3, 13), ("B", "b1", 6, 14), ("C", "c1", 1, 15)]
     assert ab._round_robin(rows, 4) == [("B", "b1", 14), ("A", "a1", 11), ("C", "c1", 15), ("A", "a2", 12)]
+
+
+def test_bad_runs_are_counted_and_left_out_of_the_rule():
+    runs = [{"ticker": "A", "prompt_id": 0, "variant": "new", "conviction": 6, "expected": 6.0},
+            {"ticker": "A", "prompt_id": 0, "variant": "new", "conviction": 7, "expected": 7.0, "salvaged": True},
+            {"ticker": "A", "prompt_id": 0, "variant": "old", "conviction": None, "expected": None},
+            {"ticker": "A", "prompt_id": 0, "variant": "old", "conviction": 7, "expected": 7.0}]
+    s = ab.summarize(runs)
+    assert s["new"]["runs"] == 1 and s["new"]["salvaged"] == 1
+    assert s["old"]["no_conviction"] == 1 and s["old"]["no_logprobs"] == 1
+    assert s["paired_mean_expected_diff"] == 1.0
+
+
+def test_conviction_parse_survives_nan_and_text():
+    assert ab._conviction(float("nan")) is None and ab._conviction("7") == 7 and ab._conviction("x") is None
+
+
+def test_pilot_prompts_are_excluded_by_default():
+    assert {79199, 79189, 79173, 79172, 79150, 79137} == set(ab.PILOT_SIGNAL_IDS)

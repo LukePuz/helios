@@ -159,11 +159,12 @@ class TestCancelOrderPollsForTerminalStatus:
 
 
 class _FakeExecution:
-    def __init__(self, order_id, shares, avg_price, side, time=None):
+    def __init__(self, order_id, shares, avg_price, side, time=None, price=None):
         self.time = time
         self.orderId = order_id
         self.shares = shares
-        self.avgPrice = avg_price
+        self.avgPrice = avg_price             # the order's running average
+        self.price = avg_price if price is None else price   # this execution's own price
         self.side = side  # "BOT" or "SLD"
 
 
@@ -212,6 +213,28 @@ class TestGetRecentSellFill:
         assert result["filled_qty"] == 84.0
         expected_avg = (50.0 * 228.00 + 34.0 * 226.50) / 84.0
         assert result["fill_price"] == expected_avg
+
+    def test_weights_each_executions_own_price_not_the_running_average(self):
+        """Review of c13548c: avgPrice is cumulative per order."""
+        fake_ib = MagicMock()
+        first = _FakeFillRecord("DDOG", order_id=11, shares=50.0, avg_price=228.00, side="SLD")
+        second = _FakeFillRecord("DDOG", order_id=11, shares=34.0, avg_price=227.39, side="SLD")
+        second.execution.price = 226.50
+        fake_ib.reqExecutions.return_value = [first, second]
+        with patch("ibkr.get_ib", return_value=fake_ib):
+            result = ibkr.get_recent_sell_fill("DDOG")
+        assert result["fill_price"] == (50.0 * 228.00 + 34.0 * 226.50) / 84.0
+
+    def test_leaves_out_orders_already_recorded(self):
+        """Professor M122: a same-day TRIM was counted again in the exit."""
+        fake_ib = MagicMock()
+        fake_ib.reqExecutions.return_value = [
+            _FakeFillRecord("DDOG", order_id=40, shares=20.0, avg_price=240.00, side="SLD"),   # logged TRIM
+            _FakeFillRecord("DDOG", order_id=11, shares=64.0, avg_price=227.80, side="SLD"),   # the stop
+        ]
+        with patch("ibkr.get_ib", return_value=fake_ib):
+            result = ibkr.get_recent_sell_fill("DDOG", {40})
+        assert result == {"filled_qty": 64.0, "fill_price": 227.80}
 
     def test_no_sell_execution_today_returns_none(self):
         fake_ib = MagicMock()

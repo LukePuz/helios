@@ -2957,6 +2957,27 @@ def update_order_fill(order_id: int, fill_price: float, filled_qty: float, statu
         _put_conn(conn)
 
 
+def recorded_sell_order_ids(ticker: str, max_age_hours: int = 24) -> set[int]:
+    """Broker order ids of the SELL orders logged for this ticker in this env
+    (market/bracket orders; stops aren't logged here). Their fills are
+    recorded by the execution or late-fill paths, so a symbol-wide execution
+    lookup must leave them out (professor M122). Empty set on error."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT broker_order_id FROM orders WHERE ticker=%s AND side='SELL' AND trading_env=%s "
+                "AND broker_order_id IS NOT NULL AND created_at > NOW() - make_interval(hours => %s)",
+                (ticker, TRADING_ENV, max_age_hours),
+            )
+            return {int(r[0]) for r in cur.fetchall()}
+    except Exception as e:
+        logging.error(f"recorded_sell_order_ids({ticker}) failed: {e}")
+        return set()
+    finally:
+        _put_conn(conn)
+
+
 def get_unconfirmed_orders(max_age_hours: int = 24) -> list[dict]:
     """Orders logged with status='unconfirmed' (no fill seen within
     place_market_order's wait window) in the last max_age_hours. Feeds

@@ -1245,6 +1245,13 @@ def _reconcile_unconfirmed_orders_locked(task):
                 log_buy_outcome(approval, ticker, approval.get("action") or intent or "OPEN", total_avg)
             except Exception as e:
                 log.error(f"[{ticker}] reconcile: could not log the late BUY's outcome row: {e}")
+        elif order["side"] == "BUY" and approval and prev_qty:
+            # The row was logged at the part fill's price: re-average it over
+            # the whole order (professor M121, entry side).
+            try:
+                db.update_outcome_entry_price(approval["id"], total_avg)
+            except Exception as e:
+                log.error(f"[{ticker}] reconcile: could not re-average the outcome entry: {e}")
         if order["side"] == "BUY" and approval:
             risk_json = approval.get("risk_json") or {}
             stop_price = approval.get("stop_loss_price") or risk_json.get("stop_loss_price")
@@ -1320,7 +1327,7 @@ def _reconcile_unconfirmed_orders_locked(task):
             # A late SELL fill (partial sale or TRIM whose stop was cancelled
             # before the sale) leaves the rest without a stop. Re-protect it at
             # the recorded stop (professor C12, 2026-10-28).
-            stop_placed = _reprotect_after_late_sell(ticker, order, fill_price)
+            stop_placed = _reprotect_after_late_sell(ticker, order, fill_price, exit_avg=total_avg)
             if stop_placed is False:
                 # Busy ticker or a failed placement: the order is already
                 # marked filled, so remember to retry (professor M50).
@@ -1613,7 +1620,8 @@ def _held_before_fill(ticker: str, fill_qty: float, action: str | None = None) -
 def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
                                fill_price: float | None = None,
                                from_queue: bool = False,
-                               expect_at_least: float | None = None) -> bool | None:
+                               expect_at_least: float | None = None,
+                               exit_avg: float | None = None) -> bool | None:
     """After a late SELL fill, finish what the selling path would have done
     (professor M-3, 2026-10-28):
     - nothing left: delete the stop record and close the outcome at the fill
@@ -1665,15 +1673,21 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
         # stale-stop branch, which logs the real exit (A2253-2).
         return None
     if remaining <= 0:
-        if db.get_position_stop(ticker):
+        had_record = bool(db.get_position_stop(ticker))
+        if had_record:
             db.delete_position_stop(ticker)
-            if fill_price:
-                try:
-                    db.close_trade_outcome(ticker, exit_price=fill_price,
-                                           exit_source=f"late_{(order.get('intent') or 'sell').lower()}",
-                                           exit_price_source="fill")   # broker average fill
-                except Exception as e:
-                    log.warning(f"[{ticker}] reconcile: close_trade_outcome failed: {e}")
+        # Flat: close from the order's cumulative average fill. An EXIT also
+        # closes without a stop record: a part-filled EXIT deleted it and
+        # left the outcome for this close (professor M121). Rows already
+        # closed or flagged orphaned are skipped by close_trade_outcome.
+        exit_price = exit_avg or fill_price
+        if exit_price and (had_record or (order.get("intent") or "").upper() == "EXIT"):
+            try:
+                db.close_trade_outcome(ticker, exit_price=exit_price,
+                                       exit_source=f"late_{(order.get('intent') or 'sell').lower()}",
+                                       exit_price_source="fill")   # broker average fill
+            except Exception as e:
+                log.warning(f"[{ticker}] reconcile: close_trade_outcome failed: {e}")
         return None
     stop_price = (db.get_position_stop(ticker) or {}).get("stop_price")
     if order.get("intent") == "PROFIT_TARGET" and order.get("stop_price"):
@@ -2092,11 +2106,18 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
                             + (" [retry]" if _is_retry else ""))
         if resting <= 0:  # shares under a stuck stop are still held
             db.delete_position_stop(ticker)
-            try:
-                db.close_trade_outcome(ticker, exit_price=fill_price, exit_source="backstop_sell",
-                                       exit_price_source="fill" if result.get("fill_price") else "quote")
-            except Exception:
-                pass
+            if filled < owned - 1e-6:
+                # Part filled: this part's price isn't the exit (professor
+                # M121). The rest is still working at the broker; the row
+                # stays open and is flagged once the position is flat.
+                log.warning(f"[{ticker}] Backstop sell part-filled ({filled:g} of {owned:g}); "
+                            f"outcome left open")
+            else:
+                try:
+                    db.close_trade_outcome(ticker, exit_price=fill_price, exit_source="backstop_sell",
+                                           exit_price_source="fill" if result.get("fill_price") else "quote")
+                except Exception as e:
+                    log.error(f"[{ticker}] close_trade_outcome failed after the backstop sell: {e}")  # m98
         log.warning(f"[{ticker}] BACKSTOP SELL executed: {filled} shares @ ~${fill_price:.2f}")
         return True
     except Exception as e:

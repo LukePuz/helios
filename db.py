@@ -3610,6 +3610,29 @@ def update_outcome_price(approval_id: int, days: int, price: float) -> None:
         _put_conn(conn)
 
 
+def update_outcome_entry_price(approval_id: int, entry_price: float) -> bool:
+    """Sets an open outcome row's entry_price to the order's cumulative
+    average when the rest of a part-filled BUY fills late (professor M121,
+    entry side). Returns True if a row was updated."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE trade_outcomes SET entry_price=%s WHERE approval_id=%s AND trading_env=%s "
+                "AND exit_date IS NULL",
+                (entry_price, approval_id, TRADING_ENV),
+            )
+            n = cur.rowcount
+        conn.commit()
+        return n > 0
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"update_outcome_entry_price failed: {e}")
+        return False
+    finally:
+        _put_conn(conn)
+
+
 def get_open_outcomes() -> list[dict]:
     """Returns trade outcomes where exit_date is NULL (position still open)."""
     conn = _get_conn()

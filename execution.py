@@ -1093,12 +1093,18 @@ def execute_approved(
             if action == "EXIT":
                 db.delete_position_stop(ticker)
                 log.info(f"[{ticker}] Position closed — stop record deleted")
-                # Close the feedback-loop outcome record with the real fill price
-                try:
-                    db.close_trade_outcome(ticker, exit_price=current_price, exit_source="model_exit",
-                                          exit_price_source=price_source)
-                except Exception as e:
-                    log.warning(f"[{ticker}] close_trade_outcome failed: {e}")
+                if filled_qty < float(shares) - 1e-6:
+                    # Part filled: the order stays 'partial' and reconcile
+                    # closes the outcome from the cumulative fill once the
+                    # rest fills (professor M121), not at this part's price.
+                    log.info(f"[{ticker}] EXIT part-filled ({filled_qty:g} of {shares}); outcome "
+                             f"left open for reconcile")
+                else:
+                    try:
+                        db.close_trade_outcome(ticker, exit_price=current_price, exit_source="model_exit",
+                                              exit_price_source=price_source)
+                    except Exception as e:
+                        log.warning(f"[{ticker}] close_trade_outcome failed: {e}")
             else:  # TRIM — re-place stop at same price for remaining quantity
                 remaining = _remaining_after_sell(ticker, owned, filled_qty)
                 stop_rec = db.get_position_stop(ticker)

@@ -94,6 +94,30 @@ class TestSellClampAndDrift:
         sold_qty = mock_order.call_args[0][2]
         assert sold_qty == 42.0
 
+    def test_part_filled_exit_leaves_the_outcome_for_reconcile(self):
+        """Professor M121: a part fill used to close the outcome at that
+        part's price; reconcile closes it from the cumulative fill."""
+        approval = _approval(action="EXIT", shares_initial=999)
+        ibkr_client = MagicMock()
+        ibkr_client.get_open_position.return_value = MagicMock(qty=42.0)
+        for filled, closes in ((20.0, False), (42.0, True)):
+            with patch("ibkr.get_ib"), \
+                 patch("ibkr.get_client", return_value=ibkr_client), \
+                 patch("ibkr.cancel_stop_orders_for", return_value=0), \
+                 patch("ibkr.place_market_order",
+                       return_value={"order_id": 1, "fill_price": 100.0, "filled_qty": filled}), \
+                 patch("ibkr.get_latest_price", return_value=100.0), \
+                 patch("market_data.get_priced_quote", return_value=None), \
+                 patch("config.USE_BRACKET_ORDERS", False), \
+                 patch("db.log_trade"), patch("db.log_order", return_value=1), \
+                 patch("db.update_order_fill") as upd, patch("db.delete_position_stop"), \
+                 patch("db.close_trade_outcome") as close, \
+                 patch("db.log_trade_outcome"), \
+                 patch("alerts.send_trade_alert"):
+                execution.execute_approved(approval)
+            assert close.called is closes
+            assert upd.call_args.args[3] == ("filled" if closes else "partial")
+
     def test_sell_not_aborted_by_large_drift(self):
         """A >8% price move must never block a risk-reducing sell — that's
         backwards (big moves are often exactly why you're exiting), and

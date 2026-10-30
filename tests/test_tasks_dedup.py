@@ -435,6 +435,7 @@ class TestReconcileUnconfirmedOrders:
                  patch("db.log_trade"), patch("db.update_order_fill"), \
                  patch("db.get_approval_by_id", return_value={**self._approval(), "action": "OPEN"}), \
                  patch("execution.log_buy_outcome") as outcome, \
+                 patch("db.update_outcome_entry_price") as reavg, \
                  patch("db.get_position_stop", return_value={"stop_price": 160.0}), \
                  patch("tasks._held_before_fill", return_value=True), \
                  patch("tasks._reprotect_after_late_sell", return_value=True), \
@@ -444,6 +445,8 @@ class TestReconcileUnconfirmedOrders:
             assert outcome.called is expect
             if expect:
                 assert outcome.call_args.args[1:] == ("CRWD", "OPEN", 181.3)
+            else:
+                reavg.assert_called_once_with(59, 181.3)   # entry side of M121
 
     def test_late_buy_keeps_existing_stop_record_and_queues_on_failure(self):
         """A2253-3: an ADD's late fill must not overwrite (loosen) the
@@ -677,8 +680,22 @@ class TestReconcileUnconfirmedOrders:
         self.extra["close"].assert_called_once_with("CRWD", exit_price=175.0, exit_source="late_exit",
                                                          exit_price_source="fill")
 
-    def test_late_exit_already_cleaned_up_is_not_closed_twice(self):
+    def test_late_exit_without_a_stop_record_closes_from_the_cumulative_fill(self):
+        """Professor M121: a part-filled EXIT deleted the record and left the
+        outcome open; the late remainder closes it (a row already closed or
+        orphaned is skipped inside close_trade_outcome)."""
         self._run_sell([], stop_rec=None, intent="EXIT")
+        self.extra["delete"].assert_not_called()
+        self.extra["close"].assert_called_once()
+
+    def test_late_exit_remainder_closes_at_the_cumulative_average_not_the_remainder_price(self):
+        """Professor M121: 30 filled @ 170 inside the window, 50 @ 175 in total;
+        the remainder alone averaged 182.5."""
+        self._run_sell([], stop_rec=None, intent="EXIT", filled_qty=30.0, fill_price=170.0)
+        assert self.extra["close"].call_args.kwargs["exit_price"] == 175.0
+
+    def test_late_trim_already_cleaned_up_is_not_closed(self):
+        self._run_sell([], stop_rec=None, intent="TRIM")
         self.extra["delete"].assert_not_called()
         self.extra["close"].assert_not_called()
 

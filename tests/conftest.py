@@ -130,3 +130,19 @@ def _no_live_ibkr(monkeypatch):
     def _blocked(*a, **k):
         raise RuntimeError("tests must not connect to IBKR; mock the ibkr.* call")
     monkeypatch.setattr(ibkr, "get_ib", _blocked)
+
+
+@pytest.fixture(autouse=True)
+def _buy_room_passes(request, monkeypatch):
+    """Execution tests mock the broker; the execution-time cash/cap check
+    (execution._buy_room_at_execution) passes through unless a test marks
+    itself `real_buy_room` to test the check itself."""
+    if request.node.get_closest_marker("real_buy_room"):
+        return
+    import execution
+    monkeypatch.setattr(execution, "_buy_room_at_execution",
+                        lambda ticker, action, shares, price: (shares, None))
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "real_buy_room: run the real execution-time cash/cap check")

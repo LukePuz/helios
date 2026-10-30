@@ -296,6 +296,41 @@ def last_outcome_reason() -> str | None:
     return getattr(_OUTCOME, "reason", None)
 
 
+def _buy_room_at_execution(ticker: str, action: str, shares: int, price: float | None
+                           ) -> tuple[int, str | None]:
+    """Re-check cash and the position cap when a buy is actually sent.
+
+    Sizing checks both, but a buy sized before the open runs later with its
+    stored share count, and several sized against the same pre-market cash
+    could together spend more than there is (pre-pull review 10-29, after the
+    one-share exception went to 50% of cash). Returns (shares to buy, None),
+    or (0, reason) to skip. Fails closed: a buy we can't check isn't sent."""
+    try:
+        import ibkr
+        from config import get_active_limits
+        from risk_manager import RiskManager
+        rm = RiskManager(ibkr.get_client())
+        limits = get_active_limits(rm.portfolio_value())
+        cap = limits.get("max_concurrent_positions")
+        if action == "OPEN" and cap is not None:
+            held = {p.symbol for p in rm._client.get_all_positions()}
+            if ticker not in held and len(held) >= cap:
+                return 0, f"position cap reached at execution ({len(held)} of {cap} held)"
+        if not price:
+            return shares, None
+        cash = rm.cash()
+        affordable = int(max(cash, 0) * 0.98 / price)   # small buffer for the fill
+        if affordable < 1:
+            return 0, "not enough cash at execution for one share"
+        if shares > affordable:
+            log.warning(f"[{ticker}] {action} cut from {shares} to {affordable} shares: "
+                        f"cash changed since sizing")
+            return affordable, None
+        return shares, None
+    except Exception as e:
+        return 0, f"cash/position check failed at execution ({str(e)[:100]})"
+
+
 # The whole execution holds the ticker's stop lock: a SELL cancels the stop,
 # sells and re-places it; a BUY places the first stop (stop_lock).
 @locked_by_ticker(lambda approval, *a, **k: approval["ticker"],
@@ -679,6 +714,17 @@ def execute_approved(
                     f"Skipping this entry rather than buy unchecked."
                 )
                 return _outcome("skipped: gap check could not run")
+
+        if side == "BUY":
+            shares, room_block = _buy_room_at_execution(
+                ticker, action, shares, current_price_pre or price_at_sizing)
+            if room_block:
+                log.error(f"[{ticker}] {action} not sent: {room_block}")
+                try:
+                    alert_module._send(f"⏸️ {action} NOT SENT — <b>{ticker}</b>\n{room_block}.")
+                except Exception:
+                    pass
+                return _outcome(f"skipped: {room_block}")
 
         if side == "SELL":
             # Cancel the existing broker stop only now that the sell is

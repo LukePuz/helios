@@ -1,0 +1,8 @@
+[Unit]
+Description=Helios nightly encrypted backup (scripts/backup_db.py)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/YOUR_USER/Desktop/trading_bot
+ExecStart=/home/YOUR_USER/Desktop/trading_bot/venv/bin/python scripts/backup_db.py
+Nice=10

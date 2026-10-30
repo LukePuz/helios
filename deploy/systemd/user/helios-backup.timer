@@ -1,0 +1,9 @@
+[Unit]
+Description=Helios nightly backup at 19:15, after the stack stops
+
+[Timer]
+OnCalendar=*-*-* 19:15:00 America/New_York
+Persistent=true
+
+[Install]
+WantedBy=timers.target

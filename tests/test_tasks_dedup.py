@@ -499,8 +499,8 @@ class TestReconcileUnconfirmedOrders:
         mock_stop.assert_not_called()
         assert "check TWS" in mock_alert.call_args[0][0]
 
-    def _run_manual_buy(self, stop_rec):
-        order = {**self._order(approval_id=None), "intent": "MANUAL_BUY"}
+    def _run_manual_buy(self, stop_rec, intent="MANUAL_OPEN", quote=None):
+        order = {**self._order(approval_id=None), "intent": intent}
         with patch("db.get_unconfirmed_orders", return_value=[order]), \
              patch("ibkr.get_fill_for_order",
                    return_value={"filled_qty": 144.0, "fill_price": 181.3}), \
@@ -509,9 +509,21 @@ class TestReconcileUnconfirmedOrders:
              patch("db.get_position_stop", return_value=stop_rec), \
              patch("db.upsert_position_stop") as upsert, \
              patch("tasks._reprotect_after_late_sell", return_value=True) as reprotect, \
+             patch("market_data.get_priced_quote", return_value=quote and {"price": quote}), \
              patch("tasks._retry_pending_reprotects"), patch("alerts._send") as alert:
             tasks.reconcile_unconfirmed_orders.run()
         return upsert, reprotect, alert
+
+    def test_late_manual_add_keeps_the_stop_despite_a_stale_read(self):
+        """Review of 9582ede: the read shows only the new shares, but the
+        order was sent onto a held position: its stop must not be replaced."""
+        upsert, reprotect, _ = self._run_manual_buy({"stop_price": 170.0}, intent="MANUAL_ADD")
+        upsert.assert_not_called()
+        reprotect.assert_called_once()
+
+    def test_late_manual_buy_stop_stays_under_the_quote(self):
+        upsert, _, _ = self._run_manual_buy(None, quote=150.0)     # fell >8% since the fill
+        assert upsert.call_args.kwargs["stop_price"] == 138.0
 
     def test_late_manual_buy_gets_a_fallback_stop(self):
         """Professor M108: a late manual BUY fill is protected 8% below the fill."""

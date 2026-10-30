@@ -1035,8 +1035,19 @@ def test_manual_orders_get_an_orders_row():
     r, log_order, fill = run({"order_id": 77, "filled_qty": 0, "status": "Submitted"})
     assert not r["success"] and "reconciled automatically" in r["message"]
     kw = log_order.call_args.kwargs
-    assert kw["status"] == "unconfirmed" and kw["intent"] == "MANUAL_BUY" and kw["broker_order_id"] == 77
+    assert kw["status"] == "unconfirmed" and kw["intent"] == "MANUAL_ADD" and kw["broker_order_id"] == 77
     assert kw.get("decision_price") is None and not fill.called
     r, log_order, fill = run({"order_id": 78, "fill_price": 100.0, "filled_qty": 2})
     assert r["success"] and log_order.call_args.kwargs["status"] == "submitted"
     fill.assert_called_once_with(5, 100.0, 2.0, "partial")
+
+
+def test_manual_buy_intent_says_open_when_nothing_held():
+    with patch("ibkr.get_client") as client, patch("risk_manager.RiskManager") as rm_cls, \
+         patch("market_data.get_priced_quote", return_value={"price": 100.0}), \
+         patch("ibkr.place_market_order", return_value={"order_id": 77, "filled_qty": 0}), \
+         patch("db.log_order", return_value=5) as log_order:
+        client.return_value.get_open_position.side_effect = Exception("No open position in ZZZ")
+        rm_cls.return_value.is_halted.return_value = False
+        execution.execute_manual("ZZZ", "BUY", 3, "test")
+    assert log_order.call_args.kwargs["intent"] == "MANUAL_OPEN"

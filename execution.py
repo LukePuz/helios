@@ -1301,7 +1301,15 @@ def execute_manual(
                     "message": f"SELL {ticker} not sent: an existing stop could not be "
                                f"cancelled (selling on top of it could short). Check TWS."}
 
+    order_intent = f"MANUAL_{side}"
     if side == "BUY":
+        # Read before sending, so a late fill knows whether it opened or added
+        # (a read right after a fill can be stale; A0253-4).
+        try:
+            held = abs(float(ibkr.get_client().get_open_position(ticker).qty))
+            order_intent = "MANUAL_ADD" if held > 0 else "MANUAL_OPEN"
+        except Exception as e:
+            order_intent = "MANUAL_OPEN" if str(e).startswith("No open position") else "MANUAL_BUY"
         try:
             import market_data
             q = market_data.get_priced_quote(ticker)
@@ -1355,7 +1363,7 @@ def execute_manual(
         try:
             db.log_order(ticker=ticker, side=side, order_type="MARKET", qty=qty,
                          broker_order_id=order_result.get("order_id"),
-                         status="unconfirmed", intent=f"MANUAL_{side}")
+                         status="unconfirmed", intent=order_intent)
         except Exception as e:
             log.warning(f"[{ticker}] Could not log the unconfirmed manual order: {e}")
         stop_note = (" The broker stop was cancelled before the sell and NOT re-placed "
@@ -1371,7 +1379,7 @@ def execute_manual(
     try:
         local_order_id = db.log_order(ticker=ticker, side=side, order_type="MARKET", qty=qty,
                                       broker_order_id=order_result.get("order_id"),
-                                      status="submitted", intent=f"MANUAL_{side}")
+                                      status="submitted", intent=order_intent)
         if local_order_id > 0 and order_result.get("fill_price"):
             # A part fill stays 'partial' so reconcile books the rest (M53).
             db.update_order_fill(local_order_id, order_result["fill_price"], filled_qty,

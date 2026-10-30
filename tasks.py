@@ -1249,16 +1249,29 @@ def _reconcile_unconfirmed_orders_locked(task):
         elif order["side"] == "BUY" and (intent or "").startswith("MANUAL"):
             # A manual BUY has no approval carrying a stop level: keep the
             # position's stop if this added to it, else a flat fallback stop
-            # below the fill (professor M108).
+            # below the fill, never above the last quote (professor M108).
+            # Whether it added was read before sending; shares already
+            # booked on a partial mean the position is this order's.
             import math
+            action = ("ADD" if intent == "MANUAL_ADD" or prev_qty > 0 else
+                      "OPEN" if intent == "MANUAL_OPEN" else None)
             try:
-                if not db.get_position_stop(ticker) or not _held_before_fill(ticker, fill_qty):
+                if not db.get_position_stop(ticker) or not _held_before_fill(ticker, fill_qty, action):
                     from execution import _MANUAL_FALLBACK_STOP_PCT as pct
                     if not (math.isfinite(total_avg) and total_avg > 0):
                         raise ValueError(f"unusable fill price {total_avg}")
+                    stop_price = round(total_avg * (1 - pct), 2)
+                    try:
+                        import market_data
+                        q = market_data.get_priced_quote(ticker)
+                        quote = float(q["price"]) if q and q.get("price") else None
+                    except Exception:
+                        quote = None
+                    if quote and stop_price >= quote:
+                        stop_price = round(quote * (1 - pct), 2)
                     db.upsert_position_stop(
                         ticker=ticker, entry_price=total_avg,
-                        stop_price=round(total_avg * (1 - pct), 2),
+                        stop_price=stop_price,
                         stop_method=f"manual late fill, flat {pct:.0%}",
                         bucket="Accelerator", conviction=5, trail_distance_pct=None,
                     )

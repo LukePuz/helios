@@ -31,3 +31,22 @@ def test_poll_falls_back_to_per_item_checks_when_the_batch_fails():
          patch("db.is_seen", return_value=True) as is_seen:
         edgar.poll_once()
     assert is_seen.called
+
+
+def test_filing_in_two_feeds_is_dispatched_once_per_pass():
+    """A filing dispatched (and marked seen by the dispatch) earlier in the
+    pass must not dispatch again from another company's feed."""
+    atom = ('<feed xmlns="http://www.w3.org/2005/Atom"><entry><id>new-1</id><title>4 - insider</title>'
+            '<updated>2026-10-30T09:00:00Z</updated></entry></feed>')
+    sent = []
+
+    def dispatch(filing):
+        sent.append(filing.pop("_seen_key", None))
+
+    with patch.object(edgar, "TICKER_TO_CIK", {"AAA": "1", "BBB": "2"}), \
+         patch.object(edgar, "FILING_FORMS", ["4"]), \
+         patch("ingestion.edgar.requests.get", return_value=MagicMock(text=atom)), \
+         patch("ingestion.edgar.time.sleep"), patch("ingestion.edgar._fetch_filing_text", return_value=""), \
+         patch("db.seen_ids", return_value=set()):
+        edgar.poll_once(on_filing=dispatch)
+    assert sent == ["new-1"]

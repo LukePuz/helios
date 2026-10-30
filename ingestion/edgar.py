@@ -389,8 +389,14 @@ def _poll_all(on_filing=None) -> list[dict]:
                 log.info(f"New {form} filing(s) for {ticker}: {len(filings)}")
                 new_filings.extend(filings)
                 for filing in filings if on_filing else ():
+                    key = filing.get("_seen_key")   # the dispatch pops it
                     try:
                         on_filing(filing)
+                        if key and _SEEN_THIS_PASS is not None:
+                            # Marked seen by the dispatch, not _mark_seen: add it
+                            # here so a filing in two feeds (a Form 4 whose owner
+                            # is also watched) isn't dispatched twice this pass.
+                            _SEEN_THIS_PASS.add(key)
                     except Exception as e:
                         log.error(f"EDGAR: dispatch failed for {ticker} {form}: {e}")
             time.sleep(0.12)  # stay under 10 req/sec SEC limit

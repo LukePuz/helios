@@ -2818,7 +2818,11 @@ def watch_plan_levels():
                 if not r.set(f"helios:plan_hit:{plan['id']}:{kind}", "1", nx=True, ex=86400):
                     continue
                 from config import PLAN_LEVEL_REVIEW_ENABLED
-                queued = bool(PLAN_LEVEL_REVIEW_ENABLED and plan["ticker"] in held)
+                # At most one queued review per ticker per ET day, whatever
+                # the plan or level (review of 2be84b5: two kinds in one tick
+                # could stack sells).
+                queued = bool(PLAN_LEVEL_REVIEW_ENABLED and plan["ticker"] in held and r.set(
+                    f"helios:plan_review:{plan['ticker']}:{today.isoformat()}", "1", nx=True, ex=86400))
                 db.log_signal(plan["ticker"], "PLAN_LEVEL_HIT", 0.0,
                               f"plan {plan['id']}: {kind} ({level}) at ${price or 0:.2f}; "
                               + ("review queued" if queued else "would re-review"),

@@ -220,7 +220,28 @@ def test_plan_level_review_skips_a_name_no_longer_held():
     with patch("ibkr.IBKRClient"), patch("agents.crew._get_positions", return_value={"NVDA": {}}), \
          patch("agents.market_regime.get_cached_regime", return_value={}), \
          patch("agents.crew._analyze_held_position", return_value={"action": "HOLD"}) as analyze, \
-         patch("agents.crew._capture_latest_thesis"), patch("agents.crew._route_to_approval") as route:
+         patch("agents.crew._capture_latest_thesis"), patch("agents.crew._route_to_approval") as route, \
+         patch("db.get_state", return_value='{"PLTR": "x"}'), patch("db.set_state") as set_state:
         assert crew.review_plan_level("NVDA", "target", "650", 660.0) == {"action": "HOLD"}
+    import json
+    saved = json.loads(set_state.call_args.args[1])
+    assert set(saved) == {"PLTR", "NVDA"}
     assert analyze.call_args.kwargs["path"] == "plan_level_review"
     assert "target" in analyze.call_args.kwargs["event"]["title"] and not route.called
+
+
+def test_two_level_kinds_on_one_ticker_queue_one_review_per_day():
+    import tasks
+    from unittest.mock import MagicMock
+    plan = _plan(catalyst_date=date(2026, 10, 1))      # invalidation AND catalyst_passed
+    seen = set()
+    redis = MagicMock()
+    redis.set.side_effect = lambda k, v, nx=False, ex=None: (k not in seen) and not seen.add(k)
+    with patch("market_data.is_market_hours", return_value=True), \
+         patch("db.get_active_plans", return_value=[plan]), \
+         patch("tasks._held_prices", return_value={"NVDA": 470.0}), \
+         patch("stop_lock._redis", return_value=redis), \
+         patch("config.PLAN_LEVEL_REVIEW_ENABLED", True), \
+         patch("tasks.review_plan_level_hit.apply_async") as queued, patch("db.log_signal"):
+        assert tasks.watch_plan_levels() == 2
+    assert queued.call_count == 1

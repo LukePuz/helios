@@ -445,6 +445,15 @@ def review_plan_level(ticker: str, kind: str, level, price: float | None) -> dic
     result = _analyze_held_position(ticker, client, positions, regime, event=event,
                                     path="plan_level_review")
     _capture_latest_thesis(ticker, result)
+    try:
+        # Counts as this name's review for the 10:15 rotation's ordering.
+        import json
+        import db
+        last = json.loads(db.get_state("position_review_last_reviewed") or "{}")
+        last[ticker] = datetime.now(timezone.utc).isoformat()
+        db.set_state("position_review_last_reviewed", json.dumps(last))
+    except Exception as e:
+        log.warning(f"[{ticker}] Plan-level review: rotation cursor not updated: {e}")
     if result.get("pass_to_risk"):
         _route_to_approval(result, regime, client)
     return result

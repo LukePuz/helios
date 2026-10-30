@@ -82,3 +82,14 @@ def test_nan_pl_from_ibkr_does_not_break_the_row():
 def test_routing_rows_do_not_copy_the_plan():
     fields = crew._route_row_fields({"provenance": {"model": "m", "plan": {"relation": "FOLLOW"}}}, "X")
     assert "plan" not in fields["provenance"] and fields["provenance"]["model"] == "m"
+
+
+def test_r_shadow_uses_the_real_stop():
+    """Audit A2114-2: reward-to-risk against the stop sizing will place."""
+    from agents.crew import _r_shadow
+    res = {"valuation": {"bull_case_target": "$130 (12 months)"}, "upside_downside_ratio": 2.4}
+    r = _r_shadow(res, 100.0, 94.0)
+    assert r["computed_r"] == 5.0 and r["model_udr"] == 2.4 and r["stop_pct"] == 6.0
+    r = _r_shadow({"valuation": {"bull_case_target": "n/a"}, "expected_return_pct": 12.0}, 100.0, 96.0)
+    assert r["computed_r"] == 3.0 and r["target_source"] == "expected_return_pct"
+    assert _r_shadow({}, 100.0, None)["computed_r"] is None

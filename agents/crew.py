@@ -726,6 +726,27 @@ def _rule_shadow_average_down(ticker: str, bucket: str, trading_client) -> None:
                     f"${price:.2f} below entry ${entry:.2f}; not enforced")
 
 
+def _r_shadow(result: dict, price: float, stop) -> dict | None:
+    """Reward-to-risk against the stop that will actually be placed, next to
+    the model's own upside_downside_ratio (audit A2114-2: the UDR >= 2 gate
+    uses the model's imagined downside, not the real stop). Log-only."""
+    try:
+        from agents.plans import _dollars
+        target = _dollars((result.get("valuation") or {}).get("bull_case_target"))
+        source = "bull_case_target"
+        if not target and isinstance(result.get("expected_return_pct"), (int, float)):
+            target, source = price * (1 + result["expected_return_pct"] / 100), "expected_return_pct"
+        stop = float(stop) if stop else None
+        r = (round((target - price) / (price - stop), 2)
+             if target and stop and target > price > stop else None)
+        return {"computed_r": r, "model_udr": result.get("upside_downside_ratio"),
+                "target": round(target, 2) if target else None, "target_source": source if target else None,
+                "stop": stop, "stop_pct": round((price - stop) / price * 100, 2) if stop else None}
+    except Exception as e:
+        log.debug(f"R shadow failed: {e}")
+        return None
+
+
 def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
     """
     Run risk sizing on an analyst recommendation and auto-execute it (paper
@@ -894,6 +915,7 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
         # Size the position — stamp the price used so execution can validate freshness
         sizing = rm.size_position(ticker, conviction, bucket, regime_str, price)
         sizing["price_at_sizing"] = price
+        sizing["r_shadow"] = _r_shadow(result, price, sizing.get("stop_loss_price"))
         if sizing.get("shares_initial", 0) <= 0:
             # 2026-08-13: if this is specifically a cash shortage (not a
             # halt, not "already at target," not conviction too low for the

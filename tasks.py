@@ -757,11 +757,9 @@ def _held_tickers() -> set[str]:
         return set()
 
 
-def _held_prices(max_age_min: float = 15) -> dict[str, float]:
-    """Held tickers' prices (market value / qty) from the latest portfolio
-    snapshot, if it is fresh. No IBKR call: the ingestion worker that runs
-    the plan watcher must not open broker connections."""
-    import math
+def _fresh_snapshot_positions(max_age_min: float = 15) -> dict:
+    """positions_json of the latest portfolio snapshot if it is fresh, else
+    {}. No IBKR call: the ingestion worker must not open broker connections."""
     import db
     from datetime import datetime, timezone
     from config import TRADING_ENV
@@ -781,8 +779,29 @@ def _held_prices(max_age_min: float = 15) -> dict[str, float]:
     ts = row[1] if row[1].tzinfo else row[1].replace(tzinfo=timezone.utc)
     if (datetime.now(timezone.utc) - ts).total_seconds() > max_age_min * 60:
         return {}
+    return row[0]
+
+
+def _held_tickers(max_age_min: float = 15) -> set[str]:
+    """Tickers with a nonzero quantity in the fresh snapshot, whatever their
+    market value (IBKR reports 0 right after a fill; review of 9a2f13c)."""
+    out = set()
+    for t, p in _fresh_snapshot_positions(max_age_min).items():
+        try:
+            if float(p.get("qty") or 0) != 0:
+                out.add(t.upper())
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return out
+
+
+def _held_prices(max_age_min: float = 15) -> dict[str, float]:
+    """Held tickers' prices (market value / qty) from the latest portfolio
+    snapshot, if it is fresh. No IBKR call: the ingestion worker that runs
+    the plan watcher must not open broker connections."""
+    import math
     out = {}
-    for t, p in row[0].items():
+    for t, p in _fresh_snapshot_positions(max_age_min).items():
         try:
             qty, mv = float(p.get("qty") or 0), float(p.get("market_value") or 0)
         except (TypeError, ValueError, AttributeError):
@@ -2744,7 +2763,7 @@ def flag_orphan_outcomes():
     Held tickers come from the fresh portfolio snapshot, not IBKR. An empty
     snapshot is skipped: stale and flat look the same."""
     import db
-    held = set(_held_prices(15))
+    held = _held_tickers(15)
     if not held:
         log.warning("flag_orphan_outcomes: no fresh held positions in the snapshot; skipped")
         return None

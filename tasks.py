@@ -2772,6 +2772,19 @@ def flag_orphan_outcomes():
     return total
 
 
+@app.task(name="tasks.review_plan_level_hit")
+def review_plan_level_hit(ticker: str, kind: str, level: str, price: float | None = None):
+    """A held name hit its plan level; review it now (PLAN_LEVEL_REVIEW_ENABLED,
+    default off). See agents.crew.review_plan_level."""
+    try:
+        from agents.crew import review_plan_level
+        result = review_plan_level(ticker, kind, level, price)
+        return (result or {}).get("action")
+    except Exception as e:
+        log.error(f"[{ticker}] review_plan_level_hit failed: {e}")
+        return None
+
+
 @app.task(name="tasks.watch_plan_levels")
 def watch_plan_levels():
     """Log-only (audit A2114-4/-7): during market hours, check every active
@@ -2804,10 +2817,18 @@ def watch_plan_levels():
             for kind, level in level_hits(plan, price, today):
                 if not r.set(f"helios:plan_hit:{plan['id']}:{kind}", "1", nx=True, ex=86400):
                     continue
+                from config import PLAN_LEVEL_REVIEW_ENABLED
+                queued = bool(PLAN_LEVEL_REVIEW_ENABLED and plan["ticker"] in held)
                 db.log_signal(plan["ticker"], "PLAN_LEVEL_HIT", 0.0,
-                              f"plan {plan['id']}: {kind} ({level}) at ${price or 0:.2f}; would re-review",
+                              f"plan {plan['id']}: {kind} ({level}) at ${price or 0:.2f}; "
+                              + ("review queued" if queued else "would re-review"),
                               provenance={"plan_id": plan["id"], "kind": kind, "level": level,
-                                          "price": price, "plan_source": plan.get("source")})
+                                          "price": price, "plan_source": plan.get("source"),
+                                          "review_queued": queued})
+                if queued:
+                    review_plan_level_hit.apply_async(
+                        args=[plan["ticker"], kind, str(level), price],
+                        queue=LLM_QUEUE_HELD, expires=6 * 3600)
                 logged += 1
         return logged
     except Exception as e:

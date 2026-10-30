@@ -517,6 +517,12 @@ SETUP_GATES_ENABLED = os.getenv("SETUP_GATES_ENABLED", "false").lower() == "true
 # (it changes what can be bought; audit A0100-2).
 ETF_FUNDAMENTALS_CAP_EXEMPT = os.getenv("ETF_FUNDAMENTALS_CAP_EXEMPT", "false").lower() == "true"
 
+# A held name hitting a level of its trade plan (invalidation, target,
+# catalyst passed, horizon end; tasks.watch_plan_levels) queues a review of
+# that position instead of only logging PLAN_LEVEL_HIT. Off until Luke turns
+# it on: it adds analyst runs and a new trigger (audit A0903-1 step 3).
+PLAN_LEVEL_REVIEW_ENABLED = os.getenv("PLAN_LEVEL_REVIEW_ENABLED", "false").lower() == "true"
+
 # Risk-per-trade-of-equity by LIVE setup category (Breakout/Catalyst/
 # Continuation) -- the SETUP_GATES_ENABLED equivalent of RISK_PCT_PER_TRADE
 # above, which stays exactly as-is and keeps governing Compounder/

@@ -181,3 +181,46 @@ def test_watcher_says_when_price_checks_were_skipped(caplog):
          caplog.at_level(logging.WARNING, logger="tasks"):
         tasks.watch_plan_levels()
     assert "price checks skipped for 1 plan" in caplog.text and "no fresh held prices" in caplog.text
+
+
+def _watch(enabled):
+    import tasks
+    plan = _plan(catalyst_date=None)
+    redis = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock()
+    redis.set.return_value = True
+    with patch("market_data.is_market_hours", return_value=True), \
+         patch("db.get_active_plans", return_value=[plan]), \
+         patch("tasks._held_prices", return_value={"NVDA": 470.0}), \
+         patch("stop_lock._redis", return_value=redis), \
+         patch("config.PLAN_LEVEL_REVIEW_ENABLED", enabled), \
+         patch("tasks.review_plan_level_hit.apply_async") as queued, \
+         patch("db.log_signal") as log_signal:
+        tasks.watch_plan_levels()
+    return queued, log_signal
+
+
+def test_level_hit_only_logs_while_the_review_switch_is_off():
+    queued, log_signal = _watch(False)
+    assert not queued.called
+    assert log_signal.call_args.kwargs["provenance"]["review_queued"] is False
+
+
+def test_level_hit_on_a_held_name_queues_a_review_when_switched_on():
+    queued, log_signal = _watch(True)
+    assert queued.call_args.kwargs["args"][:2] == ["NVDA", "invalidation"]
+    assert log_signal.call_args.kwargs["provenance"]["review_queued"] is True
+
+
+def test_plan_level_review_skips_a_name_no_longer_held():
+    from agents import crew
+    with patch("ibkr.IBKRClient"), patch("agents.crew._get_positions", return_value={"MSFT": {}}), \
+         patch("agents.crew._analyze_held_position") as analyze:
+        assert crew.review_plan_level("NVDA", "target", "650", 660.0) is None
+    assert not analyze.called
+    with patch("ibkr.IBKRClient"), patch("agents.crew._get_positions", return_value={"NVDA": {}}), \
+         patch("agents.market_regime.get_cached_regime", return_value={}), \
+         patch("agents.crew._analyze_held_position", return_value={"action": "HOLD"}) as analyze, \
+         patch("agents.crew._capture_latest_thesis"), patch("agents.crew._route_to_approval") as route:
+        assert crew.review_plan_level("NVDA", "target", "650", 660.0) == {"action": "HOLD"}
+    assert analyze.call_args.kwargs["path"] == "plan_level_review"
+    assert "target" in analyze.call_args.kwargs["event"]["title"] and not route.called

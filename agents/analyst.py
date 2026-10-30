@@ -313,7 +313,7 @@ def _treatment_config() -> dict:
         # Added 10-29 (professor M96): switches that shipped that evening.
         "REGIME_COMPLETED_BARS", "QUIVER_ENABLED", "ONE_SHARE_MAX_PCT_OF_CASH",
         "TIER_MAX_CONCURRENT_POSITIONS", "MAX_TRADE_PCT_OF_CASH_RESERVE",
-        "ETF_FUNDAMENTALS_CAP_EXEMPT")}
+        "ETF_FUNDAMENTALS_CAP_EXEMPT", "PLAN_LEVEL_REVIEW_ENABLED")}
 
 
 def _provenance(prompt: str) -> dict:

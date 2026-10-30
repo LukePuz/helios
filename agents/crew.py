@@ -421,6 +421,35 @@ def review_held_position(ticker: str, client, positions: dict, regime: dict,
     return result
 
 
+def review_plan_level(ticker: str, kind: str, level, price: float | None) -> dict | None:
+    """Review one held position because its trade plan's level was hit
+    (tasks.watch_plan_levels, only with PLAN_LEVEL_REVIEW_ENABLED). Same
+    brief/analyze/route pipeline as the scheduled review, with an event that
+    names the level. None if the name is no longer held."""
+    from ibkr import IBKRClient
+    from agents.market_regime import get_cached_regime
+
+    client = IBKRClient()
+    positions = _get_positions(client, strict=True)
+    if not positions or ticker not in positions:
+        log.info(f"[{ticker}] Plan-level review skipped: not held (or positions unavailable)")
+        return None
+    regime = get_cached_regime()
+    at = f" at about ${price:.2f}" if price else ""
+    event = {
+        "ticker": ticker, "source": "plan_watcher", "type": "plan level review",
+        "title": f"Plan level hit — {ticker}: {kind} ({level})",
+        "text": (f"{ticker} reached its trade plan's {kind} level ({level}){at}. Judge whether the "
+                 f"thesis and the plan still hold, and whether to hold, trim or exit."),
+    }
+    result = _analyze_held_position(ticker, client, positions, regime, event=event,
+                                    path="plan_level_review")
+    _capture_latest_thesis(ticker, result)
+    if result.get("pass_to_risk"):
+        _route_to_approval(result, regime, client)
+    return result
+
+
 def review_all_held_positions(max_per_run: int = 10, priority_tickers: list[str] | None = None) -> list[dict]:
     """
     Batch driver (tasks.review_positions) — capped per run since each review

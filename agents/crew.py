@@ -734,7 +734,7 @@ def _json_safe(value):
     encode would make the approval insert fail and drop the buy."""
     import json
     try:
-        return json.loads(json.dumps(value, default=float))
+        return json.loads(json.dumps(value, default=float, allow_nan=False))   # jsonb rejects NaN
     except Exception:
         return _UNENCODABLE
 

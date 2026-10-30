@@ -750,6 +750,41 @@ def _held_tickers() -> set[str]:
         return set()
 
 
+def _held_prices(max_age_min: float = 15) -> dict[str, float]:
+    """Held tickers' prices (market value / qty) from the latest portfolio
+    snapshot, if it is fresh. No IBKR call: the ingestion worker that runs
+    the plan watcher must not open broker connections."""
+    import math
+    import db
+    from datetime import datetime, timezone
+    from config import TRADING_ENV
+    conn = db._get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT positions_json, timestamp FROM portfolio_snapshots "
+                "WHERE trading_env=%s ORDER BY timestamp DESC LIMIT 1",
+                (TRADING_ENV,),
+            )
+            row = cur.fetchone()
+    finally:
+        db._put_conn(conn)
+    if not row or not row[0] or not row[1]:
+        return {}
+    ts = row[1] if row[1].tzinfo else row[1].replace(tzinfo=timezone.utc)
+    if (datetime.now(timezone.utc) - ts).total_seconds() > max_age_min * 60:
+        return {}
+    out = {}
+    for t, p in row[0].items():
+        try:
+            qty, mv = float(p.get("qty") or 0), float(p.get("market_value") or 0)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if qty > 0 and mv > 0 and math.isfinite(mv / qty):
+            out[t.upper()] = mv / qty
+    return out
+
+
 def _dispatch_event(event: dict, seen_source: str | None = None) -> None:
     """Queue an ingestion event for screening (see SCREEN_QUEUE comment
     above) — the fast, cheap first stage. Only events that pass go on to
@@ -2654,8 +2689,8 @@ def watch_plan_levels():
     shadow plan's levels and dates against the current price and write one
     PLAN_LEVEL_HIT row per plan and kind per day: what a level-triggered
     review would have re-analysed. Nothing is queued or traded. Prices come
-    from the broker's cached portfolio (held names; no historical-data
-    requests, which IBKR paces); unheld plans get the date checks only."""
+    from the latest portfolio snapshot (held names, under 15 min old; no
+    IBKR call from this worker); unheld plans get the date checks only."""
     try:
         from datetime import datetime
         from zoneinfo import ZoneInfo
@@ -2667,8 +2702,7 @@ def watch_plan_levels():
             return 0
         today = datetime.now(ZoneInfo("America/New_York")).date()
         r = stop_lock._redis()
-        held = {p.symbol: float(p.current_price) for p in _get_client().get_all_positions()
-                if getattr(p, "current_price", None)}
+        held = _held_prices()
         logged = 0
         for plan in db.get_active_plans():
             price = held.get(plan["ticker"])

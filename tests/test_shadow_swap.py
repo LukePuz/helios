@@ -112,3 +112,9 @@ def test_shadow_fields_are_always_json_safe():
     with patch("agents.crew._r_shadow", side_effect=None, return_value={"error": "boom"}):
         crew._attach_shadows(sizing, "ZZZ", {}, 100.0)
     assert sizing["shadow_status"]["r_shadow"] == "error" and sizing["shadow_status"]["heat_shadow"] == "n/a"
+
+
+def test_nan_shadow_value_is_dropped_not_stored():
+    """Postgres jsonb rejects NaN; it would drop the buy at the approval insert."""
+    from agents import crew
+    assert crew._json_safe({"r": float("nan")}) is crew._UNENCODABLE

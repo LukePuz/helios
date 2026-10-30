@@ -163,10 +163,10 @@ def test_watcher_logs_once_per_plan_and_kind():
     plan = _plan(catalyst_date=None)
     with patch("market_data.is_market_hours", return_value=True), \
          patch("db.get_active_plans", return_value=[plan]), \
+         patch("tasks._held_prices", return_value={"NVDA": 470.0}), \
          patch("tasks._get_client") as client, \
          patch("db.log_signal") as log_signal:
-        from types import SimpleNamespace
-        client.return_value.get_all_positions.return_value = [SimpleNamespace(symbol="NVDA", current_price=470.0)]
         assert tasks.watch_plan_levels() == 1
         assert tasks.watch_plan_levels() == 0          # same plan and kind today: not again
     assert log_signal.call_args.args[1] == "PLAN_LEVEL_HIT"
+    assert not client.called          # no IBKR connection from the ingestion worker

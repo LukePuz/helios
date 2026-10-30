@@ -1118,3 +1118,21 @@ def test_manual_add_keeps_the_stop_and_protects_the_whole_position():
         r = execution.execute_manual("ZZZ", "BUY", 2, "test")
     assert r["success"] and r["stop_price"] == 95.0
     assert not upsert.called and not place.called and reprotect.called
+
+
+def test_manual_fill_without_a_price_still_marks_the_order_filled():
+    """Professor run 17: a fill confirmed without a price left the orders row
+    'submitted'."""
+    with patch("ibkr.get_client") as client, patch("risk_manager.RiskManager") as rm_cls, \
+         patch("market_data.get_priced_quote", return_value={"price": 100.0}), \
+         patch("ibkr.place_market_order", return_value={"order_id": 1, "filled_qty": 2}), \
+         patch("ibkr.get_latest_price", return_value=100.0), \
+         patch("db.log_trade"), patch("db.log_order", return_value=5), \
+         patch("db.update_order_fill") as fill, patch("db.upsert_position_stop"), \
+         patch("db.set_stop_broker_order_id"), \
+         patch("tasks.manage_stop_place", return_value={"order_id": 9}), patch("alerts._send"):
+        client.return_value.get_open_position.side_effect = Exception("No open position in ZZZ")
+        rm_cls.return_value.is_halted.return_value = False
+        rm_cls.return_value.calculate_stop.return_value = (92.0, "ATR")
+        execution.execute_manual("ZZZ", "BUY", 2, "test")
+    fill.assert_called_once_with(5, None, 2.0, "filled")

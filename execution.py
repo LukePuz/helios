@@ -1035,12 +1035,15 @@ def execute_approved(
                 decision_price=price_at_sizing, approval_id=approval["id"],
                 status="submitted", intent=action,
             )
-            if local_order_id > 0 and order_result.get("fill_price"):
+            if local_order_id > 0 and (order_result.get("fill_price")
+                                       or (filled_qty > 0 and not bracket_used)):   # bracket qty is assumed
                 # Part filled within the wait: the rest may still be working,
                 # so leave it 'partial' for reconcile_unconfirmed_orders to
-                # pick up the remainder (professor M53).
+                # pick up the remainder (professor M53). A fill confirmed
+                # without a price is still a fill: record it with no price
+                # rather than leaving the row 'submitted' (professor run 17).
                 partial = not bracket_used and filled_qty < float(shares) - 1e-6
-                db.update_order_fill(local_order_id, order_result["fill_price"],
+                db.update_order_fill(local_order_id, order_result.get("fill_price"),
                                      filled_qty, "partial" if partial else "filled")
         except Exception as e:
             log.debug(f"[{ticker}] Order/slippage logging failed (non-critical): {e}")
@@ -1418,9 +1421,10 @@ def execute_manual(
         local_order_id = db.log_order(ticker=ticker, side=side, order_type="MARKET", qty=qty,
                                       broker_order_id=order_result.get("order_id"),
                                       status="submitted", intent=order_intent)
-        if local_order_id > 0 and order_result.get("fill_price"):
-            # A part fill stays 'partial' so reconcile books the rest (M53).
-            db.update_order_fill(local_order_id, order_result["fill_price"], filled_qty,
+        if local_order_id > 0 and filled_qty > 0:
+            # A part fill stays 'partial' so reconcile books the rest (M53);
+            # a fill confirmed without a price is recorded with none.
+            db.update_order_fill(local_order_id, order_result.get("fill_price"), filled_qty,
                                  "partial" if filled_qty < float(qty) - 1e-6 else "filled")
     except Exception as e:
         log.debug(f"[{ticker}] Manual order logging failed (non-critical): {e}")

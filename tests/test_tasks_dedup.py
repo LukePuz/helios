@@ -1559,11 +1559,12 @@ def test_close_trade_outcome_refuses_an_unusable_price_and_skips_orphaned_rows()
     """Professor M119/M120."""
     from unittest.mock import MagicMock
     import db
-    with patch("db._get_conn") as get_conn:
+    with patch("db._get_conn") as get_conn, patch("db.flag_orphan_outcomes_for", return_value=1) as flag:
         assert db.close_trade_outcome("NVDA", exit_price=0.0) is False
         assert db.close_trade_outcome("NVDA", exit_price=float("nan")) is False
         assert db.close_trade_outcome("NVDA", exit_price=None) is False
-    assert not get_conn.called
+    assert not get_conn.called                       # nothing closed
+    assert [c.args for c in flag.call_args_list] == [("NVDA",)] * 3
     cur = MagicMock()
     cur.fetchall.return_value = []
     conn = MagicMock()

@@ -3412,9 +3412,12 @@ def close_trade_outcome(ticker: str, exit_price: float, exit_date=None,
     except (TypeError, ValueError):
         exit_ok = False
     if not exit_ok:
-        # A 0.0 fallback price would record a -100% outcome (professor M119):
-        # leave the row open for a later close with a real price.
-        logging.error(f"close_trade_outcome: {ticker} exit price {exit_price!r} unusable; row left open")
+        # A 0.0 fallback price would record a -100% outcome (professor M119).
+        # Callers only get here after a confirmed full exit, so the rows are
+        # flagged orphaned (no trustworthy exit) rather than left looking open.
+        n = flag_orphan_outcomes_for(ticker)
+        logging.error(f"close_trade_outcome: {ticker} exit price {exit_price!r} unusable; "
+                      f"{n} open row(s) flagged orphaned, not closed")
         return False
 
     exit_date = exit_date or datetime.now(_tz.utc)

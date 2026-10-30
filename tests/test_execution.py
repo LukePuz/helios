@@ -1051,3 +1051,32 @@ def test_manual_buy_intent_says_open_when_nothing_held():
         rm_cls.return_value.is_halted.return_value = False
         execution.execute_manual("ZZZ", "BUY", 3, "test")
     assert log_order.call_args.kwargs["intent"] == "MANUAL_OPEN"
+
+
+def test_log_trade_stores_null_not_zero_and_the_price_source():
+    """Professor M109: a 0.0 fallback price reached trades as if real."""
+    import db
+    cur = MagicMock()
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    with patch("db._writer_conn", return_value=conn), patch("db._put_conn"):
+        db.log_trade("ZZZ", "BUY", 2, 0.0, "test", price_source="quote")
+        args = cur.execute.call_args.args[1]
+        assert args[4] is None and args[6] == "none"
+        db.log_trade("ZZZ", "BUY", 2, 101.5, "test", price_source="fill")
+        args = cur.execute.call_args.args[1]
+        assert args[4] == 101.5 and args[6] == "fill"
+
+
+def test_manual_trade_records_quote_as_price_source():
+    with patch("ibkr.get_client"), patch("risk_manager.RiskManager") as rm_cls, \
+         patch("market_data.get_priced_quote", return_value={"price": 100.0}), \
+         patch("ibkr.place_market_order", return_value={"order_id": 1, "filled_qty": 2}), \
+         patch("ibkr.get_latest_price", return_value=100.0), \
+         patch("db.log_trade") as log_trade, patch("db.log_order", return_value=5), \
+         patch("db.upsert_position_stop"), patch("db.set_stop_broker_order_id"), \
+         patch("tasks.manage_stop_place", return_value={"order_id": 9}), patch("alerts._send"):
+        rm_cls.return_value.is_halted.return_value = False
+        rm_cls.return_value.calculate_stop.return_value = (92.0, "ATR")
+        execution.execute_manual("ZZZ", "BUY", 2, "test")
+    assert log_trade.call_args.kwargs["price_source"] == "quote"

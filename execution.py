@@ -989,6 +989,7 @@ def execute_approved(
 
         # Real fill price; fall back to latest quote only if fill unconfirmed
         current_price = order_result.get("fill_price") or ibkr.get_latest_price(ticker) or 0.0
+        price_source = "fill" if order_result.get("fill_price") else ("quote" if current_price else None)
 
         # Log trade — reason reflects how this actually fired (see trigger
         # docstring above); it used to always say "approved via Telegram"
@@ -1000,6 +1001,7 @@ def execute_approved(
             quantity=filled_qty,
             price=current_price,
             reason=f"{action} {trigger_label} (conviction={approval['conviction']}/10)",
+            price_source=price_source,
         )
 
         # Order-lifecycle + slippage logging (decision price = price used at sizing time)
@@ -1375,7 +1377,8 @@ def execute_manual(
                            f"is reconciled automatically — check TWS.{stop_note}"}
 
     fill_price = order_result.get("fill_price") or ibkr.get_latest_price(ticker) or 0.0
-    db.log_trade(symbol=ticker, side=side, quantity=filled_qty, price=fill_price, reason=reason)
+    db.log_trade(symbol=ticker, side=side, quantity=filled_qty, price=fill_price, reason=reason,
+                 price_source="fill" if order_result.get("fill_price") else ("quote" if fill_price else None))
     try:
         local_order_id = db.log_order(ticker=ticker, side=side, order_type="MARKET", qty=qty,
                                       broker_order_id=order_result.get("order_id"),

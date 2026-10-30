@@ -732,6 +732,9 @@ _MIGRATIONS: list[tuple[int, str]] = [
     # 8-Ks from what the poller already saw (Luke D4, 10-29). NULL before 10-30.
     (64, "ALTER TABLE seen_items ADD COLUMN IF NOT EXISTS ticker VARCHAR(10), "
          "ADD COLUMN IF NOT EXISTS form VARCHAR(12);"),
+    # Where a trade's price came from: 'fill' (broker), 'quote' or
+    # 'decision' (a fallback), 'none' (price NULL). NULL before 10-30.
+    (65, "ALTER TABLE trades ADD COLUMN IF NOT EXISTS price_source VARCHAR(10);"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -819,17 +822,29 @@ def _writer_conn(writer: str, record: dict):
         return None
 
 
-def log_trade(symbol: str, side: str, quantity: int, price: float, reason: str) -> None:
-    rec = {"symbol": symbol, "side": side, "quantity": quantity, "price": price, "reason": reason}
+def log_trade(symbol: str, side: str, quantity: int, price: float, reason: str,
+              price_source: str | None = None) -> None:
+    """price_source: 'fill', 'quote', 'decision' or None (unknown). A
+    missing, zero or non-finite price is stored NULL with source 'none',
+    not 0.0 (professor M109)."""
+    import math
+    try:
+        ok = float(price) > 0 and math.isfinite(float(price))
+    except (TypeError, ValueError):
+        ok = False
+    if not ok:
+        price, price_source = None, "none"
+    rec = {"symbol": symbol, "side": side, "quantity": quantity, "price": price, "reason": reason,
+           "price_source": price_source}
     conn = _writer_conn("log_trade", rec)
     if conn is None:
         return
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO trades (symbol, trading_env, side, quantity, price, reason) "
-                "VALUES (%s,%s,%s,%s,%s,%s)",
-                (symbol, TRADING_ENV, side, quantity, price, reason),
+                "INSERT INTO trades (symbol, trading_env, side, quantity, price, reason, price_source) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                (symbol, TRADING_ENV, side, quantity, price, reason, price_source),
             )
         conn.commit()
     except Exception as e:

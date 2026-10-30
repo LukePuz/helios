@@ -1682,7 +1682,9 @@ class RiskManager:
         fill_price = order_result.get("fill_price") or decision_price or 0.0
         try:
             db.log_trade(symbol=ticker, side="SELL", quantity=filled, price=fill_price,
-                         reason="Profit target partial sell")
+                         reason="Profit target partial sell",
+                         price_source="fill" if order_result.get("fill_price") else
+                         ("decision" if decision_price else None))
             local_id = db.log_order(ticker=ticker, side="SELL", order_type="MARKET",
                                     qty=sell_qty, broker_order_id=order_result.get("order_id"),
                                     decision_price=decision_price, status="submitted",

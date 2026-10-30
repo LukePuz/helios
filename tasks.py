@@ -1206,6 +1206,7 @@ def _reconcile_unconfirmed_orders_locked(task):
             symbol=ticker, side=order["side"], quantity=fill_qty, price=fill_price,
             reason=(f"{intent + ' ' if intent else ''}Late-fill reconciled (order placed "
                     f"unconfirmed, filled after the wait window)"),
+            price_source="fill",
         )
 
         stop_placed: bool | None = False
@@ -2042,6 +2043,7 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
 
         fill_price = result.get("fill_price") or alert["current_price"]
         db.log_trade(symbol=ticker, side="SELL", quantity=filled, price=fill_price,
+                     price_source="fill" if result.get("fill_price") else "quote",
                      reason=f"Backstop stop-breach sell (stop ${alert['stop_price']:.2f})"
                             + (" [retry]" if _is_retry else ""))
         if resting <= 0:  # shares under a stuck stop are still held
@@ -3285,6 +3287,7 @@ def _reconcile_stop_orders_body(self):
                                "bot-initiated sell on record (resting stop fill or manual "
                                "close); matched to today's broker execution history during "
                                "stale-stop cleanup",
+                        price_source="fill",
                     )
                     try:
                         db.close_trade_outcome(ticker, exit_price=fill["fill_price"])

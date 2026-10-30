@@ -374,3 +374,19 @@ def test_udr_check_tolerates_missing_and_nonsense_fields():
                     "valuation": {"bull_case_target": "$500", "downside_scenario": "$700"}}, "Current Price: $600.00")
     assert r == {"model": None, "from_pcts": None, "from_targets": None, "gate_disagrees": False}
     assert _udr_check({"valuation": "x"}, "")["from_targets"] is None
+
+
+def test_event_burst_shadow_counts_other_recent_events():
+    """Audit A0700-2: separate reports minutes apart never corroborate."""
+    from agents.analyst import _event_burst
+    trig = {"path": "event", "url": "u3", "title": "Truist raises MSFT target"}
+    prior = [{"url": "u1", "title": "a"}, {"url": "u2", "title": "b"}, {"url": "u3", "title": "c"}]
+    with patch("db.recent_event_verdicts", return_value=prior):
+        r = _event_burst("MSFT", trig, ["sources 1 < 2: OPEN -> WATCH"])
+    assert r == {"window_min": 15, "prior_events": 3, "other_distinct_events": 2,
+                 "would_merge": True, "source_gate_hit": True}
+    assert _event_burst("MSFT", {"path": "scheduled_review"}, []) is None
+    with patch("db.recent_event_verdicts", return_value=[]):
+        assert _event_burst("MSFT", trig, [])["would_merge"] is False
+    with patch("db.recent_event_verdicts", side_effect=RuntimeError("db down")):
+        assert "error" in _event_burst("MSFT", trig, [])

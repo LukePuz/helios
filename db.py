@@ -3882,6 +3882,29 @@ def upsert_earnings_date(ticker: str, earnings_date, confirmed: bool = False,
         _put_conn(conn)
 
 
+def recent_event_verdicts(ticker: str, minutes: int = 15) -> list[dict]:
+    """Event-triggered analyst verdicts on the ticker in the last `minutes`
+    (this env), newest first: [{timestamp, title, url, model_action}].
+    Debounce shadow, A0700-2."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT timestamp, provenance->'trigger'->>'title', provenance->'trigger'->>'url', "
+                "decision->>'model_action' FROM signals "
+                "WHERE symbol=%s AND trading_env=%s AND provenance->'trigger'->>'path' = 'event' "
+                "AND timestamp > NOW() - make_interval(mins => %s) ORDER BY timestamp DESC",
+                (ticker, TRADING_ENV, minutes),
+            )
+            return [{"timestamp": ts, "title": t, "url": u, "model_action": a}
+                    for ts, t, u, a in cur.fetchall()]
+    except Exception as e:
+        logging.error(f"recent_event_verdicts({ticker}) failed: {e}")
+        return []
+    finally:
+        _put_conn(conn)
+
+
 def recent_model_udrs(ticker: str, n: int = 2) -> list[float | None]:
     """The model's upside_downside_ratio on the ticker's last n analyst
     verdicts, newest first (None where it gave none). Trim shadow, A0100-3."""

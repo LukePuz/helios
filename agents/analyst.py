@@ -267,6 +267,31 @@ def _udr_check(parsed: dict, brief: str) -> dict:
         return {"error": str(e)[:120]}
 
 
+_DEBOUNCE_SHADOW_MIN = 15
+
+
+def _event_burst(ticker: str, trigger: dict | None, gates: list[str]) -> dict | None:
+    """Log-only (audit A0700-2): events on one ticker are analysed one at a
+    time, so several reports minutes apart never corroborate each other
+    (five MSFT target raises in 7 minutes on 10-29, five separate WATCHes).
+    Records the other event verdicts on this ticker in the last 15 minutes,
+    whether a debounce would have merged this one with them, and whether the
+    2-source gate downgraded it. Never raises."""
+    if not trigger or trigger.get("path") != "event":
+        return None
+    try:
+        import db
+        prior = db.recent_event_verdicts(ticker, _DEBOUNCE_SHADOW_MIN)
+        keys = {p.get("url") or p.get("title") for p in prior} - {None, ""}
+        this = trigger.get("url") or trigger.get("title")
+        return {"window_min": _DEBOUNCE_SHADOW_MIN, "prior_events": len(prior),
+                "other_distinct_events": len(keys - {this}),
+                "would_merge": bool(keys - {this}),
+                "source_gate_hit": any(g.startswith("sources ") for g in gates)}
+    except Exception as e:
+        return {"error": str(e)[:120]}
+
+
 def _brief_template_sha() -> str | None:
     try:
         import hashlib
@@ -1528,6 +1553,7 @@ def analyze(
                 "rule_shadows": _rule_shadows(ticker, action, situation_brief),
                 "trim_shadow": _trim_shadow(ticker, action, parsed, situation_brief),
                 "udr_check": _udr_check(parsed, situation_brief),
+                "event_burst": _event_burst(ticker, trigger, gates),
             },
             prompt=redact_account_figures(prompt),
         )

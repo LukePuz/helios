@@ -76,3 +76,13 @@ def test_a_run_without_conviction_is_out_of_the_paired_mean_too():
             {"ticker": "A", "prompt_id": 0, "variant": "old", "conviction": None, "expected": 9.0},
             {"ticker": "A", "prompt_id": 0, "variant": "old", "conviction": 7, "expected": 7.0}]
     assert ab.summarize(runs)["paired_mean_expected_diff"] == 1.0
+
+
+def test_committed_old_schema_matches_git():
+    import subprocess
+    import pytest
+    src = subprocess.run(["git", "-C", REPO, "show", "31d52f8^:agents/analyst.py"],
+                         capture_output=True, text=True)
+    if src.returncode:
+        pytest.skip("31d52f8 not in this history (rewritten); the committed file is the record")
+    assert open(ab.OLD_SCHEMA_FILE).read() == ab.schema_block(src.stdout)

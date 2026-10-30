@@ -1093,12 +1093,12 @@ def test_null_trade_price_reads_back_and_prints():
     import db
     import chat_assistant
     cur = MagicMock()
-    cur.fetchall.return_value = [("ZZZ", "BUY", 2, None, "2026-10-30", "test")]
+    cur.fetchall.return_value = [("ZZZ", "BUY", 2, None, "2026-10-30", "test", "none")]
     conn = MagicMock()
     conn.cursor.return_value.__enter__.return_value = cur
     with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
         rows = db.get_recent_trades(5)
-    assert rows[0]["price"] is None
+    assert rows[0]["price"] is None and rows[0]["price_source"] == "none"
     with patch("db.get_recent_trades", return_value=rows):
         assert "price unknown" in chat_assistant._tool_get_trade_history({})
 

@@ -284,7 +284,9 @@ def _event_burst(ticker: str, trigger: dict | None, gates: list[str]) -> dict | 
         prior = db.recent_event_verdicts(ticker, _DEBOUNCE_SHADOW_MIN)
         keys = {p.get("url") or p.get("title") for p in prior} - {None, ""}
         this = trigger.get("url") or trigger.get("title")
-        return {"window_min": _DEBOUNCE_SHADOW_MIN, "prior_events": len(prior),
+        return {"window_min": _DEBOUNCE_SHADOW_MIN,
+                "window_end": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "published_at": trigger.get("published_at"), "prior_events": len(prior),
                 "other_distinct_events": len(keys - {this}),
                 "would_merge": bool(keys - {this}),
                 "source_gate_hit": any(g.startswith("sources ") for g in gates)}

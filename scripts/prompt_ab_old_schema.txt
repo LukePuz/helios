@@ -1,0 +1,42 @@
+Then output ONLY valid JSON in exactly this format (no markdown, no explanation outside the JSON):
+
+{
+  "action": "OPEN or ADD or HOLD or TRIM or EXIT or WATCH or PASS",
+  "conviction": <integer 1-10 per the scale above>,
+  "thesis_strength": <integer 1-5>,
+  "catalyst_quality": <integer 1-5>,
+  "valuation_risk_reward": <integer 1-5>,
+  "data_completeness": <integer 1-5>,
+  "thesis_bucket": "Compounder or Accelerator or Moonshot",
+  "thesis_summary": "One sentence why this position exists.",
+  "expectation_gap": {
+    "bull_case": "What needs to happen for upside",
+    "current_price_implies": "What growth/outcome is already priced in",
+    "upside_exists_if": "Condition under which upside materializes",
+    "primary_risk": "Single most likely thing that makes this wrong"
+  },
+  "catalyst": {
+    "event": "Description of catalyst",
+    "date": "The MOST PRECISE date you actually know: YYYY-MM-DD if a specific day is confirmed (e.g. a scheduled earnings date, or 'the next session' after a report you're reading right now), YYYY-MM if only the month is known, or 'ongoing' if there's no defined timing at all. Use day-level precision whenever the brief supports it -- 'YYYY-MM' for something you actually know happens tomorrow understates how soon it is.",
+    "expected_upside_if_positive": "+X to +Y%",
+    "expected_downside_if_negative": "-X to -Y%",
+    "is_priced_in": false
+  },
+  "valuation": {
+    "current_multiple": "Xx NTM earnings or revenue",
+    "peer_range": "Range for comparable peers",
+    "bull_case_target": "$X (12 months)",
+    "downside_scenario": "$X"
+  },
+  "expected_return_pct": <float -- your single-number bull-case % upside from the Current Price to bull_case_target, e.g. 25.0 for +25%. Same figure as catalyst.expected_upside_if_positive / valuation.bull_case_target, just as one clean number instead of a range string, so it can be tracked against the actual outcome later.>,
+  "expected_downside_pct": <float -- same idea for the downside_scenario, as a negative number, e.g. -15.0>,
+  "sources": [
+    {"type": "news or edgar_filing or options_flow or insider_trade or congressional_trade or analyst_rating or fundamentals_data or price_action or arxiv_paper or other", "detail": "The specific fact this source contributes -- not a repeat of the catalyst description"}
+  ],
+  "upside_downside_ratio": <your computed ratio: bull-case upside percent divided by downside percent>,
+  "key_risks": ["Risk 1", "Risk 2", "Risk 3"],
+  "options_opportunity": false,
+  "options_notes": "Brief note or null",
+  "pass_to_risk": true,
+  "reasoning": "2-3 sentence narrative explaining the recommendation, citing specific numbers and their source per the rule below."
+}

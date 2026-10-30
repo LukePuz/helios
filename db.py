@@ -971,14 +971,15 @@ def get_recent_trades(limit: int = 50) -> list[dict]:
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT symbol, side, quantity, price, timestamp, reason "
+                "SELECT symbol, side, quantity, price, timestamp, reason, price_source "
                 "FROM trades WHERE trading_env=%s ORDER BY timestamp DESC LIMIT %s",
                 (TRADING_ENV, limit),
             )
             return [
                 # price is NULL when no price was known (price_source 'none').
                 {"symbol": r[0], "side": r[1], "quantity": r[2],
-                 "price": float(r[3]) if r[3] is not None else None, "timestamp": r[4], "reason": r[5]}
+                 "price": float(r[3]) if r[3] is not None else None, "timestamp": r[4], "reason": r[5],
+                 "price_source": r[6]}
                 for r in cur.fetchall()
             ]
     except Exception as e:

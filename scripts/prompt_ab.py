@@ -53,6 +53,9 @@ sys.path.insert(0, REPO)
 _START = "Then output ONLY valid JSON"
 _END = "\nRules:"
 OLD_COMMIT = "31d52f8^"
+# The old block, saved from git 31d52f8^ on 10-30, so the run doesn't depend
+# on that commit surviving the history rewrite (professor M112).
+OLD_SCHEMA_FILE = os.path.join(REPO, "scripts", "prompt_ab_old_schema.txt")
 RULE_SHARE_PTS = 15.0     # research log 10-30 07:02 (set after the 10-28 pilot)
 RULE_EXPECTED = 0.5
 # The 10-28 pilot's prompts (TER, META, MSFT x2, KLAC, ORCL; checked against
@@ -79,7 +82,7 @@ def summarize(runs: list[dict]) -> dict:
     (by prompt) difference old - new, and the pre-set rule's verdict."""
     by = defaultdict(lambda: defaultdict(list))   # variant -> prompt -> rows
     for r in runs:
-        by[r["variant"]][r.get("prompt_id", r["ticker"])].append(r)
+        by[r["variant"]][r.get("signal_id", r.get("prompt_id", r["ticker"]))].append(r)
     out = {}
     for v in ("new", "old"):
         rows = [r for t in by[v].values() for r in t]
@@ -151,7 +154,8 @@ def main():
     ap.add_argument("--out", default=None)
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--include-pilot", action="store_true")
-    ap.add_argument("--old-schema", default=None, help="file with the old schema block (instead of git)")
+    ap.add_argument("--old-schema", default=OLD_SCHEMA_FILE,
+                    help="file with the old schema block (default: the committed copy); 'git' reads 31d52f8^")
     args = ap.parse_args()
 
     live = subprocess.run(["systemctl", "is-active", "helios-local"], capture_output=True, text=True).stdout.strip()
@@ -162,7 +166,7 @@ def main():
     load_dotenv(os.path.join(REPO, ".env"))
     from agents import analyst
 
-    if args.old_schema:
+    if args.old_schema != "git":
         with open(args.old_schema) as f:
             old_block, old_commit = f.read(), f"file {args.old_schema}"
     else:
@@ -176,6 +180,7 @@ def main():
 
     exclude = frozenset() if args.include_pilot else PILOT_SIGNAL_IDS
     rows = _stored_prompts(args.n, exclude)
+    skipped = []
     if not rows:
         sys.exit("no stored prompts yet (signals.prompt is recorded from 10-28 16:05)")
 
@@ -204,6 +209,7 @@ def main():
             variants = {"new": prompt, "old": old_variant(prompt, new_block, old_block)}
         except ValueError as e:
             print(f"{ticker}: skipped ({e})")
+            skipped.append(signal_id)
             continue
         order = ("new", "old") if i % 2 == 0 else ("old", "new")
         for run in range(args.k):
@@ -214,7 +220,7 @@ def main():
                 action = str((parsed or {}).get("action", "ERR")).upper()
                 c = _conviction((parsed or {}).get("conviction"))
                 salvaged = bool((parsed or {}).get("_salvaged"))
-                runs.append({"ticker": ticker, "prompt_id": i, "variant": name, "conviction": c,
+                runs.append({"ticker": ticker, "prompt_id": i, "signal_id": signal_id, "variant": name, "conviction": c,
                              "salvaged": salvaged, "expected": dist.get("expected")})
                 lines.append(f"{i},{signal_id},{ticker},{name},{run},{action},{c},{int(salvaged)},"
                              f"{dist.get('expected')},{dist.get('p_ge7')}")
@@ -223,6 +229,7 @@ def main():
                     out.write(lines[-1] + "\n")
                     out.flush()
     summary = summarize(runs)
+    summary["skipped_signal_ids"] = skipped
     print("summary:", summary)
     if out:
         out.write(f"# summary: {json.dumps(summary)}\n")

@@ -383,7 +383,8 @@ def test_event_burst_shadow_counts_other_recent_events():
     prior = [{"url": "u1", "title": "a"}, {"url": "u2", "title": "b"}, {"url": "u3", "title": "c"}]
     with patch("db.recent_event_verdicts", return_value=prior):
         r = _event_burst("MSFT", trig, ["sources 1 < 2: OPEN -> WATCH"])
-    assert r == {"window_min": 15, "prior_events": 3, "other_distinct_events": 2,
+    assert r.pop("window_end")
+    assert r == {"window_min": 15, "published_at": None, "prior_events": 3, "other_distinct_events": 2,
                  "would_merge": True, "source_gate_hit": True}
     assert _event_burst("MSFT", {"path": "scheduled_review"}, []) is None
     with patch("db.recent_event_verdicts", return_value=[]):

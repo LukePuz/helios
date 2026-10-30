@@ -48,5 +48,5 @@ def test_missing_logprobs_or_unparsed_runs_are_skipped():
 
 
 def test_round_robin_takes_newest_per_ticker_first():
-    rows = [("A", "a1", 5), ("A", "a2", 4), ("A", "a3", 3), ("B", "b1", 6), ("C", "c1", 1)]
-    assert ab._round_robin(rows, 4) == [("B", "b1"), ("A", "a1"), ("C", "c1"), ("A", "a2")]
+    rows = [("A", "a1", 5, 11), ("A", "a2", 4, 12), ("A", "a3", 3, 13), ("B", "b1", 6, 14), ("C", "c1", 1, 15)]
+    assert ab._round_robin(rows, 4) == [("B", "b1", 14), ("A", "a1", 11), ("C", "c1", 15), ("A", "a2", 12)]

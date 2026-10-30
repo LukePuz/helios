@@ -21,8 +21,9 @@ the research log on 10-30 before any run (old c7+ share at least 15 points
 higher AND paired mean expected conviction at least 0.5 higher).
 
 Refuses to run while helios-local is active (the 72B is shared with the
-live analyst) unless --force. Prints and optionally writes ticker, variant,
-run, action, conviction, expected, p_ge7. No portfolio values: prompts are
+live analyst) unless --force. Prints and optionally writes prompt_id,
+signal_id (signals.id of the stored prompt), ticker, variant, run, action,
+conviction, expected, p_ge7. No portfolio values: prompts are
 read from the DB and never written out.
 """
 from __future__ import annotations
@@ -83,16 +84,18 @@ def summarize(runs: list[dict]) -> dict:
     return out
 
 
-def _round_robin(rows: list[tuple], n: int) -> list[tuple[str, str]]:
-    """rows: (symbol, prompt, timestamp). Newest per ticker first (tickers by
-    their newest prompt), then each ticker's next newest, until n."""
+def _round_robin(rows: list[tuple], n: int) -> list[tuple]:
+    """rows: (symbol, prompt, timestamp, ...). Newest per ticker first (tickers
+    by their newest prompt), then each ticker's next newest, until n. Returns
+    (symbol, prompt, *rest) with the timestamp dropped."""
     per = defaultdict(list)
     for r in sorted(rows, key=lambda r: r[2], reverse=True):
         per[r[0]].append(r)
     tickers = list(per)          # dicts keep insertion order: newest first
     out, depth = [], 0
     while len(out) < n and any(len(per[t]) > depth for t in tickers):
-        out += [(per[t][depth][0], per[t][depth][1]) for t in tickers if len(per[t]) > depth]
+        out += [(per[t][depth][0], per[t][depth][1], *per[t][depth][3:])
+                for t in tickers if len(per[t]) > depth]
         depth += 1
     return out[:n]
 
@@ -103,7 +106,7 @@ def _stored_prompts(n: int) -> list[tuple[str, str]]:
     try:
         with conn.cursor() as cur:
             # Same environment only (professor C13, 2026-10-28).
-            cur.execute("SELECT symbol, prompt, timestamp FROM signals "
+            cur.execute("SELECT symbol, prompt, timestamp, id FROM signals "
                         "WHERE prompt IS NOT NULL AND trading_env=%s", (db.TRADING_ENV,))
             rows = cur.fetchall()
     finally:
@@ -137,10 +140,10 @@ def main():
     if not rows:
         sys.exit("no stored prompts yet (signals.prompt is recorded from 10-28 16:05)")
 
-    header = "ticker,variant,run,action,conviction,expected,p_ge7"
+    header = "prompt_id,signal_id,ticker,variant,run,action,conviction,expected,p_ge7"
     lines, runs = [header], []
     print(header, flush=True)
-    for i, (ticker, prompt) in enumerate(rows):
+    for i, (ticker, prompt, signal_id) in enumerate(rows):
         try:
             variants = {"new": prompt, "old": old_variant(prompt, new_block, old_block)}
         except ValueError as e:
@@ -157,7 +160,8 @@ def main():
                 c = int(c) if isinstance(c, (int, float)) else None
                 runs.append({"ticker": ticker, "prompt_id": i, "variant": name, "conviction": c,
                              "expected": dist.get("expected")})
-                lines.append(f"{ticker},{name},{run},{action},{c},{dist.get('expected')},{dist.get('p_ge7')}")
+                lines.append(f"{i},{signal_id},{ticker},{name},{run},{action},{c},"
+                             f"{dist.get('expected')},{dist.get('p_ge7')}")
                 print(lines[-1], flush=True)
     summary = summarize(runs)
     print("summary:", summary)

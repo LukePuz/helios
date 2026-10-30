@@ -149,8 +149,10 @@ def observe(ticker: str, parsed: dict, action: str, conviction: int, brief: str,
     try:
         import db
         from datetime import datetime, timezone
+        from zoneinfo import ZoneInfo
         now = now or datetime.now(timezone.utc)
-        today = now.date()
+        et = ZoneInfo("America/New_York")
+        today = now.astimezone(et).date()   # trading dates are ET, not UTC
         price = brief_price(brief)
         held = db.get_position_stop(ticker) is not None
         plan = db.get_active_plan(ticker)
@@ -171,7 +173,8 @@ def observe(ticker: str, parsed: dict, action: str, conviction: int, brief: str,
 
         out = classify(plan, action, new, price, today, held)
         out["price"] = price
-        out["plan_age_days"] = (today - plan["created_at"].date()).days if plan.get("created_at") else None
+        out["plan_age_days"] = ((today - plan["created_at"].astimezone(et).date()).days
+                                if plan.get("created_at") else None)
         last = plan.get("last_seen_at") or plan.get("created_at")
         out["would_coalesce"] = bool(
             out["relation"] == "FOLLOW" and last

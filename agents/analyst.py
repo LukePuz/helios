@@ -1318,8 +1318,11 @@ def analyze(
     llm["reply_cut"] = llm.get("done_reason") == "length"
     provenance["llm_call"] = llm
     # Shadow trade plan (roadmap 1): log-only, nothing reads it back.
-    from agents.plans import observe as _plan_observe
-    provenance["plan"] = _plan_observe(ticker, parsed, action, conviction, situation_brief)
+    try:
+        from agents.plans import observe as _plan_observe
+        provenance["plan"] = _plan_observe(ticker, parsed, action, conviction, situation_brief)
+    except Exception as e:
+        log.warning(f"[{ticker}] plan shadow unavailable: {e}")
     try:
         import db
         db.log_signal(

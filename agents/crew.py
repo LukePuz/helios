@@ -199,6 +199,10 @@ def _route_row_fields(result: dict, kind: str) -> dict:
     and provenance and had to be joined to the preceding verdict). The
     prompt_sha in provenance identifies that verdict's signals row."""
     prov = result.get("provenance") or None
+    if prov and "plan" in prov:
+        # The plan observation belongs to the verdict row only; copied onto
+        # routing rows it was counted 2-3 times (pre-pull review 10-29).
+        prov = {k: v for k, v in prov.items() if k != "plan"}
     return {
         "model": (prov or {}).get("model"),
         "provenance": prov,
@@ -228,6 +232,7 @@ def _shadow_swap(rm, ticker: str, conviction: int, sizing: dict, result: dict, n
         if conviction < _SHADOW_SWAP_MIN_CONVICTION or not _room_blocked(sizing):
             return None
         import db
+        import math
         from datetime import datetime, timedelta, timezone
         now = now or datetime.now(timezone.utc)
         held, stale = [], []
@@ -238,10 +243,10 @@ def _shadow_swap(rm, ticker: str, conviction: int, sizing: dict, result: dict, n
             if not sig or not sig.get("timestamp") or now - sig["timestamp"] > timedelta(days=_SHADOW_SWAP_FRESH_DAYS):
                 stale.append(p.symbol)
                 continue
+            mv, pl = float(p.market_value), float(p.unrealized_pl)
+            pl_pct = round(100 * pl / (mv - pl), 1) if mv - pl and math.isfinite(mv) and math.isfinite(pl) else None
             held.append({"ticker": p.symbol, "conviction": round(sig["confidence"] * 10),
-                         "signal": sig["signal"], "unrealized_pl_pct": (
-                             round(100 * float(p.unrealized_pl) / (float(p.market_value) - float(p.unrealized_pl)), 1)
-                             if float(p.market_value) - float(p.unrealized_pl) else None)})
+                         "signal": sig["signal"], "unrealized_pl_pct": pl_pct})
         # Lowest conviction first; among equals, the weakest performer.
         held.sort(key=lambda h: (h["conviction"], h["unrealized_pl_pct"] if h["unrealized_pl_pct"] is not None else 0))
         low = held[0] if held else None

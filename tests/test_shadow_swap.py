@@ -69,3 +69,17 @@ def test_never_raises():
     rm._client.get_all_positions.side_effect = RuntimeError("ib down")
     with patch("db.log_signal"):
         assert crew._shadow_swap(rm, "NOW", 8, CAP, {}, now=NOW) is None
+
+
+def test_nan_pl_from_ibkr_does_not_break_the_row():
+    sigs = {"A": {"signal": "HOLD", "confidence": 0.5, "timestamp": FRESH},
+            "B": {"signal": "HOLD", "confidence": 0.5, "timestamp": FRESH}}
+    rec, log_signal = _run(_rm(_pos("A", 100, float("nan")), _pos("B", 90, -10)), 8, CAP, sigs)
+    assert rec["would_swap"] and log_signal.called
+    a = [h for h in [rec["lowest"]] if h["ticker"] == "A"]
+    assert all(h["unrealized_pl_pct"] is None for h in a)
+
+
+def test_routing_rows_do_not_copy_the_plan():
+    fields = crew._route_row_fields({"provenance": {"model": "m", "plan": {"relation": "FOLLOW"}}}, "X")
+    assert "plan" not in fields["provenance"] and fields["provenance"]["model"] == "m"

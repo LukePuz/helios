@@ -653,7 +653,7 @@ class TestReconcileUnconfirmedOrders:
         stale-stop cleanup logged the SELL a second time."""
         self._run_sell([], intent="EXIT")
         self.extra["delete"].assert_called_once_with("CRWD")
-        self.extra["close"].assert_called_once_with("CRWD", exit_price=175.0)
+        self.extra["close"].assert_called_once_with("CRWD", exit_price=175.0, exit_source="late_exit")
 
     def test_late_exit_already_cleaned_up_is_not_closed_twice(self):
         self._run_sell([], stop_rec=None, intent="EXIT")
@@ -897,7 +897,7 @@ class TestStaleStopReconciliation:
         assert mock_log_trade.call_args.kwargs["side"] == "SELL"
         assert mock_log_trade.call_args.kwargs["quantity"] == 84.0
         assert mock_log_trade.call_args.kwargs["price"] == 227.80
-        mock_close_outcome.assert_called_once_with("DDOG", exit_price=227.80)
+        mock_close_outcome.assert_called_once_with("DDOG", exit_price=227.80, exit_source="broker_exit")
         mock_delete.assert_called_once_with("DDOG")
         # A reconciled exit is real information, not an emergency -- no Telegram ping.
         mock_alert.assert_not_called()

@@ -735,6 +735,10 @@ _MIGRATIONS: list[tuple[int, str]] = [
     # Where a trade's price came from: 'fill' (broker), 'quote' or
     # 'decision' (a fallback), 'none' (price NULL). NULL before 10-30.
     (65, "ALTER TABLE trades ADD COLUMN IF NOT EXISTS price_source VARCHAR(10);"),
+    # What closed an outcome row: model_exit, model_trim_last, manual_sell,
+    # backstop_sell, broker_exit (stop fill or a close at the broker),
+    # late_<intent> (a reconciled late sell). NULL before 10-30.
+    (66, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS exit_source VARCHAR(30);"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -3386,7 +3390,8 @@ def compute_outcome_metrics(
     }
 
 
-def close_trade_outcome(ticker: str, exit_price: float, exit_date=None) -> bool:
+def close_trade_outcome(ticker: str, exit_price: float, exit_date=None,
+                        exit_source: str | None = None) -> bool:
     """
     Closes every still-open (exit_date IS NULL) trade_outcomes row for this
     ticker: computes outcome_pct, was_correct, and alpha vs. SPY over each
@@ -3436,10 +3441,10 @@ def close_trade_outcome(ticker: str, exit_price: float, exit_date=None) -> bool:
 
                 cur.execute(
                     "UPDATE trade_outcomes SET exit_price=%s, exit_date=%s, outcome_pct=%s, "
-                    "was_correct=%s, exit_benchmark_price=%s, benchmark_return_pct=%s, alpha_pct=%s "
-                    "WHERE id=%s",
+                    "was_correct=%s, exit_benchmark_price=%s, benchmark_return_pct=%s, alpha_pct=%s, "
+                    "exit_source=%s WHERE id=%s",
                     (exit_price, exit_date, outcome_pct, was_correct, exit_benchmark_price,
-                     benchmark_return_pct, alpha_pct, outcome_id),
+                     benchmark_return_pct, alpha_pct, exit_source, outcome_id),
                 )
         conn.commit()
         logging.info(

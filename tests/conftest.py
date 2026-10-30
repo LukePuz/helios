@@ -101,6 +101,14 @@ class _FakeRedis:
     def exists(self, key):
         return int(key in _FakeRedis.store)
 
+    def get(self, key):
+        v = _FakeRedis.store.get(key)
+        return v.encode() if isinstance(v, str) else v
+
+    def scan_iter(self, pattern):
+        import fnmatch
+        return [k for k in list(_FakeRedis.store) if fnmatch.fnmatch(k, pattern)]
+
 
 @pytest.fixture(autouse=True)
 def _no_live_redis(monkeypatch):

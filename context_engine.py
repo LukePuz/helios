@@ -328,7 +328,9 @@ Event Title: {event.get('title', 'N/A')}
         pv = _portfolio_value(trading_client)
         for sym, pos in positions.items():
             pl_str = f"{pos.get('pl_pct', 0):+.1%}"
-            weight = (f"{pos.get('market_value', 0) / pv:.1%} of portfolio" if pv
+            # Nearest 5%: an exact weight next to a one-share price gave
+            # away the account size (pre-pull review 10-29 #7).
+            weight = (f"~{round(20 * pos.get('market_value', 0) / pv) * 5}% of portfolio" if pv
                       else "weight unknown")
             pos_lines.append(
                 f"  {sym:<6} {weight} | "
@@ -469,7 +471,9 @@ Ticker: {ticker}
         pv = _portfolio_value(trading_client)
         for sym, pos in positions.items():
             pl_str = f"{pos.get('pl_pct', 0):+.1%}"
-            weight = (f"{pos.get('market_value', 0) / pv:.1%} of portfolio" if pv
+            # Nearest 5%: an exact weight next to a one-share price gave
+            # away the account size (pre-pull review 10-29 #7).
+            weight = (f"~{round(20 * pos.get('market_value', 0) / pv) * 5}% of portfolio" if pv
                       else "weight unknown")
             pos_lines.append(
                 f"  {sym:<6} {weight} | "

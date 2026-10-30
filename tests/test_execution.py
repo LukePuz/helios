@@ -908,3 +908,32 @@ def test_lock_lost_stop_is_queued_and_failed_stop_queued_too():
             execution.execute_approved(approval)
         assert place.call_count == calls
         queued.assert_called_once()
+
+
+def test_buy_sends_the_share_count_the_room_check_allows():
+    """Pre-pull review 10-29 #3: a cut from the execution-time cash check must
+    reach the order and the stop, and a skip must stop the order."""
+    approval = _approval(action="ADD", shares_initial=5, price_at_sizing=108.0)
+    fresh = {"price": 110.0, "is_stale": False, "age_minutes": 1.0, "market_open": True}
+
+    def run(room):
+        with patch("ibkr.get_ib"), patch("ibkr.get_client"), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("ibkr.place_market_order") as mock_order, \
+             patch("market_data.get_priced_quote", return_value=fresh), \
+             patch("market_data.check_gap_confirmation", return_value={"status": "no_gap"}), \
+             patch("market_data.is_market_hours", return_value=True), \
+             patch("config.USE_BRACKET_ORDERS", False), \
+             patch("execution._buy_room_at_execution", return_value=room), \
+             patch("db.log_trade"), patch("db.log_order", return_value=1), \
+             patch("db.upsert_position_stop"), patch("db.set_stop_broker_order_id"), \
+             patch("db.log_trade_outcome"), patch("alerts._send"), \
+             patch("alerts.send_trade_alert"):
+            mock_rm_cls.return_value.is_halted.return_value = False
+            mock_order.return_value = {"order_id": 1, "fill_price": 110.0, "filled_qty": room[0]}
+            return execution.execute_approved(approval), mock_order
+
+    result, order = run((2, None))
+    assert result is True and order.call_args.args[2] == 2
+    result, order = run((0, "not enough cash at execution under the per-trade cash limits"))
+    assert result is False and not order.called

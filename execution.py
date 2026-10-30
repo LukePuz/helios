@@ -296,37 +296,77 @@ def last_outcome_reason() -> str | None:
     return getattr(_OUTCOME, "reason", None)
 
 
+_BUY_RESERVE_TTL_S = 300   # a sent buy's cost counts against cash this long
+
+
+def _buy_reservations() -> list[tuple[str, float]]:
+    """(ticker, notional) of buys approved in the last few minutes. IBKR's
+    cash figure doesn't subtract unfilled orders and refreshes on a timer."""
+    import stop_lock
+    r = stop_lock._redis()
+    out = []
+    for key in r.scan_iter("helios:buy_reserve:*"):
+        val = r.get(key)
+        if val:
+            t, n = val.decode().split("|")
+            out.append((t, float(n)))
+    return out
+
+
+def _reserve_buy(ticker: str, notional: float) -> None:
+    import uuid
+    import stop_lock
+    stop_lock._redis().set(f"helios:buy_reserve:{uuid.uuid4().hex}", f"{ticker}|{notional}",
+                           ex=_BUY_RESERVE_TTL_S)
+
+
 def _buy_room_at_execution(ticker: str, action: str, shares: int, price: float | None
                            ) -> tuple[int, str | None]:
     """Re-check cash and the position cap when a buy is actually sent.
 
     Sizing checks both, but a buy sized before the open runs later with its
-    stored share count, and several sized against the same pre-market cash
-    could together spend more than there is (pre-pull review 10-29, after the
-    one-share exception went to 50% of cash). Returns (shares to buy, None),
+    stored share count, and buys deferred to the same open run in parallel
+    against the same cash (pre-pull reviews 10-29). One check at a time
+    (a lock), each subtracting the buys approved in the last 5 minutes, and
+    the same per-trade cash limits as sizing. Returns (shares to buy, None),
     or (0, reason) to skip. Fails closed: a buy we can't check isn't sent."""
+    if not price:
+        return 0, "no price to check cash against at execution"
     try:
         import ibkr
-        from config import get_active_limits
+        import stop_lock
+        from config import (ALLOW_ONE_SHARE_ABOVE_ALLOCATION, MAX_TRADE_PCT_OF_CASH_RESERVE,
+                            ONE_SHARE_MAX_PCT_OF_CASH, get_active_limits)
         from risk_manager import RiskManager
-        rm = RiskManager(ibkr.get_client())
-        limits = get_active_limits(rm.portfolio_value())
-        cap = limits.get("max_concurrent_positions")
-        if action == "OPEN" and cap is not None:
-            held = {p.symbol for p in rm._client.get_all_positions()}
-            if ticker not in held and len(held) >= cap:
-                return 0, f"position cap reached at execution ({len(held)} of {cap} held)"
-        if not price:
+        with stop_lock.ticker_lock("__BUY_ROOM__", wait=60):
+            rm = RiskManager(ibkr.get_client())
+            try:
+                reserved = _buy_reservations()
+            except Exception as e:
+                log.warning(f"[{ticker}] buy reservations unavailable: {e}")
+                reserved = []
+            limits = get_active_limits(rm.portfolio_value())
+            cap = limits.get("max_concurrent_positions")
+            if action == "OPEN" and cap is not None:
+                held = {p.symbol for p in rm._client.get_all_positions()}
+                taken = held | {t for t, _ in reserved}
+                if ticker not in taken and len(taken) >= cap:
+                    return 0, f"position cap reached at execution ({len(taken)} of {cap} held or being bought)"
+            cash = max(rm.cash() - sum(n for _, n in reserved), 0)
+            affordable = int(cash * MAX_TRADE_PCT_OF_CASH_RESERVE / price)
+            if affordable < 1 and ALLOW_ONE_SHARE_ABOVE_ALLOCATION and price <= cash * ONE_SHARE_MAX_PCT_OF_CASH:
+                affordable = 1
+            if affordable < 1:
+                return 0, "not enough cash at execution under the per-trade cash limits"
+            if shares > affordable:
+                log.warning(f"[{ticker}] {action} cut from {shares} to {affordable} shares: "
+                            f"cash changed since sizing")
+                shares = affordable
+            try:
+                _reserve_buy(ticker, shares * price)
+            except Exception as e:
+                log.warning(f"[{ticker}] buy reservation not stored: {e}")
             return shares, None
-        cash = rm.cash()
-        affordable = int(max(cash, 0) * 0.98 / price)   # small buffer for the fill
-        if affordable < 1:
-            return 0, "not enough cash at execution for one share"
-        if shares > affordable:
-            log.warning(f"[{ticker}] {action} cut from {shares} to {affordable} shares: "
-                        f"cash changed since sizing")
-            return affordable, None
-        return shares, None
     except Exception as e:
         return 0, f"cash/position check failed at execution ({str(e)[:100]})"
 

@@ -246,6 +246,27 @@ Market cap: ${fund['market_cap']:,.0f}{pctile_note}"""
         return ""
 
 
+def _portfolio_value(trading_client) -> float | None:
+    try:
+        return float(trading_client.get_account().portfolio_value) if trading_client else None
+    except Exception:
+        return None
+
+
+def _account_state_section(account, positions: dict | None) -> str:
+    """Account state as percentages, not dollars (Luke D11, 10-29): the model
+    needs how invested the account is, not its size, and dollar balances in
+    stored prompts were a privacy problem (A1453-3)."""
+    pv = float(account.portfolio_value)
+    cash = float(account.cash)
+    if pv <= 0:
+        return "=== ACCOUNT STATE ===\nPortfolio value unavailable."
+    return (f"=== ACCOUNT STATE ===\n"
+            f"Cash:      {cash / pv:.1%} of portfolio\n"
+            f"Invested:  {1 - cash / pv:.1%} of portfolio\n"
+            f"Positions: {len(positions or {})}")
+
+
 def assemble_brief(
     event: dict,
     positions: dict[str, dict],
@@ -304,14 +325,16 @@ Event Title: {event.get('title', 'N/A')}
     # ── Current Portfolio ────────────────────────────────────────────────────
     if positions:
         pos_lines = ["=== CURRENT PORTFOLIO ==="]
+        pv = _portfolio_value(trading_client)
         for sym, pos in positions.items():
             pl_str = f"{pos.get('pl_pct', 0):+.1%}"
+            weight = (f"{pos.get('market_value', 0) / pv:.1%} of portfolio" if pv
+                      else "weight unknown")
             pos_lines.append(
-                f"  {sym:<6} {pos.get('qty', 0):>6.0f} shares | "
+                f"  {sym:<6} {weight} | "
                 f"Entry: ${pos.get('entry_price', 0):.2f} | "
                 f"Current: ${pos.get('current_price', 0):.2f} | "
-                f"P&L: {pl_str} | "
-                f"Value: ${pos.get('market_value', 0):,.0f}"
+                f"P&L: {pl_str}"
             )
         sections.append("\n".join(pos_lines))
     else:
@@ -320,11 +343,7 @@ Event Title: {event.get('title', 'N/A')}
     # ── Account State ────────────────────────────────────────────────────────
     if trading_client:
         try:
-            account = trading_client.get_account()
-            sections.append(f"""=== ACCOUNT STATE ===
-Portfolio Value: ${float(account.portfolio_value):,.2f}
-Cash Available:  ${float(account.cash):,.2f}
-Buying Power:    ${float(account.buying_power):,.2f}""")
+            sections.append(_account_state_section(trading_client.get_account(), positions))
         except Exception as e:
             log.warning(f"Could not fetch account for brief: {e}")
 
@@ -447,14 +466,16 @@ Ticker: {ticker}
     # ── Current Portfolio ────────────────────────────────────────────────────
     if positions:
         pos_lines = ["=== CURRENT PORTFOLIO ==="]
+        pv = _portfolio_value(trading_client)
         for sym, pos in positions.items():
             pl_str = f"{pos.get('pl_pct', 0):+.1%}"
+            weight = (f"{pos.get('market_value', 0) / pv:.1%} of portfolio" if pv
+                      else "weight unknown")
             pos_lines.append(
-                f"  {sym:<6} {pos.get('qty', 0):>6.0f} shares | "
+                f"  {sym:<6} {weight} | "
                 f"Entry: ${pos.get('entry_price', 0):.2f} | "
                 f"Current: ${pos.get('current_price', 0):.2f} | "
-                f"P&L: {pl_str} | "
-                f"Value: ${pos.get('market_value', 0):,.0f}"
+                f"P&L: {pl_str}"
             )
         sections.append("\n".join(pos_lines))
     else:
@@ -463,11 +484,7 @@ Ticker: {ticker}
     # ── Account State ────────────────────────────────────────────────────────
     if trading_client:
         try:
-            account = trading_client.get_account()
-            sections.append(f"""=== ACCOUNT STATE ===
-Portfolio Value: ${float(account.portfolio_value):,.2f}
-Cash Available:  ${float(account.cash):,.2f}
-Buying Power:    ${float(account.buying_power):,.2f}""")
+            sections.append(_account_state_section(trading_client.get_account(), positions))
         except Exception as e:
             log.warning(f"Could not fetch account for scan brief: {e}")
 

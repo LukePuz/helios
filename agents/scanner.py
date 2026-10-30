@@ -427,12 +427,13 @@ def run_scan(regime_packet: dict | None = None) -> dict:
     candidates:   list[dict] = []
     disqualified: list[dict] = []
     threshold = _regime_threshold(regime)
+    from agents.market_regime import completed_bars
 
     for ticker, entry in watchlist.items():
         entry_with_ticker = {**entry, "ticker": ticker}
 
         # Fetch bars
-        bars = _fetch_bars(ticker, days=220)
+        bars = completed_bars(_fetch_bars(ticker, days=220))
         if not bars:
             disqualified.append({"ticker": ticker, "reason": "No price data available", "composite_score": 0})
             continue

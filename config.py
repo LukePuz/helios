@@ -343,9 +343,10 @@ ONE_SHARE_MAX_PCT_OF_CASH = float(os.getenv("ONE_SHARE_MAX_PCT_OF_CASH", "0.50")
 BRIEF_PRICE_STRUCTURE = os.getenv("BRIEF_PRICE_STRUCTURE", "false").lower() == "true"
 BRIEF_POSITION_CONTEXT = os.getenv("BRIEF_POSITION_CONTEXT", "false").lower() == "true"
 # Market-regime fallback reads only overall-market rows (audit 20:53 A2053-1,
-# 08:53 A0853-1). Off by default: it changes the regime the analyst and the
-# conviction gate see, which is Luke's decision (analyst-input rule).
-REGIME_OVERALL_ONLY = os.getenv("REGIME_OVERALL_ONLY", "false").lower() == "true"
+# 08:53 A0853-1). On from 10-30 (Luke D3, 10-29); false restores sector-row reads.
+REGIME_OVERALL_ONLY = os.getenv("REGIME_OVERALL_ONLY", "true").lower() == "true"
+# Regime and scanner score completed daily bars only (A1053-2; Luke D3).
+REGIME_COMPLETED_BARS = os.getenv("REGIME_COMPLETED_BARS", "true").lower() == "true"
 # When a monitored stop level is breached and NO protective stop exists at
 # the broker, execute a market sell of the full position instead of only
 # alerting. Only ever reduces exposure; set False to fall back to alert-only.

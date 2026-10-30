@@ -234,10 +234,12 @@ def _score_liquidity(macro: dict) -> tuple[int, str]:
             return _SCORE["Bullish"], " | ".join(notes_parts) + " — stable, benign"
         elif t10y2y > 0 and fedfunds < 5.5:
             return _SCORE["Neutral"], " | ".join(notes_parts) + " — mixed signals"
-        elif t10y2y < -0.25:
-            return _SCORE["Bearish"], " | ".join(notes_parts) + " — inverted yield curve, tightening stress"
+        # Deeper inversion first: with -0.25 checked first, Very Bearish was
+        # unreachable (audit A1853-3; Luke D9, 10-29).
         elif t10y2y < -0.5:
             return _SCORE["Very Bearish"], " | ".join(notes_parts) + " — severe inversion, high liquidity stress"
+        elif t10y2y < -0.25:
+            return _SCORE["Bearish"], " | ".join(notes_parts) + " — inverted yield curve, tightening stress"
         else:
             return _SCORE["Neutral"], " | ".join(notes_parts)
 
@@ -571,6 +573,23 @@ def _fetch_bars(ticker: str = "SPY", days: int = 220) -> list[dict]:
         return []
 
 
+def completed_bars(bars: list[dict], now=None) -> list[dict]:
+    """Drop today's unfinished daily bar before the 16:00 ET close (audit
+    A1053-2; Luke D3, 10-29): a 09:35 scan scored a five-minute "day" as if
+    it were a full session. REGIME_COMPLETED_BARS=false restores the old reads."""
+    try:
+        from config import REGIME_COMPLETED_BARS
+    except ImportError:
+        REGIME_COMPLETED_BARS = True
+    if not REGIME_COMPLETED_BARS or not bars:
+        return bars
+    from zoneinfo import ZoneInfo
+    et = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo("America/New_York"))
+    if bars[-1].get("date") == et.date().isoformat() and (et.hour, et.minute) < (16, 0):
+        return bars[:-1]
+    return bars
+
+
 def _fetch_spy_bars(days: int = 220) -> list[dict]:
     """Thin backward-compatible wrapper -- kept so the one existing call
     site in assess_regime() doesn't need to change."""
@@ -593,7 +612,7 @@ def assess_regime() -> dict:
     now = datetime.now(timezone.utc)
 
     # --- Fetch data ---
-    spy_bars = _fetch_spy_bars(days=220)
+    spy_bars = completed_bars(_fetch_spy_bars(days=220))
 
     try:
         from ingestion.macro import get_macro_snapshot
@@ -845,9 +864,9 @@ def assess_sector_regime(
     log.info(f"Assessing {sector_etf} sector regime ({regime_type})...")
     now = datetime.now(timezone.utc)
 
-    sector_bars = _fetch_bars(sector_etf, days=220)
+    sector_bars = completed_bars(_fetch_bars(sector_etf, days=220))
     if spy_bars is None:
-        spy_bars = _fetch_bars("SPY", days=220)
+        spy_bars = completed_bars(_fetch_bars("SPY", days=220))
 
     trend_raw, trend_notes = _score_trend(sector_bars)
     # Same trade_style classification as assess_regime() (see
@@ -1066,7 +1085,7 @@ def assess_market_sector_map() -> dict:
     from ingestion.sp500_universe import SECTOR_ETF_MAP, get_tickers_by_gics_sector
 
     log.info("Assessing full GICS sector map (11 sectors)...")
-    spy_bars = _fetch_bars("SPY", days=220)
+    spy_bars = completed_bars(_fetch_bars("SPY", days=220))
 
     results: dict[str, dict] = {}
     for gics_sector, etf in SECTOR_ETF_MAP.items():

@@ -726,6 +726,21 @@ def _rule_shadow_average_down(ticker: str, bucket: str, trading_client) -> None:
                     f"${price:.2f} below entry ${entry:.2f}; not enforced")
 
 
+def _compiled_plan(ticker: str, result: dict, price: float, stop) -> dict | None:
+    """Shadow plan from the analyst's view plus the price ladder (audit
+    A2114-1). Log-only, never raises."""
+    try:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        import db
+        from agents.plans import compile_plan
+        return compile_plan(result, price, db.get_trade_ladder(ticker), stop,
+                            datetime.now(ZoneInfo("America/New_York")).date())
+    except Exception as e:
+        log.debug(f"[{ticker}] compiled plan failed: {e}")
+        return None
+
+
 def _r_shadow(result: dict, price: float, stop) -> dict | None:
     """Reward-to-risk against the stop that will actually be placed, next to
     the model's own upside_downside_ratio (audit A2114-2: the UDR >= 2 gate
@@ -916,6 +931,7 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
         sizing = rm.size_position(ticker, conviction, bucket, regime_str, price)
         sizing["price_at_sizing"] = price
         sizing["r_shadow"] = _r_shadow(result, price, sizing.get("stop_loss_price"))
+        sizing["plan_compiled"] = _compiled_plan(ticker, result, price, sizing.get("stop_loss_price"))
         if sizing.get("shares_initial", 0) <= 0:
             # 2026-08-13: if this is specifically a cash shortage (not a
             # halt, not "already at target," not conviction too low for the

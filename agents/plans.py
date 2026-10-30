@@ -205,3 +205,50 @@ def observe(ticker: str, parsed: dict, action: str, conviction: int, brief: str,
     except Exception as e:
         log.error(f"[{ticker}] plan shadow failed: {e}")   # error level so the log monitor sees it
         return {"relation": "ERROR", "error": str(e)[:200]}
+
+
+def compile_plan(parsed: dict, price: float, ladder: dict | None, actual_stop,
+                 today: date) -> dict:
+    """A concrete trade plan from the analyst's view plus the stock's price
+    structure (trade_ladder rungs), shadow only (audit A2114-1): today the
+    stop, targets and trailing come from generic rules and ignore both.
+
+      structural_stop  below the nearest support rung (by 0.5 ATR) that sits
+                       at least 1 ATR under price; the analyst's invalidation
+                       when there is no ladder
+      t1               the nearest resistance rung at least 1 ATR above price
+      t2               the analyst's bull target, else the blended fair value
+                       or the next resistance
+      add_trigger      a close above t1's band (breakout through resistance)
+      time_stop        the plan horizon (catalyst + grace, or bucket days)
+
+    Logged next to the stop sizing actually places, so the gap between the
+    plan and the trade can be measured before anything is wired in."""
+    base = plan_from_verdict("", parsed, 0, price, today)
+    out = {"source": "ladder" if ladder else "analyst_only",
+           "invalidation_analyst": base["invalidation_price"], "time_stop": str(base["horizon_end"]),
+           "catalyst_date": str(base["catalyst_date"]) if base["catalyst_date"] else None}
+    atr = float((ladder or {}).get("atr") or 0) or None
+    rungs = sorted((ladder or {}).get("rungs") or [], key=lambda r: r["price"])
+    supports = [r for r in rungs if atr and r["price"] <= price - atr]
+    resist = [r for r in rungs if atr and r["price"] >= price + atr]
+    stop = round(supports[-1]["price"] - 0.5 * atr, 2) if supports else base["invalidation_price"]
+    t1 = resist[0]["price"] if resist else None
+    t2 = base["target_price"]
+    if t2 is None:
+        fv = (ladder or {}).get("fair_value_blended")
+        t2 = (float(fv) if fv and float(fv) > price else None) or (resist[1]["price"] if len(resist) > 1 else None)
+    out.update(
+        structural_stop=stop, t1=t1, t2=round(t2, 2) if t2 else None,
+        add_trigger=resist[0].get("band_high") if resist else None,
+        support_types=supports[-1]["types"] if supports else None,
+        resistance_types=resist[0]["types"] if resist else None,
+        actual_stop=float(actual_stop) if actual_stop else None,
+    )
+    if stop and stop < price:
+        out["structural_stop_pct"] = round((price - stop) / price * 100, 2)
+        if t1:
+            out["r_to_t1"] = round((t1 - price) / (price - stop), 2)
+    if out["actual_stop"] and stop:
+        out["stop_gap_pct"] = round((out["actual_stop"] - stop) / price * 100, 2)  # + = actual is tighter
+    return out

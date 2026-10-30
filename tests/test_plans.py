@@ -130,3 +130,18 @@ def test_expired_or_closed_position_plan_is_closed_first():
         r = plans.observe("NVDA", PARSED, "WATCH", 6, "Current Price: $540.00", now=NOW)
     touch.assert_called_once_with(1, "CLOSED", close_reason="position closed")
     assert r["relation"] == "NO_PLAN"
+
+
+def test_compile_plan_uses_ladder_levels():
+    """Audit A2114-1: shadow plan from analyst view + price ladder."""
+    ladder = {"atr": 10.0, "fair_value_blended": 640.0, "rungs": [
+        {"price": 500.0, "band_high": 503.0, "types": ["ma50"]},
+        {"price": 535.0, "band_high": 538.0, "types": ["ma10"]},      # within 1 ATR: ignored
+        {"price": 575.0, "band_high": 578.0, "types": ["swing_high"]},
+        {"price": 610.0, "band_high": 613.0, "types": ["52w_high"]}]}
+    p = plans.compile_plan(PARSED, 540.0, ladder, 500.0, TODAY)
+    assert p["structural_stop"] == 495.0 and p["support_types"] == ["ma50"]
+    assert p["t1"] == 575.0 and p["add_trigger"] == 578.0 and p["t2"] == 650.0
+    assert p["r_to_t1"] == round(35 / 45, 2) and p["stop_gap_pct"] == round(5 / 540 * 100, 2)
+    bare = plans.compile_plan(PARSED, 540.0, None, None, TODAY)
+    assert bare["source"] == "analyst_only" and bare["structural_stop"] == 480.0 and bare["t1"] is None

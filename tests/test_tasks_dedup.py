@@ -1509,3 +1509,30 @@ def test_reprotect_does_not_confirm_a_lagging_read_after_a_manual_add():
         assert tasks._reprotect_after_late_sell("CRWD", {}, None, from_queue=True, expect_at_least=150) is False
         assert tasks._reprotect_after_late_sell("CRWD", {}, None, from_queue=True) is True
     assert not place.called
+
+
+def test_orphan_outcome_flag_skips_an_empty_snapshot_and_passes_held_tickers():
+    """Professor M111: open outcomes with no position get flagged, never closed."""
+    with patch("tasks._held_prices", return_value={}), patch("db.flag_orphan_outcomes") as flag:
+        assert tasks.flag_orphan_outcomes() is None
+    assert not flag.called
+    with patch("tasks._held_prices", return_value={"NVDA": 200.0, "PLTR": 180.0}), \
+         patch("db.flag_orphan_outcomes", return_value=(3, 105)) as flag:
+        assert tasks.flag_orphan_outcomes() == 105
+    assert flag.call_args.args[0] == {"NVDA", "PLTR"}
+
+
+def test_flag_orphan_outcomes_sql_flags_unheld_and_unflags_held():
+    from unittest.mock import MagicMock
+    import db
+    cur = MagicMock()
+    cur.rowcount = 3
+    cur.fetchone.return_value = (105,)
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
+        assert db.flag_orphan_outcomes({"nvda"}) == (3, 105)
+    sqls = [c.args[0] for c in cur.execute.call_args_list]
+    assert "orphaned_at = NOW()" in sqls[0] and "<> ALL" in sqls[0]
+    assert "orphaned_at = NULL" in sqls[1] and cur.execute.call_args_list[0].args[1][1] == ["NVDA"]
+    assert "exit_date IS NULL" in sqls[0] and "UPDATE" in sqls[0] and "exit_price" not in sqls[0]

@@ -510,6 +510,13 @@ app.conf.beat_schedule = {
         "schedule": 900,
         "options":  {"queue": INGESTION_QUEUE, "expires": 900},
     },
+    # Flag open outcome rows with no position (professor M111) — weekdays
+    # 15:45, while the 5-minute portfolio snapshot is fresh
+    "flag-orphan-outcomes": {
+        "task":     "tasks.flag_orphan_outcomes",
+        "schedule": crontab(hour=15, minute=45, day_of_week="mon-fri"),
+        "options":  {"queue": INGESTION_QUEUE, "expires": 3600},
+    },
     # Auto-expire stale approval requests — every 30 minutes
     "expire-approvals": {
         "task":     "tasks.auto_expire_approvals",
@@ -2727,6 +2734,23 @@ def send_daily_digest(self):
     except Exception as e:
         log.error(f"send_daily_digest failed: {e}")
         raise self.retry(exc=e, countdown=300)
+
+
+@app.task(name="tasks.flag_orphan_outcomes")
+def flag_orphan_outcomes():
+    """Open trade_outcomes rows whose ticker isn't held get orphaned_at set:
+    stale-stop cleanup deletes the stop record but leaves the outcome open
+    when no exit fill is found (professor M111; 108 of 113 pilot rows open).
+    Held tickers come from the fresh portfolio snapshot, not IBKR. An empty
+    snapshot is skipped: stale and flat look the same."""
+    import db
+    held = set(_held_prices(15))
+    if not held:
+        log.warning("flag_orphan_outcomes: no fresh held positions in the snapshot; skipped")
+        return None
+    newly, total = db.flag_orphan_outcomes(held)
+    log.info(f"flag_orphan_outcomes: {newly} newly flagged, {total} open outcome rows flagged orphaned")
+    return total
 
 
 @app.task(name="tasks.watch_plan_levels")

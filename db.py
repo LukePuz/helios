@@ -739,6 +739,9 @@ _MIGRATIONS: list[tuple[int, str]] = [
     # backstop_sell, broker_exit (stop fill or a close at the broker),
     # late_<intent> (a reconciled late sell). NULL before 10-30.
     (66, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS exit_source VARCHAR(30);"),
+    # Set when an open outcome row's ticker isn't held (a flag, not a close:
+    # no exit price is known). NULL before 10-30 (professor M111).
+    (67, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS orphaned_at TIMESTAMPTZ;"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -3887,6 +3890,41 @@ def upsert_earnings_date(ticker: str, earnings_date, confirmed: bool = False,
     except Exception as e:
         conn.rollback()
         logging.error(f"upsert_earnings_date failed: {e}")
+    finally:
+        _put_conn(conn)
+
+
+def flag_orphan_outcomes(held: set[str]) -> tuple[int, int]:
+    """Flags open trade_outcomes rows (exit_date NULL, this env) whose ticker
+    isn't in `held` by setting orphaned_at once; a row whose ticker is held
+    again is unflagged. Returns (newly flagged, total flagged open rows).
+    Never closes a row: no exit price is known (professor M111)."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            held_list = sorted(t.upper() for t in held) or [""]
+            cur.execute(
+                "UPDATE trade_outcomes SET orphaned_at = NOW() WHERE trading_env=%s AND exit_date IS NULL "
+                "AND orphaned_at IS NULL AND UPPER(ticker) <> ALL(%s)",
+                (TRADING_ENV, held_list),
+            )
+            newly = cur.rowcount
+            cur.execute(
+                "UPDATE trade_outcomes SET orphaned_at = NULL WHERE trading_env=%s AND exit_date IS NULL "
+                "AND orphaned_at IS NOT NULL AND UPPER(ticker) = ANY(%s)",
+                (TRADING_ENV, held_list),
+            )
+            cur.execute(
+                "SELECT COUNT(*) FROM trade_outcomes WHERE trading_env=%s AND exit_date IS NULL "
+                "AND orphaned_at IS NOT NULL", (TRADING_ENV,),
+            )
+            total = cur.fetchone()[0]
+        conn.commit()
+        return newly, total
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"flag_orphan_outcomes failed: {e}")
+        return 0, -1
     finally:
         _put_conn(conn)
 

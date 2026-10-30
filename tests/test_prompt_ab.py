@@ -1,4 +1,5 @@
-"""prompt_ab swaps exactly the schema block between old and new templates."""
+"""prompt_ab swaps exactly the schema block between old and new templates,
+and its summary applies the rule fixed before the run."""
 import importlib.util
 import os
 import subprocess
@@ -26,3 +27,26 @@ def test_variant_replaces_block_in_a_rendered_prompt():
     assert new in prompt
     old = ab.old_variant(prompt, new, "OLD BLOCK")
     assert "OLD BLOCK" in old and "BRIEF TEXT" in old and new not in old
+
+def _runs(new, old):
+    return ([{"ticker": t, "variant": "new", "conviction": c, "expected": e} for t, c, e in new]
+            + [{"ticker": t, "variant": "old", "conviction": c, "expected": e} for t, c, e in old])
+
+
+def test_order_effect_needs_both_thresholds():
+    s = ab.summarize(_runs([("A", 6, 6.1), ("B", 6, 5.9)], [("A", 7, 6.9), ("B", 7, 7.0)]))
+    assert s["c7_share_diff_pts"] == 100.0 and s["paired_mean_expected_diff"] == 0.95
+    assert s["order_effect"] is True
+    # share moves but the paired expected conviction barely does
+    s = ab.summarize(_runs([("A", 6, 6.6), ("B", 6, 6.6)], [("A", 7, 6.8), ("B", 7, 6.8)]))
+    assert s["order_effect"] is False
+
+
+def test_missing_logprobs_or_unparsed_runs_are_skipped():
+    s = ab.summarize(_runs([("A", None, None), ("A", 6, 6.0)], [("A", 6, None)]))
+    assert s["new"]["runs"] == 1 and s["paired_prompts"] == 0 and s["order_effect"] is False
+
+
+def test_round_robin_takes_newest_per_ticker_first():
+    rows = [("A", "a1", 5), ("A", "a2", 4), ("A", "a3", 3), ("B", "b1", 6), ("C", "c1", 1)]
+    assert ab._round_robin(rows, 4) == [("B", "b1"), ("A", "a1"), ("C", "c1"), ("A", "a2")]

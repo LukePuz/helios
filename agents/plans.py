@@ -175,18 +175,24 @@ def observe(ticker: str, parsed: dict, action: str, conviction: int, brief: str,
 
         if plan is None:
             if new:
-                return {"relation": "NEW_PLAN", "plan_id": db.insert_plan(new), "price": price}
+                return {"relation": "NEW_PLAN", "plan_id": db.insert_plan(new), "price": price,
+                        "held": held, "plan_live": held}
             stop = db.get_position_stop(ticker) if held else None
             if stop and price:
                 seed = plan_from_verdict(ticker, parsed, conviction, price, today)
                 seed.update(source="held_seed", entry_price=stop["entry_price"],
                             invalidation_price=stop["stop_price"],
                             bucket=stop.get("thesis_bucket") or seed["bucket"])
-                return {"relation": "SEEDED", "plan_id": db.insert_plan(seed), "price": price}
-            return {"relation": "NO_PLAN", "price": price}
+                return {"relation": "SEEDED", "plan_id": db.insert_plan(seed), "price": price,
+                        "held": held, "plan_live": True}
+            return {"relation": "NO_PLAN", "price": price, "held": held}
 
         out = classify(plan, action, new, price, today, held)
         out["price"] = price
+        # A plan written by an OPEN that never filled (sized to 0 shares) is
+        # not a live plan: WATCH/HOLD on it reads as FOLLOW (audit A0100-4).
+        # Count FOLLOW/DIVERGE on plan_live rows only.
+        out.update(held=held, plan_source=plan.get("source"), plan_live=held)
         out["plan_age_days"] = ((today - plan["created_at"].astimezone(et).date()).days
                                 if plan.get("created_at") else None)
         last = plan.get("last_seen_at") or plan.get("created_at")

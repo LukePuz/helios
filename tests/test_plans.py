@@ -85,6 +85,7 @@ def test_observe_creates_then_follows_and_coalesces():
         r3 = plans.observe("NVDA", PARSED, "WATCH", 6, brief, now=NOW + timedelta(hours=6))
     assert r1["relation"] == "NEW_PLAN" and r1["plan_id"] == 7
     assert r2["relation"] == "FOLLOW" and r2["would_coalesce"] is True
+    assert r2["plan_live"] is False and r2["held"] is False      # an unfilled OPEN's plan (A0100-4)
     assert r3["would_coalesce"] is False
     assert store["touched"] == (7, "FOLLOW", None)
 

@@ -2682,7 +2682,7 @@ def watch_plan_levels():
                 logged += 1
         return logged
     except Exception as e:
-        log.warning(f"watch_plan_levels failed: {e}")
+        log.error(f"watch_plan_levels failed: {e}")
         return 0
 
 

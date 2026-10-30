@@ -311,3 +311,20 @@ def test_conviction_distribution_from_token_logprobs():
     assert d["chosen"] == "6" and abs(d["expected"] - 6.2) < 1e-6 and d["p_ge7"] == 0.3
     assert _conviction_distribution(None) is None
     assert _conviction_distribution([{"token": '"reasoning": "cut off'}]) is None
+
+
+def test_trim_shadow_flags_a_fully_priced_holding():
+    """Audit A0100-3: held, HOLD, UDR below 1 three reviews running."""
+    from unittest.mock import patch
+    from agents.analyst import _trim_shadow
+    with patch("db.get_position_stop", return_value={"entry_price": 100.0}), \
+         patch("db.recent_model_udrs", return_value=[0.8, 0.6]), \
+         patch("db.get_active_plan", return_value=None):
+        r = _trim_shadow("NVDA", "HOLD", {"upside_downside_ratio": 0.7}, "Current Price: $200.00")
+    assert r["udr_below_1_streak"] == 3 and r["would_trim_review"] is True
+    with patch("db.get_position_stop", return_value={"entry_price": 100.0}), \
+         patch("db.recent_model_udrs", return_value=[1.4, 0.6]), \
+         patch("db.get_active_plan", return_value={"target_price": 190.0}):
+        r = _trim_shadow("NVDA", "HOLD", {"upside_downside_ratio": 0.7}, "Current Price: $200.00")
+    assert r["udr_below_1_streak"] == 1 and r["at_plan_target"] and r["would_trim_review"]
+    assert _trim_shadow("NVDA", "OPEN", {}, "") is None

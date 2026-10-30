@@ -203,6 +203,38 @@ def _rule_shadows(ticker: str, action: str, brief: str) -> dict | None:
     return out
 
 
+_TRIM_SHADOW_STREAK = 3   # reviews in a row with UDR below 1
+
+
+def _trim_shadow(ticker: str, action: str, parsed: dict, brief: str) -> dict | None:
+    """Log-only (audit A0100-3): a held name the model keeps at HOLD/WATCH
+    while its own upside/downside is below 1 on several reviews in a row, or
+    whose price has reached its plan target. Asymmetry is only checked at
+    entry today, so a fully priced holding is never trimmed. Never raises."""
+    if action not in ("HOLD", "WATCH"):
+        return None
+    try:
+        import db
+        from agents.plans import brief_price
+        if db.get_position_stop(ticker) is None:
+            return None
+        udr = parsed.get("upside_downside_ratio")
+        udr = float(udr) if isinstance(udr, (int, float)) else None
+        history = [udr] + db.recent_model_udrs(ticker, _TRIM_SHADOW_STREAK - 1)
+        streak = 0
+        for v in history:
+            if v is None or v >= 1:
+                break
+            streak += 1
+        plan = db.get_active_plan(ticker)
+        price = brief_price(brief)
+        at_target = bool(plan and plan.get("target_price") and price and price >= plan["target_price"])
+        return {"udr": udr, "udr_below_1_streak": streak, "at_plan_target": at_target,
+                "would_trim_review": streak >= _TRIM_SHADOW_STREAK or at_target}
+    except Exception as e:
+        return {"error": str(e)[:120]}
+
+
 def _brief_template_sha() -> str | None:
     try:
         import hashlib
@@ -1449,6 +1481,7 @@ def analyze(
                 "catalyst_check": _catalyst_check(ticker, parsed),
                 "prior_verdicts_72h": _prior_verdicts(ticker) if action in ("OPEN", "ADD") else None,
                 "rule_shadows": _rule_shadows(ticker, action, situation_brief),
+                "trim_shadow": _trim_shadow(ticker, action, parsed, situation_brief),
             },
             prompt=redact_account_figures(prompt),
         )

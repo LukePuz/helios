@@ -3828,6 +3828,32 @@ def upsert_earnings_date(ticker: str, earnings_date, confirmed: bool = False,
         _put_conn(conn)
 
 
+def recent_model_udrs(ticker: str, n: int = 2) -> list[float | None]:
+    """The model's upside_downside_ratio on the ticker's last n analyst
+    verdicts, newest first (None where it gave none). Trim shadow, A0100-3."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT decision->'model_output'->>'upside_downside_ratio' FROM signals "
+                "WHERE symbol=%s AND signal NOT IN %s AND decision IS NOT NULL AND trading_env=%s "
+                "ORDER BY timestamp DESC LIMIT %s",
+                (ticker, _NON_ANALYST_SIGNALS, TRADING_ENV, n),
+            )
+            out = []
+            for (v,) in cur.fetchall():
+                try:
+                    out.append(float(v) if v is not None else None)
+                except ValueError:
+                    out.append(None)
+            return out
+    except Exception as e:
+        logging.error(f"recent_model_udrs failed: {e}")
+        return []
+    finally:
+        _put_conn(conn)
+
+
 def last_sell_trade(ticker: str, days: int = 14) -> dict | None:
     """Most recent SELL trade on the ticker within `days`, or None."""
     conn = _get_conn()

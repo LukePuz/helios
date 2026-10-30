@@ -1115,9 +1115,18 @@ def trigger_record(path: str, event: dict | None = None) -> dict:
     """What started this analysis, for the verdict's provenance (audit 16:53,
     A1653-2). Log-only: never passed to the prompt."""
     e = event or {}
-    return {"path": path, "source": e.get("source"), "type": e.get("type"),
-            "title": (e.get("title") or "")[:200] or None, "url": e.get("url"),
-            "published_at": str(e.get("timestamp") or e.get("published_at") or "") or None}
+    rec = {"path": path, "source": e.get("source"), "type": e.get("type"),
+           "title": (e.get("title") or "")[:200] or None, "url": e.get("url"),
+           "published_at": str(e.get("timestamp") or e.get("published_at") or "") or None}
+    if isinstance(e.get("text"), str) and e["text"]:
+        # The brief shows only the first EVENT_TEXT_CAP characters (SEF data QA).
+        rec["text_len"] = len(e["text"])
+        try:
+            from context_engine import EVENT_TEXT_CAP
+            rec["text_truncated"] = len(e["text"]) > EVENT_TEXT_CAP
+        except Exception:
+            pass
+    return rec
 
 
 def analyze(

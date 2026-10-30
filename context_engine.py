@@ -22,6 +22,10 @@ log = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
 
 
+# Characters of the triggering event's text shown in the brief.
+EVENT_TEXT_CAP = 3000
+
+
 def _safe_import(module_name: str):
     """Imports a module, returns None if unavailable (missing API key etc)."""
     try:
@@ -350,8 +354,8 @@ Event Title: {event.get('title', 'N/A')}
     if event_text:
         sections.append(f"""
 === EVENT CONTENT ===
-{event_text[:3000]}
-{'[Content truncated — see full filing at ' + event.get('url','') + ']' if len(event_text) > 3000 else ''}""")
+{event_text[:EVENT_TEXT_CAP]}
+{'[Content truncated — see full filing at ' + event.get('url','') + ']' if len(event_text) > EVENT_TEXT_CAP else ''}""")
 
     # ── Current Portfolio ────────────────────────────────────────────────────
     if positions:

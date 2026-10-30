@@ -391,3 +391,13 @@ def test_event_burst_shadow_counts_other_recent_events():
         assert _event_burst("MSFT", trig, [])["would_merge"] is False
     with patch("db.recent_event_verdicts", side_effect=RuntimeError("db down")):
         assert "error" in _event_burst("MSFT", trig, [])
+
+
+def test_trigger_record_notes_when_the_brief_cut_the_event_text():
+    from agents.analyst import trigger_record
+    from context_engine import EVENT_TEXT_CAP
+    long = trigger_record("event", {"source": "edgar", "text": "x" * (EVENT_TEXT_CAP + 1)})
+    assert long["text_len"] == EVENT_TEXT_CAP + 1 and long["text_truncated"] is True
+    short = trigger_record("event", {"source": "news", "text": "short"})
+    assert short["text_truncated"] is False
+    assert "text_len" not in trigger_record("daily_scan", {"source": "scanner"})

@@ -102,7 +102,13 @@ def test_shadow_fields_are_always_json_safe():
     from decimal import Decimal
     from agents import crew
     assert crew._json_safe({"a": Decimal("1.5"), "d": [Decimal("2")]}) == {"a": 1.5, "d": [2.0]}
-    assert crew._json_safe({"d": date(2026, 1, 1)}) is None      # not float-able: dropped, not raised
-    sizing = {"stop_loss_price": 95.0, "heat_shadow": {"x": Decimal("0.1")}}
+    assert crew._json_safe({"d": date(2026, 1, 1)}) is crew._UNENCODABLE   # dropped, not raised
+    sizing = {"stop_loss_price": 95.0, "heat_shadow": {"x": date(2026, 1, 1)}}
     crew._attach_shadows(sizing, "ZZZ", {"valuation": {"bull_case_target": "$130"}}, 100.0)
     json.dumps(sizing)
+    assert sizing["shadow_status"]["heat_shadow"] == "unencodable" and sizing["heat_shadow"] is None
+    assert sizing["shadow_status"]["r_shadow"] == "ok"
+    sizing = {"heat_shadow": None}
+    with patch("agents.crew._r_shadow", side_effect=None, return_value={"error": "boom"}):
+        crew._attach_shadows(sizing, "ZZZ", {}, 100.0)
+    assert sizing["shadow_status"]["r_shadow"] == "error" and sizing["shadow_status"]["heat_shadow"] == "n/a"

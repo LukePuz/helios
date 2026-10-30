@@ -612,7 +612,7 @@ class RiskManager:
                     "shares_within_cap": min(shares, fits)}
         except Exception as e:
             log.debug(f"[{ticker}] heat shadow failed: {e}")
-            return None
+            return {"error": str(e)[:200]}
 
     # ------------------------------------------------------------------
     # Swing-trading cutover, Phase 4/5 (2026-10-11): setup-gate sizing path

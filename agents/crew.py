@@ -726,23 +726,38 @@ def _rule_shadow_average_down(ticker: str, bucket: str, trading_client) -> None:
                     f"${price:.2f} below entry ${entry:.2f}; not enforced")
 
 
+_UNENCODABLE = object()
+
+
 def _json_safe(value):
-    """A shadow value as plain JSON, or None. A value json can't encode would
-    make the approval insert fail and drop the buy (shadow review 10-29)."""
+    """A shadow value as plain JSON, or _UNENCODABLE. A value json can't
+    encode would make the approval insert fail and drop the buy."""
     import json
     try:
         return json.loads(json.dumps(value, default=float))
     except Exception:
-        return None
+        return _UNENCODABLE
 
 
 def _attach_shadows(sizing: dict, ticker: str, result: dict, price: float) -> None:
-    """Log-only fields on a sizing dict, each guaranteed JSON-safe."""
+    """Log-only fields on a sizing dict, each guaranteed JSON-safe, with
+    shadow_status saying why one is missing: ok, n/a (doesn't apply),
+    error (the helper raised; the dict holds the message) or unencodable."""
     stop = sizing.get("stop_loss_price")
-    sizing["r_shadow"] = _json_safe(_r_shadow(result, price, stop))
-    sizing["plan_compiled"] = _json_safe(_compiled_plan(ticker, result, price, stop))
+    values = {"r_shadow": _r_shadow(result, price, stop),
+              "plan_compiled": _compiled_plan(ticker, result, price, stop)}
     if "heat_shadow" in sizing:
-        sizing["heat_shadow"] = _json_safe(sizing["heat_shadow"])
+        values["heat_shadow"] = sizing["heat_shadow"]
+    status = {}
+    for name, value in values.items():
+        safe = _json_safe(value)
+        if safe is _UNENCODABLE:
+            sizing[name], status[name] = None, "unencodable"
+        else:
+            sizing[name] = safe
+            status[name] = ("n/a" if safe is None
+                            else "error" if isinstance(safe, dict) and "error" in safe else "ok")
+    sizing["shadow_status"] = status
 
 
 def _compiled_plan(ticker: str, result: dict, price: float, stop) -> dict | None:
@@ -757,7 +772,7 @@ def _compiled_plan(ticker: str, result: dict, price: float, stop) -> dict | None
                             datetime.now(ZoneInfo("America/New_York")).date())
     except Exception as e:
         log.debug(f"[{ticker}] compiled plan failed: {e}")
-        return None
+        return {"error": str(e)[:200]}
 
 
 def _r_shadow(result: dict, price: float, stop) -> dict | None:
@@ -778,7 +793,7 @@ def _r_shadow(result: dict, price: float, stop) -> dict | None:
                 "stop": stop, "stop_pct": round((price - stop) / price * 100, 2) if stop else None}
     except Exception as e:
         log.debug(f"R shadow failed: {e}")
-        return None
+        return {"error": str(e)[:200]}
 
 
 def _route_to_approval(result: dict, regime: dict, trading_client) -> None:

@@ -703,6 +703,10 @@ app.conf.beat_schedule = {
     },
 }
 
+from config import QUIVER_ENABLED as _QUIVER_ENABLED
+if not _QUIVER_ENABLED:   # Luke D2, 10-29
+    app.conf.beat_schedule.pop("poll-congressional", None)
+
 
 def _get_client():
     """Lazy-loads IBKR client adapter."""
@@ -2477,6 +2481,8 @@ def _get_stale_ingestion_sources() -> list[str]:
     stale = []
     now = datetime.now(timezone.utc)
     health = {h["source"]: h for h in db.get_ingestion_health()}
+    if not _QUIVER_ENABLED:
+        expected_minutes.pop("congressional", None)
     for source, max_gap in expected_minutes.items():
         if source in rth_only and not rth:
             continue

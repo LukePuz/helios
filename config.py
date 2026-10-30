@@ -337,6 +337,10 @@ ALLOW_ONE_SHARE_ABOVE_ALLOCATION = os.getenv("ALLOW_ONE_SHARE_ABOVE_ALLOCATION",
 # per-trade cash cap, which blocked every $400-600 share once most cash was
 # invested; Luke 10-29). Normal multi-share sizing keeps the 20% cap.
 ONE_SHARE_MAX_PCT_OF_CASH = float(os.getenv("ONE_SHARE_MAX_PCT_OF_CASH", "0.50"))
+# Quiver Quant (congressional trades, gov contracts): key rejected since
+# 10-13; Luke dropped it 10-29 (D2). true turns the poller and the
+# scanner lookup back on once a key exists.
+QUIVER_ENABLED = os.getenv("QUIVER_ENABLED", "false").lower() == "true"
 # Brief sections that change what the analyst sees (professor M37-M39, Q35).
 # On from 10-30 (Luke D12, 10-29: needed for plan-following); false turns
 # either back off.

@@ -250,8 +250,11 @@ def _score_catalyst(watchlist_entry: dict, recent_filings: list[str]) -> tuple[i
     if role == "Moonshot" and ticker in recent_filings:
         scan_type = "TAIL"
 
-    # Government contract awards (Quiver Quant)
+    # Government contract awards (Quiver Quant; off with QUIVER_ENABLED, Luke D2)
     try:
+        from config import QUIVER_ENABLED
+        if not QUIVER_ENABLED:
+            raise RuntimeError("Quiver disabled")
         from ingestion.congressional import get_gov_contracts
         contracts = get_gov_contracts(ticker, days_back=14)
         if contracts:

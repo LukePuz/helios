@@ -728,6 +728,10 @@ _MIGRATIONS: list[tuple[int, str]] = [
          "thesis TEXT, primary_risk TEXT, revision INTEGER DEFAULT 0, replaces_id INTEGER, "
          "verdicts_seen INTEGER DEFAULT 0, last_seen_at TIMESTAMPTZ, last_relation VARCHAR(16)); "
          "CREATE INDEX IF NOT EXISTS trade_plans_active ON trade_plans (ticker, trading_env, status);"),
+    # Which ticker/form an EDGAR filing was, so the scanner can score recent
+    # 8-Ks from what the poller already saw (Luke D4, 10-29). NULL before 10-30.
+    (64, "ALTER TABLE seen_items ADD COLUMN IF NOT EXISTS ticker VARCHAR(10), "
+         "ADD COLUMN IF NOT EXISTS form VARCHAR(12);"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -2300,10 +2304,22 @@ def is_seen(source: str, external_id: str) -> bool:
         _put_conn(conn)
 
 
-def mark_seen(source: str, external_id: str) -> None:
+def mark_seen(source: str, external_id: str, ticker: str | None = None,
+              form: str | None = None) -> None:
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
+            if ticker or form:
+                try:
+                    cur.execute(
+                        "INSERT INTO seen_items (source, external_id, ticker, form) "
+                        "VALUES (%s, %s, %s, %s) ON CONFLICT (source, external_id) DO NOTHING",
+                        (source, external_id, ticker, form),
+                    )
+                    conn.commit()
+                    return
+                except psycopg2.errors.UndefinedColumn:
+                    conn.rollback()   # migration 64 not applied yet
             cur.execute(
                 "INSERT INTO seen_items (source, external_id) VALUES (%s, %s) "
                 "ON CONFLICT (source, external_id) DO NOTHING",
@@ -2313,6 +2329,26 @@ def mark_seen(source: str, external_id: str) -> None:
     except Exception as e:
         conn.rollback()
         logging.error(f"mark_seen({source}, {external_id}) failed: {e}")
+    finally:
+        _put_conn(conn)
+
+
+def recent_filing_tickers(form_prefix: str = "8-K", days: int = 3) -> set[str]:
+    """Tickers with a filing of this form first seen in the last `days`
+    (migration 64). Empty on error or before the migration."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT ticker FROM seen_items WHERE source='edgar' AND ticker IS NOT NULL "
+                "AND form LIKE %s AND first_seen > NOW() - make_interval(days => %s)",
+                (form_prefix + "%", days),
+            )
+            return {r[0] for r in cur.fetchall()}
+    except Exception as e:
+        conn.rollback()
+        logging.warning(f"recent_filing_tickers failed: {e}")
+        return set()
     finally:
         _put_conn(conn)
 

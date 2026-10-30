@@ -765,7 +765,10 @@ def _dispatch_event(event: dict, seen_source: str | None = None) -> None:
         try:
             import db
             for src, key in seen_keys:
-                db.mark_seen(src, key)
+                if src == "edgar":   # ticker/form feed the scanner's 8-K points (D4)
+                    db.mark_seen(src, key, ticker=event.get("ticker"), form=event.get("form"))
+                else:
+                    db.mark_seen(src, key)
         except Exception as e:
             log.warning(f"mark_seen failed for {seen_keys}: {e}")
 

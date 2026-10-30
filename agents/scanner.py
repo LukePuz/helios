@@ -222,6 +222,9 @@ def _score_momentum_with_flow(bars: list[dict], ticker: str) -> tuple[int, str]:
     return score, notes
 
 
+_EARNINGS_CATALYST_DAYS = 21
+
+
 def _score_catalyst(watchlist_entry: dict, recent_filings: list[str]) -> tuple[int, str, str]:
     """
     Catalyst proximity scoring. Returns (score, notes, scan_type).
@@ -270,6 +273,21 @@ def _score_catalyst(watchlist_entry: dict, recent_filings: list[str]) -> tuple[i
             notes_parts.append(f"Dark pool ${dp['largest_print']/1e6:.1f}M print")
     except Exception as e:
         log.debug(f"[{ticker}] Dark pool check skipped: {e}")
+
+    # A dated earnings report soon is a catalyst (Luke D4, 10-29). Same
+    # Postgres calendar the bot acts on.
+    try:
+        import db
+        from datetime import date
+        nxt = db.get_next_earnings(ticker)
+        if nxt is not None:
+            days_out = (nxt - date.today()).days
+            if 0 <= days_out <= _EARNINGS_CATALYST_DAYS:
+                score += 10
+                notes_parts.append(f"earnings in {days_out}d ({nxt})")
+                scan_type = "CATALYST"
+    except Exception as e:
+        log.debug(f"[{ticker}] Earnings proximity check skipped: {e}")
 
     # Tier-based base catalyst score (Core tickers have more visibility)
     if tier == "Core" and score == 0:
@@ -342,28 +360,14 @@ def _priority_label(score: int, regime: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _get_recent_filings() -> set[str]:
-    """
-    Quick check: which watchlist tickers have recent 8-K filings (last 3 days).
-    Uses the existing EDGAR ingestion module if available.
-    """
+    """Watchlist tickers with an 8-K the EDGAR poller saw in the last 3 days.
+    Until 10-30 this imported names edgar.py doesn't have, so the ImportError
+    was swallowed and no scan ever scored an 8-K (audit A1253-1; Luke D4)."""
     try:
-        from ingestion.edgar import _CIK_MAP, _fetch_recent_filings
-        recent: set[str] = set()
-        cutoff = datetime.now(timezone.utc) - timedelta(days=3)
-
-        for ticker in list(_CIK_MAP.keys())[:20]:  # sample first 20 to avoid rate limits
-            try:
-                filings = _fetch_recent_filings(ticker, form_types=["8-K"])
-                for f in filings:
-                    filed_at = f.get("filed_at", "")
-                    if filed_at and filed_at >= cutoff.strftime("%Y-%m-%d"):
-                        recent.add(ticker)
-                        break
-            except Exception:
-                pass
-        return recent
+        import db
+        return db.recent_filing_tickers("8-K", days=3)
     except Exception as e:
-        log.debug(f"EDGAR recent filings check failed: {e}")
+        log.warning(f"Recent 8-K lookup failed: {e}")
         return set()
 
 

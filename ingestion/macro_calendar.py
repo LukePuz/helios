@@ -73,8 +73,38 @@ CPI_2026 = [
     ("2026-08-12", "Jun 2026", "estimated"),
     ("2026-09-11", "Jul 2026", "confirmed"),
     ("2026-10-13", "Aug 2026", "estimated"),
-    ("2026-11-12", "Sep 2026", "estimated"),
-    ("2026-12-10", "Oct 2026", "estimated"),
+    # Corrected 2026-10-29 from bls.gov/schedule/news_release/cpi.htm: Oct
+    # data comes out 11-10 (was 11-12, "Sep 2026"), Nov data 12-10.
+    ("2026-11-10", "Oct 2026", "confirmed"),
+    ("2026-12-10", "Nov 2026", "confirmed"),
+]
+
+# 2027 dates (Luke D18, 10-29), checked against the official pages on
+# 2026-10-29. FOMC dates are tentative until the preceding meeting confirms them.
+FOMC_2027 = [
+    ("2027-01-27", "FOMC meeting (Jan 26-27) -- rate decision + statement"),
+    ("2027-03-17", "FOMC meeting (Mar 16-17) -- rate decision, statement, dot plot"),
+    ("2027-04-28", "FOMC meeting (Apr 27-28) -- rate decision + statement"),
+    ("2027-06-09", "FOMC meeting (Jun 8-9) -- rate decision, statement, dot plot"),
+    ("2027-07-28", "FOMC meeting (Jul 27-28) -- rate decision + statement"),
+    ("2027-09-15", "FOMC meeting (Sep 14-15) -- rate decision, statement, dot plot"),
+    ("2027-10-27", "FOMC meeting (Oct 26-27) -- rate decision + statement"),
+    ("2027-12-08", "FOMC meeting (Dec 7-8) -- rate decision, statement, dot plot"),
+]
+
+CPI_2027 = [
+    ("2027-01-13", "Dec 2026", "confirmed"),
+    ("2027-02-11", "Jan 2027", "confirmed"),
+    ("2027-03-10", "Feb 2027", "confirmed"),
+    ("2027-04-13", "Mar 2027", "confirmed"),
+    ("2027-05-12", "Apr 2027", "confirmed"),
+    ("2027-06-10", "May 2027", "confirmed"),
+    ("2027-07-14", "Jun 2027", "confirmed"),
+    ("2027-08-11", "Jul 2027", "confirmed"),
+    ("2027-09-14", "Aug 2027", "confirmed"),
+    ("2027-10-14", "Sep 2027", "confirmed"),
+    ("2027-11-10", "Oct 2027", "confirmed"),
+    ("2027-12-10", "Nov 2027", "confirmed"),
 ]
 
 # (event_date, month_covered) -- 8:30 ET, first Friday of the month
@@ -85,6 +115,24 @@ JOBS_REPORT_2026 = [
     ("2026-11-06", "Oct 2026"),
     ("2026-12-04", "Nov 2026"),
 ]
+
+JOBS_REPORT_2027 = [
+    ("2027-01-08", "Dec 2026"),
+    ("2027-02-05", "Jan 2027"),
+    ("2027-03-05", "Feb 2027"),
+    ("2027-04-02", "Mar 2027"),
+    ("2027-05-07", "Apr 2027"),
+    ("2027-06-04", "May 2027"),
+    ("2027-07-02", "Jun 2027"),
+    ("2027-08-06", "Jul 2027"),
+    ("2027-09-03", "Aug 2027"),
+    ("2027-10-08", "Sep 2027"),
+    ("2027-11-05", "Oct 2027"),
+    ("2027-12-03", "Nov 2027"),
+]
+
+# Warn when the hard-coded calendar has less future than this left (A1653-3).
+_MIN_FUTURE_DAYS = 60
 
 ELECTION_2026 = [
     ("2026-11-03", "2026 U.S. midterm elections -- every House seat, 35 Senate seats, plus state/local"),
@@ -105,7 +153,7 @@ def refresh_macro_calendar() -> int:
     count = 0
     today = date.today().isoformat()
 
-    for event_date, note in FOMC_2026:
+    for event_date, note in FOMC_2026 + FOMC_2027:
         if event_date < today:
             continue
         try:
@@ -119,7 +167,7 @@ def refresh_macro_calendar() -> int:
         except Exception as e:
             log.warning(f"FOMC event upsert failed for {event_date}: {e}")
 
-    for event_date, month_covered, confidence in CPI_2026:
+    for event_date, month_covered, confidence in CPI_2026 + CPI_2027:
         if event_date < today:
             continue
         try:
@@ -134,7 +182,7 @@ def refresh_macro_calendar() -> int:
         except Exception as e:
             log.warning(f"CPI event upsert failed for {event_date}: {e}")
 
-    for event_date, month_covered in JOBS_REPORT_2026:
+    for event_date, month_covered in JOBS_REPORT_2026 + JOBS_REPORT_2027:
         if event_date < today:
             continue
         try:
@@ -162,5 +210,43 @@ def refresh_macro_calendar() -> int:
         except Exception as e:
             log.warning(f"Election event upsert failed for {event_date}: {e}")
 
+    _drop_unlisted_future_events(today)
+    last = max(d for d, *_ in FOMC_2026 + FOMC_2027 + CPI_2026 + CPI_2027
+               + JOBS_REPORT_2026 + JOBS_REPORT_2027)
+    import datetime as _dt
+    left = (_dt.date.fromisoformat(last) - _dt.date.fromisoformat(today)).days
+    if left < _MIN_FUTURE_DAYS:
+        log.warning(f"Macro calendar has only {left} days of future events left "
+                    f"(last {last}); add the next year's FOMC/CPI/jobs dates")
     log.info(f"Macro calendar refreshed: {count} upcoming events upserted")
     return count
+
+
+def _drop_unlisted_future_events(today: str) -> None:
+    """Delete future FOMC/CPI/jobs rows no longer in the lists above, so a
+    corrected date doesn't leave the old one in the analyst's calendar (the
+    upsert key includes the date)."""
+    keep = {
+        "fomc_meeting": {d for d, _ in FOMC_2026 + FOMC_2027},
+        "cpi_release": {d for d, *_ in CPI_2026 + CPI_2027},
+        "jobs_report": {d for d, _ in JOBS_REPORT_2026 + JOBS_REPORT_2027},
+    }
+    try:
+        from catalyst_service.storage import get_conn
+        conn = get_conn()
+        try:
+            for event_type, dates in keep.items():
+                rows = conn.execute(
+                    "SELECT event_date FROM catalyst_events WHERE scope='macro' "
+                    "AND event_type=? AND event_date>=?", (event_type, today)).fetchall()
+                stale = sorted({r[0] for r in rows} - dates)
+                for d in stale:
+                    conn.execute("DELETE FROM catalyst_events WHERE scope='macro' "
+                                 "AND event_type=? AND event_date=?", (event_type, d))
+                if stale:
+                    log.info(f"Macro calendar: removed {event_type} dates no longer listed: {stale}")
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        log.warning(f"Macro calendar cleanup failed: {e}")

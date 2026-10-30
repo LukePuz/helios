@@ -9,7 +9,8 @@ from unittest.mock import patch
 
 from catalyst_service import client, storage
 from ingestion.macro_calendar import (
-    CPI_2026, ELECTION_2026, FOMC_2026, JOBS_REPORT_2026, refresh_macro_calendar,
+    CPI_2026, CPI_2027, ELECTION_2026, FOMC_2026, FOMC_2027, JOBS_REPORT_2026,
+    JOBS_REPORT_2027, refresh_macro_calendar,
 )
 
 
@@ -32,11 +33,11 @@ class MacroCalendarTests(unittest.TestCase):
             mock_date.today.return_value = date(2026, 8, 30)
             count = refresh_macro_calendar()
         expected_future = sum(
-            1 for d, _ in FOMC_2026 if d >= "2026-08-30"
+            1 for d, _ in FOMC_2026 + FOMC_2027 if d >= "2026-08-30"
         ) + sum(
-            1 for d, _, _ in CPI_2026 if d >= "2026-08-30"
+            1 for d, _, _ in CPI_2026 + CPI_2027 if d >= "2026-08-30"
         ) + sum(
-            1 for d, _ in JOBS_REPORT_2026 if d >= "2026-08-30"
+            1 for d, _ in JOBS_REPORT_2026 + JOBS_REPORT_2027 if d >= "2026-08-30"
         ) + sum(
             1 for d, _ in ELECTION_2026 if d >= "2026-08-30"
         )
@@ -45,9 +46,26 @@ class MacroCalendarTests(unittest.TestCase):
     def test_refresh_skips_past_events(self):
         # A date well past every hardcoded entry -- nothing should upsert.
         with patch("ingestion.macro_calendar.date") as mock_date:
-            mock_date.today.return_value = date(2027, 6, 1)
+            mock_date.today.return_value = date(2028, 1, 1)
             count = refresh_macro_calendar()
         self.assertEqual(count, 0)
+
+    def test_corrected_date_removes_the_old_future_row(self):
+        storage.upsert_macro_event(event_type="cpi_release", event_date="2026-11-12",
+                                   confidence="estimated", source_tier=3, sources=[])
+        with patch("ingestion.macro_calendar.date") as mock_date:
+            mock_date.today.return_value = date(2026, 10, 29)
+            refresh_macro_calendar()
+        cpi = {r["event_date"] for r in storage.query_events(scope="macro", event_type="cpi_release")}
+        self.assertNotIn("2026-11-12", cpi)
+        self.assertIn("2026-11-10", cpi)
+
+    def test_warns_when_calendar_runs_short(self):
+        with patch("ingestion.macro_calendar.date") as mock_date, \
+             self.assertLogs("ingestion.macro_calendar", level="WARNING") as logs:
+            mock_date.today.return_value = date(2027, 11, 15)
+            refresh_macro_calendar()
+        self.assertTrue(any("days of future events left" in m for m in logs.output))
 
     def test_refresh_is_idempotent(self):
         with patch("ingestion.macro_calendar.date") as mock_date:

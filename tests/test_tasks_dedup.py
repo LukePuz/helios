@@ -1494,3 +1494,18 @@ def test_busy_ticker_is_not_counted_as_a_reprotect_try(monkeypatch):
         tasks._retry_pending_reprotects()
     assert json.loads(state["reprotect_pending"])["AMD"]["tries"] == 3
     send.assert_not_called()
+
+
+def test_reprotect_does_not_confirm_a_lagging_read_after_a_manual_add():
+    """Review of 2f95331: holding 100 with a stop for 100, an ADD of 50, and
+    a read still showing 100 must not count the old stop as full cover."""
+    from unittest.mock import MagicMock
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="CRWD", qty=100)]
+    with patch("ibkr.get_client", return_value=client), \
+         patch("db.get_position_stop", return_value={"stop_price": 150.0}), \
+         patch("execution._stops_still_resting", return_value=100.0), \
+         patch("tasks.manage_stop_place") as place:
+        assert tasks._reprotect_after_late_sell("CRWD", {}, None, from_queue=True, expect_at_least=150) is False
+        assert tasks._reprotect_after_late_sell("CRWD", {}, None, from_queue=True) is True
+    assert not place.called

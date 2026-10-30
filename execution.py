@@ -1316,12 +1316,13 @@ def execute_manual(
                                f"cancelled (selling on top of it could short). Check TWS."}
 
     order_intent = f"MANUAL_{side}"
+    held_before = 0.0
     if side == "BUY":
         # Read before sending, so a late fill knows whether it opened or added
         # (a read right after a fill can be stale; A0253-4).
         try:
-            held = abs(float(ibkr.get_client().get_open_position(ticker).qty))
-            order_intent = "MANUAL_ADD" if held > 0 else "MANUAL_OPEN"
+            held_before = abs(float(ibkr.get_client().get_open_position(ticker).qty))
+            order_intent = "MANUAL_ADD" if held_before > 0 else "MANUAL_OPEN"
         except Exception as e:
             order_intent = "MANUAL_OPEN" if str(e).startswith("No open position") else "MANUAL_BUY"
         try:
@@ -1446,7 +1447,8 @@ def execute_manual(
         stop_price = float(add_rec["stop_price"])
         placed = None
         try:
-            placed = tasks._reprotect_after_late_sell(ticker, {}, None, from_queue=True)
+            placed = tasks._reprotect_after_late_sell(ticker, {}, None, from_queue=True,
+                                                      expect_at_least=held_before + filled_qty)
         except Exception as e:
             log.error(f"[{ticker}] Re-protecting after a manual ADD failed: {e}")
         if placed is not True:
@@ -1454,13 +1456,17 @@ def execute_manual(
                 tasks._queue_reprotect(ticker, {"intent": "BUY"}, None)
             except Exception as e:
                 log.error(f"[{ticker}] Could not queue the stop retry: {e}")
+            # The old stop may already be cancelled, or not cover the new
+            # shares: treat the position as unprotected until a retry lands.
             try:
                 alert_module._send(
-                    f"⚠️ {ticker}: manual ADD filled; the stop for the whole position "
-                    f"(@ ${stop_price:.2f}) isn't confirmed yet. It is queued and retried every "
-                    f"reconcile cycle; check TWS.")
+                    f"🚨 UNPROTECTED POSITION — {ticker}\nManual ADD filled, but the stop for the "
+                    f"whole position (@ ${stop_price:.2f}) isn't confirmed. It is queued and retried "
+                    f"every reconcile cycle; place it manually if it isn't back within ~15 min.")
             except Exception:
                 pass
+            tasks.open_manual_action(ticker, f"confirm the stop @ ${stop_price:.2f} covers the whole "
+                                             f"position after a manual ADD")
     else:  # BUY — place an ATR stop and make the position visible to the monitor
         try:
             stop_price, stop_method = rm.calculate_stop(ticker, fill_price, bucket)

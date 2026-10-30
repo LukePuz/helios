@@ -1578,7 +1578,8 @@ def _held_before_fill(ticker: str, fill_qty: float, action: str | None = None) -
 @locked_by_ticker(lambda ticker, *a, **k: ticker, on_busy=False)
 def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
                                fill_price: float | None = None,
-                               from_queue: bool = False) -> bool | None:
+                               from_queue: bool = False,
+                               expect_at_least: float | None = None) -> bool | None:
     """After a late SELL fill, finish what the selling path would have done
     (professor M-3, 2026-10-28):
     - nothing left: delete the stop record and close the outcome at the fill
@@ -1617,6 +1618,13 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
         except Exception:
             pass
         return None
+    if expect_at_least and 0 < remaining < float(expect_at_least) - 1e-6:
+        # The read lags a fill it should include (a manual ADD): resting stops
+        # sized for the old position would look like full cover (review of
+        # 2f95331). Not confirmed, so the caller queues a retry.
+        log.warning(f"[{ticker}] reconcile: broker shows {remaining:g} shares, expected at least "
+                    f"{float(expect_at_least):g}; stop not confirmed yet")
+        return False
     if remaining <= 0 and from_queue:
         # A queued retry carries an old fill price, and the rest may have
         # exited since by its stop: leave the close to reconcile_stop_orders'

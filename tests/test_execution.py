@@ -1096,3 +1096,20 @@ def test_null_trade_price_reads_back_and_prints():
     assert rows[0]["price"] is None
     with patch("db.get_recent_trades", return_value=rows):
         assert "price unknown" in chat_assistant._tool_get_trade_history({})
+
+
+def test_manual_add_keeps_the_stop_and_protects_the_whole_position():
+    """Professor M115: a manual ADD overwrote the stop record with a fresh
+    stop and placed it for the new shares only."""
+    with patch("ibkr.get_client") as client, patch("risk_manager.RiskManager") as rm_cls, \
+         patch("market_data.get_priced_quote", return_value={"price": 100.0}), \
+         patch("ibkr.place_market_order", return_value={"order_id": 1, "fill_price": 100.0, "filled_qty": 2}), \
+         patch("db.log_trade"), patch("db.log_order", return_value=5), patch("db.update_order_fill"), \
+         patch("db.get_position_stop", return_value={"stop_price": 95.0}), \
+         patch("db.upsert_position_stop") as upsert, patch("tasks.manage_stop_place") as place, \
+         patch("tasks._reprotect_after_late_sell", return_value=True) as reprotect, patch("alerts._send"):
+        client.return_value.get_open_position.return_value = MagicMock(qty=5)
+        rm_cls.return_value.is_halted.return_value = False
+        r = execution.execute_manual("ZZZ", "BUY", 2, "test")
+    assert r["success"] and r["stop_price"] == 95.0
+    assert not upsert.called and not place.called and reprotect.called

@@ -1229,6 +1229,18 @@ def execute_approved(
         return _outcome("failed: exception during execution")
 
 
+def _stop_record_or_none(ticker: str) -> dict | None:
+    """The position's stop record, or None if it can't be read (a manual
+    ADD then falls back to the normal BUY stop path rather than failing
+    after the fill)."""
+    import db
+    try:
+        return db.get_position_stop(ticker)
+    except Exception as e:
+        log.warning(f"[{ticker}] could not read the stop record: {e}")
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Manual / !urgent execution (dashboard form, chat !urgent command)
 # ---------------------------------------------------------------------------
@@ -1427,6 +1439,28 @@ def execute_manual(
                         pass
                     tasks.open_manual_action(ticker, f"re-place the stop @ "
                                                      f"${float(stop_rec['stop_price']):.2f} after a manual sell")
+    elif order_intent == "MANUAL_ADD" and (add_rec := _stop_record_or_none(ticker)):
+        # Added to a held position: keep its stop record (a fresh ATR stop
+        # from this fill could loosen it) and protect the whole position at
+        # that level, not just the new shares (professor M115).
+        stop_price = float(add_rec["stop_price"])
+        placed = None
+        try:
+            placed = tasks._reprotect_after_late_sell(ticker, {}, None, from_queue=True)
+        except Exception as e:
+            log.error(f"[{ticker}] Re-protecting after a manual ADD failed: {e}")
+        if placed is not True:
+            try:
+                tasks._queue_reprotect(ticker, {"intent": "BUY"}, None)
+            except Exception as e:
+                log.error(f"[{ticker}] Could not queue the stop retry: {e}")
+            try:
+                alert_module._send(
+                    f"⚠️ {ticker}: manual ADD filled; the stop for the whole position "
+                    f"(@ ${stop_price:.2f}) isn't confirmed yet. It is queued and retried every "
+                    f"reconcile cycle; check TWS.")
+            except Exception:
+                pass
     else:  # BUY — place an ATR stop and make the position visible to the monitor
         try:
             stop_price, stop_method = rm.calculate_stop(ticker, fill_price, bucket)

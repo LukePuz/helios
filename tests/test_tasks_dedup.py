@@ -947,13 +947,19 @@ class TestStaleStopReconciliation:
     def test_waits_while_one_of_our_sells_is_still_unconfirmed(self):
         """Review of cc72fe3: an unconfirmed EXIT keeps its stop record;
         this branch must leave the exit to the late-fill reconcile."""
+        from datetime import datetime, timedelta, timezone
         state = {}
-        pending = [{"ticker": "DDOG", "side": "SELL"}]
+        pending = [{"ticker": "DDOG", "side": "SELL", "created_at": datetime.now(timezone.utc)}]
         self._run(state, fill_return=None, unconfirmed=pending)            # arms the marker
         mock_fill, mock_log_trade, _, mock_delete, _ = self._run(state, fill_return=None, unconfirmed=pending)
         mock_fill.assert_not_called()
         mock_log_trade.assert_not_called()
         mock_delete.assert_not_called()
+        # An order from an earlier day doesn't hold the cleanup back: the
+        # execution lookup only reaches today (review of 5e79eef).
+        old = [{**pending[0], "created_at": datetime.now(timezone.utc) - timedelta(days=2)}]
+        mock_fill, _, _, _, _ = self._run(state, fill_return=None, unconfirmed=old)
+        mock_fill.assert_called_once()
 
     def test_no_fill_found_does_not_fabricate_a_trade_and_alerts_instead(self):
         state = {}

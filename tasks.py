@@ -3369,6 +3369,22 @@ def _reconcile_stop_orders_body(self):
         # (trailing-stop management, entry/bucket/conviction metadata) was
         # gone until manually restored. Same pending-marker pattern as
         # branch 1 closes this.
+        # Tickers with one of our SELLs placed today still unconfirmed or
+        # part-filled: reconcile_unconfirmed_orders owns that exit (review of
+        # cc72fe3). Today only: the execution lookup below reaches only the
+        # current day, so an older order must not hold the cleanup back.
+        from zoneinfo import ZoneInfo
+        _et = ZoneInfo("America/New_York")
+        _today_et = datetime.now(_et).date()
+        try:
+            pending_sell_tickers = {
+                o["ticker"] for o in db.get_unconfirmed_orders()
+                if o["side"] == "SELL" and o.get("created_at") is not None
+                and o["created_at"].astimezone(_et).date() == _today_et
+            }
+        except Exception as e:
+            log.warning(f"reconcile_stop_orders: unconfirmed-SELL check failed, not waiting on any: {e}")
+            pending_sell_tickers = set()
         for rec in db.get_all_position_stops():
             if rec["ticker"] not in held:
                 ticker = rec["ticker"]
@@ -3379,11 +3395,9 @@ def _reconcile_stop_orders_body(self):
                              f"position in this cycle's snapshot) — waiting for the next "
                              f"cycle to confirm before reconciling")
                     continue
-                if any(o["ticker"] == ticker and o["side"] == "SELL" for o in db.get_unconfirmed_orders()):
-                    # A SELL of ours is still unconfirmed or part-filled:
-                    # reconcile_unconfirmed_orders owns this exit. Leaving
-                    # its fills out below would orphan the outcome (review
-                    # of cc72fe3), so wait for it.
+                if ticker in pending_sell_tickers:
+                    # Leaving that order's fills out below would orphan the
+                    # outcome, so wait for the late-fill reconcile.
                     log.info(f"[{ticker}] Stale stop record: an unconfirmed SELL order is still being "
                              f"reconciled; waiting")
                     continue

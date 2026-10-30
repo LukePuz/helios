@@ -1041,7 +1041,9 @@ _NON_ANALYST_SIGNALS = ("SCREENED_OUT", "CATALYST_BLOCKED", "COOLDOWN_SKIPPED", 
                         # holding look like conviction 0, a swap candidate.
                         "CATALYST_GATE_ERROR", "SHADOW_SWAP",
                         # Log-only plan level watcher (audit A2114-4).
-                        "PLAN_LEVEL_HIT")
+                        "PLAN_LEVEL_HIT",
+                        # A sell skipped because the market was closed (A0903-4).
+                        "SELL_SKIPPED_CLOSED")
 
 
 def get_latest_signal_for(ticker: str) -> dict | None:

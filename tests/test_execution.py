@@ -223,6 +223,8 @@ class TestMarketHoursGate:
              patch("ibkr.place_market_order") as mock_order, \
              patch("tasks.manage_cancel_stop_orders_for") as cancel, \
              patch("market_data.is_market_hours", return_value=False), \
+             patch("ibkr.get_latest_price", return_value=101.5), \
+             patch("db.log_signal") as log_signal, \
              patch("alerts._send") as send:
             mock_client.return_value.get_open_position.return_value = MagicMock(qty=100)
             assert execution.execute_approved(approval) is False
@@ -231,6 +233,9 @@ class TestMarketHoursGate:
         cancel.assert_not_called()
         assert "market closed" in execution.last_outcome_reason()
         assert "NOT SENT" in send.call_args[0][0]
+        # Log-only record of the skipped sell (audit A0903-4)
+        assert log_signal.call_args.args[1] == "SELL_SKIPPED_CLOSED"
+        assert log_signal.call_args.kwargs["provenance"]["price_at_skip"] == 101.5
 
     def test_sell_cancelled_unfilled_restores_stop(self):
         approval = _approval(action="TRIM", shares_initial=40)

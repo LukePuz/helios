@@ -470,6 +470,27 @@ def _stop_anchored_to_fill(ticker: str, stop: float, sized_at: float | None,
     return anchored
 
 
+def _log_skipped_sell(ticker: str, action: str, shares, approval: dict) -> None:
+    """Log-only (audit A0903-4): a TRIM/EXIT decided while the market is
+    closed is dropped, where a buy is deferred to the open. Record the
+    decision and the price then, so the cost of not deferring sells can be
+    measured against the next open before anything changes. Never raises."""
+    try:
+        import db
+        import ibkr
+        try:
+            price = ibkr.get_latest_price(ticker)
+        except Exception:
+            price = None
+        db.log_signal(ticker, "SELL_SKIPPED_CLOSED", 0.0,
+                      f"{action} {shares} not sent: market closed; would defer to the open",
+                      provenance={"approval_id": approval.get("id"), "action": action,
+                                  "shares": shares, "conviction": approval.get("conviction"),
+                                  "price_at_skip": price})
+    except Exception as e:
+        log.warning(f"[{ticker}] could not log the skipped sell: {e}")
+
+
 # The whole execution holds the ticker's stop lock: a SELL cancels the stop,
 # sells and re-places it; a BUY places the first stop (stop_lock).
 @locked_by_ticker(lambda approval, *a, **k: approval["ticker"],
@@ -621,6 +642,7 @@ def execute_approved(
                     )
                 except Exception:
                     pass
+                _log_skipped_sell(ticker, action, shares, approval)
                 return _outcome("skipped: market closed, sell not sent (stop kept)")
             # NOTE: broker stops are cancelled AFTER the drift check below —
             # cancelling first meant a drift abort left the position both

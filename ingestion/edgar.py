@@ -122,7 +122,14 @@ _SOURCE = "edgar"
 _MAX_AGE_HOURS = 48
 
 
+_SEEN_THIS_PASS: set[str] | None = None   # loaded once per poll_once pass
+
+
 def _is_seen(filing_id: str) -> bool:
+    if _SEEN_THIS_PASS is not None and filing_id in _SEEN_THIS_PASS:
+        return True
+    if _SEEN_THIS_PASS is not None:
+        return False      # the pass-start set is complete for this source
     try:
         import db
         return db.is_seen(_SOURCE, filing_id)
@@ -131,6 +138,8 @@ def _is_seen(filing_id: str) -> bool:
 
 
 def _mark_seen(filing_id: str) -> None:
+    if _SEEN_THIS_PASS is not None:
+        _SEEN_THIS_PASS.add(filing_id)
     try:
         import db
         db.mark_seen(_SOURCE, filing_id)
@@ -359,6 +368,19 @@ def poll_once(on_filing=None) -> list[dict]:
     the whole loop (audit 10:53, A1053-4). A callback failure is logged and
     the filing stays unseen, so the next poll picks it up again.
     """
+    global _SEEN_THIS_PASS
+    try:
+        import db
+        _SEEN_THIS_PASS = db.seen_ids(_SOURCE)   # None on failure: per-item checks
+    except Exception:
+        _SEEN_THIS_PASS = None
+    try:
+        return _poll_all(on_filing)
+    finally:
+        _SEEN_THIS_PASS = None
+
+
+def _poll_all(on_filing=None) -> list[dict]:
     new_filings = []
     for ticker, cik in TICKER_TO_CIK.items():
         for form in FILING_FORMS:

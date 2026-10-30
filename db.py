@@ -2342,6 +2342,22 @@ def set_state(key: str, value: str) -> None:
 # Persistent dedupe (survives restarts — replaces in-memory _seen_* sets)
 # ---------------------------------------------------------------------------
 
+def seen_ids(source: str) -> set[str] | None:
+    """Every external_id already seen for a source, in one query, or None on
+    failure. The EDGAR poller checked each entry separately: about 1,500
+    round trips at ~230 ms made one pass take 11-18 minutes."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT external_id FROM seen_items WHERE source=%s", (source,))
+            return {r[0] for r in cur.fetchall()}
+    except Exception as e:
+        logging.error(f"seen_ids({source}) failed: {e}")
+        return None
+    finally:
+        _put_conn(conn)
+
+
 def is_seen(source: str, external_id: str) -> bool:
     conn = _get_conn()
     try:

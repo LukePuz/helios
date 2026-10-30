@@ -3797,6 +3797,26 @@ def upsert_earnings_date(ticker: str, earnings_date, confirmed: bool = False,
         _put_conn(conn)
 
 
+def last_sell_trade(ticker: str, days: int = 14) -> dict | None:
+    """Most recent SELL trade on the ticker within `days`, or None."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT timestamp, reason FROM trades WHERE symbol=%s AND side='SELL' "
+                "AND trading_env=%s AND timestamp > NOW() - make_interval(days => %s) "
+                "ORDER BY timestamp DESC LIMIT 1",
+                (ticker, TRADING_ENV, days),
+            )
+            row = cur.fetchone()
+        return {"timestamp": row[0], "reason": row[1]} if row else None
+    except Exception as e:
+        logging.error(f"last_sell_trade failed: {e}")
+        return None
+    finally:
+        _put_conn(conn)
+
+
 def get_next_earnings_row(ticker: str) -> tuple | None:
     """(next earnings date, confirmed) from earnings_calendar, or None."""
     conn = _get_conn()

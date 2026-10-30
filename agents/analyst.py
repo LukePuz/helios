@@ -176,6 +176,33 @@ def _code_mixed_check() -> dict:
     return _DISK_CHECK["value"]
 
 
+def _rule_shadows(ticker: str, action: str, brief: str) -> dict | None:
+    """Log-only checks of rules Luke wants watched before they can block
+    (D13-D15, 10-29): a buy soon after selling the name, a buy with no
+    earnings date on file, and a Moonshot ADD below the recorded entry
+    (average down). Recorded on OPEN/ADD verdicts only. Never raises."""
+    if action not in ("OPEN", "ADD"):
+        return None
+    out = {}
+    try:
+        import db
+        from datetime import datetime, timezone
+        sell = db.last_sell_trade(ticker, days=14)
+        out["recent_exit_days"] = ((datetime.now(timezone.utc) - sell["timestamp"]).days
+                                   if sell else None)
+        out["recent_exit_reason"] = (sell["reason"] or "")[:80] if sell else None
+        out["earnings_date_missing"] = db.get_next_earnings_row(ticker) is None
+        stop = db.get_position_stop(ticker)
+        from agents.plans import brief_price
+        price = brief_price(brief)
+        out["average_down_moonshot"] = bool(
+            action == "ADD" and stop and stop.get("thesis_bucket") == "Moonshot"
+            and price and price < stop["entry_price"])
+    except Exception as e:
+        out["error"] = str(e)[:120]
+    return out
+
+
 def _brief_template_sha() -> str | None:
     try:
         import hashlib
@@ -1379,6 +1406,7 @@ def analyze(
                 "gates": gates, "model_output": model_output,
                 "catalyst_check": _catalyst_check(ticker, parsed),
                 "prior_verdicts_72h": _prior_verdicts(ticker) if action in ("OPEN", "ADD") else None,
+                "rule_shadows": _rule_shadows(ticker, action, situation_brief),
             },
             prompt=redact_account_figures(prompt),
         )

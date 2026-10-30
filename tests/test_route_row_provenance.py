@@ -279,3 +279,18 @@ def test_philosophy_excerpt_keeps_exit_cash_and_own_bucket():
     assert "### Moonshots" in out and "### Compounders" not in out
     assert len(out) <= 4500
     assert _philosophy_sections("no headings here", "Moonshot") == "no headings here"
+
+
+def test_rule_shadows_record_recent_exit_missing_earnings_and_average_down():
+    """Luke D13-D15 (10-29): log-only rule checks on OPEN/ADD verdicts."""
+    from datetime import datetime, timedelta, timezone
+    from unittest.mock import patch
+    from agents.analyst import _rule_shadows
+    sold = {"timestamp": datetime.now(timezone.utc) - timedelta(days=3), "reason": "Protective stop filled"}
+    stop = {"entry_price": 20.0, "stop_price": 15.0, "thesis_bucket": "Moonshot"}
+    with patch("db.last_sell_trade", return_value=sold), patch("db.get_next_earnings_row", return_value=None), \
+         patch("db.get_position_stop", return_value=stop):
+        r = _rule_shadows("QBTS", "ADD", "Current Price: $18.00")
+    assert r == {"recent_exit_days": 3, "recent_exit_reason": "Protective stop filled",
+                 "earnings_date_missing": True, "average_down_moonshot": True}
+    assert _rule_shadows("QBTS", "HOLD", "") is None

@@ -1513,10 +1513,10 @@ def test_reprotect_does_not_confirm_a_lagging_read_after_a_manual_add():
 
 def test_orphan_outcome_flag_skips_an_empty_snapshot_and_passes_held_tickers():
     """Professor M111: open outcomes with no position get flagged, never closed."""
-    with patch("tasks._held_tickers", return_value=set()), patch("db.flag_orphan_outcomes") as flag:
+    with patch("tasks._held_qty_tickers", return_value=set()), patch("db.flag_orphan_outcomes") as flag:
         assert tasks.flag_orphan_outcomes() is None
     assert not flag.called
-    with patch("tasks._held_tickers", return_value={"NVDA", "PLTR"}), \
+    with patch("tasks._held_qty_tickers", return_value={"NVDA", "PLTR"}), \
          patch("db.flag_orphan_outcomes", return_value=(3, 105)) as flag:
         assert tasks.flag_orphan_outcomes() == 105
     assert flag.call_args.args[0] == {"NVDA", "PLTR"}
@@ -1541,4 +1541,10 @@ def test_flag_orphan_outcomes_sql_flags_unheld_and_unflags_held():
 def test_held_tickers_keep_a_position_with_zero_market_value():
     with patch("tasks._fresh_snapshot_positions",
                return_value={"amd": {"qty": 1, "market_value": 0}, "x": {"qty": 0}, "y": "bad"}):
-        assert tasks._held_tickers() == {"AMD"}
+        assert tasks._held_qty_tickers() == {"AMD"}
+
+
+def test_routing_helper_is_not_shadowed():
+    """Review of 352d290: a second _held_tickers replaced the LLM-routing one."""
+    import inspect
+    assert "max_age_min" not in inspect.signature(tasks._held_tickers).parameters

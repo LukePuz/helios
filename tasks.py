@@ -782,7 +782,7 @@ def _fresh_snapshot_positions(max_age_min: float = 15) -> dict:
     return row[0]
 
 
-def _held_tickers(max_age_min: float = 15) -> set[str]:
+def _held_qty_tickers(max_age_min: float = 15) -> set[str]:
     """Tickers with a nonzero quantity in the fresh snapshot, whatever their
     market value (IBKR reports 0 right after a fill; review of 9a2f13c)."""
     out = set()
@@ -2763,7 +2763,7 @@ def flag_orphan_outcomes():
     Held tickers come from the fresh portfolio snapshot, not IBKR. An empty
     snapshot is skipped: stale and flat look the same."""
     import db
-    held = _held_tickers(15)
+    held = _held_qty_tickers(15)
     if not held:
         log.warning("flag_orphan_outcomes: no fresh held positions in the snapshot; skipped")
         return None

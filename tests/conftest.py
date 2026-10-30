@@ -108,9 +108,15 @@ class _FakeRedis:
         v = _FakeRedis.store.get(key)
         return v.encode() if isinstance(v, str) else v
 
-    def scan_iter(self, pattern):
+    def scan_iter(self, pattern, count=None):
         import fnmatch
         return [k for k in list(_FakeRedis.store) if fnmatch.fnmatch(k, pattern)]
+
+    def delete(self, key):
+        return int(_FakeRedis.store.pop(key, None) is not None)
+
+    def ping(self):
+        return True
 
 
 @pytest.fixture(autouse=True)

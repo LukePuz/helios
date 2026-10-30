@@ -296,28 +296,60 @@ def last_outcome_reason() -> str | None:
     return getattr(_OUTCOME, "reason", None)
 
 
-_BUY_RESERVE_TTL_S = 300   # a sent buy's cost counts against cash this long
+_BUY_RESERVE_TTL_S = 300   # a sent buy's cost counts against cash at most this long
+_SIZING_DRIFT_TOLERANCE = 1.08   # same 8% the drift guard allows
 
 
-def _buy_reservations() -> list[tuple[str, float]]:
-    """(ticker, notional) of buys approved in the last few minutes. IBKR's
-    cash figure doesn't subtract unfilled orders and refreshes on a timer."""
+def _buy_reservations() -> list[dict]:
+    """Buys approved in the last few minutes: {ticker, notional, cash_before, ts}.
+    IBKR's cash figure doesn't subtract unfilled orders and refreshes on a timer."""
     import stop_lock
     r = stop_lock._redis()
     out = []
-    for key in r.scan_iter("helios:buy_reserve:*"):
+    for key in r.scan_iter("helios:buy_reserve:*", count=1000):
         val = r.get(key)
-        if val:
-            t, n = val.decode().split("|")
-            out.append((t, float(n)))
+        if not val:
+            continue
+        try:
+            notional, cash_before, ts = (float(x) for x in val.decode().split("|"))
+        except ValueError:
+            log.warning(f"Ignoring malformed buy reservation {key!r}")
+            continue
+        out.append({"ticker": key.decode().rsplit(":", 1)[-1] if isinstance(key, bytes) else key.rsplit(":", 1)[-1],
+                    "notional": notional, "cash_before": cash_before, "ts": ts})
     return out
 
 
-def _reserve_buy(ticker: str, notional: float) -> None:
-    import uuid
+def _unreflected(reserved: list[dict], cash_now: float) -> float:
+    """Reserved spend not yet visible in IBKR's cash. Once cash has dropped
+    by a buy's cost since it was reserved, that buy has filled and is in the
+    figure already (third pre-pull review #1: otherwise counted twice)."""
+    if not reserved:
+        return 0.0
+    drop = max(r["cash_before"] for r in reserved) - cash_now
+    pending = 0.0
+    for r in sorted(reserved, key=lambda r: r["ts"]):
+        if drop >= 0.9 * r["notional"]:
+            drop -= r["notional"]
+        else:
+            pending += r["notional"]
+    return pending
+
+
+def _reserve_buy(ticker: str, notional: float, cash_before: float) -> None:
+    import time
     import stop_lock
-    stop_lock._redis().set(f"helios:buy_reserve:{uuid.uuid4().hex}", f"{ticker}|{notional}",
+    stop_lock._redis().set(f"helios:buy_reserve:{ticker}", f"{notional}|{cash_before}|{time.time()}",
                            ex=_BUY_RESERVE_TTL_S)
+
+
+def _release_buy(ticker: str) -> None:
+    """The buy definitely didn't go out: free its cash and slot now."""
+    try:
+        import stop_lock
+        stop_lock._redis().delete(f"helios:buy_reserve:{ticker}")
+    except Exception as e:
+        log.warning(f"[{ticker}] buy reservation not released (expires in {_BUY_RESERVE_TTL_S}s): {e}")
 
 
 def _buy_room_at_execution(ticker: str, action: str, shares: int, price: float | None
@@ -327,9 +359,10 @@ def _buy_room_at_execution(ticker: str, action: str, shares: int, price: float |
     Sizing checks both, but a buy sized before the open runs later with its
     stored share count, and buys deferred to the same open run in parallel
     against the same cash (pre-pull reviews 10-29). One check at a time
-    (a lock), each subtracting the buys approved in the last 5 minutes, and
-    the same per-trade cash limits as sizing. Returns (shares to buy, None),
-    or (0, reason) to skip. Fails closed: a buy we can't check isn't sent."""
+    (a Redis lock), each subtracting buys approved in the last 5 minutes that
+    IBKR's cash doesn't show yet, under the same per-trade cash limits as
+    sizing (with the drift guard's 8% tolerance). Returns (shares to buy,
+    None), or (0, reason) to skip. Fails closed, including without Redis."""
     if not price:
         return 0, "no price to check cash against at execution"
     try:
@@ -338,23 +371,22 @@ def _buy_room_at_execution(ticker: str, action: str, shares: int, price: float |
         from config import (ALLOW_ONE_SHARE_ABOVE_ALLOCATION, MAX_TRADE_PCT_OF_CASH_RESERVE,
                             ONE_SHARE_MAX_PCT_OF_CASH, get_active_limits)
         from risk_manager import RiskManager
+        stop_lock._redis().ping()   # ticker_lock runs unlocked without Redis; this must not
         with stop_lock.ticker_lock("__BUY_ROOM__", wait=60):
             rm = RiskManager(ibkr.get_client())
-            try:
-                reserved = _buy_reservations()
-            except Exception as e:
-                log.warning(f"[{ticker}] buy reservations unavailable: {e}")
-                reserved = []
+            reserved = [r for r in _buy_reservations() if r["ticker"] != ticker]
             limits = get_active_limits(rm.portfolio_value())
             cap = limits.get("max_concurrent_positions")
             if action == "OPEN" and cap is not None:
                 held = {p.symbol for p in rm._client.get_all_positions()}
-                taken = held | {t for t, _ in reserved}
+                taken = held | {r["ticker"] for r in reserved}
                 if ticker not in taken and len(taken) >= cap:
                     return 0, f"position cap reached at execution ({len(taken)} of {cap} held or being bought)"
-            cash = max(rm.cash() - sum(n for _, n in reserved), 0)
-            affordable = int(cash * MAX_TRADE_PCT_OF_CASH_RESERVE / price)
-            if affordable < 1 and ALLOW_ONE_SHARE_ABOVE_ALLOCATION and price <= cash * ONE_SHARE_MAX_PCT_OF_CASH:
+            cash_now = rm.cash()
+            cash = max(cash_now - _unreflected(reserved, cash_now), 0)
+            affordable = int(cash * MAX_TRADE_PCT_OF_CASH_RESERVE * _SIZING_DRIFT_TOLERANCE / price)
+            if (affordable < 1 and ALLOW_ONE_SHARE_ABOVE_ALLOCATION
+                    and price <= cash * ONE_SHARE_MAX_PCT_OF_CASH * _SIZING_DRIFT_TOLERANCE):
                 affordable = 1
             if affordable < 1:
                 return 0, "not enough cash at execution under the per-trade cash limits"
@@ -362,10 +394,7 @@ def _buy_room_at_execution(ticker: str, action: str, shares: int, price: float |
                 log.warning(f"[{ticker}] {action} cut from {shares} to {affordable} shares: "
                             f"cash changed since sizing")
                 shares = affordable
-            try:
-                _reserve_buy(ticker, shares * price)
-            except Exception as e:
-                log.warning(f"[{ticker}] buy reservation not stored: {e}")
+            _reserve_buy(ticker, shares * price, cash_now)
             return shares, None
     except Exception as e:
         return 0, f"cash/position check failed at execution ({str(e)[:100]})"
@@ -826,11 +855,16 @@ def execute_approved(
             except Exception:
                 if side == "SELL":
                     _restore_stop_after_failed_sell(ticker)
+                else:
+                    _release_buy(ticker)
                 raise
             log.info(f"[{ticker}] Order submitted: {side} {shares} shares (id={order_result['order_id']})")
 
         if not bracket_used:
             filled_qty = float(order_result.get("filled_qty") or 0)
+            if filled_qty <= 0 and side == "BUY" and \
+                    order_result.get("status") in _DEAD_ORDER_STATUSES:
+                _release_buy(ticker)   # rejected/cancelled: no late fill can come
             if filled_qty <= 0 and side == "SELL" and \
                     order_result.get("status") in _DEAD_ORDER_STATUSES:
                 # Definitely not working at the broker, so no late fill can

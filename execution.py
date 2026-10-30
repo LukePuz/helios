@@ -450,6 +450,7 @@ def _manual_buy_room(ticker: str, qty: float, price: float | None) -> str | None
 
 
 _STOP_MIN_GAP_BELOW_FILL = 0.01
+_MANUAL_FALLBACK_STOP_PCT = 0.08   # the flat fallback's widest band in calculate_stop
 
 
 def _stop_anchored_to_fill(ticker: str, stop: float, sized_at: float | None,
@@ -1401,6 +1402,25 @@ def execute_manual(
         except Exception as e:
             log.warning(f"[{ticker}] calculate_stop failed: {e}")
             stop_price, stop_method = None, ""
+        if not stop_price and fill_price:
+            # Never leave a manual buy without a stop (professor M107): fall
+            # back to a flat stop below the fill and say so.
+            stop_price = round(float(fill_price) * (1 - _MANUAL_FALLBACK_STOP_PCT), 2)
+            stop_method = f"fallback flat {_MANUAL_FALLBACK_STOP_PCT:.0%} (ATR stop failed)"
+            log.error(f"[{ticker}] ATR stop unavailable for a manual BUY; using {stop_method} @ ${stop_price:.2f}")
+            try:
+                alert_module._send(f"⚠️ {ticker}: manual BUY filled but the ATR stop couldn't be computed; "
+                                   f"placing a fallback stop @ ${stop_price:.2f}. Review it.")
+            except Exception:
+                pass
+        if not stop_price:
+            log.error(f"[{ticker}] Manual BUY filled with no fill price and no stop")
+            try:
+                alert_module._send(f"🚨 UNPROTECTED POSITION — {ticker}\nManual BUY filled, but no stop "
+                                   f"could be computed (no fill price). Place a stop manually now.")
+            except Exception:
+                pass
+            tasks.open_manual_action(ticker, "place a stop after a manual BUY (no stop could be computed)")
         if stop_price:
             db.upsert_position_stop(
                 ticker=ticker, entry_price=fill_price,

@@ -839,9 +839,24 @@ def log_trade(symbol: str, side: str, quantity: int, price: float, reason: str) 
         _put_conn(conn)
 
 
+def _finite_json(o):
+    """o with NaN/inf floats replaced by None: Postgres jsonb rejects them,
+    and json.loads accepts "NaN" from model output, so one such value lost
+    the whole verdict row (professor M106)."""
+    import math
+    if isinstance(o, float):
+        return o if math.isfinite(o) else None
+    if isinstance(o, dict):
+        return {k: _finite_json(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_finite_json(v) for v in o]
+    return o
+
+
 def log_signal(symbol: str, signal: str, confidence: float, reasoning: str,
                model: str | None = None, provenance: dict | None = None,
                decision: dict | None = None, prompt: str | None = None) -> None:
+    provenance, decision = _finite_json(provenance), _finite_json(decision)
     rec = {"symbol": symbol, "signal": signal, "confidence": confidence, "reasoning": reasoning,
            "trading_env": TRADING_ENV, "model": model, "provenance": provenance,
            "decision": decision}

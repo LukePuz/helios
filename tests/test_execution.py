@@ -973,3 +973,18 @@ def test_entry_stop_keeps_its_distance_below_a_lower_fill():
     assert anchor("X", 99.7, 100.0, 99.6) < 99.6          # tight structural stop above the fill
     assert anchor("X", 98.8, 100.0, 99.6) <= 98.8         # never tightened
     assert anchor("X", 95.0, None, 90.0) == 95.0          # unknown sizing price: unchanged
+
+
+def test_manual_buy_gets_a_fallback_stop_when_atr_fails():
+    """Professor M107: a failed calculate_stop left a manual buy with no stop."""
+    with patch("ibkr.get_client"), patch("risk_manager.RiskManager") as rm_cls, \
+         patch("market_data.get_priced_quote", return_value={"price": 100.0}), \
+         patch("ibkr.place_market_order", return_value={"order_id": 1, "fill_price": 100.0, "filled_qty": 2}), \
+         patch("db.log_trade"), patch("db.upsert_position_stop") as upsert, \
+         patch("db.set_stop_broker_order_id"), patch("tasks.manage_stop_place", return_value={"order_id": 9}), \
+         patch("alerts._send") as alert:
+        rm_cls.return_value.is_halted.return_value = False
+        rm_cls.return_value.calculate_stop.side_effect = RuntimeError("no bars")
+        r = execution.execute_manual("ZZZ", "BUY", 2, "test")
+    assert r["success"] and r["stop_price"] == 92.0
+    assert upsert.call_args.kwargs["stop_price"] == 92.0 and alert.called

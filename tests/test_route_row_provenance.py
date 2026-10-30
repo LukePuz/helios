@@ -328,3 +328,12 @@ def test_trim_shadow_flags_a_fully_priced_holding():
         r = _trim_shadow("NVDA", "HOLD", {"upside_downside_ratio": 0.7}, "Current Price: $200.00")
     assert r["udr_below_1_streak"] == 1 and r["at_plan_target"] and r["would_trim_review"]
     assert _trim_shadow("NVDA", "OPEN", {}, "") is None
+
+
+def test_nan_in_a_verdict_does_not_lose_the_row():
+    """Professor M106: jsonb rejects NaN; it is stored as null instead."""
+    import json
+    import db
+    clean = db._finite_json({"a": float("nan"), "b": [1.0, float("inf")], "c": {"d": 2.5}})
+    assert clean == {"a": None, "b": [1.0, None], "c": {"d": 2.5}}
+    json.dumps(clean, allow_nan=False)

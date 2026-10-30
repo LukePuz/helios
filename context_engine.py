@@ -56,6 +56,20 @@ def _get_macro_summary(macro_mod) -> str:
     return macro_mod.get_macro_summary_text()
 
 
+def _own_earnings_line(ticker: str) -> str:
+    try:
+        import db
+        from datetime import date
+        row = db.get_next_earnings_row(ticker)
+        if not row or (row[0] - date.today()).days > 45:
+            return ""
+        return (f"  [TICKER] {row[0]} — {ticker} earnings "
+                f"({'confirmed' if row[1] else 'estimated'}): next earnings report")
+    except Exception as e:
+        log.debug(f"Own earnings line unavailable for {ticker}: {e}")
+        return ""
+
+
 def _catalyst_calendar_section(ticker: str) -> str:
     """
     Structured, dated catalyst events (2026-08-30, user request): ticker's
@@ -71,9 +85,18 @@ def _catalyst_calendar_section(ticker: str) -> str:
     try:
         from catalyst_service.client import upcoming_events
         cal_events = upcoming_events(ticker=ticker, days_ahead=45)
-        if not cal_events:
+        # The ticker's own earnings come from the Postgres calendar the bot
+        # acts on (blackout, earnings review), not this store, which kept
+        # moved dates as duplicates and marked every one "estimated"
+        # (audit A1653-1; Luke D5, 10-29).
+        cal_events = [e for e in cal_events
+                      if not (e.get("scope") == "ticker" and e.get("event_type") == "earnings")]
+        own = _own_earnings_line(ticker)
+        if not cal_events and not own:
             return ""
         cal_lines = ["=== UPCOMING CATALYST CALENDAR (next 45 days) ==="]
+        if own:
+            cal_lines.append(own)
         for e in cal_events:
             scope_tag = {"ticker": ticker, "sector": e.get("ticker"), "macro": "MARKET"}[e["scope"]]
             cal_lines.append(

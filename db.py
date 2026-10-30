@@ -3797,6 +3797,26 @@ def upsert_earnings_date(ticker: str, earnings_date, confirmed: bool = False,
         _put_conn(conn)
 
 
+def get_next_earnings_row(ticker: str) -> tuple | None:
+    """(next earnings date, confirmed) from earnings_calendar, or None."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT earnings_date, confirmed FROM earnings_calendar "
+                "WHERE ticker=%s AND earnings_date >= CURRENT_DATE "
+                "ORDER BY earnings_date ASC LIMIT 1",
+                (ticker,),
+            )
+            row = cur.fetchone()
+        return (row[0], bool(row[1])) if row else None
+    except Exception as e:
+        logging.error(f"get_next_earnings_row failed: {e}")
+        return None
+    finally:
+        _put_conn(conn)
+
+
 def get_next_earnings(ticker: str):
     """Returns the next upcoming earnings date for ticker, or None."""
     conn = _get_conn()

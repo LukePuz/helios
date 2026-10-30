@@ -24,7 +24,10 @@ class CatalystCalendarSectionTests(unittest.TestCase):
             {"scope": "macro", "event_date": "2026-09-16", "event_type": "fomc_meeting",
              "confidence": "confirmed", "thesis_note": "FOMC rate decision", "ticker": "MARKET"},
         ]
-        with patch("catalyst_service.client.upcoming_events", return_value=events):
+        # The ticker's own earnings line comes from Postgres (Luke D5, 10-29).
+        from datetime import date, timedelta
+        with patch("catalyst_service.client.upcoming_events", return_value=events), \
+             patch("db.get_next_earnings_row", return_value=(date.today() + timedelta(days=5), True)):
             result = _catalyst_calendar_section("NVDA")
         self.assertIn("UPCOMING CATALYST CALENDAR", result)
         self.assertIn("[TICKER", result)

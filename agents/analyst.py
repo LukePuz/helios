@@ -567,6 +567,37 @@ Rules:
 # Ollama call
 # ---------------------------------------------------------------------------
 
+def _conviction_distribution(tokens) -> dict | None:
+    """The model's probability over the conviction digit it wrote, from the
+    same call's top-5 token logprobs: an expected value and P(>=7) instead of
+    one integer that clusters at 5 and 7 (SEF research R5, after G-Eval).
+    Log-only. None when the field or logprobs are missing."""
+    import math
+    if not tokens:
+        return None
+    text = ""
+    for i, tok in enumerate(tokens):
+        if re.search(r'"conviction"\s*:\s*$', text) and (tok.get("token") or "").strip():
+            probs = {}
+            for alt in tok.get("top_logprobs") or [tok]:
+                t = (alt.get("token") or "").strip()
+                if t.isdigit() and 1 <= int(t) <= 9:
+                    probs[int(t)] = probs.get(int(t), 0.0) + math.exp(alt.get("logprob", -99))
+            total = sum(probs.values())
+            if not total:
+                return None
+            nxt = tokens[i + 1].get("token", "") if i + 1 < len(tokens) else ""
+            return {
+                "chosen": (tok.get("token") or "").strip() + ("0" if nxt.startswith("0") else ""),
+                "expected": round(sum(v * p for v, p in probs.items()) / total, 3),
+                "p_ge7": round(sum(p for v, p in probs.items() if v >= 7) / total, 3),
+                "probs": {str(v): round(p / total, 3) for v, p in sorted(probs.items())},
+                "mass": round(total, 3),     # share of probability on 1-9 digits
+            }
+        text += tok.get("token") or ""
+    return None
+
+
 def _call_ollama(prompt: str, num_ctx: int = _NUM_CTX) -> str | None:
     _LAST_CALL_STATS.clear()  # a failed call must not inherit the last one's counts
     payload = {
@@ -579,6 +610,10 @@ def _call_ollama(prompt: str, num_ctx: int = _NUM_CTX) -> str | None:
             "num_ctx":        num_ctx,
             "repeat_penalty": 1.1,
         },
+        # Token probabilities, for the log-only conviction distribution
+        # (SEF research R5, 10-29). Doesn't change sampling.
+        "logprobs":     True,
+        "top_logprobs": 5,
     }
     try:
         # Real 72B completions on this hardware routinely land at 182-195s
@@ -603,6 +638,7 @@ def _call_ollama(prompt: str, num_ctx: int = _NUM_CTX) -> str | None:
         _LAST_CALL_STATS.update({k: body.get(k) for k in (
             "prompt_eval_count", "eval_count", "done_reason", "total_duration")})
         _LAST_CALL_STATS["num_ctx"] = num_ctx
+        _LAST_CALL_STATS["conviction_logprobs"] = _conviction_distribution(body.get("logprobs"))
         if body.get("done_reason") == "length":
             log.warning(f"Ollama reply hit num_predict ({_NUM_PREDICT}); the JSON may be cut off")
         return body.get("response", "")

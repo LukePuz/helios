@@ -294,3 +294,20 @@ def test_rule_shadows_record_recent_exit_missing_earnings_and_average_down():
     assert r == {"recent_exit_days": 3, "recent_exit_reason": "Protective stop filled",
                  "earnings_date_missing": True, "average_down_moonshot": True}
     assert _rule_shadows("QBTS", "HOLD", "") is None
+
+
+def test_conviction_distribution_from_token_logprobs():
+    """SEF research R5 (10-29): log-only expected conviction from the same call."""
+    import math
+    from agents.analyst import _conviction_distribution
+    lp = lambda p: math.log(p)
+    toks = [{"token": ' "'}, {"token": "conv"}, {"token": "iction"}, {"token": '":'},
+            {"token": " ", "top_logprobs": [{"token": " ", "logprob": lp(0.9)}]},
+            {"token": "6", "top_logprobs": [{"token": "6", "logprob": lp(0.6)},
+                                            {"token": "7", "logprob": lp(0.3)},
+                                            {"token": "5", "logprob": lp(0.1)}]},
+            {"token": "}"}]
+    d = _conviction_distribution(toks)
+    assert d["chosen"] == "6" and abs(d["expected"] - 6.2) < 1e-6 and d["p_ge7"] == 0.3
+    assert _conviction_distribution(None) is None
+    assert _conviction_distribution([{"token": '"reasoning": "cut off'}]) is None

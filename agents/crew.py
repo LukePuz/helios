@@ -207,6 +207,62 @@ def _route_row_fields(result: dict, kind: str) -> dict:
     }
 
 
+# Swap shadow (Luke 10-29: "sell my lowest rated one and buy the higher rated
+# one"). Log-only: records what a ranking swap would do when a buy is blocked
+# for room. The live swap (find_swap_candidate) never fired: it skips the
+# position cap, Compounders and holdings above c6.
+_SHADOW_SWAP_MIN_CONVICTION = 7
+_SHADOW_SWAP_MIN_GAP = 2
+_SHADOW_SWAP_FRESH_DAYS = 3
+
+
+def _room_blocked(sizing: dict) -> bool:
+    return bool(sizing.get("cash_blocked") or sizing.get("heat_blocked")
+                or any("concurrent positions" in f for f in sizing.get("flags", [])))
+
+
+def _shadow_swap(rm, ticker: str, conviction: int, sizing: dict, result: dict, now=None) -> dict | None:
+    """Lowest-rated holding with a fresh verdict, if the blocked buy beats it
+    by the gap. Writes a SHADOW_SWAP row either way when it runs. Never raises."""
+    try:
+        if conviction < _SHADOW_SWAP_MIN_CONVICTION or not _room_blocked(sizing):
+            return None
+        import db
+        from datetime import datetime, timedelta, timezone
+        now = now or datetime.now(timezone.utc)
+        held, stale = [], []
+        for p in rm._client.get_all_positions():
+            if p.symbol == ticker:
+                continue
+            sig = db.get_latest_signal_for(p.symbol)
+            if not sig or not sig.get("timestamp") or now - sig["timestamp"] > timedelta(days=_SHADOW_SWAP_FRESH_DAYS):
+                stale.append(p.symbol)
+                continue
+            held.append({"ticker": p.symbol, "conviction": round(sig["confidence"] * 10),
+                         "signal": sig["signal"], "unrealized_pl_pct": (
+                             round(100 * float(p.unrealized_pl) / (float(p.market_value) - float(p.unrealized_pl)), 1)
+                             if float(p.market_value) - float(p.unrealized_pl) else None)})
+        # Lowest conviction first; among equals, the weakest performer.
+        held.sort(key=lambda h: (h["conviction"], h["unrealized_pl_pct"] if h["unrealized_pl_pct"] is not None else 0))
+        low = held[0] if held else None
+        would = bool(low and conviction - low["conviction"] >= _SHADOW_SWAP_MIN_GAP)
+        rec = {"would_swap": would, "buy": ticker, "buy_conviction": conviction,
+               "sell": low["ticker"] if would else None, "lowest": low,
+               "block": [f for f in sizing.get("flags", [])][:3], "stale_holdings": stale,
+               "min_gap": _SHADOW_SWAP_MIN_GAP, "fresh_days": _SHADOW_SWAP_FRESH_DAYS}
+        fields = _route_row_fields(result, "SHADOW_SWAP")
+        fields["decision"]["shadow_swap"] = rec
+        reason = (f"would sell {low['ticker']} (c{low['conviction']}) to buy {ticker} (c{conviction})"
+                  if would else f"no swap: lowest fresh holding "
+                  f"{(low or {}).get('ticker')} c{(low or {}).get('conviction')}")
+        db.log_signal(ticker, "SHADOW_SWAP", conviction / 10.0, reason, **fields)
+        log.info(f"[{ticker}] Swap shadow: {reason}")
+        return rec
+    except Exception as e:
+        log.warning(f"[{ticker}] swap shadow failed: {e}")
+        return None
+
+
 def _earnings_review_event(ticker: str, earnings_date, today=None) -> dict:
     """Review event for a held name that reports within a few days, or just
     did (limitations audit 2026-10-27: no earnings playbook; held names went
@@ -916,6 +972,7 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
                 flags = sizing.get("flags", [])
                 log.info(f"[{ticker}] Risk sizing returned 0 shares: {flags}")
                 _log_route_exit(ticker, "ROUTE_ZERO_SHARES", result, "; ".join(flags))
+                _shadow_swap(rm, ticker, conviction, sizing, result)
                 return
 
         # Concentration check. position_size_pct is the remaining target; the

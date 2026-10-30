@@ -881,7 +881,7 @@ class TestStaleStopReconciliation:
     call .run() an extra time to reach the confirmed cycle before
     asserting, same pattern as TestReconciliationAlertThrottle above."""
 
-    def _run(self, state, fill_return, alert_due=True):
+    def _run(self, state, fill_return, alert_due=True, unconfirmed=()):
         client = MagicMock()
         client.get_all_positions.return_value = []  # DDOG no longer held
 
@@ -901,6 +901,7 @@ class TestStaleStopReconciliation:
              patch("db.set_state", side_effect=fake_set_state), \
              patch("ibkr.get_recent_sell_fill", return_value=fill_return) as mock_fill, \
              patch("db.recorded_sell_order_ids", return_value={40}), \
+             patch("db.get_unconfirmed_orders", return_value=list(unconfirmed)), \
              patch("db.log_trade") as mock_log_trade, \
              patch("db.close_trade_outcome") as mock_close_outcome, \
              patch("db.delete_position_stop") as mock_delete, \
@@ -942,6 +943,17 @@ class TestStaleStopReconciliation:
         mock_delete.assert_called_once_with("DDOG")
         # A reconciled exit is real information, not an emergency -- no Telegram ping.
         mock_alert.assert_not_called()
+
+    def test_waits_while_one_of_our_sells_is_still_unconfirmed(self):
+        """Review of cc72fe3: an unconfirmed EXIT keeps its stop record;
+        this branch must leave the exit to the late-fill reconcile."""
+        state = {}
+        pending = [{"ticker": "DDOG", "side": "SELL"}]
+        self._run(state, fill_return=None, unconfirmed=pending)            # arms the marker
+        mock_fill, mock_log_trade, _, mock_delete, _ = self._run(state, fill_return=None, unconfirmed=pending)
+        mock_fill.assert_not_called()
+        mock_log_trade.assert_not_called()
+        mock_delete.assert_not_called()
 
     def test_no_fill_found_does_not_fabricate_a_trade_and_alerts_instead(self):
         state = {}

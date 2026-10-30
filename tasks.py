@@ -3379,6 +3379,14 @@ def _reconcile_stop_orders_body(self):
                              f"position in this cycle's snapshot) — waiting for the next "
                              f"cycle to confirm before reconciling")
                     continue
+                if any(o["ticker"] == ticker and o["side"] == "SELL" for o in db.get_unconfirmed_orders()):
+                    # A SELL of ours is still unconfirmed or part-filled:
+                    # reconcile_unconfirmed_orders owns this exit. Leaving
+                    # its fills out below would orphan the outcome (review
+                    # of cc72fe3), so wait for it.
+                    log.info(f"[{ticker}] Stale stop record: an unconfirmed SELL order is still being "
+                             f"reconciled; waiting")
+                    continue
                 db.set_state(pending_key, "")
                 fill = None
                 try:

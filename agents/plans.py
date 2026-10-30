@@ -252,3 +252,18 @@ def compile_plan(parsed: dict, price: float, ladder: dict | None, actual_stop,
     if out["actual_stop"] and stop:
         out["stop_gap_pct"] = round((out["actual_stop"] - stop) / price * 100, 2)  # + = actual is tighter
     return out
+
+
+def level_hits(plan: dict, price: float | None, today: date) -> list[tuple[str, float | str]]:
+    """Plan levels or dates the price or calendar has reached: what a level
+    watcher would re-review on (audit A2114-4/-7). Pure; log-only caller."""
+    hits = []
+    if price is not None and plan.get("invalidation_price") and price <= plan["invalidation_price"]:
+        hits.append(("invalidation", plan["invalidation_price"]))
+    if price is not None and plan.get("target_price") and price >= plan["target_price"]:
+        hits.append(("target", plan["target_price"]))
+    if plan.get("horizon_end") and today > plan["horizon_end"]:
+        hits.append(("horizon_end", str(plan["horizon_end"])))
+    elif plan.get("catalyst_date") and today > plan["catalyst_date"]:
+        hits.append(("catalyst_passed", str(plan["catalyst_date"])))
+    return hits

@@ -504,6 +504,12 @@ app.conf.beat_schedule = {
         "schedule": 300,
         "options":  {"expires": 300},
     },
+    # Shadow plan level watcher, log-only (audit A2114-4) — every 15 minutes
+    "watch-plan-levels": {
+        "task":     "tasks.watch_plan_levels",
+        "schedule": 900,
+        "options":  {"queue": INGESTION_QUEUE, "expires": 900},
+    },
     # Auto-expire stale approval requests — every 30 minutes
     "expire-approvals": {
         "task":     "tasks.auto_expire_approvals",
@@ -2640,6 +2646,44 @@ def send_daily_digest(self):
     except Exception as e:
         log.error(f"send_daily_digest failed: {e}")
         raise self.retry(exc=e, countdown=300)
+
+
+@app.task(name="tasks.watch_plan_levels")
+def watch_plan_levels():
+    """Log-only (audit A2114-4/-7): during market hours, check every active
+    shadow plan's levels and dates against the current price and write one
+    PLAN_LEVEL_HIT row per plan and kind per day: what a level-triggered
+    review would have re-analysed. Nothing is queued or traded. Prices come
+    from the broker's cached portfolio (held names; no historical-data
+    requests, which IBKR paces); unheld plans get the date checks only."""
+    try:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        import db
+        import market_data
+        import stop_lock
+        from agents.plans import level_hits
+        if not market_data.is_market_hours():
+            return 0
+        today = datetime.now(ZoneInfo("America/New_York")).date()
+        r = stop_lock._redis()
+        held = {p.symbol: float(p.current_price) for p in _get_client().get_all_positions()
+                if getattr(p, "current_price", None)}
+        logged = 0
+        for plan in db.get_active_plans():
+            price = held.get(plan["ticker"])
+            for kind, level in level_hits(plan, price, today):
+                if not r.set(f"helios:plan_hit:{plan['id']}:{kind}", "1", nx=True, ex=86400):
+                    continue
+                db.log_signal(plan["ticker"], "PLAN_LEVEL_HIT", 0.0,
+                              f"plan {plan['id']}: {kind} ({level}) at ${price or 0:.2f}; would re-review",
+                              provenance={"plan_id": plan["id"], "kind": kind, "level": level,
+                                          "price": price, "plan_source": plan.get("source")})
+                logged += 1
+        return logged
+    except Exception as e:
+        log.warning(f"watch_plan_levels failed: {e}")
+        return 0
 
 
 @app.task(name="tasks.take_portfolio_snapshot", bind=True, max_retries=3)

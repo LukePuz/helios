@@ -996,7 +996,9 @@ _NON_ANALYST_SIGNALS = ("SCREENED_OUT", "CATALYST_BLOCKED", "COOLDOWN_SKIPPED", 
                         "ROUTE_ZERO_SHARES", "ROUTE_CONCENTRATION_ZERO",
                         # Written at 0.0: read as a verdict it made a healthy
                         # holding look like conviction 0, a swap candidate.
-                        "CATALYST_GATE_ERROR", "SHADOW_SWAP")
+                        "CATALYST_GATE_ERROR", "SHADOW_SWAP",
+                        # Log-only plan level watcher (audit A2114-4).
+                        "PLAN_LEVEL_HIT")
 
 
 def get_latest_signal_for(ticker: str) -> dict | None:
@@ -1609,6 +1611,35 @@ _PLAN_COLS = ("id", "ticker", "status", "source", "created_at", "bucket", "convi
               "entry_price", "invalidation_price", "target_price", "catalyst_event",
               "catalyst_date", "horizon_end", "thesis", "primary_risk", "revision",
               "verdicts_seen", "last_seen_at", "last_relation")
+
+
+def get_active_plans() -> list[dict]:
+    """Every active shadow trade plan in this environment (level watcher)."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {', '.join(_PLAN_COLS)} FROM trade_plans "
+                "WHERE trading_env=%s AND status='active' ORDER BY ticker, id DESC",
+                (TRADING_ENV,),
+            )
+            rows = cur.fetchall()
+        out, seen = [], set()
+        for row in rows:
+            plan = dict(zip(_PLAN_COLS, row))
+            if plan["ticker"] in seen:
+                continue            # newest active plan per ticker, as get_active_plan
+            seen.add(plan["ticker"])
+            for k in ("entry_price", "invalidation_price", "target_price"):
+                if plan[k] is not None:
+                    plan[k] = float(plan[k])
+            out.append(plan)
+        return out
+    except Exception as e:
+        logging.error(f"get_active_plans failed: {e}")
+        return []
+    finally:
+        _put_conn(conn)
 
 
 def get_active_plan(ticker: str) -> dict | None:

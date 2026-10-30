@@ -145,3 +145,27 @@ def test_compile_plan_uses_ladder_levels():
     assert p["r_to_t1"] == round(35 / 45, 2) and p["stop_gap_pct"] == round(5 / 540 * 100, 2)
     bare = plans.compile_plan(PARSED, 540.0, None, None, TODAY)
     assert bare["source"] == "analyst_only" and bare["structural_stop"] == 480.0 and bare["t1"] is None
+
+
+def test_level_hits_for_the_watcher():
+    """Audit A2114-4/-7: levels and dates a level-triggered review would use."""
+    plan = _plan(catalyst_date=date(2026, 11, 20), horizon_end=date(2026, 11, 25))
+    assert plans.level_hits(plan, 540.0, TODAY) == []
+    assert plans.level_hits(plan, 470.0, TODAY) == [("invalidation", 480.0)]
+    assert plans.level_hits(plan, 660.0, TODAY) == [("target", 650.0)]
+    assert plans.level_hits(plan, None, date(2026, 11, 21)) == [("catalyst_passed", "2026-11-20")]
+    assert plans.level_hits(plan, None, date(2026, 11, 26)) == [("horizon_end", "2026-11-25")]
+
+
+def test_watcher_logs_once_per_plan_and_kind():
+    import tasks
+    plan = _plan(catalyst_date=None)
+    with patch("market_data.is_market_hours", return_value=True), \
+         patch("db.get_active_plans", return_value=[plan]), \
+         patch("tasks._get_client") as client, \
+         patch("db.log_signal") as log_signal:
+        from types import SimpleNamespace
+        client.return_value.get_all_positions.return_value = [SimpleNamespace(symbol="NVDA", current_price=470.0)]
+        assert tasks.watch_plan_levels() == 1
+        assert tasks.watch_plan_levels() == 0          # same plan and kind today: not again
+    assert log_signal.call_args.args[1] == "PLAN_LEVEL_HIT"

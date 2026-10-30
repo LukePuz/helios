@@ -67,3 +67,11 @@ def test_prompt_tells_the_screener_about_holdings_and_symmetry():
         screener.screen({"ticker": "NOW", "source": "news", "title": "t", "text": "x"})
     prompt = call.call_args.args[0]
     assert "We currently hold this stock: no" in prompt and "price-target CUT" in prompt
+
+
+def test_recap_headline_does_not_use_up_a_rating_changes_override():
+    """Review 4 #3: separate cooldowns for headlines and rating changes; the
+    override is recorded in provenance (#4)."""
+    r = _screen("Why Is ServiceNow Stock Falling Today?", source="news")
+    assert r["relevant"] and r["provenance"]["override"] == "held_negative_or_rating"
+    assert _screen("BTIG main NOW: Buy, price target lowers to $180")["relevant"]

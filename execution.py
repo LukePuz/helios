@@ -315,8 +315,9 @@ def _buy_reservations() -> list[dict]:
         except ValueError:
             log.warning(f"Ignoring malformed buy reservation {key!r}")
             continue
-        out.append({"ticker": key.decode().rsplit(":", 1)[-1] if isinstance(key, bytes) else key.rsplit(":", 1)[-1],
-                    "notional": notional, "cash_before": cash_before, "ts": ts})
+        key = key.decode() if isinstance(key, bytes) else key
+        out.append({"ticker": key.split(":")[2], "notional": notional,
+                    "cash_before": cash_before, "ts": ts})
     return out
 
 
@@ -336,18 +337,30 @@ def _unreflected(reserved: list[dict], cash_now: float) -> float:
     return pending
 
 
+_RESERVATION = threading.local()   # this thread's last reservation key, by ticker
+
+
 def _reserve_buy(ticker: str, notional: float, cash_before: float) -> None:
+    """One key per order (review 4 #5: a per-ticker key let a second buy of
+    the same name overwrite the first one's reservation)."""
     import time
     import stop_lock
-    stop_lock._redis().set(f"helios:buy_reserve:{ticker}", f"{notional}|{cash_before}|{time.time()}",
-                           ex=_BUY_RESERVE_TTL_S)
+    now = time.time()
+    key = f"helios:buy_reserve:{ticker}:{time.time_ns()}"
+    stop_lock._redis().set(key, f"{notional}|{cash_before}|{now}", ex=_BUY_RESERVE_TTL_S)
+    if not hasattr(_RESERVATION, "keys"):
+        _RESERVATION.keys = {}
+    _RESERVATION.keys[ticker] = key
 
 
 def _release_buy(ticker: str) -> None:
     """The buy definitely didn't go out: free its cash and slot now."""
+    key = getattr(_RESERVATION, "keys", {}).pop(ticker, None)
+    if key is None:
+        return
     try:
         import stop_lock
-        stop_lock._redis().delete(f"helios:buy_reserve:{ticker}")
+        stop_lock._redis().delete(key)
     except Exception as e:
         log.warning(f"[{ticker}] buy reservation not released (expires in {_BUY_RESERVE_TTL_S}s): {e}")
 
@@ -374,12 +387,15 @@ def _buy_room_at_execution(ticker: str, action: str, shares: int, price: float |
         stop_lock._redis().ping()   # ticker_lock runs unlocked without Redis; this must not
         with stop_lock.ticker_lock("__BUY_ROOM__", wait=60):
             rm = RiskManager(ibkr.get_client())
-            reserved = [r for r in _buy_reservations() if r["ticker"] != ticker]
+            # All reservations count toward cash, the own ticker's too (a
+            # second buy of it within 5 minutes); the cap ignores the own
+            # ticker since buying more of a name takes no new slot.
+            reserved = _buy_reservations()
             limits = get_active_limits(rm.portfolio_value())
             cap = limits.get("max_concurrent_positions")
             if action == "OPEN" and cap is not None:
                 held = {p.symbol for p in rm._client.get_all_positions()}
-                taken = held | {r["ticker"] for r in reserved}
+                taken = held | {r["ticker"] for r in reserved if r["ticker"] != ticker}
                 if ticker not in taken and len(taken) >= cap:
                     return 0, f"position cap reached at execution ({len(taken)} of {cap} held or being bought)"
             cash_now = rm.cash()
@@ -851,12 +867,19 @@ def execute_approved(
             try:
                 import stop_lock
                 stop_lock.assert_held(ticker)  # professor M69
-                order_result = ibkr.place_market_order(ticker, side, shares)
             except Exception:
                 if side == "SELL":
                     _restore_stop_after_failed_sell(ticker)
                 else:
-                    _release_buy(ticker)
+                    _release_buy(ticker)   # nothing was sent
+                raise
+            try:
+                order_result = ibkr.place_market_order(ticker, side, shares)
+            except Exception:
+                # A buy's reservation stays until it expires: the order may
+                # have been sent before the error and can still fill (review 4 #6).
+                if side == "SELL":
+                    _restore_stop_after_failed_sell(ticker)
                 raise
             log.info(f"[{ticker}] Order submitted: {side} {shares} shares (id={order_result['order_id']})")
 

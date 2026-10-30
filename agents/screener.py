@@ -288,7 +288,9 @@ def _held_negative_override(result: dict, ticker: str, source: str, title: str, 
     """Held stock + analyst rating change or bad-news headline: send it to the
     analyst even if the 7B said no (Luke D7, 10-29). The screener passed PT
     raises 93/171 but cuts 3/105, so held names got no review on bad news.
-    One override per ticker per 4 h keeps recaps from flooding the 72B."""
+    One override per ticker per 4 h for headlines, kept apart from rating
+    changes so a recap can't use up a downgrade's slot (review 4 #3), keeps
+    recaps from flooding the 72B."""
     if result.get("relevant") or not held:
         return
     tone = title_tone(title)
@@ -296,7 +298,8 @@ def _held_negative_override(result: dict, ticker: str, source: str, title: str, 
         return
     try:
         import stop_lock
-        if not stop_lock._redis().set(f"helios:held_override:{ticker}", "1",
+        kind = "rating" if source == "analyst_ratings" else "headline"
+        if not stop_lock._redis().set(f"helios:held_override:{ticker}:{kind}", "1",
                                       nx=True, ex=_HELD_OVERRIDE_COOLDOWN_S):
             result["override_skipped"] = "cooldown"
             return
@@ -371,6 +374,7 @@ def screen(event: dict) -> dict:
             "prompt_template_sha": hashlib.sha256(_SCREENER_PROMPT.encode()).hexdigest()[:12],
             "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:12],
             "title_tone": title_tone(title),
+            "override": result.get("override"),
         }
     except Exception as e:
         log.warning(f"screener provenance failed: {e}")

@@ -148,7 +148,20 @@ _ENTITY_DROPS: dict[str, int] = {}
 # Tickers that are also ordinary words or match unrelated text: a bare
 # uppercase match isn't enough for these, the company name or $TICKER is.
 _WORDLIKE_TICKERS = {"NOW", "NET", "V", "MA", "ON", "ALL", "IT", "A", "DAVE", "OPEN", "KEY",
-                     "PLAY", "FUN", "ARE", "CAN", "AI", "BE", "GO", "SO", "ANY", "TEAM"}
+                     "PLAY", "FUN", "ARE", "CAN", "AI", "BE", "GO", "SO", "ANY", "TEAM", "DRAM"}
+# Short names headlines use instead of the watchlist name (review 4, 10-29:
+# "Sandisk", "D-Wave", "Google" were all dropped by the full-name match).
+_NAME_ALIASES = {
+    "GOOG": ["Google", "GOOGL"], "QBTS": ["D-Wave"], "SMR": ["NuScale"], "RGTI": ["Rigetti"],
+    "PWR": ["Quanta"], "ANET": ["Arista"], "AUR": ["Aurora"], "CEG": ["Constellation"],
+    "KLIC": ["Kulicke"], "PANW": ["Palo Alto"], "GEV": ["Vernova"], "BWXT": ["BWX Technologies"],
+    "ASTS": ["AST"], "QTUM": ["Defiance"], "DRAM": ["Roundhill"], "AMD": ["AMD"],
+}
+# Names to use instead of the watchlist name, which matches generic headlines.
+_NAME_OVERRIDES = {"QUBT": ["Quantum Computing Inc", "QCi"]}
+# Names that are also ordinary words: matched in exact case only.
+_WORDLIKE_NAMES = {"Dave", "Visa", "Coherent", "Aurora", "Constellation", "Meta", "Arm", "Credo",
+                   "Oracle", "Quanta", "Defiance", "Amazon", "Core Scientific"}
 _NAME_SUFFIXES = re.compile(
     r",?\s+(Inc\.?|Corp\.?|Corporation|Holdings|Technologies|Technology|Group|Ltd\.?|plc|Co\.?|"
     r"Company|Systems|Platforms|Incorporated)$", re.I)
@@ -163,18 +176,29 @@ def _company_core(company: str) -> str:
         core = new
 
 
+def _company_names(ticker: str, company: str) -> list[str]:
+    if ticker in _NAME_OVERRIDES:
+        return _NAME_OVERRIDES[ticker]
+    core = _company_core(company)
+    return ([core] if core else []) + _NAME_ALIASES.get(ticker, [])
+
+
 def mentions_company(ticker: str, company: str, text: str) -> bool:
     """Is this headline about the ticker's company? Google News search for
     "NOW stock" returns "Is Now the Right Time to Buy..." about other names
-    (audit A1853-2; Luke D8). Company name in exact case as a whole word,
-    $TICKER or (TICKER), or the bare uppercase ticker unless it's word-like."""
+    (audit A1853-2; Luke D8). Accepts the company name or a short alias as a
+    whole word (any case, exact case for names that are ordinary words),
+    $TICKER, (TICKER), "TICKER stock/shares", or the bare uppercase ticker
+    unless it's word-like."""
     text = text or ""
-    core = _company_core(company)
-    if core and re.search(rf"(?<![\w]){re.escape(core)}(?![\w])", text):
+    for name in _company_names(ticker, company):
+        flags = 0 if name in _WORDLIKE_NAMES else re.I
+        if re.search(rf"(?<![\w]){re.escape(name)}(?![\w])", text, flags):
+            return True
+    t = re.escape(ticker)
+    if re.search(rf"(\${t}\b|\({t}\)|\b(?:NYSE|NASDAQ|Nasdaq):\s*{t}\b|\b{t}\s+(?:[Ss]tock|[Ss]hares|STOCK)\b)", text):
         return True
-    if re.search(rf"(\${ticker}\b|\({ticker}\)|\b(?:NYSE|NASDAQ|Nasdaq):\s*{ticker}\b)", text):
-        return True
-    return ticker not in _WORDLIKE_TICKERS and bool(re.search(rf"\b{re.escape(ticker)}\b", text))
+    return ticker not in _WORDLIKE_TICKERS and bool(re.search(rf"\b{t}\b", text))
 
 
 def _google_news_rss(ticker: str, company: str = "") -> list[dict]:

@@ -937,3 +937,27 @@ def test_buy_sends_the_share_count_the_room_check_allows():
     assert result is True and order.call_args.args[2] == 2
     result, order = run((0, "not enough cash at execution under the per-trade cash limits"))
     assert result is False and not order.called
+
+
+def test_buy_reservation_kept_when_the_order_call_raises():
+    """Review 4 #6: place_market_order can raise after the order was sent
+    (a disconnect while waiting for the fill), so its cash stays reserved."""
+    approval = _approval(action="ADD", shares_initial=5, price_at_sizing=108.0)
+    fresh = {"price": 110.0, "is_stale": False, "age_minutes": 1.0, "market_open": True}
+    with patch("ibkr.get_ib"), patch("ibkr.get_client"), \
+         patch("risk_manager.RiskManager") as mock_rm_cls, \
+         patch("ibkr.place_market_order", side_effect=ConnectionError("lost")), \
+         patch("market_data.get_priced_quote", return_value=fresh), \
+         patch("market_data.check_gap_confirmation", return_value={"status": "no_gap"}), \
+         patch("market_data.is_market_hours", return_value=True), \
+         patch("config.USE_BRACKET_ORDERS", False), \
+         patch("execution._buy_room_at_execution", return_value=(2, None)), \
+         patch("execution._release_buy") as release, \
+         patch("db.log_trade"), patch("db.log_order", return_value=1), \
+         patch("alerts._send"), patch("alerts.send_trade_alert"):
+        mock_rm_cls.return_value.is_halted.return_value = False
+        try:
+            execution.execute_approved(approval)
+        except ConnectionError:
+            pass
+    release.assert_not_called()

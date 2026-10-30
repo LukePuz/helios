@@ -32,7 +32,7 @@ _COALESCE_HOURS = 4           # FOLLOWs this close together add no decision
 
 _PRICE_RE = re.compile(r"Current Price: \$([\d,]+(?:\.\d+)?)")
 # A per-share price, not "$2B" or "$40 million" (professor M94).
-_DOLLAR_RE = re.compile(r"\$\s?(\d[\d,]*(?:\.\d+)?)(?![\d,]*\d)(?!\s*(?:[BMKT]\b|bn|mn|billion|million|thousand|trillion))", re.I)
+_DOLLAR_RE = re.compile(r"\$\s?(\d[\d,]*(?:\.\d+)?)(?![\d,]*\d)(?!\.\d)(?!\s*(?:[BMKT]\b|bn|mn|billion|million|thousand|trillion))", re.I)
 
 _BUY, _HOLD, _SELL = "buy", "hold", "sell"
 _DIRECTION = {"OPEN": _BUY, "ADD": _BUY, "HOLD": _HOLD, "WATCH": _HOLD, "PASS": _HOLD,
@@ -49,7 +49,8 @@ def _dollars(text) -> float | None:
         return float(text) if text > 0 else None
     m = _DOLLAR_RE.search(str(text or ""))
     try:
-        return float(m.group(1).replace(",", "")) if m else None
+        v = float(m.group(1).replace(",", "")) if m else None
+        return v if v else None
     except ValueError:
         return None
 

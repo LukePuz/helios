@@ -363,7 +363,7 @@ Event Title: {event.get('title', 'N/A')}
             # away the account size (pre-pull review 10-29 #7).
             w = pos.get('market_value', 0) / pv if pv else None
             weight = ("weight unknown" if w is None else "<5% of portfolio" if w < 0.025
-                      else f"~{round(20 * w) * 5}% of portfolio")
+                      else f"~{int(20 * w + 0.5) * 5}% of portfolio")   # half-up: 2.5% is ~5%
             pos_lines.append(
                 f"  {sym:<6} {weight} | "
                 f"Entry: ${pos.get('entry_price', 0):.2f} | "
@@ -507,7 +507,7 @@ Ticker: {ticker}
             # away the account size (pre-pull review 10-29 #7).
             w = pos.get('market_value', 0) / pv if pv else None
             weight = ("weight unknown" if w is None else "<5% of portfolio" if w < 0.025
-                      else f"~{round(20 * w) * 5}% of portfolio")
+                      else f"~{int(20 * w + 0.5) * 5}% of portfolio")   # half-up: 2.5% is ~5%
             pos_lines.append(
                 f"  {sym:<6} {weight} | "
                 f"Entry: ${pos.get('entry_price', 0):.2f} | "

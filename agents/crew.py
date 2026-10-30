@@ -153,8 +153,11 @@ def deep_analyze(event: dict, screening: dict | None = None) -> dict:
     regime = get_cached_regime()
     try:
         from agents.analyst import trigger_record
+        trigger = trigger_record("event", event)
+        if screening and screening.get("override"):
+            trigger["screen_override"] = screening["override"]   # review 4 #4
         result = analyze(candidate, situation_brief=brief, regime_packet=regime,
-                         trigger=trigger_record("event", event))
+                         trigger=trigger)
     except Exception as exc:
         log.error(f"[{ticker}] analyze() raised an unhandled exception: {exc}", exc_info=True)
         result = {

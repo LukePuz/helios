@@ -22,3 +22,24 @@ def test_plain_tickers_and_case():
     assert not mentions_company("NVDA", "Nvidia", "Intel CEO Has News for AMD Stock Investors")
     assert not mentions_company("ARM", "Arm Holdings", "an arms race in AI chips")
     assert mentions_company("ARM", "Arm Holdings", "Arm's royalty rates rise")
+
+
+def test_short_names_and_other_casing_still_count():
+    """Review 4 #1: the exact-case full-name match dropped real news."""
+    from ingestion.news import mentions_company as m
+    assert m("SNDK", "SanDisk Corporation", "Sandisk Drops 23% From 52-Week High")
+    assert m("QBTS", "D-Wave Quantum Inc.", "Lawsuit alleges D-Wave misled investors")
+    assert m("GOOG", "Alphabet Inc.", "Google faces EU fine")
+    assert m("GOOG", "Alphabet Inc.", "GOOGL slides after earnings")
+    assert m("MSFT", "Microsoft Corporation", "MICROSOFT CUTS 5,000 JOBS")
+    assert m("SMR", "NuScale Power Corporation", "NuScale Stock Faces Contract Doubts")
+    assert m("DAVE", "Dave Inc.", "Is DAVE Stock Still Worth Buying")
+    assert m("KLIC", "Kulicke and Soffa Industries", "Kulicke & Soffa beats estimates")
+
+
+def test_ordinary_word_names_and_tickers_still_filtered():
+    from ingestion.news import mentions_company as m
+    assert not m("DRAM", "Roundhill Memory ETF", "DRAM prices surge on AI demand")
+    assert not m("QUBT", "Quantum Computing Inc.", "3 Quantum Computing Stocks to Buy Now")
+    assert m("QUBT", "Quantum Computing Inc.", "QUBT jumps 12%")
+    assert not m("AUR", "Aurora Innovation", "aurora borealis visible tonight")

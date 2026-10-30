@@ -54,7 +54,7 @@ def test_filled_buy_is_not_counted_twice_once_cash_shows_it():
     assert _check(_rm(550.0), ticker="B", price=250.0) == (1, None)
     # Before cash updates (still 1000), A's $450 is pending: 1000-450=550, still fits.
     import stop_lock
-    stop_lock._redis().delete("helios:buy_reserve:B")
+    execution._release_buy("B")
     assert _check(_rm(1_000.0), ticker="C", price=300.0)[0] == 0          # 300 > 50% of 550*1.08
 
 
@@ -85,3 +85,20 @@ def test_fails_closed_without_price_or_on_error():
     rm.cash.side_effect = RuntimeError("gateway down")
     shares, reason = _check(rm, ticker="Z")
     assert shares == 0 and "check failed" in reason
+
+
+def test_second_buy_of_the_same_name_counts_its_own_reservation():
+    """Review 4 #5: AAA reserved, BBB reserved and unfilled, AAA filled; a
+    second AAA buy must still see BBB's pending $1000."""
+    assert _check(_rm(10_000.0), ticker="AAA", shares=10, price=100.0) == (10, None)
+    assert _check(_rm(10_000.0), ticker="BBB", shares=10, price=100.0) == (10, None)
+    # AAA filled (cash 10000 -> 9000), BBB still pending: 8000 x 20% x 1.08 buys 17
+    # (excluding AAA's own reservation read BBB as filled and allowed 19).
+    assert _check(_rm(9_000.0), ticker="AAA", shares=20, price=100.0) == (17, None)
+
+
+def test_release_frees_only_that_orders_reservation():
+    assert _check(_rm(10_000.0), ticker="A", shares=10, price=100.0) == (10, None)
+    assert _check(_rm(10_000.0), ticker="A", shares=10, price=100.0) == (10, None)
+    execution._release_buy("A")                       # the second order died
+    assert [r["ticker"] for r in execution._buy_reservations()] == ["A"]

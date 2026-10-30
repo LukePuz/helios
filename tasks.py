@@ -3401,12 +3401,18 @@ def _reconcile_stop_orders_body(self):
                     log.info(f"[{ticker}] Stale stop record: an unconfirmed SELL order is still being "
                              f"reconciled; waiting")
                     continue
-                db.set_state(pending_key, "")
-                fill = None
                 try:
                     recorded = db.recorded_sell_order_ids(ticker)   # professor M122
                 except Exception:
-                    recorded = set()
+                    recorded = None
+                if recorded is None:
+                    # Unknown which sells are already logged: counting them all
+                    # would blend them into the exit again. Retry next cycle.
+                    log.warning(f"[{ticker}] Stale stop record: recorded-sell lookup failed; retrying "
+                                f"next cycle")
+                    continue
+                db.set_state(pending_key, "")
+                fill = None
                 try:
                     fill = ibkr.get_recent_sell_fill(ticker, recorded)
                 except Exception as e:

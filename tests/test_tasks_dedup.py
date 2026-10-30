@@ -881,7 +881,7 @@ class TestStaleStopReconciliation:
     call .run() an extra time to reach the confirmed cycle before
     asserting, same pattern as TestReconciliationAlertThrottle above."""
 
-    def _run(self, state, fill_return, alert_due=True, unconfirmed=()):
+    def _run(self, state, fill_return, alert_due=True, unconfirmed=(), recorded=frozenset({40})):
         client = MagicMock()
         client.get_all_positions.return_value = []  # DDOG no longer held
 
@@ -900,7 +900,7 @@ class TestStaleStopReconciliation:
              patch("db.get_state", side_effect=fake_get_state), \
              patch("db.set_state", side_effect=fake_set_state), \
              patch("ibkr.get_recent_sell_fill", return_value=fill_return) as mock_fill, \
-             patch("db.recorded_sell_order_ids", return_value={40}), \
+             patch("db.recorded_sell_order_ids", return_value=recorded), \
              patch("db.get_unconfirmed_orders", return_value=list(unconfirmed)), \
              patch("db.log_trade") as mock_log_trade, \
              patch("db.close_trade_outcome") as mock_close_outcome, \
@@ -960,6 +960,16 @@ class TestStaleStopReconciliation:
         old = [{**pending[0], "created_at": datetime.now(timezone.utc) - timedelta(days=2)}]
         mock_fill, _, _, _, _ = self._run(state, fill_return=None, unconfirmed=old)
         mock_fill.assert_called_once()
+
+    def test_waits_when_the_recorded_sells_are_unknown(self):
+        """Professor, review of M122: a DB error must not fall back to
+        blending already-logged sells into the exit."""
+        state = {}
+        self._run(state, fill_return=None, recorded=None)                  # arms the marker
+        mock_fill, mock_log_trade, _, mock_delete, _ = self._run(state, fill_return=None, recorded=None)
+        mock_fill.assert_not_called()
+        mock_delete.assert_not_called()
+        assert state.get("stale_stop_pending_DDOG")                         # marker kept for the retry
 
     def test_no_fill_found_does_not_fabricate_a_trade_and_alerts_instead(self):
         state = {}

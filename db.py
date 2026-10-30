@@ -2957,11 +2957,12 @@ def update_order_fill(order_id: int, fill_price: float, filled_qty: float, statu
         _put_conn(conn)
 
 
-def recorded_sell_order_ids(ticker: str, max_age_hours: int = 24) -> set[int]:
+def recorded_sell_order_ids(ticker: str, max_age_hours: int = 24) -> set[int] | None:
     """Broker order ids of the SELL orders logged for this ticker in this env
     (market/bracket orders; stops aren't logged here). Their fills are
     recorded by the execution or late-fill paths, so a symbol-wide execution
-    lookup must leave them out (professor M122). Empty set on error."""
+    lookup must leave them out (professor M122). None on error, so the
+    caller can wait rather than blend those fills back in."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
@@ -2973,7 +2974,7 @@ def recorded_sell_order_ids(ticker: str, max_age_hours: int = 24) -> set[int]:
             return {int(r[0]) for r in cur.fetchall()}
     except Exception as e:
         logging.error(f"recorded_sell_order_ids({ticker}) failed: {e}")
-        return set()
+        return None
     finally:
         _put_conn(conn)
 

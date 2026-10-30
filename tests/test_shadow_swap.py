@@ -93,3 +93,16 @@ def test_r_shadow_uses_the_real_stop():
     r = _r_shadow({"valuation": {"bull_case_target": "n/a"}, "expected_return_pct": 12.0}, 100.0, 96.0)
     assert r["computed_r"] == 3.0 and r["target_source"] == "expected_return_pct"
     assert _r_shadow({}, 100.0, None)["computed_r"] is None
+
+
+def test_shadow_fields_are_always_json_safe():
+    """A shadow value json can't encode would drop the buy at the approval insert."""
+    import json
+    from datetime import date
+    from decimal import Decimal
+    from agents import crew
+    assert crew._json_safe({"a": Decimal("1.5"), "d": [Decimal("2")]}) == {"a": 1.5, "d": [2.0]}
+    assert crew._json_safe({"d": date(2026, 1, 1)}) is None      # not float-able: dropped, not raised
+    sizing = {"stop_loss_price": 95.0, "heat_shadow": {"x": Decimal("0.1")}}
+    crew._attach_shadows(sizing, "ZZZ", {"valuation": {"bull_case_target": "$130"}}, 100.0)
+    json.dumps(sizing)

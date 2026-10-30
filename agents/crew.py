@@ -726,6 +726,25 @@ def _rule_shadow_average_down(ticker: str, bucket: str, trading_client) -> None:
                     f"${price:.2f} below entry ${entry:.2f}; not enforced")
 
 
+def _json_safe(value):
+    """A shadow value as plain JSON, or None. A value json can't encode would
+    make the approval insert fail and drop the buy (shadow review 10-29)."""
+    import json
+    try:
+        return json.loads(json.dumps(value, default=float))
+    except Exception:
+        return None
+
+
+def _attach_shadows(sizing: dict, ticker: str, result: dict, price: float) -> None:
+    """Log-only fields on a sizing dict, each guaranteed JSON-safe."""
+    stop = sizing.get("stop_loss_price")
+    sizing["r_shadow"] = _json_safe(_r_shadow(result, price, stop))
+    sizing["plan_compiled"] = _json_safe(_compiled_plan(ticker, result, price, stop))
+    if "heat_shadow" in sizing:
+        sizing["heat_shadow"] = _json_safe(sizing["heat_shadow"])
+
+
 def _compiled_plan(ticker: str, result: dict, price: float, stop) -> dict | None:
     """Shadow plan from the analyst's view plus the price ladder (audit
     A2114-1). Log-only, never raises."""
@@ -930,8 +949,7 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
         # Size the position — stamp the price used so execution can validate freshness
         sizing = rm.size_position(ticker, conviction, bucket, regime_str, price)
         sizing["price_at_sizing"] = price
-        sizing["r_shadow"] = _r_shadow(result, price, sizing.get("stop_loss_price"))
-        sizing["plan_compiled"] = _compiled_plan(ticker, result, price, sizing.get("stop_loss_price"))
+        _attach_shadows(sizing, ticker, result, price)
         if sizing.get("shares_initial", 0) <= 0:
             # 2026-08-13: if this is specifically a cash shortage (not a
             # halt, not "already at target," not conviction too low for the
@@ -1010,6 +1028,7 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
                         # Re-size now that the sale has freed up cash.
                         sizing = rm.size_position(ticker, conviction, bucket, regime_str, price)
                         sizing["price_at_sizing"] = price
+                        _attach_shadows(sizing, ticker, result, price)
                     else:
                         log.warning(f"[{swap['ticker']}] Swap sell did not complete: "
                                     f"{sell_result.get('message')}")

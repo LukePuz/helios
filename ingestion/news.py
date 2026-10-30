@@ -143,7 +143,41 @@ def _yfinance_news(ticker: str) -> list[dict]:
     return results
 
 
-def _google_news_rss(ticker: str) -> list[dict]:
+_ENTITY_DROPS: dict[str, int] = {}
+
+# Tickers that are also ordinary words or match unrelated text: a bare
+# uppercase match isn't enough for these, the company name or $TICKER is.
+_WORDLIKE_TICKERS = {"NOW", "NET", "V", "MA", "ON", "ALL", "IT", "A", "DAVE", "OPEN", "KEY",
+                     "PLAY", "FUN", "ARE", "CAN", "AI", "BE", "GO", "SO", "ANY", "TEAM"}
+_NAME_SUFFIXES = re.compile(
+    r",?\s+(Inc\.?|Corp\.?|Corporation|Holdings|Technologies|Technology|Group|Ltd\.?|plc|Co\.?|"
+    r"Company|Systems|Platforms|Incorporated)$", re.I)
+
+
+def _company_core(company: str) -> str:
+    core = (company or "").strip()
+    while True:
+        new = _NAME_SUFFIXES.sub("", core).strip()
+        if new == core:
+            return core
+        core = new
+
+
+def mentions_company(ticker: str, company: str, text: str) -> bool:
+    """Is this headline about the ticker's company? Google News search for
+    "NOW stock" returns "Is Now the Right Time to Buy..." about other names
+    (audit A1853-2; Luke D8). Company name in exact case as a whole word,
+    $TICKER or (TICKER), or the bare uppercase ticker unless it's word-like."""
+    text = text or ""
+    core = _company_core(company)
+    if core and re.search(rf"(?<![\w]){re.escape(core)}(?![\w])", text):
+        return True
+    if re.search(rf"(\${ticker}\b|\({ticker}\)|\b(?:NYSE|NASDAQ|Nasdaq):\s*{ticker}\b)", text):
+        return True
+    return ticker not in _WORDLIKE_TICKERS and bool(re.search(rf"\b{re.escape(ticker)}\b", text))
+
+
+def _google_news_rss(ticker: str, company: str = "") -> list[dict]:
     """Fetches recent headlines for a ticker via Google News RSS search."""
     query = quote(f"{ticker} stock")
     url = f"{GOOGLE_NEWS_RSS}?q={query}&hl=en-US&gl=US&ceid=US:en"
@@ -164,6 +198,9 @@ def _google_news_rss(ticker: str) -> list[dict]:
         if not title or not item_id or _is_seen(item_id) or _is_seen_title(title):
             continue
         if _too_old(_parse_published(pub)):
+            continue
+        if company and not mentions_company(ticker, company, title):
+            _ENTITY_DROPS[ticker] = _ENTITY_DROPS.get(ticker, 0) + 1
             continue
 
         results.append({
@@ -188,13 +225,20 @@ def poll_once() -> list[dict]:
     Deduped persistently across restarts via db.seen_items.
     """
     from knowledge_loader import get_all_tickers
+    try:
+        from knowledge_loader import load_watchlist
+        companies = {t: e.get("company", "") for t, e in load_watchlist().items()}
+    except Exception as e:
+        log.warning(f"News entity filter off this poll (watchlist unavailable): {e}")
+        companies = {}
 
     all_items = []
     batch_keys = set()
+    _ENTITY_DROPS.clear()
     for ticker in get_all_tickers():
         fetched = _yfinance_news(ticker)
         time.sleep(0.1)
-        fetched += _google_news_rss(ticker)
+        fetched += _google_news_rss(ticker, companies.get(ticker, ""))
         time.sleep(0.3)  # be polite to Google's unofficial RSS endpoint
         # Items are only marked seen after dispatch, so the same headline from
         # both feeds used to pass in one poll (TSLA analysed 3x on 10-26).
@@ -204,6 +248,9 @@ def poll_once() -> list[dict]:
                 continue
             batch_keys.add(key)
             all_items.append(it)
+    if _ENTITY_DROPS:
+        log.info(f"News entity filter dropped {sum(_ENTITY_DROPS.values())} Google News item(s) "
+                 f"not naming the company: {dict(sorted(_ENTITY_DROPS.items()))}")
     return all_items
 
 

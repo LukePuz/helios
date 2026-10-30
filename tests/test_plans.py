@@ -106,3 +106,27 @@ def test_no_price_no_plan():
     with patch("db.get_position_stop", return_value=None), \
          patch("db.get_active_plan", return_value=None):
         assert plans.observe("NVDA", PARSED, "OPEN", 7, "Current Price: UNKNOWN", now=NOW)["relation"] == "NO_PLAN"
+
+
+def test_dollar_parse_skips_magnitudes():
+    """Professor M94: '$2B' is not a $2 price target."""
+    assert plans._dollars("$2B revenue run-rate, target $650") == 650.0
+    assert plans._dollars("$40 million contract") is None
+    assert plans._dollars("$1,250.50 (12 months)") == 1250.5
+    assert plans._dollars("a target of $650.") == 650.0
+
+
+def test_expired_or_closed_position_plan_is_closed_first():
+    old = _plan(horizon_end=TODAY - timedelta(days=1))
+    with patch("db.get_position_stop", return_value=None), \
+         patch("db.get_active_plan", return_value=old), \
+         patch("db.touch_plan") as touch, patch("db.insert_plan", return_value=9):
+        r = plans.observe("NVDA", PARSED, "OPEN", 7, "Current Price: $540.00", now=NOW)
+    touch.assert_called_once_with(1, "CLOSED", close_reason="expired")
+    assert r["relation"] == "NEW_PLAN"
+    seeded = _plan(source="held_seed")
+    with patch("db.get_position_stop", return_value=None), \
+         patch("db.get_active_plan", return_value=seeded), patch("db.touch_plan") as touch:
+        r = plans.observe("NVDA", PARSED, "WATCH", 6, "Current Price: $540.00", now=NOW)
+    touch.assert_called_once_with(1, "CLOSED", close_reason="position closed")
+    assert r["relation"] == "NO_PLAN"

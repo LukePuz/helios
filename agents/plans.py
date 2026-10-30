@@ -31,7 +31,8 @@ _REVISE_LEVEL_PCT = 0.10      # target/invalidation move that counts as a revisi
 _COALESCE_HOURS = 4           # FOLLOWs this close together add no decision
 
 _PRICE_RE = re.compile(r"Current Price: \$([\d,]+(?:\.\d+)?)")
-_DOLLAR_RE = re.compile(r"\$\s?([\d,]+(?:\.\d+)?)")
+# A per-share price, not "$2B" or "$40 million" (professor M94).
+_DOLLAR_RE = re.compile(r"\$\s?(\d[\d,]*(?:\.\d+)?)(?![\d,]*\d)(?!\s*(?:[BMKT]\b|bn|mn|billion|million|thousand|trillion))", re.I)
 
 _BUY, _HOLD, _SELL = "buy", "hold", "sell"
 _DIRECTION = {"OPEN": _BUY, "ADD": _BUY, "HOLD": _HOLD, "WATCH": _HOLD, "PASS": _HOLD,
@@ -158,6 +159,18 @@ def observe(ticker: str, parsed: dict, action: str, conviction: int, brief: str,
         plan = db.get_active_plan(ticker)
         new = (plan_from_verdict(ticker, parsed, conviction, price, today)
                if price and action in ("OPEN", "ADD") else None)
+
+        # Close a plan that ran past its horizon, or a held-position plan
+        # whose position is gone, before judging this verdict (professor M93).
+        if plan is not None:
+            reason = None
+            if plan.get("horizon_end") and today > plan["horizon_end"]:
+                reason = "expired"
+            elif plan.get("source") == "held_seed" and not held:
+                reason = "position closed"
+            if reason:
+                db.touch_plan(plan["id"], "CLOSED", close_reason=reason)
+                plan = None
 
         if plan is None:
             if new:

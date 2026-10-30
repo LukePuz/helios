@@ -353,8 +353,9 @@ Event Title: {event.get('title', 'N/A')}
             pl_str = f"{pos.get('pl_pct', 0):+.1%}"
             # Nearest 5%: an exact weight next to a one-share price gave
             # away the account size (pre-pull review 10-29 #7).
-            weight = (f"~{round(20 * pos.get('market_value', 0) / pv) * 5}% of portfolio" if pv
-                      else "weight unknown")
+            w = pos.get('market_value', 0) / pv if pv else None
+            weight = ("weight unknown" if w is None else "<5% of portfolio" if w < 0.025
+                      else f"~{round(20 * w) * 5}% of portfolio")
             pos_lines.append(
                 f"  {sym:<6} {weight} | "
                 f"Entry: ${pos.get('entry_price', 0):.2f} | "
@@ -496,8 +497,9 @@ Ticker: {ticker}
             pl_str = f"{pos.get('pl_pct', 0):+.1%}"
             # Nearest 5%: an exact weight next to a one-share price gave
             # away the account size (pre-pull review 10-29 #7).
-            weight = (f"~{round(20 * pos.get('market_value', 0) / pv) * 5}% of portfolio" if pv
-                      else "weight unknown")
+            w = pos.get('market_value', 0) / pv if pv else None
+            weight = ("weight unknown" if w is None else "<5% of portfolio" if w < 0.025
+                      else f"~{round(20 * w) * 5}% of portfolio")
             pos_lines.append(
                 f"  {sym:<6} {weight} | "
                 f"Entry: ${pos.get('entry_price', 0):.2f} | "

@@ -176,12 +176,25 @@ def _code_mixed_check() -> dict:
     return _DISK_CHECK["value"]
 
 
+def _brief_template_sha() -> str | None:
+    try:
+        import hashlib
+        import inspect
+        import context_engine
+        return hashlib.sha256(inspect.getsource(context_engine).encode()).hexdigest()[:12]
+    except Exception:
+        return None
+
+
 def _treatment_config() -> dict:
     import config
     return {k: getattr(config, k, None) for k in (
         "EARNINGS_ENTRY_BLACKOUT_DAYS", "ALLOW_ONE_SHARE_ABOVE_ALLOCATION", "SETUP_GATES_ENABLED",
         "ANALYST_MODEL", "SCREENER_MODEL", "MIN_EXPECTED_RETURN_PCT_PER_WEEK",
-        "BRIEF_PRICE_STRUCTURE", "BRIEF_POSITION_CONTEXT", "REGIME_OVERALL_ONLY")}
+        "BRIEF_PRICE_STRUCTURE", "BRIEF_POSITION_CONTEXT", "REGIME_OVERALL_ONLY",
+        # Added 10-29 (professor M96): switches that shipped that evening.
+        "REGIME_COMPLETED_BARS", "QUIVER_ENABLED", "ONE_SHARE_MAX_PCT_OF_CASH",
+        "TIER_MAX_CONCURRENT_POSITIONS", "MAX_TRADE_PCT_OF_CASH_RESERVE")}
 
 
 def _provenance(prompt: str) -> dict:
@@ -210,6 +223,9 @@ def _provenance(prompt: str) -> dict:
             "model_digest": digest[:12] if digest else None,
             "prompt_template_sha": hashlib.sha256(
                 inspect.getsource(_build_prompt).encode()).hexdigest()[:12],
+            # The brief builder changes what the model sees without touching
+            # _build_prompt (professor C29, 10-29).
+            "brief_template_sha": _brief_template_sha(),
         }
     if _PROVENANCE_STATIC.get("model_digest") is None:
         # The first /api/tags call failed (Ollama still loading): don't stamp

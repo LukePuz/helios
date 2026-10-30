@@ -3931,7 +3931,12 @@ def flag_orphan_outcomes_for(ticker: str) -> int:
 
 def flag_orphan_outcomes(held: set[str]) -> tuple[int, int]:
     """Flags open trade_outcomes rows (exit_date NULL, this env) whose ticker
-    isn't in `held` by setting orphaned_at once. A flag is never cleared: a
+    isn't in `held` and has no position_stops record by setting orphaned_at
+    once, skipping rows entered in the last 30 minutes. The stop-record and
+    age checks keep one partial snapshot (cache lag, a fill the snapshot
+    hasn't seen) from orphaning a live position for good; reconcile's
+    stale-stop branch flags those rows when the position is really gone.
+    A flag is never cleared: a
     later position in the same ticker is a new position, and
     close_trade_outcome skips flagged rows (professor M120). Returns (newly
     flagged, total flagged open rows). Never closes a row: no exit price is
@@ -3942,7 +3947,10 @@ def flag_orphan_outcomes(held: set[str]) -> tuple[int, int]:
             held_list = sorted(t.upper() for t in held) or [""]
             cur.execute(
                 "UPDATE trade_outcomes SET orphaned_at = NOW() WHERE trading_env=%s AND exit_date IS NULL "
-                "AND orphaned_at IS NULL AND UPPER(ticker) <> ALL(%s)",
+                "AND orphaned_at IS NULL AND entry_date < NOW() - INTERVAL '30 minutes' "
+                "AND UPPER(ticker) <> ALL(%s) AND NOT EXISTS ("
+                "SELECT 1 FROM position_stops ps WHERE UPPER(ps.ticker) = UPPER(trade_outcomes.ticker) "
+                "AND ps.trading_env = trade_outcomes.trading_env)",
                 (TRADING_ENV, held_list),
             )
             newly = cur.rowcount

@@ -337,3 +337,20 @@ def test_nan_in_a_verdict_does_not_lose_the_row():
     clean = db._finite_json({"a": float("nan"), "b": [1.0, float("inf")], "c": {"d": 2.5}})
     assert clean == {"a": None, "b": [1.0, None], "c": {"d": 2.5}}
     json.dumps(clean, allow_nan=False)
+
+
+def test_log_signal_writes_null_for_nan_and_counts_it():
+    """Professor run 16 follow-up: through log_signal itself, not only the helper."""
+    import json
+    from unittest.mock import MagicMock, patch
+    import db
+    conn = MagicMock()
+    cur = conn.cursor.return_value.__enter__.return_value
+    with patch("db._writer_conn", return_value=conn), patch("db._put_conn"):
+        db.log_signal("ZZZ", "HOLD", 0.5, "r", decision={"udr": float("nan"), "ok": 1.0},
+                      provenance={"x": float("inf")})
+    params = cur.execute.call_args.args[1]
+    prov, dec = params[6], params[7]
+    assert json.loads(prov.dumps(prov.adapted)) == {"x": None}
+    stored = json.loads(dec.dumps(dec.adapted))
+    assert stored["udr"] is None and stored["ok"] == 1.0 and stored["nonfinite_replaced"] == 2

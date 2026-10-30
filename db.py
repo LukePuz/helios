@@ -839,24 +839,32 @@ def log_trade(symbol: str, side: str, quantity: int, price: float, reason: str) 
         _put_conn(conn)
 
 
-def _finite_json(o):
+def _finite_json(o, replaced: list | None = None):
     """o with NaN/inf floats replaced by None: Postgres jsonb rejects them,
     and json.loads accepts "NaN" from model output, so one such value lost
-    the whole verdict row (professor M106)."""
+    the whole verdict row (professor M106). Appends to `replaced` once per
+    value swapped, so the caller can record how many."""
     import math
     if isinstance(o, float):
-        return o if math.isfinite(o) else None
+        if math.isfinite(o):
+            return o
+        if replaced is not None:
+            replaced.append(1)
+        return None
     if isinstance(o, dict):
-        return {k: _finite_json(v) for k, v in o.items()}
+        return {k: _finite_json(v, replaced) for k, v in o.items()}
     if isinstance(o, (list, tuple)):
-        return [_finite_json(v) for v in o]
+        return [_finite_json(v, replaced) for v in o]
     return o
 
 
 def log_signal(symbol: str, signal: str, confidence: float, reasoning: str,
                model: str | None = None, provenance: dict | None = None,
                decision: dict | None = None, prompt: str | None = None) -> None:
-    provenance, decision = _finite_json(provenance), _finite_json(decision)
+    replaced: list = []
+    provenance, decision = _finite_json(provenance, replaced), _finite_json(decision, replaced)
+    if replaced and isinstance(decision, dict):
+        decision["nonfinite_replaced"] = len(replaced)   # nulls that were NaN/inf
     rec = {"symbol": symbol, "signal": signal, "confidence": confidence, "reasoning": reasoning,
            "trading_env": TRADING_ENV, "model": model, "provenance": provenance,
            "decision": decision}

@@ -354,3 +354,23 @@ def test_log_signal_writes_null_for_nan_and_counts_it():
     assert json.loads(prov.dumps(prov.adapted)) == {"x": None}
     stored = json.loads(dec.dumps(dec.adapted))
     assert stored["udr"] is None and stored["ok"] == 1.0 and stored["nonfinite_replaced"] == 2
+
+
+def test_udr_check_recomputes_and_flags_a_gate_disagreement():
+    """Audit A0700-5: the gate reads the model's own UDR; log it beside the
+    ratio its % fields and its dollar targets imply."""
+    from agents.analyst import _udr_check
+    parsed = {"upside_downside_ratio": 2.9, "expected_return_pct": 15.0, "expected_downside_pct": -10.0,
+              "valuation": {"bull_case_target": "$660 (12 months)", "downside_scenario": "$500"}}
+    r = _udr_check(parsed, "Current Price: $600.00")
+    assert r == {"model": 2.9, "from_pcts": 1.5, "from_targets": 0.6, "gate_disagrees": True}
+    agree = _udr_check({**parsed, "upside_downside_ratio": 1.4}, "Current Price: $600.00")
+    assert agree["gate_disagrees"] is False
+
+
+def test_udr_check_tolerates_missing_and_nonsense_fields():
+    from agents.analyst import _udr_check
+    r = _udr_check({"upside_downside_ratio": "n/a", "expected_downside_pct": 0,
+                    "valuation": {"bull_case_target": "$500", "downside_scenario": "$700"}}, "Current Price: $600.00")
+    assert r == {"model": None, "from_pcts": None, "from_targets": None, "gate_disagrees": False}
+    assert _udr_check({"valuation": "x"}, "")["from_targets"] is None

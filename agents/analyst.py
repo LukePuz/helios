@@ -235,6 +235,38 @@ def _trim_shadow(ticker: str, action: str, parsed: dict, brief: str) -> dict | N
         return {"error": str(e)[:120]}
 
 
+def _udr_check(parsed: dict, brief: str) -> dict:
+    """Log-only (audit A0700-5): the gate uses the UDR the model writes,
+    which swings 1.1-2.9 on one name within minutes. Recompute it from the
+    model's own % fields and from its dollar targets against the brief's
+    price, and flag when the 2.0 gate would decide differently. Never raises."""
+    import math
+
+    def num(v):
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return None
+        return v if math.isfinite(v) else None
+
+    try:
+        from agents.plans import _dollars, brief_price
+        model = num(parsed.get("upside_downside_ratio"))
+        up, down = num(parsed.get("expected_return_pct")), num(parsed.get("expected_downside_pct"))
+        from_pcts = round(up / abs(down), 2) if up is not None and down else None
+        val = parsed.get("valuation") if isinstance(parsed.get("valuation"), dict) else {}
+        target, floor = _dollars(val.get("bull_case_target")), _dollars(val.get("downside_scenario"))
+        price = brief_price(brief)
+        from_targets = (round((target - price) / (price - floor), 2)
+                        if price and target and floor and target > price > floor else None)
+        computed = [v for v in (from_pcts, from_targets) if v is not None]
+        return {"model": model, "from_pcts": from_pcts, "from_targets": from_targets,
+                "gate_disagrees": (model is not None and bool(computed)
+                                   and any((v >= 2.0) != (model >= 2.0) for v in computed))}
+    except Exception as e:
+        return {"error": str(e)[:120]}
+
+
 def _brief_template_sha() -> str | None:
     try:
         import hashlib
@@ -1495,6 +1527,7 @@ def analyze(
                 "prior_verdicts_72h": _prior_verdicts(ticker) if action in ("OPEN", "ADD") else None,
                 "rule_shadows": _rule_shadows(ticker, action, situation_brief),
                 "trim_shadow": _trim_shadow(ticker, action, parsed, situation_brief),
+                "udr_check": _udr_check(parsed, situation_brief),
             },
             prompt=redact_account_figures(prompt),
         )

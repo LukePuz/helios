@@ -33,6 +33,17 @@ load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 log = logging.getLogger(__name__)
 
+
+class _DropPortfolioUpdates(logging.Filter):
+    """ib_async logs every account portfolio update at INFO (3,797 lines in
+    the llm worker log on 10-30), which buries real warnings. Order status,
+    executions and errors from the same logger are kept."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not str(record.msg).startswith("updatePortfolio:")
+
+
+logging.getLogger("ib_async.wrapper").addFilter(_DropPortfolioUpdates())
+
 # Sourced from config.py (not read directly from the environment here) so
 # this can never drift from config.TRADING_ENV's derived paper/live
 # defaults — see config.py's "Trading environment" section.

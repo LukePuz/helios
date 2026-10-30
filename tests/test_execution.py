@@ -1151,3 +1151,12 @@ def test_manual_fill_without_a_price_still_marks_the_order_filled():
         rm_cls.return_value.calculate_stop.return_value = (92.0, "ATR")
         execution.execute_manual("ZZZ", "BUY", 2, "test")
     fill.assert_called_once_with(5, None, 2.0, "filled")
+
+
+def test_portfolio_updates_are_dropped_from_the_ib_async_log_but_order_status_is_kept():
+    import logging
+    import ibkr
+    f = ibkr._DropPortfolioUpdates()
+    rec = lambda m: logging.LogRecord("ib_async.wrapper", logging.INFO, "", 0, m, None, None)
+    assert not f.filter(rec("updatePortfolio: PortfolioItem(...)"))
+    assert f.filter(rec("orderStatus: Trade(...)"))

@@ -145,7 +145,8 @@ def embed(text: str) -> list[float]:
     in a broad try/except. .encode() returns a numpy array; ChromaDB needs
     a plain list.
     """
-    result = _get_embedder().encode(text)
+    # No tqdm bar: the workers log stderr at WARNING (482 empty bars on 10-30).
+    result = _get_embedder().encode(text, show_progress_bar=False)
     return result.tolist() if hasattr(result, "tolist") else list(result)
 
 

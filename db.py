@@ -716,6 +716,18 @@ _MIGRATIONS: list[tuple[int, str]] = [
     (62, "CREATE TABLE IF NOT EXISTS earnings_calendar_history ("
          "id SERIAL PRIMARY KEY, ticker VARCHAR(10) NOT NULL, earnings_date DATE NOT NULL, "
          "confirmed BOOLEAN, recorded_at TIMESTAMPTZ DEFAULT NOW());"),
+    # Trade plans, shadow only (roadmap 1, Luke 10-27/10-29): one active plan
+    # per ticker built from the analyst's own fields; later verdicts are
+    # checked against it (agents/plans.py). Nothing reads it for trading.
+    (63, "CREATE TABLE IF NOT EXISTS trade_plans ("
+         "id SERIAL PRIMARY KEY, ticker VARCHAR(10) NOT NULL, trading_env VARCHAR(10), "
+         "status VARCHAR(16) NOT NULL DEFAULT 'active', source VARCHAR(16), "
+         "created_at TIMESTAMPTZ DEFAULT NOW(), closed_at TIMESTAMPTZ, close_reason TEXT, "
+         "bucket VARCHAR(16), conviction INTEGER, entry_price DECIMAL, invalidation_price DECIMAL, "
+         "target_price DECIMAL, catalyst_event TEXT, catalyst_date DATE, horizon_end DATE, "
+         "thesis TEXT, primary_risk TEXT, revision INTEGER DEFAULT 0, replaces_id INTEGER, "
+         "verdicts_seen INTEGER DEFAULT 0, last_seen_at TIMESTAMPTZ, last_relation VARCHAR(16)); "
+         "CREATE INDEX IF NOT EXISTS trade_plans_active ON trade_plans (ticker, trading_env, status);"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -1582,6 +1594,85 @@ def clear_trailing_active(ticker: str) -> None:
     except Exception as e:
         conn.rollback()
         logging.error(f"clear_trailing_active failed: {e}")
+    finally:
+        _put_conn(conn)
+
+
+_PLAN_COLS = ("id", "ticker", "status", "source", "created_at", "bucket", "conviction",
+              "entry_price", "invalidation_price", "target_price", "catalyst_event",
+              "catalyst_date", "horizon_end", "thesis", "primary_risk", "revision",
+              "verdicts_seen", "last_seen_at", "last_relation")
+
+
+def get_active_plan(ticker: str) -> dict | None:
+    """The ticker's active shadow trade plan (migration 63), or None."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {', '.join(_PLAN_COLS)} FROM trade_plans "
+                "WHERE ticker=%s AND trading_env=%s AND status='active' ORDER BY id DESC LIMIT 1",
+                (ticker, TRADING_ENV),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        plan = dict(zip(_PLAN_COLS, row))
+        for k in ("entry_price", "invalidation_price", "target_price"):
+            if plan[k] is not None:
+                plan[k] = float(plan[k])
+        return plan
+    except Exception as e:
+        logging.error(f"get_active_plan failed: {e}")
+        return None
+    finally:
+        _put_conn(conn)
+
+
+def insert_plan(plan: dict) -> int | None:
+    """Insert a shadow plan; with replaces_id, close that plan as superseded."""
+    cols = ("ticker", "source", "bucket", "conviction", "entry_price", "invalidation_price",
+            "target_price", "catalyst_event", "catalyst_date", "horizon_end", "thesis",
+            "primary_risk", "revision", "replaces_id")
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            if plan.get("replaces_id"):
+                cur.execute("UPDATE trade_plans SET status='superseded', closed_at=NOW(), "
+                            "close_reason='revised' WHERE id=%s AND status='active'",
+                            (plan["replaces_id"],))
+            cur.execute(
+                f"INSERT INTO trade_plans (trading_env, {', '.join(cols)}) "
+                f"VALUES (%s, {', '.join(['%s'] * len(cols))}) RETURNING id",
+                (TRADING_ENV, *[plan.get(c) for c in cols]),
+            )
+            new_id = cur.fetchone()[0]
+        conn.commit()
+        return new_id
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"insert_plan failed: {e}")
+        return None
+    finally:
+        _put_conn(conn)
+
+
+def touch_plan(plan_id: int, relation: str, close_reason: str | None = None) -> None:
+    """Count a verdict against a plan; with close_reason, close it (shadow)."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            if close_reason:
+                cur.execute("UPDATE trade_plans SET verdicts_seen=verdicts_seen+1, last_seen_at=NOW(), "
+                            "last_relation=%s, status='closed', closed_at=NOW(), close_reason=%s "
+                            "WHERE id=%s", (relation, close_reason, plan_id))
+            else:
+                cur.execute("UPDATE trade_plans SET verdicts_seen=verdicts_seen+1, last_seen_at=NOW(), "
+                            "last_relation=%s WHERE id=%s", (relation, plan_id))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"touch_plan failed: {e}")
     finally:
         _put_conn(conn)
 

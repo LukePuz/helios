@@ -1317,6 +1317,9 @@ def analyze(
                         f"~{est} estimated; the prompt's start may have been cut")
     llm["reply_cut"] = llm.get("done_reason") == "length"
     provenance["llm_call"] = llm
+    # Shadow trade plan (roadmap 1): log-only, nothing reads it back.
+    from agents.plans import observe as _plan_observe
+    provenance["plan"] = _plan_observe(ticker, parsed, action, conviction, situation_brief)
     try:
         import db
         db.log_signal(

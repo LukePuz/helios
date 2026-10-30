@@ -244,7 +244,29 @@ def _provenance(prompt: str) -> dict:
 
 # The prefix caps in _build_prompt (kept out of it: its source is hashed into
 # prompt_template_sha). Keep these equal to the slices there.
-_THESIS_CAP, _PHILOSOPHY_CAP = 6000, 2000
+_THESIS_CAP, _PHILOSOPHY_CAP = 6000, 4500
+
+# Sections of portfolio_philosophy.md every verdict gets, plus the stock's own
+# bucket. The prefix cut kept 2,000 of 8,458 chars, so the exit, cash and
+# bucket rules never reached the model (A1053-1; Luke D10, 10-29).
+_PHILOSOPHY_KEEP = ("Primary Mission", "Core Beliefs", "Investment Style", "Concentration Philosophy",
+                    "Cash Management", "Risk Tolerance", "When to Hold Through Drawdown",
+                    "When to Exit Despite Thesis", "Conviction Tiers")
+_BUCKET_HEADINGS = {"Compounder": "Compounders", "Accelerator": "Accelerators", "Moonshot": "Moonshots"}
+
+
+def _philosophy_sections(text: str, role: str) -> str:
+    """The kept sections, in file order, with their headings. Falls back to
+    the full text if the file has none of them (the prompt's cap then applies)."""
+    import re
+    heads = [(m.start(), m.group(1).strip()) for m in re.finditer(r"^#{2,3}\s+(.+)$", text, re.M)]
+    bucket = _BUCKET_HEADINGS.get(role, "Accelerators")
+    parts = []
+    for i, (pos, title) in enumerate(heads):
+        end = heads[i + 1][0] if i + 1 < len(heads) else len(text)
+        if title in _PHILOSOPHY_KEEP or title.startswith(bucket):
+            parts.append(text[pos:end].strip())
+    return "\n\n".join(parts) if parts else text
 
 
 def _knowledge_coverage(ticker: str, thesis_text: str, philosophy_text: str,
@@ -337,7 +359,7 @@ def _build_prompt(
     # Generous caps — num_ctx was raised from 8192, and the budget loop below
     # trims further if the assembled prompt still doesn't fit.
     thesis_excerpt      = thesis_text[:6000]
-    philosophy_excerpt  = philosophy_text[:2000]
+    philosophy_excerpt  = philosophy_text[:4500]
     # Was a silent 8,000-char cut that dropped the brief's later sections
     # (fundamentals, memory) before the token guard below ever ran (limitations
     # audit 2026-10-27, finding 12). The guard trims by priority and logs it.
@@ -979,7 +1001,8 @@ def analyze(
         thesis_text     = ""
         philosophy_text = ""
 
-    prompt = _build_prompt(candidate, situation_brief, thesis_text, regime_packet, philosophy_text)
+    prompt = _build_prompt(candidate, situation_brief, thesis_text, regime_packet,
+                           _philosophy_sections(philosophy_text, candidate.get("role", "Accelerator")))
 
     raw_response = _call_ollama(prompt)
     if not raw_response:

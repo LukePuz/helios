@@ -113,10 +113,10 @@ def test_knowledge_coverage_lists_cut_headings_and_matches_the_prompt_caps():
     src = inspect.getsource(analyst._build_prompt)
     assert f"thesis_text[:{analyst._THESIS_CAP}]" in src
     assert f"philosophy_text[:{analyst._PHILOSOPHY_CAP}]" in src
-    philosophy = "# P\n" + "x" * 2100 + "\n### When to Exit\nrules\n"
+    philosophy = "# P\n" + "x" * 4600 + "\n### When to Exit\nrules\n"
     cov = analyst._knowledge_coverage("ZZZZ", "## T\nshort", philosophy)
     assert cov["philosophy"]["cut_headings"] == ["When to Exit"]
-    assert cov["philosophy"]["cap_kept"] == 2000 and cov["thesis"]["cut_headings"] == []
+    assert cov["philosophy"]["cap_kept"] == 4500 and cov["thesis"]["cut_headings"] == []
 
 
 def test_fundamentals_history_keeps_revision_fields_and_falls_back():
@@ -267,3 +267,15 @@ def test_buy_stop_record_clears_trail_params_and_target_flag():
     sql = cur.execute.call_args[0][0]
     for frag in ("trail_amount      = NULL", "trail_percent     = NULL", "profit_target_taken = FALSE"):
         assert frag in sql
+
+
+def test_philosophy_excerpt_keeps_exit_cash_and_own_bucket():
+    """Luke D10 (10-29): section-aware philosophy, not a 2,000-char prefix."""
+    from pathlib import Path
+    from agents.analyst import _philosophy_sections
+    text = (Path(__file__).resolve().parent.parent / "knowledge" / "portfolio_philosophy.md").read_text()
+    out = _philosophy_sections(text, "Moonshot")
+    assert "### When to Exit Despite Thesis" in out and "### Cash Management" in out
+    assert "### Moonshots" in out and "### Compounders" not in out
+    assert len(out) <= 4500
+    assert _philosophy_sections("no headings here", "Moonshot") == "no headings here"

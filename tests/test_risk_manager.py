@@ -897,3 +897,20 @@ class TestSwapPreCheck:
         n = self._with_conc({"passed": True},
                             {"shares_initial": 3, "position_size_pct": 0.05, "order_pct": 0.003})
         assert n == 3
+
+
+def test_heat_shadow_reports_what_the_cap_would_cut():
+    """Audit A2114-9: log-only heat cap on the legacy sizing path."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+    from risk_manager import RiskManager
+    rm = RiskManager.__new__(RiskManager)
+    rm._client = MagicMock()
+    rm._client.get_all_positions.return_value = [SimpleNamespace(symbol="A", qty=10)]
+    with patch("db.get_portfolio_heat_pct", return_value={"heat_pct": 0.06}):
+        h = rm._heat_shadow("X", 10, 100.0, 95.0, 10_000.0, 1.0)   # 10 x $5 = 0.5% new risk
+    assert h["would_cut"] is False and h["new_trade_risk_pct"] == 0.005
+    with patch("db.get_portfolio_heat_pct", return_value={"heat_pct": 0.068}):
+        h = rm._heat_shadow("X", 10, 100.0, 95.0, 10_000.0, 1.0)
+    assert h["would_cut"] is True and h["shares_within_cap"] == 4
+    assert rm._heat_shadow("X", 10, 100.0, None, 10_000.0, 1.0) is None

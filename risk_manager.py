@@ -590,7 +590,29 @@ class RiskManager:
             "bucket":              bucket,
             "conviction":          conviction,
             "flags":               flags,
+            "heat_shadow":         self._heat_shadow(ticker, shares_initial, price, stop_price, pv, mult),
         }
+
+    def _heat_shadow(self, ticker: str, shares: int, price: float, stop_price, pv: float,
+                     mult: float) -> dict | None:
+        """What the portfolio heat cap would do on this (legacy) path, where
+        it isn't enforced: it only runs in the setup-gate path, which is off
+        (audit A2114-9). Log-only, never raises."""
+        try:
+            if not (pv and stop_price and stop_price < price):
+                return None
+            import db
+            positions_map = {p.symbol: {"qty": float(p.qty)} for p in self._client.get_all_positions()}
+            current = float(db.get_portfolio_heat_pct(pv, positions_map).get("heat_pct", 0.0))
+            cap = PORTFOLIO_HEAT_CAP_PCT * mult
+            new = shares * (price - stop_price) / pv
+            fits = max(0, int(max(0.0, cap - current) * pv / (price - stop_price)))
+            return {"current_heat_pct": round(current, 4), "new_trade_risk_pct": round(new, 4),
+                    "cap_pct": round(cap, 4), "would_cut": current + new > cap,
+                    "shares_within_cap": min(shares, fits)}
+        except Exception as e:
+            log.debug(f"[{ticker}] heat shadow failed: {e}")
+            return None
 
     # ------------------------------------------------------------------
     # Swing-trading cutover, Phase 4/5 (2026-10-11): setup-gate sizing path

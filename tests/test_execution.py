@@ -969,5 +969,7 @@ def test_entry_stop_keeps_its_distance_below_a_lower_fill():
     from execution import _stop_anchored_to_fill as anchor
     assert anchor("X", 101.0, 106.0, 99.5) == round(99.5 * 101 / 106, 2) < 99.5
     assert anchor("X", 95.0, 100.0, 100.2) == 95.0        # fill at or above sizing: unchanged
-    assert anchor("X", 95.0, 100.0, 99.8) == 95.0         # within 0.5%: unchanged
+    assert anchor("X", 95.0, 100.0, 97.0) == 95.0         # still safely below the fill: kept
+    assert anchor("X", 99.7, 100.0, 99.6) < 99.6          # tight structural stop above the fill
+    assert anchor("X", 98.8, 100.0, 99.6) <= 98.8         # never tightened
     assert anchor("X", 95.0, None, 90.0) == 95.0          # unknown sizing price: unchanged

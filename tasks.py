@@ -1185,6 +1185,9 @@ def _reconcile_unconfirmed_orders_locked(task):
                         # No record, or the record is a closed position's
                         # leftover (kept up to 2 reconcile cycles): a re-entry
                         # must not inherit that old level (audit 00:53 A0053-5).
+                        from execution import _stop_anchored_to_fill   # 28323dd review #1
+                        stop_price = _stop_anchored_to_fill(
+                            ticker, float(stop_price), risk_json.get("price_at_sizing"), total_avg)
                         db.upsert_position_stop(
                             ticker=ticker, entry_price=total_avg, stop_price=float(stop_price),
                             stop_method=risk_json.get("stop_method", ""),

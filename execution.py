@@ -416,14 +416,21 @@ def _buy_room_at_execution(ticker: str, action: str, shares: int, price: float |
         return 0, f"cash/position check failed at execution ({str(e)[:100]})"
 
 
+_STOP_MIN_GAP_BELOW_FILL = 0.01
+
+
 def _stop_anchored_to_fill(ticker: str, stop: float, sized_at: float | None,
                            fill: float | None) -> float:
     """The stop was set from the sizing price. If the fill came in lower (a
-    pre-market price that faded by the open, review 5 #1), keep the planned
-    distance below the fill instead, so the stop never sits at or above it."""
-    if not (sized_at and fill and 0 < stop < sized_at) or fill >= sized_at * 0.995:
+    pre-market price that faded by the open, review 5 #1) and left the stop
+    at, above or within 1% of the fill, move it to the planned distance below
+    the fill. A stop still safely below the fill keeps its level, so a
+    structural stop at support isn't moved (28323dd review #2/#3)."""
+    if not (sized_at and fill and 0 < stop < sized_at and fill < sized_at):
         return stop
-    anchored = round(fill * stop / sized_at, 2)
+    if stop < fill * (1 - _STOP_MIN_GAP_BELOW_FILL):
+        return stop
+    anchored = round(min(stop, fill * stop / sized_at), 2)
     log.warning(f"[{ticker}] Stop moved from ${stop:.2f} to ${anchored:.2f}: filled at "
                 f"${fill:.2f}, below the ${sized_at:.2f} sizing price")
     return anchored

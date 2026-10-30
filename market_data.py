@@ -233,12 +233,15 @@ def get_session_quote(ticker: str, now_utc: datetime | None = None) -> dict | No
     prior close all night, so a post-earnings morning priced the pre-print
     close (audit A1853-4; Luke D6, 10-29)."""
     import time
-    cached = now_utc is None and _SESSION_QUOTE_CACHE.get(ticker)
+    if now_utc is not None:
+        return _session_quote_uncached(ticker, now_utc)
+    now_utc = datetime.now(timezone.utc)
+    key = f"{ticker}|{is_market_hours(now_utc)}"   # a session change starts fresh
+    cached = _SESSION_QUOTE_CACHE.get(key)
     if cached and time.monotonic() - cached[0] < _SESSION_QUOTE_TTL_S:
         return cached[1]
-    q = _session_quote_uncached(ticker, now_utc or datetime.now(timezone.utc))
-    if now_utc is None:
-        _SESSION_QUOTE_CACHE[ticker] = (time.monotonic(), q)
+    q = _session_quote_uncached(ticker, now_utc)
+    _SESSION_QUOTE_CACHE[key] = (time.monotonic(), q)
     return q
 
 

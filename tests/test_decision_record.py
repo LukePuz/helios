@@ -5,7 +5,7 @@ from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
 
-def _analyze(udr, regime="Risk-On"):
+def _analyze(udr, regime="Risk-On", fund={"market_cap": 1}, extra=()):
     response = json.dumps({
         "action": "OPEN", "conviction": 8, "thesis_strength": 4, "catalyst_quality": 4,
         "valuation_risk_reward": 4, "data_completeness": 4, "thesis_bucket": "Compounder",
@@ -22,11 +22,12 @@ def _analyze(udr, regime="Risk-On"):
         patch("knowledge_loader.get_watchlist_entry", return_value={"role": "Compounder"}),
         patch("agents.chase_risk.compute_chase_risk", return_value=None),
         patch("agents.price_action.compute_price_action", return_value=None),
-        patch("db.get_fundamentals", return_value={"market_cap": 1}),
+        patch("db.get_fundamentals", return_value=fund),
         patch("db.get_latest_signal_for", return_value=None),
         patch("db.get_conviction_calibration", return_value=[]),
         patch("db.log_signal", log_signal),
         patch("feed.emit"),
+        *extra,
     ]
     with ExitStack() as stack:
         for p in patches:
@@ -61,3 +62,13 @@ def test_log_signal_writes_decision_column():
         db.log_signal("NVDA", "WATCH", 0.8, "r", decision={"gates": ["x"]})
     sql, params = cur.execute.call_args[0]
     assert "decision" in sql and params[7].adapted == {"gates": ["x"]}
+
+
+def test_etf_exemption_from_the_missing_fundamentals_cap_is_off_by_default():
+    """Audit A0100-2: ETFs never have fundamentals; the exemption ships off."""
+    etf = patch("knowledge_loader.get_etf_tickers", return_value={"MSFT"})
+    d = _analyze(udr=3.0, fund=None, extra=(etf,))
+    assert d["final_conviction"] == 6 and any("ETF; exemption off" in g for g in d["gates"])
+    on = patch("config.ETF_FUNDAMENTALS_CAP_EXEMPT", True)
+    d = _analyze(udr=3.0, fund=None, extra=(patch("knowledge_loader.get_etf_tickers", return_value={"MSFT"}), on))
+    assert d["final_conviction"] == 8 and any("ETF, cap not applied" in g for g in d["gates"])

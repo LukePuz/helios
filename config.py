@@ -511,6 +511,11 @@ USE_BRACKET_ORDERS = _os.getenv("USE_BRACKET_ORDERS", "false").lower() == "true"
 # for the full pre-flip checklist (this sizing math has zero live track
 # record as of this writing).
 SETUP_GATES_ENABLED = os.getenv("SETUP_GATES_ENABLED", "false").lower() == "true"
+# Watchlist ETFs (DRAM, QTUM) never have company fundamentals, so the
+# missing-fundamentals conviction cap (6) makes them unbuyable wherever the
+# floor is 7. True exempts them from that cap. Off until Luke turns it on
+# (it changes what can be bought; audit A0100-2).
+ETF_FUNDAMENTALS_CAP_EXEMPT = os.getenv("ETF_FUNDAMENTALS_CAP_EXEMPT", "false").lower() == "true"
 
 # Risk-per-trade-of-equity by LIVE setup category (Breakout/Catalyst/
 # Continuation) -- the SETUP_GATES_ENABLED equivalent of RISK_PCT_PER_TRADE

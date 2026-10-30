@@ -253,7 +253,8 @@ def _treatment_config() -> dict:
         "BRIEF_PRICE_STRUCTURE", "BRIEF_POSITION_CONTEXT", "REGIME_OVERALL_ONLY",
         # Added 10-29 (professor M96): switches that shipped that evening.
         "REGIME_COMPLETED_BARS", "QUIVER_ENABLED", "ONE_SHARE_MAX_PCT_OF_CASH",
-        "TIER_MAX_CONCURRENT_POSITIONS", "MAX_TRADE_PCT_OF_CASH_RESERVE")}
+        "TIER_MAX_CONCURRENT_POSITIONS", "MAX_TRADE_PCT_OF_CASH_RESERVE",
+        "ETF_FUNDAMENTALS_CAP_EXEMPT")}
 
 
 def _provenance(prompt: str) -> dict:
@@ -1410,10 +1411,22 @@ def analyze(
     except Exception:
         fundamentals_missing = True
     conviction_raw = conviction
+    is_etf = False
     if fundamentals_missing and action in ("OPEN", "ADD") and conviction > 6:
-        log.info(f"[{ticker}] No cached fundamentals — capping conviction {conviction} -> 6")
-        gates.append(f"no fundamentals: conviction {conviction} -> 6")
-        conviction = 6
+        try:
+            from knowledge_loader import get_etf_tickers
+            is_etf = ticker in get_etf_tickers()
+        except Exception:
+            pass
+    if fundamentals_missing and action in ("OPEN", "ADD") and conviction > 6:
+        from config import ETF_FUNDAMENTALS_CAP_EXEMPT
+        if is_etf and ETF_FUNDAMENTALS_CAP_EXEMPT:
+            gates.append(f"no fundamentals: ETF, cap not applied (conviction {conviction})")
+        else:
+            log.info(f"[{ticker}] No cached fundamentals — capping conviction {conviction} -> 6")
+            gates.append(f"no fundamentals: conviction {conviction} -> 6"
+                         + (" (ETF; exemption off)" if is_etf else ""))
+            conviction = 6
 
     # Validate pass_to_risk
     actionable = action in ("OPEN", "ADD", "TRIM", "EXIT")

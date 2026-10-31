@@ -432,6 +432,38 @@ def redact_account_figures(prompt: str) -> str:
     return _ACCOUNT_FIGURE_RE.sub(r"\1$[REDACTED]", prompt or "")
 
 
+def _brief_exposure(ticker: str, prompt: str) -> dict:
+    """Log-only: what the brief showed the model about its own position and
+    past verdicts, and whether the broker holds the ticker (audit A1031-0453
+    -1/-2). Read from the prompt text, so it is what the model saw. Since
+    BRIEF_POSITION_CONTEXT, repeats on held names see their last verdicts and
+    aren't independent draws; the section keys on a stop row, not the broker.
+    held_broker is None when there is no fresh snapshot (or no positions)."""
+    out = {"position_context_shown": "=== POSITION CONTEXT" in (prompt or ""),
+           "prior_verdicts_shown": []}
+    for line in (prompt or "").splitlines():
+        if line.startswith("Recent verdicts: "):
+            out["prior_verdicts_shown"] = [v.strip() for v in line[len("Recent verdicts: "):].split(";")
+                                           if v.strip()]
+            break
+    try:
+        import db
+        out["has_stop_row"] = db.get_position_stop(ticker) is not None
+    except Exception:
+        out["has_stop_row"] = None
+    try:
+        import tasks
+        positions = tasks._fresh_snapshot_positions()
+        if positions:
+            p = positions.get(ticker.upper()) or positions.get(ticker) or {}
+            out["held_broker"] = float(p.get("qty") or 0) > 0 if isinstance(p, dict) else False
+        else:
+            out["held_broker"] = None
+    except Exception:
+        out["held_broker"] = None
+    return out
+
+
 def _decision_inputs_record(ticker: str, regime_packet: dict | None) -> dict:
     """Log-only, after the model call: which regime row this verdict used
     (professor C25; a sector row here is A0853-1) and the nightly reverse-DCF
@@ -1541,6 +1573,10 @@ def analyze(
     except Exception as e:
         log.debug(f"[{ticker}] knowledge coverage record failed: {e}")
     provenance.update(_decision_inputs_record(ticker, regime_packet))
+    try:
+        provenance["brief_exposure"] = _brief_exposure(ticker, prompt)
+    except Exception as e:
+        log.debug(f"[{ticker}] brief exposure record failed: {e}")
     provenance["trigger"] = trigger
     est = _estimate_tokens(prompt)
     llm = {**_LAST_CALL_STATS, "prompt_tokens_est": est}

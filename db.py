@@ -3638,10 +3638,11 @@ def update_outcome_price(approval_id: int, days: int, price: float) -> None:
         _put_conn(conn)
 
 
-def update_outcome_entry_price(approval_id: int, entry_price: float) -> bool:
+def update_outcome_entry_price(approval_id: int, entry_price: float) -> bool | None:
     """Sets an open outcome row's entry_price to the order's cumulative
     average when the rest of a part-filled BUY fills late (professor M121,
-    entry side). Returns True if a row was updated."""
+    entry side). True if a row was updated, False if no open row, None if
+    the write failed."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
@@ -3656,7 +3657,7 @@ def update_outcome_entry_price(approval_id: int, entry_price: float) -> bool:
     except Exception as e:
         conn.rollback()
         logging.error(f"update_outcome_entry_price failed: {e}")
-        return False
+        return None
     finally:
         _put_conn(conn)
 

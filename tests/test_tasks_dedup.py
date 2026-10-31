@@ -1702,3 +1702,21 @@ class TestBuyOutcomeRetry:
             tasks._retry_pending_buy_outcomes()
         alert.assert_called_once()
         assert json.loads(state[tasks._OUTCOME_STATE_KEY]) == {}
+
+    def test_reaverage_with_no_open_row_writes_the_row_instead(self):
+        """Review of fed009b: the part fill's own row was never written."""
+        state, gs, ss = self._state()
+        with gs, ss, patch("db.update_outcome_entry_price", return_value=False), \
+             patch("execution.log_buy_outcome", return_value=True) as write:
+            tasks._apply_buy_outcome(59, {**self.REC, "kind": "reaverage"}, {"id": 59})
+        write.assert_called_once_with({"id": 59}, "CRWD", "OPEN", 181.3)
+        assert tasks._OUTCOME_STATE_KEY not in state
+
+    def test_a_failed_reaverage_is_retried_not_inserted(self):
+        import json
+        state, gs, ss = self._state()
+        with gs, ss, patch("db.update_outcome_entry_price", return_value=None), \
+             patch("execution.log_buy_outcome") as write:
+            tasks._apply_buy_outcome(59, {**self.REC, "kind": "reaverage"})
+        write.assert_not_called()
+        assert json.loads(state[tasks._OUTCOME_STATE_KEY])["59"]["kind"] == "reaverage"

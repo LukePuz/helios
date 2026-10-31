@@ -1357,7 +1357,7 @@ def _reconcile_unconfirmed_orders_locked(task):
 _REPROTECT_STATE_KEY = "reprotect_pending"
 
 
-def _reprotect_queue_edit(fn) -> None:
+def _reprotect_queue_edit(fn, key: str = _REPROTECT_STATE_KEY) -> None:
     """Apply fn(pending) -> pending to the queue under a short Redis lock.
     Writers now include the LLM worker and the Telegram bot as well as the
     reconcile run, so an unlocked read-modify-write could drop an entry
@@ -1368,7 +1368,7 @@ def _reprotect_queue_edit(fn) -> None:
     import db
     lock = None
     try:
-        lock = stop_lock._redis().lock("helios:reprotect_queue", timeout=30, blocking_timeout=35)
+        lock = stop_lock._redis().lock(f"helios:{key}", timeout=30, blocking_timeout=35)
         if not lock.acquire():
             lock = None
             log.error("reprotect queue lock still busy after 35 s; editing without it")
@@ -1377,10 +1377,10 @@ def _reprotect_queue_edit(fn) -> None:
         log.warning(f"reprotect queue lock unavailable ({e}); editing without it")
     try:
         try:
-            pending = json.loads(db.get_state(_REPROTECT_STATE_KEY) or "{}")
+            pending = json.loads(db.get_state(key) or "{}")
         except Exception:
             pending = {}
-        db.set_state(_REPROTECT_STATE_KEY, json.dumps(fn(pending)))
+        db.set_state(key, json.dumps(fn(pending)))
     finally:
         if lock is not None:
             try:
@@ -1531,38 +1531,46 @@ _BUY_FLAT_MAX_TRIES = 2   # ~30 min for a new BUY's position to show up
 
 
 _OUTCOME_STATE_KEY = "buy_outcome_pending"
-_OUTCOME_MAX_TRIES = 8    # reconcile_unconfirmed_orders runs, ~2 h
+_OUTCOME_MAX_TRIES = 24   # reconcile_unconfirmed_orders runs, 5 min apart (~2 h)
 
 
 def _write_buy_outcome(approval_id: int, rec: dict, approval: dict | None = None) -> bool:
     import db
     try:
         if rec["kind"] == "reaverage":
-            return bool(db.update_outcome_entry_price(approval_id, rec["entry_price"]))
+            updated = db.update_outcome_entry_price(approval_id, rec["entry_price"])
+            if updated is None:
+                return False          # write failed: retry
+            if updated:
+                return True
+            # No open row: the part fill's own row was never written. Insert it
+            # at the whole order's average (deduped per approval; review of fed009b).
         from execution import log_buy_outcome
         approval = approval or db.get_approval_by_id(approval_id)
         return bool(approval) and bool(log_buy_outcome(approval, rec["ticker"], rec["action"],
                                                        rec["entry_price"]))
     except Exception as e:
-        log.error(f"[{rec.get('ticker')}] reconcile: outcome {rec.get('kind')} for approval "
+        log.error(f"[{rec.get('ticker')}] outcome {rec.get('kind')} for approval "
                   f"{approval_id} failed: {e}")
         return False
 
 
 def _apply_buy_outcome(approval_id: int, rec: dict, approval: dict | None = None) -> None:
-    """Write a late BUY's outcome row (or re-average it); queue it for the
-    next runs if that fails (professor M125). Only reconcile_unconfirmed_orders
-    writes this queue, one run at a time, so it needs no lock."""
+    """Write a BUY's outcome row (or re-average it); queue it for the next
+    reconcile runs if that fails (professor M125). Called at the fill and by
+    reconcile, so queue edits take the queue lock."""
     if _write_buy_outcome(approval_id, rec, approval):
         return
-    import db
-    log.error(f"[{rec['ticker']}] reconcile: late BUY outcome {rec['kind']} failed; queued for retry")
-    try:
-        pending = json.loads(db.get_state(_OUTCOME_STATE_KEY) or "{}")
+    log.error(f"[{rec['ticker']}] BUY outcome {rec['kind']} failed; queued for retry")
+
+    def add(pending):
+        # A later re-average carries the newer price; either kind ends in a row.
         pending[str(approval_id)] = {**rec, "tries": 0}
-        db.set_state(_OUTCOME_STATE_KEY, json.dumps(pending))
+        return pending
+    try:
+        _reprotect_queue_edit(add, key=_OUTCOME_STATE_KEY)
     except Exception as e:
-        log.error(f"[{rec['ticker']}] reconcile: could not queue the outcome retry: {e}")
+        log.error(f"[{rec['ticker']}] could not queue the outcome retry: {e}")
 
 
 def _retry_pending_buy_outcomes() -> None:
@@ -1573,26 +1581,38 @@ def _retry_pending_buy_outcomes() -> None:
         return
     if not pending:
         return
-    keep = {}
+    outcome = {}  # approval id -> (entry seen, entry to keep or None)
     for aid, rec in pending.items():
         if _write_buy_outcome(int(aid), rec):
             log.info(f"[{rec['ticker']}] reconcile: queued outcome {rec['kind']} for approval {aid} done")
+            outcome[aid] = (rec, None)
             continue
         tries = int(rec.get("tries", 0)) + 1
         if tries < _OUTCOME_MAX_TRIES:
-            keep[aid] = {**rec, "tries": tries}
+            outcome[aid] = (rec, {**rec, "tries": tries})
             continue
         log.error(f"[{rec['ticker']}] reconcile: outcome {rec['kind']} for approval {aid} gave up "
                   f"after {tries} tries")
         try:
             import alerts
-            alerts._send(f"⚠️ OUTCOME NOT RECORDED — <b>{rec['ticker']}</b>\nA late-filled BUY "
-                         f"(approval {aid}) could not be written to trade_outcomes after {tries} tries. "
+            alerts._send(f"⚠️ OUTCOME NOT RECORDED — <b>{rec['ticker']}</b>\nA filled BUY "
+                         f"(approval {aid}) could not be written to trade_outcomes for ~2 h. "
                          f"Trading is unaffected; the research record needs a manual fix.")
         except Exception:
             pass
+        outcome[aid] = (rec, None)
+
+    def apply(current):
+        for aid, (seen, keep) in outcome.items():
+            if current.get(aid) != seen:
+                continue  # re-queued while we worked: the newer entry stays
+            if keep is None:
+                current.pop(aid, None)
+            else:
+                current[aid] = keep
+        return current
     try:
-        db.set_state(_OUTCOME_STATE_KEY, json.dumps(keep))
+        _reprotect_queue_edit(apply, key=_OUTCOME_STATE_KEY)
     except Exception as e:
         log.error(f"reconcile: could not save the outcome retry queue: {e}")
 

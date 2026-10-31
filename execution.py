@@ -1243,7 +1243,13 @@ def execute_approved(
         # outcome row right after close_trade_outcome closed the BUY's row,
         # and nothing ever closed it.
         if side == "BUY":
-            log_buy_outcome(approval, ticker, action, current_price)
+            # A failed write is queued for reconcile to retry (professor M125).
+            try:
+                from tasks import _apply_buy_outcome
+                _apply_buy_outcome(approval["id"], {"kind": "insert", "ticker": ticker, "action": action,
+                                                    "entry_price": current_price}, approval)
+            except Exception as e:
+                log.error(f"[{ticker}] outcome row write/queue failed: {e}")
 
         # Send trade alert — full rationale + all conviction scores + bucket,
         # not just the bare fill details, per explicit user request.

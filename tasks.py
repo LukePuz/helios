@@ -1211,6 +1211,12 @@ def _deferred_buy_shares_now(approval: dict) -> int | None:
         rm = RiskManager(ibkr.get_client())
         sizing = rm.size_position(approval["ticker"], int(approval.get("conviction") or 5),
                                   bucket, regime, float(price))
+        if sizing.get("halt_unknown") is True:
+            # One unreadable check mustn't expire the buy for good; execution
+            # re-checks the halt and leaves it FAILED if it still can't.
+            log.warning(f"retry_deferred_entry: [{approval.get('ticker')}] halt check "
+                        f"unreadable, keeping the approved size")
+            return None
         return rm.shares_after_concentration(approval["ticker"], sizing, bucket)
     except Exception as e:
         log.warning(f"retry_deferred_entry: [{approval.get('ticker')}] re-size failed, "
@@ -3710,9 +3716,10 @@ def check_portfolio_drawdown(self):
                             f"high-water mark on {implausible} checks in a row.\n"
                             f"Either the baseline is stale or the account really fell. Check TWS. "
                             f"If the value is right and the baseline is stale, send /rebase to "
-                            f"make it the new high-water mark and resume; /resume lifts the halt "
-                            f"without touching the baseline, and the halt returns after 3 more low "
-                            f"reads (about 90 min) while the value stays under half of it."
+                            f"make it the new high-water mark and resume. /resume clears the flag "
+                            f"without touching the baseline, but each buy still re-checks and is "
+                            f"blocked while the value reads under half of it, and the halt returns "
+                            f"after 3 more low reads (about 90 min)."
                         )
                     except Exception:
                         pass

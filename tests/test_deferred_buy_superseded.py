@@ -114,3 +114,15 @@ def test_recheck_uses_sizing_and_caps():
          patch("risk_manager.RiskManager", return_value=rm):
         assert tasks._deferred_buy_shares_now(_sized_approval()) == 3
     assert rm.size_position.call_args.args == ("SNOW", 7, "Accelerator", "Neutral", 100.0)
+
+
+def test_an_unreadable_halt_check_does_not_expire_the_buy():
+    """Audit A1031-1053-2 follow-up: one bad read mustn't drop a deferred buy for good."""
+    from unittest.mock import MagicMock
+    rm = MagicMock()
+    rm.size_position.return_value = {"shares_initial": 0, "halt_unknown": True}
+    with patch("ibkr.get_client"), \
+         patch("agents.market_regime.get_cached_regime", return_value={"regime": "Neutral"}), \
+         patch("risk_manager.RiskManager", return_value=rm):
+        assert tasks._deferred_buy_shares_now(_sized_approval()) is None
+    rm.shares_after_concentration.assert_not_called()

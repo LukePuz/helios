@@ -184,7 +184,21 @@ class TestHaltCheckFailsClosed:
              patch("alerts._send"):
             mock_rm_cls.return_value.is_halted.side_effect = RuntimeError("db down")
             result = execution.execute_approved(approval)
-        assert result is False
+        assert result is False and execution.last_outcome_reason() == "blocked: halt check failed"
+        mock_order.assert_not_called()
+
+    def test_an_unreadable_halt_check_blocks_with_its_own_reason(self):
+        approval = _approval(action="ADD", price_at_sizing=100.0)
+        with patch("ibkr.get_ib"), \
+             patch("ibkr.get_client"), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("ibkr.place_market_order") as mock_order, \
+             patch("alerts._send") as send:
+            mock_rm_cls.return_value.is_halted.return_value = True
+            mock_rm_cls.return_value.halt_unknown = True
+            result = execution.execute_approved(approval)
+        assert result is False and execution.last_outcome_reason() == "blocked: halt check unreadable"
+        assert "No halt is set" in send.call_args[0][0]
         mock_order.assert_not_called()
 
 

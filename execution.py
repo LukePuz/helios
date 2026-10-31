@@ -633,6 +633,15 @@ def execute_approved(
                 from risk_manager import RiskManager
                 rm = RiskManager(ibkr.get_client())
                 if rm.is_halted():
+                    if getattr(rm, "halt_unknown", False) is True:
+                        log.error(f"[{ticker}] Order blocked — halt state or account value unreadable")
+                        alert_module._send(
+                            f"🛑 ORDER BLOCKED — halt check unreadable\n"
+                            f"<b>{ticker}</b> {action} was approved but not sent: the halt state or "
+                            f"the account value couldn't be read safely. No halt is set; "
+                            f"nothing to reset. Sells and stops are unaffected."
+                        )
+                        return _outcome("blocked: halt check unreadable")
                     log.error(f"[{ticker}] Order blocked — portfolio drawdown halt active")
                     alert_module._send(
                         f"🛑 ORDER BLOCKED — Drawdown Halt\n"
@@ -643,8 +652,16 @@ def execute_approved(
                     return _outcome("blocked: drawdown halt active")
             except Exception as halt_err:
                 # Fail closed: an unchecked halt must not let a buy through
-                # (A1031-1053-2). The approval can be retried.
+                # (A1031-1053-2). It ends FAILED; only a manual retry re-runs it.
                 log.warning(f"[{ticker}] Drawdown halt check failed: {halt_err} — blocking")
+                try:
+                    alert_module._send(
+                        f"🛑 ORDER BLOCKED — halt check failed\n"
+                        f"<b>{ticker}</b> {action} was approved but not sent: the drawdown halt "
+                        f"check errored. No halt is set. Sells and stops are unaffected."
+                    )
+                except Exception:
+                    pass
                 return _outcome("blocked: halt check failed")
 
         if action in ("OPEN", "ADD"):

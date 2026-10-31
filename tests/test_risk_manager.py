@@ -212,7 +212,19 @@ class TestHalt:
              patch("db.set_state") as set_state:
             rm = risk_manager.RiskManager(client)
             assert rm.is_halted() is True
+            assert rm.halt_unknown is True
+            sizing = rm.size_position("NVDA", conviction=7, bucket="Accelerator", regime="Risk-On", price=100.0)
         set_state.assert_not_called()
+        assert sizing["shares_initial"] == 0 and sizing["halt_unknown"] is True
+        assert sizing["flags"][0].startswith("HALT CHECK BLOCKED")
+
+    def test_a_latched_halt_is_not_marked_unknown(self):
+        client = _make_client()
+        with patch("risk_manager.TRADING_ENV", "paper"), \
+             patch("db.get_state", side_effect=lambda k, d=None: {"trading_halted_paper": "true"}.get(k, d)):
+            rm = risk_manager.RiskManager(client)
+            sizing = rm.size_position("NVDA", conviction=7, bucket="Accelerator", regime="Risk-On", price=100.0)
+        assert sizing["halt_unknown"] is False and sizing["flags"][0].startswith("HALTED")
 
 
 class TestConcentrationFailsClosed:

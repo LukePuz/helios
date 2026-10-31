@@ -190,6 +190,9 @@ class RiskManager:
         self._client = client
         account = self._get_account()
         self.start_value: float = start_value or float(account.portfolio_value)
+        # Set by is_halted(): True when it blocked because the state or the
+        # account read was unusable, not because a halt is latched.
+        self.halt_unknown: bool = False
 
     def _get_account(self) -> object:
         return self._client.get_account()
@@ -246,6 +249,7 @@ class RiskManager:
         actually for) -- silently disabling the drawdown halt, the single
         most important safety mechanism in the system, for live trading.
         """
+        self.halt_unknown = False
         # Persisted halt flag (set manually via /halt or by the drawdown task)
         try:
             import db
@@ -258,6 +262,7 @@ class RiskManager:
             # and the fallback baseline is the account value at construction,
             # so the drawdown would read as ~0. Not latched: this call only.
             log.warning(f"Halt state read failed ({e}) — treating as halted for this check")
+            self.halt_unknown = True
             return True
 
         current  = self.portfolio_value()
@@ -274,6 +279,7 @@ class RiskManager:
         if current <= 0 or current < 0.5 * baseline:
             log.warning(f"Implausible portfolio value ${current:,.2f} "
                        f"(baseline ${baseline:,.2f}) — blocking this buy, not latching a halt")
+            self.halt_unknown = True
             return True
 
         drawdown = (baseline - current) / baseline
@@ -330,9 +336,10 @@ class RiskManager:
             flags                — list of warning strings
         """
         if self.is_halted():
+            flag = ("HALT CHECK BLOCKED — halt state or account value unreadable (no halt latched)"
+                    if self.halt_unknown else "HALTED — portfolio drawdown limit reached")
             return {"position_size_pct": 0, "dollar_amount": 0, "shares_initial": 0,
-                    "cash_blocked": False,
-                    "flags": ["HALTED — portfolio drawdown limit reached"]}
+                    "cash_blocked": False, "halt_unknown": self.halt_unknown, "flags": [flag]}
 
         pv     = self.portfolio_value()
         limits = get_active_limits(pv)

@@ -1954,6 +1954,7 @@ class TestRetryHeldSell:
         ex, upd, _ = self._run(market=False)
         ex.assert_not_called()
         assert upd.call_args.kwargs["reason"].endswith("not retried: market closed")
+        assert upd.call_args.args[1] == "FAILED"
 
     def test_no_retry_when_nothing_is_held(self):
         ex, upd, _ = self._run(held=0.0)
@@ -1969,6 +1970,7 @@ class TestRetryHeldSell:
         ex, upd, _ = self._run(newer=None)
         ex.assert_not_called()
         assert upd.call_args.kwargs["reason"].endswith("not retried: newer-activity check failed")
+        assert upd.call_args.args[1] == "FAILED"
 
     def test_a_failed_position_read_is_noted(self):
         from unittest.mock import MagicMock
@@ -1983,6 +1985,7 @@ class TestRetryHeldSell:
             tasks.retry_held_sell.run(81)
         ex.assert_not_called()
         assert upd.call_args.kwargs["reason"].endswith("not retried: position read failed")
+        assert upd.call_args.args[1] == "FAILED"
 
     def test_a_lost_claim_on_a_skip_writes_nothing(self):
         ex, upd, _ = self._run(market=False, claim=None)

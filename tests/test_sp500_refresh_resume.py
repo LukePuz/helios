@@ -55,6 +55,20 @@ def test_a_no_op_catchup_records_no_heartbeat():
     ok.assert_called_once_with("sp500_history", 12)
 
 
+def test_a_weekly_run_that_advanced_nothing_records_no_heartbeat():
+    import tasks
+    with patch("tasks._run_singleton", side_effect=lambda name, fn, **k: fn()), \
+         patch("ingestion.price_history.refresh_sp500_price_history", return_value=0), \
+         patch("tasks._heartbeat_ok") as ok:
+        tasks.refresh_sp500_history.run()
+    ok.assert_not_called()
+    with patch("tasks._run_singleton", side_effect=lambda name, fn, **k: fn()), \
+         patch("ingestion.price_history.refresh_sp500_price_history", return_value=400), \
+         patch("tasks._heartbeat_ok") as ok:
+        tasks.refresh_sp500_history.run()
+    ok.assert_called_once_with("sp500_history", 400)
+
+
 def test_only_tickers_whose_newest_bar_moved_count_as_updated():
     """Professor M141: a re-written stale bar must not count."""
     newest = {"STUCK": date(2026, 10, 16), "MOVES": date(2026, 10, 16)}

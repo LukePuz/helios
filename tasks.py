@@ -3157,7 +3157,13 @@ def refresh_sp500_history(self):
         def run():
             count = refresh_sp500_price_history()
             log.info(f"S&P 500 price history refreshed: {count} tickers updated")
-            _heartbeat_ok("sp500_history", count)
+            # 0 means no ticker's newest bar advanced (a current cache is
+            # skipped, so this is Yahoo serving stale bars or failing): leave
+            # the last heartbeat to age into the staleness alert.
+            if count:
+                _heartbeat_ok("sp500_history", count)
+            else:
+                log.warning("S&P 500 price history: no ticker advanced; heartbeat not recorded")
         # One run at a time with the weekday catch-up (ingestion runs 4 wide).
         _run_singleton("sp500_history", run, max_hold_s=_SP500_REFRESH_HOLD_S)
     except Exception as e:

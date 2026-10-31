@@ -2985,6 +2985,39 @@ def poll_options_flow(self):
         raise self.retry(exc=e, countdown=60)
 
 
+def _log_would_reassess(live_vix: float) -> None:
+    """Log-only (audit A1031-1453-2): the intraday VIX-shock reassessment is
+    dead code (should_reassess reads a process cache the ingestion worker
+    never fills). Record when it would have fired: live ^VIX more than 5
+    points (should_reassess's threshold) from the newest overall regime row.
+    One activity_feed row per stored regime row. Market data only."""
+    try:
+        import math
+        import db
+        from config import TRADING_ENV
+        if not math.isfinite(live_vix):
+            return
+        row = db.get_latest_regime()
+        if not row or not str(row.get("regime_source", "overall")).startswith("overall"):
+            return
+        stored = ((row.get("signals_json") or {}).get("volatility") or {}).get("vix")
+        if stored is None or abs(live_vix - float(stored)) <= 5:
+            return
+        row_at = str(row.get("timestamp"))
+        key = f"would_reassess_logged_{TRADING_ENV}"
+        if db.get_state(key, "") == row_at:
+            return
+        db.set_state(key, row_at)
+        db.log_activity("regime_shadow", "", f"would reassess: live VIX {live_vix:.1f} vs "
+                        f"{float(stored):.1f} at the last regime row", "alert",
+                        {"would_reassess": True, "live_vix": round(live_vix, 2),
+                         "stored_vix": round(float(stored), 2),
+                         "delta": round(live_vix - float(stored), 2),
+                         "regime": row.get("regime"), "regime_row_at": row_at})
+    except Exception as e:
+        log.debug(f"would_reassess log failed: {e}")
+
+
 @app.task(name="tasks.poll_macro", bind=True, max_retries=3)
 def poll_macro(self):
     """Fetches macro snapshot, stores in vector memory, and triggers intraday regime reassessment if VIX spikes."""
@@ -3017,6 +3050,8 @@ def poll_macro(self):
         try:
             from agents.market_regime import should_reassess, assess_regime, get_intraday_vix
             vix = get_intraday_vix()
+            if vix:
+                _log_would_reassess(vix)
             if vix and should_reassess(vix):
                 log.info(f"Intraday VIX shift detected ({vix:.1f}) — reassessing market regime")
                 assess_regime()

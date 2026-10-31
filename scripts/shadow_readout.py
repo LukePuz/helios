@@ -71,6 +71,7 @@ def main() -> None:
     conn = db._get_conn()
     try:
         with conn.cursor() as cur:
+            cur.execute("SET TRANSACTION READ ONLY")   # this transaction only, not the pooled conn
             cur.execute("SELECT signal, provenance, decision FROM signals "
                         "WHERE trading_env=%s AND timestamp >= NOW() - make_interval(days => %s)",
                         (TRADING_ENV, args.days))

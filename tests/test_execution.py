@@ -1195,7 +1195,7 @@ def test_manual_orders_get_an_orders_row():
     assert kw.get("decision_price") is None and not fill.called
     r, log_order, fill = run({"order_id": 78, "fill_price": 100.0, "filled_qty": 2})
     assert r["success"] and log_order.call_args.kwargs["status"] == "submitted"
-    fill.assert_called_once_with(5, 100.0, 2.0, "partial")
+    fill.assert_called_once_with(5, 100.0, 2.0, "partial", filled_at=None)
 
 
 def test_manual_buy_intent_says_open_when_nothing_held():
@@ -1286,7 +1286,7 @@ def test_manual_fill_without_a_price_still_marks_the_order_filled():
         rm_cls.return_value.is_halted.return_value = False
         rm_cls.return_value.calculate_stop.return_value = (92.0, "ATR")
         execution.execute_manual("ZZZ", "BUY", 2, "test")
-    fill.assert_called_once_with(5, None, 2.0, "filled")
+    fill.assert_called_once_with(5, None, 2.0, "filled", filled_at=None)
 
 
 def test_portfolio_updates_are_dropped_from_the_ib_async_log_but_order_status_is_kept():
@@ -1296,3 +1296,15 @@ def test_portfolio_updates_are_dropped_from_the_ib_async_log_but_order_status_is
     rec = lambda m: logging.LogRecord("ib_async.wrapper", logging.INFO, "", 0, m, None, None)
     assert not f.filter(rec("updatePortfolio: PortfolioItem(...)"))
     assert f.filter(rec("orderStatus: Trade(...)"))
+
+
+@pytest.mark.parametrize("trigger, label", [
+    ("auto", "auto-executed"),
+    ("telegram", "approved via Telegram"),
+    ("auto_retry", "executed on a deferred retry"),
+    ("held_sell_retry", "executed on a held-sell retry"),
+])
+def test_every_execution_trigger_has_its_own_reason_label(trigger, label):
+    """Professor M134: retries used to read "approved via Telegram"."""
+    assert execution._TRIGGER_LABELS[trigger] == label
+    assert len(set(execution._TRIGGER_LABELS.values())) == len(execution._TRIGGER_LABELS)

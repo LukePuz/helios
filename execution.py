@@ -192,6 +192,14 @@ def _queue_stop_for_retry(ticker: str, qty: float, stop_price: float, alert: boo
 # Order states after which nothing can fill (ib_async OrderStatus).
 _DEAD_ORDER_STATUSES = ("Cancelled", "ApiCancelled", "Inactive")
 
+# How each execute_approved trigger reads in trades.reason (professor M134).
+_TRIGGER_LABELS = {
+    "auto": "auto-executed",
+    "telegram": "approved via Telegram",
+    "auto_retry": "executed on a deferred retry",
+    "held_sell_retry": "executed on a held-sell retry",
+}
+
 
 def _restore_stop_after_failed_sell(ticker: str) -> None:
     """A TRIM/EXIT cancels the broker stop before its market SELL. If the
@@ -569,10 +577,12 @@ def execute_approved(
     """
     Submit the approved order to IBKR via TWS, log the trade and stop.
 
-    trigger distinguishes how this fired, purely for the trades.reason
-    audit trail: "auto" for the crew.py pipeline (no human ever saw this),
-    "telegram" for an actual Approve-button tap. Everything else about
-    execution is identical regardless of trigger.
+    trigger names how this fired, for the trades.reason audit trail
+    (_TRIGGER_LABELS): "auto" for the crew.py pipeline (no human ever saw
+    this), "telegram" for an actual Approve-button tap, "auto_retry" for
+    tasks.retry_deferred_entry and "held_sell_retry" for tasks.retry_held_sell.
+    The one behavior difference: a held_sell_retry that is held again is not
+    re-scheduled (_schedule_held_sell_retry).
 
     gap_retry_attempt counts opening-gap-confirmation re-checks (see the
     gap-confirmation block below and tasks.retry_deferred_entry).
@@ -1109,12 +1119,7 @@ def execute_approved(
         # even for fully autonomous crew.py executions no human ever saw.
         # Every trigger named: the retries used to read "approved via Telegram"
         # too (professor M134). A deferred retry may come from either path.
-        trigger_label = {
-            "auto": "auto-executed",
-            "telegram": "approved via Telegram",
-            "auto_retry": "executed on a deferred retry",
-            "held_sell_retry": "executed on a held-sell retry (held_sell_retry)",
-        }.get(trigger, f"executed (trigger={trigger})")
+        trigger_label = _TRIGGER_LABELS.get(trigger, f"executed (trigger={trigger})")
         db.log_trade(
             symbol=ticker,
             side=side,
@@ -1143,7 +1148,8 @@ def execute_approved(
                 # rather than leaving the row 'submitted' (professor run 17).
                 partial = not bracket_used and filled_qty < float(shares) - 1e-6
                 db.update_order_fill(local_order_id, order_result.get("fill_price"),
-                                     filled_qty, "partial" if partial else "filled")
+                                     filled_qty, "partial" if partial else "filled",
+                                     filled_at=order_result.get("fill_time"))
         except Exception as e:
             log.debug(f"[{ticker}] Order/slippage logging failed (non-critical): {e}")
 
@@ -1162,7 +1168,8 @@ def execute_approved(
                 else:
                     try:
                         db.close_trade_outcome(ticker, exit_price=current_price, exit_source="model_exit",
-                                              exit_price_source=price_source)
+                                              exit_price_source=price_source,
+                                              exit_fill_at=order_result.get("fill_time"))
                     except Exception as e:
                         log.warning(f"[{ticker}] close_trade_outcome failed: {e}")
             else:  # TRIM — re-place stop at same price for remaining quantity
@@ -1200,7 +1207,8 @@ def execute_approved(
                     db.delete_position_stop(ticker)
                     try:
                         db.close_trade_outcome(ticker, exit_price=current_price, exit_source="model_trim_last",
-                                              exit_price_source=price_source)
+                                              exit_price_source=price_source,
+                                              exit_fill_at=order_result.get("fill_time"))
                     except Exception as e:
                         log.warning(f"[{ticker}] close_trade_outcome failed: {e}")
 
@@ -1515,7 +1523,8 @@ def execute_manual(
             # A part fill stays 'partial' so reconcile books the rest (M53);
             # a fill confirmed without a price is recorded with none.
             db.update_order_fill(local_order_id, order_result.get("fill_price"), filled_qty,
-                                 "partial" if filled_qty < float(qty) - 1e-6 else "filled")
+                                 "partial" if filled_qty < float(qty) - 1e-6 else "filled",
+                                 filled_at=order_result.get("fill_time"))
     except Exception as e:
         log.debug(f"[{ticker}] Manual order logging failed (non-critical): {e}")
 
@@ -1531,7 +1540,8 @@ def execute_manual(
             db.delete_position_stop(ticker)
             try:
                 db.close_trade_outcome(ticker, exit_price=fill_price, exit_source="manual_sell",
-                                       exit_price_source="fill" if order_result.get("fill_price") else "quote")
+                                       exit_price_source="fill" if order_result.get("fill_price") else "quote",
+                                       exit_fill_at=order_result.get("fill_time"))
             except Exception:
                 pass  # no open outcome row is expected for positions not opened via approval
         else:

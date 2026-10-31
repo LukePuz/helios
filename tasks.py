@@ -2631,7 +2631,8 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
                                     intent="BACKSTOP")
             if local_id and local_id > 0:
                 db.update_order_fill(local_id, result.get("fill_price"), filled,
-                                     "filled" if filled >= owned - 1e-6 else "partial")
+                                     "filled" if filled >= owned - 1e-6 else "partial",
+                                     filled_at=result.get("fill_time"))
         except Exception as e:
             log.warning(f"[{ticker}] Backstop sale order logging failed: {e}")
         # Shares under a stuck stop, or under our working SELL, are still
@@ -2653,7 +2654,8 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
                 db.delete_position_stop(ticker)
                 try:
                     db.close_trade_outcome(ticker, exit_price=fill_price, exit_source="backstop_sell",
-                                           exit_price_source="fill" if result.get("fill_price") else "quote")
+                                           exit_price_source="fill" if result.get("fill_price") else "quote",
+                                           exit_fill_at=result.get("fill_time"))
                 except Exception as e:
                     log.error(f"[{ticker}] close_trade_outcome failed after the backstop sell: {e}")  # m98
         log.warning(f"[{ticker}] BACKSTOP SELL executed: {filled} shares @ ~${fill_price:.2f}")

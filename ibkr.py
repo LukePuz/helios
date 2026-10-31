@@ -372,7 +372,9 @@ def place_market_order(ticker: str, side: str, qty: float, fill_timeout: float =
                 log.error(f"Failed to cancel stale {side.upper()} {ticker} order "
                           f"(orderId={trade.order.orderId}) after market-closed check: {e}")
 
-    return {
+    # fill_time from the executions, so an immediate close records when it
+    # filled, not only problem orders that reconcile later (professor m128).
+    return _with_fill_time({
         "order_id":   trade.order.orderId,
         # Assigned by TWS after placeOrder, so 0 until its first status
         # message; read after the fill wait (professor M127). openOrder sets
@@ -385,7 +387,7 @@ def place_market_order(ticker: str, side: str, qty: float, fill_timeout: float =
         "filled_qty": filled_qty,
         "fill_price": fill_price,
         "status":     status,
-    }
+    }, getattr(trade, "fills", None) or [])
 
 
 def _compute_marketable_limit(ib: ibi.IB, contract: ibi.Stock, side: str,

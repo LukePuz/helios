@@ -106,6 +106,28 @@ class TestPlaceMarketOrderWaitTiming:
                  patch("ibkr.ibi.MarketOrder", return_value=_FakeOrder()):
                 assert ibkr.place_market_order("NVDA", "BUY", 10, fill_timeout=5.0)["perm_id"] == expect
 
+    def test_returns_the_last_execution_time_as_fill_time(self):
+        """Professor m128: an immediate close records when it filled, from
+        the trade's own executions; no executions means no fill_time."""
+        from datetime import datetime, timezone
+        from types import SimpleNamespace
+        t1 = datetime(2026, 11, 2, 14, 31, 5, tzinfo=timezone.utc)
+        t2 = datetime(2026, 11, 2, 14, 31, 9, tzinfo=timezone.utc)
+        for fills, expect in (([SimpleNamespace(execution=SimpleNamespace(time=t2)),
+                                SimpleNamespace(execution=SimpleNamespace(time=t1))], t2), ([], None)):
+            fake_ib = MagicMock()
+            fake_trade = _FakeTrade()
+            fake_trade.isDone = MagicMock(return_value=True)
+            fake_trade.orderStatus.status = "Filled"
+            fake_trade.orderStatus.filled = 10.0
+            fake_trade.orderStatus.avgFillPrice = 181.30
+            fake_trade.fills = fills
+            fake_ib.placeOrder.return_value = fake_trade
+            with patch("ibkr.get_ib", return_value=fake_ib), \
+                 patch("ibkr._stock", return_value=MagicMock()), \
+                 patch("ibkr.ibi.MarketOrder", return_value=_FakeOrder()):
+                assert ibkr.place_market_order("NVDA", "BUY", 10, fill_timeout=5.0).get("fill_time") == expect
+
 
 class TestCancelOrderPollsForTerminalStatus:
     """Regression coverage for the 2026-08-04 MRVL incident: cancel_order

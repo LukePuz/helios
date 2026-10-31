@@ -2055,7 +2055,7 @@ def test_sweep_stuck_processing_sql():
         assert db.sweep_stuck_processing(60) == [(81, "AMD", "EXIT")]
     sql, params = cur.execute.call_args[0]
     assert "status='PROCESSING'" in sql and "SET status='FAILED'" in sql and "decided_at <" in sql
-    assert params[-1] == 60 and "swept" in params[0]
+    assert params[-1] == 60 and "swept" in params[0] and params[1] == db.TRADING_ENV
 
 
 def test_held_sell_retry_leaves_a_final_status_when_execution_raises():

@@ -173,7 +173,7 @@ def test_backstop_sale_gets_an_orders_row_and_a_part_fill_waits_for_reconcile():
             assert tasks._execute_backstop_sell("AMD", TestBackstopSellReads._alert) is True
         assert log_order.call_args.kwargs["intent"] == "BACKSTOP"
         assert log_order.call_args.kwargs["broker_order_id"] == 77
-        upd.assert_called_once_with(5, 140.0, filled, status)
+        upd.assert_called_once_with(5, 140.0, filled, status, filled_at=None)
         assert close.called is closes
         # A part fill keeps the stop record: a broker-cancelled remainder
         # leaves held shares the next cycle must see (professor, M128 class).

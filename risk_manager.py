@@ -1706,7 +1706,8 @@ class RiskManager:
             if local_id and local_id > 0 and order_result.get("fill_price"):
                 # A remainder may still fill: reconcile picks up 'partial' (M53).
                 db.update_order_fill(local_id, order_result["fill_price"], filled,
-                                     "filled" if filled >= float(sell_qty) - 1e-6 else "partial")
+                                     "filled" if filled >= float(sell_qty) - 1e-6 else "partial",
+                                     filled_at=order_result.get("fill_time"))
         except Exception as e:
             log.warning(f"[{ticker}] Profit-target sale logging failed: {e}")
 

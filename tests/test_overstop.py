@@ -177,6 +177,28 @@ def test_backstop_sale_gets_an_orders_row_and_a_part_fill_waits_for_reconcile():
         assert close.called is closes
 
 
+def test_backstop_does_not_sell_shares_a_working_sell_already_covers():
+    """Review of 16009ad: a second backstop while the first one's remainder
+    was still working would short once both filled."""
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="AMD", qty=10)]
+    working = [{"order_id": 77, "ticker": "AMD", "action": "SELL", "order_type": "MKT",
+                "qty": 10.0, "stop_price": None, "status": "Submitted", "remaining": 4.0}]
+    for open_orders, sold in ((working, 6.0), ([{**working[0], "remaining": 10.0}], None)):
+        with patch("ibkr.get_client", return_value=client), \
+             patch("tasks.manage_cancel_stop_orders_for"), \
+             patch("ibkr.get_open_orders", return_value=open_orders), \
+             patch("ibkr.place_market_order",
+                   return_value={"order_id": 78, "filled_qty": 6, "fill_price": 140.0}) as order, \
+             patch("db.log_trade"), patch("db.delete_position_stop"), patch("db.log_order", return_value=5), \
+             patch("db.update_order_fill"), patch("db.close_trade_outcome"), patch("alerts._send"):
+            tasks._execute_backstop_sell("AMD", TestBackstopSellReads._alert)
+        if sold is None:
+            order.assert_not_called()
+        else:
+            order.assert_called_once_with("AMD", "SELL", sold)
+
+
 def test_cancel_failure_in_overcover_returns_a_line_not_a_crash():
     """A0253-7: label was unbound when the cancel raised."""
     client = MagicMock()

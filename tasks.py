@@ -2090,6 +2090,16 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
             owned = round(owned - resting, 4)
             if owned <= 0:
                 return False
+        # A SELL of ours still working (an earlier backstop's or an EXIT's
+        # remainder) will sell its shares; selling them again would short
+        # once both fill (review of 16009ad). Same remainder rule as stops.
+        working = sum(float(o["qty"]) for o in _resting_sell_stops(ticker, types=("MKT", "LMT")))
+        if working > 0:
+            log.warning(f"[{ticker}] Backstop: a SELL for {working:g} shares is still working; "
+                        f"selling only what it doesn't cover")
+            owned = round(owned - working, 4)
+            if owned <= 0:
+                return False
         stop_lock.assert_held(ticker)  # professor M69
         result = ibkr.place_market_order(ticker, "SELL", owned)
         filled = float(result.get("filled_qty") or 0)

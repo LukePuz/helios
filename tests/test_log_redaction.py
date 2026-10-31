@@ -21,3 +21,25 @@ def test_installed_factory_redacts_formatted_args(caplog):
 
 def test_ordinary_text_untouched():
     assert log_redaction.redact("NVDA UDR 2.5 at 05:00, order 14") == "NVDA UDR 2.5 at 05:00, order 14"
+
+
+def test_query_string_credentials_are_redacted():
+    """Audit A1031-0253-5: FRED errors logged the full URL with api_key."""
+    import log_redaction
+    url = ("502 Server Error for url: https://api.stlouisfed.org/fred/series/observations"
+           "?series_id=DEXUSEU&api_key=abc123DEF456&file_type=json")
+    out = log_redaction.redact(url)
+    assert "abc123DEF456" not in out and "api_key=[REDACTED]&file_type=json" in out
+    assert log_redaction.redact("x?apikey=Q1&access_token=Z9 y") == "x?apikey=[REDACTED]&access_token=[REDACTED] y"
+
+
+def test_fred_failure_logs_no_url(caplog):
+    import requests
+    from unittest.mock import MagicMock, patch
+    from ingestion import macro
+    err = requests.HTTPError("502 Server Error for url: https://x/?api_key=SECRETKEY1")
+    err.response = MagicMock(status_code=502)
+    with patch.object(macro, "FRED_API_KEY", "SECRETKEY1"), \
+         patch("requests.get", side_effect=err), caplog.at_level("WARNING"):
+        assert macro._fetch_series("DEXUSEU") == []
+    assert "SECRETKEY1" not in caplog.text and "HTTP 502" in caplog.text

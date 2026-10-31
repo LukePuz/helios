@@ -12,6 +12,9 @@ import re
 _PATTERNS = [
     (re.compile(r"bot\d{6,}:[A-Za-z0-9_-]{20,}"), "bot[REDACTED]"),
     (re.compile(r"\b[UD]U?\d{7,8}\b"), "[ACCOUNT]"),
+    # Credentials in a query string: FRED's api_key rode along in every
+    # requests error message (audit A1031-0253-5).
+    (re.compile(r"(?i)\b(api_?key|access_token|token)=[^&\s'\"]+"), r"\1=[REDACTED]"),
 ]
 
 

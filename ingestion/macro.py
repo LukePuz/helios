@@ -56,7 +56,11 @@ def _fetch_series(series_id: str, lookback_days: int = 30, limit: int = 5) -> li
         resp.raise_for_status()
         return resp.json().get("observations", [])
     except Exception as e:
-        log.warning(f"FRED fetch failed for {series_id}: {e}")
+        # Not the exception text: it carries the request URL, api_key included
+        # (audit A1031-0253-5).
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        log.warning(f"FRED fetch failed for {series_id}: {type(e).__name__}"
+                    + (f" (HTTP {status})" if status else ""))
         return []
 
 

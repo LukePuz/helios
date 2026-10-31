@@ -380,3 +380,43 @@ def test_queued_reprotect_places_no_stop_on_a_short():
                                                 from_queue=True) is None
     place.assert_not_called(); cancel.assert_not_called()
     assert "SHORT" in send.call_args[0][0]
+
+
+def _queued_flat(intent, unconfirmed=(), outcomes=({"ticker": "CRWD"},), stop=None):
+    client = MagicMock()
+    client.get_all_positions.return_value = []
+    with patch("ibkr.get_client", return_value=client), \
+         patch("db.get_position_stop", return_value=stop), \
+         patch("db.get_open_outcomes", return_value=list(outcomes)), \
+         patch("db.get_unconfirmed_orders", return_value=list(unconfirmed)), \
+         patch("db.recorded_sell_order_ids", return_value={7}), \
+         patch("ibkr.get_recent_sell_fill", return_value={"filled_qty": 20.0, "fill_price": 171.0}) as fill, \
+         patch("db.log_trade") as trade, patch("db.close_trade_outcome") as close, \
+         patch("db.flag_orphan_outcomes_for"), patch("alerts._send"):
+        r = tasks._reprotect_after_late_sell("CRWD", {"intent": intent}, 175.0, from_queue=True)
+    return r, fill, trade, close
+
+
+def test_queued_flat_exit_is_closed_from_todays_unrecorded_sells():
+    """Professor M124: the part-filled EXIT deleted the stop record, so the
+    stale-stop branch never ran and the outcome became a sweep orphan."""
+    r, fill, trade, close = _queued_flat("EXIT")
+    assert r is None
+    fill.assert_called_once_with("CRWD", {7})
+    trade.assert_called_once()
+    close.assert_called_once_with("CRWD", exit_price=171.0, exit_source="broker_exit", exit_price_source="fill")
+
+
+def test_queued_flat_exit_waits_while_a_sell_is_still_reconciling_or_a_record_exists():
+    from datetime import datetime, timezone
+    sell = {"ticker": "CRWD", "side": "SELL", "created_at": datetime.now(timezone.utc)}
+    for kw in ({"unconfirmed": [sell]}, {"stop": {"stop_price": 150.0}}, {"outcomes": []}):
+        _, fill, _, close = _queued_flat("BACKSTOP", **kw)
+        fill.assert_not_called()
+        close.assert_not_called()
+
+
+def test_queued_flat_trim_still_leaves_the_close_to_the_stale_branch():
+    _, fill, _, close = _queued_flat("TRIM")
+    fill.assert_not_called()
+    close.assert_not_called()

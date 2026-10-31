@@ -3237,10 +3237,12 @@ def _get_stale_ingestion_sources() -> list[str]:
     from datetime import datetime, timezone
 
     # Expected max gap per source, generously above its beat schedule interval
+    # (sp500_history: 8 days, as a weekly run ends ~2.6 h after it starts and a
+    # later finish than the week before must not read as stale).
     expected_minutes = {
         "edgar": 20, "options_flow": 15, "macro": 90, "arxiv": 1560,
         "congressional": 400, "insider": 60, "news": 30, "fundamentals": 1560,
-        "price_history": 1560, "sp500_history": 10080, "analyst_ratings": 60,
+        "price_history": 1560, "sp500_history": 11520, "analyst_ratings": 60,
         "candidate_scan": 10080,
     }
 

@@ -3029,6 +3029,26 @@ def get_unconfirmed_orders(max_age_hours: int = 24) -> list[dict]:
         _put_conn(conn)
 
 
+def get_order_fill_state(order_id: int) -> dict | None:
+    """status, fill_price, filled_qty and broker_order_id of one orders row
+    (professor M124), or None if there is no such row. Raises on error."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT status, fill_price, filled_qty, broker_order_id FROM orders "
+                        "WHERE id=%s AND trading_env=%s", (order_id, TRADING_ENV))
+            r = cur.fetchone()
+        if not r:
+            return None
+        return {"status": r[0], "fill_price": float(r[1]) if r[1] is not None else None,
+                "filled_qty": float(r[2]) if r[2] is not None else 0.0, "broker_order_id": r[3]}
+    except Exception as e:
+        logging.error(f"get_order_fill_state failed: {e}")
+        raise
+    finally:
+        _put_conn(conn)
+
+
 def get_recent_orders(limit: int = 50) -> list[dict]:
     conn = _get_conn()
     try:

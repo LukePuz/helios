@@ -382,41 +382,63 @@ def test_queued_reprotect_places_no_stop_on_a_short():
     assert "SHORT" in send.call_args[0][0]
 
 
-def _queued_flat(intent, unconfirmed=(), outcomes=({"ticker": "CRWD"},), stop=None):
+
+def _queued_flat(intent, row, open_orders=(), stop=None, order_id=5):
     client = MagicMock()
     client.get_all_positions.return_value = []
     with patch("ibkr.get_client", return_value=client), \
          patch("db.get_position_stop", return_value=stop), \
-         patch("db.get_open_outcomes", return_value=list(outcomes)), \
-         patch("db.get_unconfirmed_orders", return_value=list(unconfirmed)), \
-         patch("db.recorded_sell_order_ids", return_value={7}), \
-         patch("ibkr.get_recent_sell_fill", return_value={"filled_qty": 20.0, "fill_price": 171.0}) as fill, \
-         patch("db.log_trade") as trade, patch("db.close_trade_outcome") as close, \
-         patch("db.flag_orphan_outcomes_for"), patch("alerts._send"):
-        r = tasks._reprotect_after_late_sell("CRWD", {"intent": intent}, 175.0, from_queue=True)
-    return r, fill, trade, close
+         patch("db.get_order_fill_state", **({"side_effect": row} if isinstance(row, Exception)
+                                            else {"return_value": row})), \
+         patch("ibkr.get_open_orders", return_value=list(open_orders)), \
+         patch("ibkr.get_recent_sell_fill") as fill, \
+         patch("db.close_trade_outcome") as close, patch("alerts._send") as alert:
+        r = tasks._reprotect_after_late_sell("CRWD", {"intent": intent, "order_id": order_id}, 175.0,
+                                             from_queue=True)
+    fill.assert_not_called()   # never the execution-blend lookup
+    alert.assert_not_called()
+    return r, close
 
 
-def test_queued_flat_exit_is_closed_from_todays_unrecorded_sells():
+def test_queued_flat_exit_closes_at_its_orders_average_fill():
     """Professor M124: the part-filled EXIT deleted the stop record, so the
-    stale-stop branch never ran and the outcome became a sweep orphan."""
-    r, fill, trade, close = _queued_flat("EXIT")
+    stale-stop branch never closed the outcome."""
+    r, close = _queued_flat("EXIT", {"status": "filled", "fill_price": 171.5, "broker_order_id": 77})
     assert r is None
-    fill.assert_called_once_with("CRWD", {7})
-    trade.assert_called_once()
-    close.assert_called_once_with("CRWD", exit_price=171.0, exit_source="broker_exit", exit_price_source="fill")
+    close.assert_called_once_with("CRWD", exit_price=171.5, exit_source="late_exit", exit_price_source="fill")
 
 
-def test_queued_flat_exit_waits_while_a_sell_is_still_reconciling_or_a_record_exists():
-    from datetime import datetime, timezone
-    sell = {"ticker": "CRWD", "side": "SELL", "created_at": datetime.now(timezone.utc)}
-    for kw in ({"unconfirmed": [sell]}, {"stop": {"stop_price": 150.0}}, {"outcomes": []}):
-        _, fill, _, close = _queued_flat("BACKSTOP", **kw)
-        fill.assert_not_called()
+def test_queued_flat_exit_waits_while_its_remainder_works_or_a_lookup_fails():
+    row = {"status": "partial", "fill_price": 171.5, "broker_order_id": 77}
+    working = {"order_id": 77, "status": "Submitted"}
+    for kw in ({"row": row, "open_orders": [working]}, {"row": RuntimeError("db")}):
+        r, close = _queued_flat("BACKSTOP", **kw)
+        assert r == "wait"
         close.assert_not_called()
 
 
-def test_queued_flat_trim_still_leaves_the_close_to_the_stale_branch():
-    _, fill, _, close = _queued_flat("TRIM")
-    fill.assert_not_called()
+def test_queued_flat_exit_leaves_mixed_and_owned_cases_alone():
+    row = {"status": "partial", "fill_price": 171.5, "broker_order_id": 77}
+    for kw in ({"row": row, "open_orders": [{"order_id": 77, "status": "Cancelled"}]},   # mixed close
+               {"row": row, "stop": {"stop_price": 150.0}},                              # stale branch's
+               {"row": row, "order_id": None}):                                          # old entry
+        r, close = _queued_flat("EXIT", **kw)
+        assert r is None
+        close.assert_not_called()
+    r, close = _queued_flat("TRIM", {"status": "filled", "fill_price": 171.5, "broker_order_id": 77})
+    assert r is None
     close.assert_not_called()
+
+
+def test_retry_keeps_a_waiting_exit_without_counting_a_try():
+    import json
+    state = {tasks._REPROTECT_STATE_KEY: json.dumps({"CRWD": {"intent": "EXIT", "order_id": 5, "nonce": "n"}})}
+    with patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
+         patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+         patch("stop_lock._redis", side_effect=RuntimeError("no redis")), \
+         patch("tasks._reprotect_after_late_sell", return_value="wait"), \
+         patch("alerts._send") as alert:
+        tasks._retry_pending_reprotects()
+    kept = json.loads(state[tasks._REPROTECT_STATE_KEY])["CRWD"]
+    assert kept["waits"] == 1 and "tries" not in kept
+    alert.assert_not_called()

@@ -1394,7 +1394,7 @@ def _queue_reprotect(ticker: str, order: dict, fill_price: float | None) -> None
     # The nonce makes a re-queue with the same fields a different entry, so a
     # retry pass running meanwhile can't pop it as the one it saw (m36).
     entry = {"intent": order.get("intent"), "stop_price": order.get("stop_price"),
-             "fill_price": fill_price, "nonce": uuid.uuid4().hex}
+             "fill_price": fill_price, "order_id": order.get("id"), "nonce": uuid.uuid4().hex}
 
     def add(pending):
         old = pending.get(ticker) or {}
@@ -1528,6 +1528,53 @@ def _review_manual_actions() -> None:
 
 _REPROTECT_MAX_TRIES = 4  # reconcile_stop_orders cycles, 15 min apart (~1 h)
 _BUY_FLAT_MAX_TRIES = 2   # ~30 min for a new BUY's position to show up
+_EXIT_WAIT_MAX = 48       # 5-min reconcile runs a queued flat EXIT waits on its remainder (~4 h)
+
+
+def _close_queued_flat_exit(ticker: str, rec: dict) -> bool:
+    """A queued re-protect of a part-filled EXIT/BACKSTOP found the position
+    flat, and that sale deleted the stop record, so the stale-stop branch will
+    never close the outcome (professor M124). Returns True to keep waiting.
+    - Order row filled: close at its cumulative average fill.
+    - Remainder still working at the broker, or a lookup failed: wait.
+    - Remainder no longer working (something else sold the rest): the exit
+      price for that mix is an open question for Luke, so leave it as before.
+    close_trade_outcome only closes open rows not flagged orphaned."""
+    import db
+    import ibkr
+    oid = rec.get("order_id")
+    if not oid:
+        return False   # queued before this field existed
+    try:
+        if db.get_position_stop(ticker):
+            return False   # the stale-stop branch owns the close
+        row = db.get_order_fill_state(oid)
+    except Exception as e:
+        log.warning(f"[{ticker}] reconcile: queued flat EXIT lookup failed ({e}); waiting")
+        return True
+    if not row:
+        return False
+    if row["status"] == "filled" and row.get("fill_price"):
+        try:
+            db.close_trade_outcome(ticker, exit_price=row["fill_price"],
+                                   exit_source=f"late_{(rec.get('intent') or 'sell').lower()}",
+                                   exit_price_source="fill")
+        except Exception as e:
+            log.warning(f"[{ticker}] reconcile: close_trade_outcome failed: {e}; waiting")
+            return True
+        return False
+    if row["status"] in ("partial", "unconfirmed"):
+        try:
+            working = any(o.get("order_id") == row.get("broker_order_id")
+                          and o.get("status") not in _NOT_WORKING for o in ibkr.get_open_orders())
+        except Exception as e:
+            log.warning(f"[{ticker}] reconcile: open-order read failed ({e}); queued flat EXIT waiting")
+            return True
+        if working:
+            return True
+        log.warning(f"[{ticker}] reconcile: flat after a part-filled {rec.get('intent')} whose remainder "
+                    f"is no longer working; outcome left open (exit price for a mixed close is undecided)")
+    return False
 
 
 _OUTCOME_STATE_KEY = "buy_outcome_pending"
@@ -1635,93 +1682,6 @@ def _retry_pending_buy_outcomes() -> None:
         log.error(f"reconcile: could not save the outcome retry queue: {e}")
 
 
-def _reconcile_queued_flat_exit(ticker: str) -> None:
-    """The queued re-protect of a part-filled EXIT/BACKSTOP found the position
-    flat (professor M124). Waits (does nothing) while the stop record exists
-    (the stale-stop branch owns it), while one of today's SELLs is still being
-    reconciled (that order's close comes from its own fill), or when either
-    lookup fails; otherwise closes the open outcome from today's unrecorded
-    SELL executions, or flags it no_fill."""
-    import db
-    try:
-        if db.get_position_stop(ticker):
-            return
-        if not any(r.get("ticker") == ticker for r in db.get_open_outcomes()):
-            return
-        from zoneinfo import ZoneInfo
-        from datetime import datetime
-        et = ZoneInfo("America/New_York")
-        today = datetime.now(et).date()
-        if any(o["ticker"] == ticker and o["side"] == "SELL" and o.get("created_at") is not None
-               and o["created_at"].astimezone(et).date() == today
-               for o in db.get_unconfirmed_orders()):
-            return
-        recorded = db.recorded_sell_order_ids(ticker)
-    except Exception as e:
-        log.warning(f"[{ticker}] reconcile: queued flat exit check failed ({e}); not closed")
-        return
-    if recorded is None:
-        log.warning(f"[{ticker}] reconcile: recorded-sell lookup failed; queued flat exit not closed")
-        return
-    log.info(f"[{ticker}] reconcile: {_reconcile_untracked_exit(ticker, recorded)}")
-
-
-def _reconcile_untracked_exit(ticker: str, recorded) -> str:
-    """A position closed at the broker with no bot-recorded exit: log today's
-    unrecorded SELL execution as the exit and close the outcome, or flag the
-    outcome no_fill and alert. Shared by stale-stop cleanup and the queued
-    re-protect of a part-filled EXIT/BACKSTOP (professor M124)."""
-    import db
-    import ibkr
-    fill = None
-    try:
-        fill = ibkr.get_recent_sell_fill(ticker, recorded)
-    except Exception as e:
-        log.warning(f"[{ticker}] Exit-fill lookup failed while reconciling "
-                    f"stale stop record: {e}")
-
-    if fill:
-        db.log_trade(
-            symbol=ticker, side="SELL", quantity=fill["filled_qty"],
-            price=fill["fill_price"],
-            reason="Reconciled exit — position closed at the broker with no "
-                   "bot-initiated sell on record (resting stop fill or manual "
-                   "close); matched to today's broker execution history during "
-                   "stale-stop cleanup",
-            price_source="fill",
-        )
-        try:
-            db.close_trade_outcome(ticker, exit_price=fill["fill_price"], exit_source="broker_exit",
-                                   exit_price_source="fill")
-        except Exception as e:
-            log.error(f"[{ticker}] close_trade_outcome failed after reconciling "
-                      f"exit: {e}")
-        msg = (f"Reconciled untracked exit for {ticker}: SELL "
-               f"{fill['filled_qty']:g} @ ${fill['fill_price']:.2f}")
-    else:
-        msg = (f"{ticker} position disappeared with NO matching SELL execution "
-               f"found in today's broker history — trade/outcome NOT recorded, "
-               f"needs manual reconciliation against a broker statement")
-        log.error(f"[{ticker}] {msg}")
-        try:
-            db.flag_orphan_outcomes_for(ticker, "no_fill")   # professor M120
-        except Exception as e:
-            log.error(f"[{ticker}] could not flag the open outcome orphaned: {e}")
-        if _reconcile_alert_due(f"unreconciled_exit_{ticker}"):
-            try:
-                import alerts
-                alerts._send(
-                    f"🚨 UNRECONCILED EXIT — <b>{ticker}</b>\n"
-                    f"Position closed at the broker but no matching SELL execution "
-                    f"was found in today's history. Trade and outcome NOT recorded. "
-                    f"Check TWS/account statement to reconstruct manually."
-                )
-            except Exception as e:
-                log.error(f"[{ticker}] Could not send unreconciled-exit alert: {e}")
-
-    return msg
-
-
 def _retry_pending_reprotects() -> None:
     """Re-protect after late SELL fills whose first attempt failed or found
     the ticker busy (professor M50). Runs every reconcile cycle until each
@@ -1745,6 +1705,16 @@ def _retry_pending_reprotects() -> None:
                 result = fn(ticker, rec, rec.get("fill_price"), from_queue=True)
         except stop_lock.TickerBusy:
             log.info(f"[{ticker}] reconcile: queued re-protect skipped, ticker busy; not counted")
+            continue
+        if result == "wait":
+            # The EXIT's remainder is still working: keep the entry, untried,
+            # for up to ~4 h (professor M124).
+            waits = int(rec.get("waits", 0)) + 1
+            if waits < _EXIT_WAIT_MAX:
+                outcome[ticker] = (rec, {**rec, "waits": waits})
+            else:
+                log.warning(f"[{ticker}] reconcile: queued flat EXIT still waiting after {waits} cycles; dropped")
+                outcome[ticker] = (rec, None)
             continue
         tries = int(rec.get("tries", 0)) + 1
         # A BUY that still reads flat is retried for 2 cycles (~30 min; they
@@ -1818,7 +1788,7 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
                                fill_price: float | None = None,
                                from_queue: bool = False,
                                expect_at_least: float | None = None,
-                               exit_avg: float | None = None) -> bool | None:
+                               exit_avg: float | None = None) -> bool | None | str:
     """After a late SELL fill, finish what the selling path would have done
     (professor M-3, 2026-10-28):
     - nothing left: delete the stop record and close the outcome at the fill
@@ -1827,7 +1797,8 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
       the rest at the stop that sale computed (breakeven or higher);
     - otherwise: cancel resting stops and protect the rest at the stop on record.
     Returns True if a stop was placed, False if it should have been but failed,
-    None if nothing is held."""
+    None if nothing is held, and (queued retries only) "wait" while a flat
+    EXIT's remainder is still working."""
     import db
     import ibkr
     order = order or {}
@@ -1868,10 +1839,10 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
         # A queued retry carries an old fill price, and the rest may have
         # exited since by its stop: leave the close to reconcile_stop_orders'
         # stale-stop branch, which logs the real exit (A2253-2). A part-filled
-        # EXIT/BACKSTOP deleted that record, so nothing would: reconcile the
-        # exit from today's executions here (professor M124).
-        if (order.get("intent") or "").upper() in ("EXIT", "BACKSTOP"):
-            _reconcile_queued_flat_exit(ticker)
+        # EXIT/BACKSTOP deleted that record, so close from its order (M124).
+        if (order.get("intent") or "").upper() in ("EXIT", "BACKSTOP") and \
+                _close_queued_flat_exit(ticker, order):
+            return "wait"
         return None
     if remaining <= 0:
         had_record = bool(db.get_position_stop(ticker))
@@ -3673,9 +3644,55 @@ def _reconcile_stop_orders_body(self):
                                 f"next cycle")
                     continue
                 db.set_state(pending_key, "")
-                msg = _reconcile_untracked_exit(ticker, recorded)
-                all_actions.append(msg)
-                new_actions.append(msg)
+                fill = None
+                try:
+                    fill = ibkr.get_recent_sell_fill(ticker, recorded)
+                except Exception as e:
+                    log.warning(f"[{ticker}] Exit-fill lookup failed while reconciling "
+                                f"stale stop record: {e}")
+
+                if fill:
+                    db.log_trade(
+                        symbol=ticker, side="SELL", quantity=fill["filled_qty"],
+                        price=fill["fill_price"],
+                        reason="Reconciled exit — position closed at the broker with no "
+                               "bot-initiated sell on record (resting stop fill or manual "
+                               "close); matched to today's broker execution history during "
+                               "stale-stop cleanup",
+                        price_source="fill",
+                    )
+                    try:
+                        db.close_trade_outcome(ticker, exit_price=fill["fill_price"], exit_source="broker_exit",
+                                               exit_price_source="fill")
+                    except Exception as e:
+                        log.error(f"[{ticker}] close_trade_outcome failed after reconciling "
+                                  f"exit: {e}")
+                    msg = (f"Reconciled untracked exit for {ticker}: SELL "
+                           f"{fill['filled_qty']:g} @ ${fill['fill_price']:.2f}")
+                    all_actions.append(msg)
+                    new_actions.append(msg)
+                else:
+                    msg = (f"{ticker} position disappeared with NO matching SELL execution "
+                           f"found in today's broker history — trade/outcome NOT recorded, "
+                           f"needs manual reconciliation against a broker statement")
+                    all_actions.append(msg)
+                    new_actions.append(msg)
+                    log.error(f"[{ticker}] {msg}")
+                    try:
+                        db.flag_orphan_outcomes_for(ticker, "no_fill")   # professor M120
+                    except Exception as e:
+                        log.error(f"[{ticker}] could not flag the open outcome orphaned: {e}")
+                    if _reconcile_alert_due(f"unreconciled_exit_{ticker}"):
+                        try:
+                            import alerts
+                            alerts._send(
+                                f"🚨 UNRECONCILED EXIT — <b>{ticker}</b>\n"
+                                f"Position closed at the broker but no matching SELL execution "
+                                f"was found in today's history. Trade and outcome NOT recorded. "
+                                f"Check TWS/account statement to reconstruct manually."
+                            )
+                        except Exception as e:
+                            log.error(f"[{ticker}] Could not send unreconciled-exit alert: {e}")
 
                 db.delete_position_stop(ticker)
 

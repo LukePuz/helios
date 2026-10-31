@@ -42,6 +42,13 @@ from config import SYMBOLS
 _ENTITLEMENT_BLOCKED: set[str] = set()
 
 
+def _safe_err(e: Exception) -> str:
+    """Type and HTTP status only: the exception text carries the request URL,
+    apiKey included (audit A1031-0253-5)."""
+    status = getattr(getattr(e, "response", None), "status_code", None)
+    return type(e).__name__ + (f" (HTTP {status})" if status else "")
+
+
 def _get(endpoint: str, params: dict | None = None) -> dict:
     if not API_KEY:
         return {}
@@ -72,12 +79,12 @@ def _get(endpoint: str, params: dict | None = None) -> dict:
                     f"restarts. Upgrade at polygon.io/pricing to restore it."
                 )
             else:
-                log.debug(f"Polygon fetch failed ({endpoint}): {e}")
+                log.debug(f"Polygon fetch failed ({endpoint}): {_safe_err(e)}")
         else:
-            log.warning(f"Polygon fetch failed ({endpoint}): {e}")
+            log.warning(f"Polygon fetch failed ({endpoint}): {_safe_err(e)}")
         return {}
     except Exception as e:
-        log.warning(f"Polygon fetch failed ({endpoint}): {e}")
+        log.warning(f"Polygon fetch failed ({endpoint}): {_safe_err(e)}")
         return {}
 
 

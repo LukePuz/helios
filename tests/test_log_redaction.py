@@ -43,3 +43,22 @@ def test_fred_failure_logs_no_url(caplog):
          patch("requests.get", side_effect=err), caplog.at_level("WARNING"):
         assert macro._fetch_series("DEXUSEU") == []
     assert "SECRETKEY1" not in caplog.text and "HTTP 502" in caplog.text
+
+
+def test_polygon_apikey_and_bare_token_are_redacted():
+    import log_redaction
+    assert log_redaction.redact("https://api.polygon.io/v2/x?apiKey=P0LY9&limit=1") == \
+        "https://api.polygon.io/v2/x?apiKey=[REDACTED]&limit=1"
+    assert log_redaction.redact("ws://h/?token=T0K3N") == "ws://h/?token=[REDACTED]"
+
+
+def test_polygon_failure_logs_no_url(caplog):
+    import requests
+    from unittest.mock import MagicMock, patch
+    from ingestion import polygon_stream
+    err = requests.HTTPError("500 Server Error for url: https://x/?apiKey=SECRETKEY2")
+    err.response = MagicMock(status_code=500, text="boom")
+    with patch.object(polygon_stream, "API_KEY", "SECRETKEY2"), \
+         patch("requests.get", side_effect=err), caplog.at_level("WARNING"):
+        assert polygon_stream._get("/v2/snapshot/NVDA") == {}
+    assert "SECRETKEY2" not in caplog.text and "HTTP 500" in caplog.text

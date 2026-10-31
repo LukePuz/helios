@@ -1663,9 +1663,12 @@ _EXIT_WAIT_MAX = 48       # 5-min reconcile runs a queued flat EXIT waits on its
 
 def _close_queued_flat_exit(ticker: str, rec: dict) -> bool:
     """A queued re-protect of a part-filled EXIT/BACKSTOP found the position
-    flat, and that sale deleted the stop record, so the stale-stop branch will
-    never close the outcome (professor M124). Returns True to keep waiting.
-    - Order row filled: close at its cumulative average fill.
+    flat. The stale-stop branch can't close it: the sale may have deleted the
+    stop record, and when it hasn't (a part-filled backstop keeps it), that
+    branch leaves this order's own fills out and would read no_fill (professor
+    M124; review of f464bd7). Returns True to keep waiting.
+    - Order row filled: close at its cumulative average fill, then drop any
+      stop record.
     - Remainder still working at the broker, or a lookup failed: wait.
     - Remainder no longer working (something else sold the rest): the exit
       price for that mix is an open question for Luke, so leave it as before.
@@ -1676,8 +1679,6 @@ def _close_queued_flat_exit(ticker: str, rec: dict) -> bool:
     if not oid:
         return False   # queued before this field existed
     try:
-        if db.get_position_stop(ticker):
-            return False   # the stale-stop branch owns the close
         row = db.get_order_fill_state(oid)
     except Exception as e:
         log.warning(f"[{ticker}] reconcile: queued flat EXIT lookup failed ({e}); waiting")
@@ -1689,8 +1690,9 @@ def _close_queued_flat_exit(ticker: str, rec: dict) -> bool:
             db.close_trade_outcome(ticker, exit_price=row["fill_price"],
                                    exit_source=f"late_{(rec.get('intent') or 'sell').lower()}",
                                    exit_price_source="fill")
+            db.delete_position_stop(ticker)
         except Exception as e:
-            log.warning(f"[{ticker}] reconcile: close_trade_outcome failed: {e}; waiting")
+            log.warning(f"[{ticker}] reconcile: close after a queued flat exit failed: {e}; waiting")
             return True
         return False
     if row["status"] in ("partial", "unconfirmed"):

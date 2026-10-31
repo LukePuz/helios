@@ -394,7 +394,7 @@ def _queued_flat(intent, row, open_orders=(), stop=None, order_id=5):
          patch("db.get_order_fill_state", **({"side_effect": row} if isinstance(row, Exception)
                                             else {"return_value": row})), \
          patch("ibkr.get_open_orders", return_value=list(open_orders)), \
-         patch("ibkr.get_recent_sell_fill") as fill, \
+         patch("ibkr.get_recent_sell_fill") as fill, patch("db.delete_position_stop"), \
          patch("db.close_trade_outcome") as close, patch("alerts._send") as alert:
         r = tasks._reprotect_after_late_sell("CRWD", {"intent": intent, "order_id": order_id}, 175.0,
                                              from_queue=True)
@@ -427,7 +427,6 @@ def test_queued_flat_exit_waits_while_its_remainder_works_or_a_lookup_fails():
 def test_queued_flat_exit_leaves_mixed_and_owned_cases_alone():
     row = {"status": "partial", "fill_price": 171.5, "broker_order_id": 77}
     for kw in ({"row": row, "open_orders": [{"order_id": 77, "status": "Cancelled"}]},   # mixed close
-               {"row": row, "stop": {"stop_price": 150.0}},                              # stale branch's
                {"row": row, "order_id": None}):                                          # old entry
         r, close, alert = _queued_flat("EXIT", **kw)
         assert r is None
@@ -567,3 +566,20 @@ def test_a_profit_target_replacing_a_queued_buy_keeps_its_flat_read_protection()
              patch("stop_lock._redis", side_effect=RuntimeError("no redis")):
             tasks._queue_reprotect("CRWD", new, None)
         assert bool(json.loads(state[tasks._REPROTECT_STATE_KEY])["CRWD"].get("had_buy")) is expect
+
+
+def test_a_queued_flat_backstop_with_its_kept_record_closes_from_its_fill():
+    """Review of f464bd7: a part-filled backstop keeps the record, and the
+    stale-stop branch leaves the backstop's own fills out (false no_fill)."""
+    client = MagicMock()
+    client.get_all_positions.return_value = []
+    with patch("ibkr.get_client", return_value=client), \
+         patch("db.get_position_stop", return_value={"stop_price": 150.0}), \
+         patch("db.get_order_fill_state", return_value={"status": "filled", "fill_price": 171.5,
+                                                         "broker_order_id": 77}), \
+         patch("db.close_trade_outcome") as close, patch("db.delete_position_stop") as delete:
+        r = tasks._reprotect_after_late_sell("CRWD", {"intent": "BACKSTOP", "order_id": 5}, 171.0,
+                                             from_queue=True)
+    assert r is None
+    close.assert_called_once_with("CRWD", exit_price=171.5, exit_source="late_backstop", exit_price_source="fill")
+    delete.assert_called_once_with("CRWD")

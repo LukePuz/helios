@@ -119,7 +119,7 @@ class TestGapConfirmation:
         drift guard governs, this check doesn't apply."""
         fake = _daily_intraday(prior_close=100.0, opens_and_closes=[(101.0, 101.2)])
         with patch("market_data.get_historical_bars", side_effect=fake):
-            result = market_data.check_gap_confirmation("AAPL")
+            result = market_data.check_gap_confirmation("AAPL", today="2026-07-29")
         assert result["status"] == "no_gap"
 
     def test_gap_holding_after_enough_bars_is_confirmed(self):
@@ -128,7 +128,7 @@ class TestGapConfirmation:
         path = [(110.0, 110.0)] * 12  # 12 bars, essentially flat at the open
         fake = _daily_intraday(prior_close=100.0, opens_and_closes=path)
         with patch("market_data.get_historical_bars", side_effect=fake):
-            result = market_data.check_gap_confirmation("AAPL")
+            result = market_data.check_gap_confirmation("AAPL", today="2026-07-29")
         assert result["status"] == "confirmed"
         assert result["gap_pct"] == pytest.approx(0.10)
 
@@ -138,7 +138,7 @@ class TestGapConfirmation:
         path = [(110.0, 110.0)] * 3
         fake = _daily_intraday(prior_close=100.0, opens_and_closes=path)
         with patch("market_data.get_historical_bars", side_effect=fake):
-            result = market_data.check_gap_confirmation("AAPL")
+            result = market_data.check_gap_confirmation("AAPL", today="2026-07-29")
         assert result["status"] == "pending"
 
     def test_gap_fully_reversing_is_failed(self):
@@ -150,11 +150,44 @@ class TestGapConfirmation:
                 (100.0, 100.0), (100.0, 100.0)]
         fake = _daily_intraday(prior_close=100.0, opens_and_closes=path)
         with patch("market_data.get_historical_bars", side_effect=fake):
-            result = market_data.check_gap_confirmation("AAPL")
+            result = market_data.check_gap_confirmation("AAPL", today="2026-07-29")
         assert result["status"] == "failed"
         assert result["retracement_pct"] >= 0.5
 
+    def test_todays_partial_daily_bar_is_not_the_prior_close(self):
+        """Audit A1031-1453-1: in market hours the last daily bar is today's
+        partial one; a gap-up that kept rising read as a reversed gap-down."""
+        path = [(110.0, 111.0)] * 12 + [(111.0, 116.0)]
+        fake_base = _daily_intraday(prior_close=100.0, opens_and_closes=path)
+        today_partial = {"time": "2026-07-29", "open": 110.0, "high": 116.0, "low": 110.0,
+                         "close": 116.0, "volume": 500_000}
+
+        def fake(ticker, duration="20 D", bar_size="1 day", **kwargs):
+            bars = fake_base(ticker, duration, bar_size)
+            return bars + [today_partial] if bar_size == "1 day" else bars
+        with patch("market_data.get_historical_bars", side_effect=fake):
+            result = market_data.check_gap_confirmation("AAPL", today="2026-07-29")
+        assert result["prior_close"] == 100.0 and result["gap_pct"] == pytest.approx(0.10)
+        assert result["status"] == "confirmed"
+
+    def test_no_prior_session_bar_is_no_gap(self):
+        intraday = [{"time": "2026-07-29 09:30:00-04:00", "open": 110.0, "high": 110.0,
+                     "low": 110.0, "close": 110.0, "volume": 1}]
+        daily = [{"time": "2026-07-29", "open": 110.0, "high": 110.0, "low": 110.0,
+                  "close": 110.0, "volume": 1}]
+        with patch("market_data.get_historical_bars",
+                   side_effect=lambda t, duration="20 D", bar_size="1 day", **k:
+                   daily if bar_size == "1 day" else intraday):
+            assert market_data.check_gap_confirmation("AAPL", today="2026-07-29")["status"] == "no_gap"
+
+    def test_before_todays_first_bar_is_no_gap(self):
+        """Pre-open the 1-min bars are yesterday's session: don't judge yesterday's gap."""
+        path = [(110.0, 100.0)] * 12                         # yesterday's faded gap
+        fake = _daily_intraday(prior_close=100.0, opens_and_closes=path)
+        with patch("market_data.get_historical_bars", side_effect=fake):
+            assert market_data.check_gap_confirmation("AAPL", today="2026-07-30")["status"] == "no_gap"
+
     def test_no_data_available_is_no_gap_not_an_error(self):
         with patch("market_data.get_historical_bars", return_value=[]):
-            result = market_data.check_gap_confirmation("AAPL")
+            result = market_data.check_gap_confirmation("AAPL", today="2026-07-29")
         assert result["status"] == "no_gap"

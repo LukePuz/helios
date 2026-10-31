@@ -155,7 +155,7 @@ def get_priced_quote(ticker: str) -> dict | None:
         return None
 
 
-def check_gap_confirmation(ticker: str) -> dict:
+def check_gap_confirmation(ticker: str, today: str | None = None) -> dict:
     """
     Judges whether an opening gap (today's open vs. the prior day's close)
     is holding or already fading. Added 2026-07-29 after TER: a stock that
@@ -184,12 +184,28 @@ def check_gap_confirmation(ticker: str) -> dict:
     empty = {"status": "no_gap", "gap_pct": None, "retracement_pct": None,
              "open_price": None, "prior_close": None, "current_price": None}
     try:
-        daily = get_historical_bars(ticker, duration="2 D", bar_size="1 day")
+        daily = get_historical_bars(ticker, duration="5 D", bar_size="1 day")
         intraday = get_historical_bars(ticker, duration="1 D", bar_size="1 min")
         if not daily or not intraday:
             return empty
 
-        prior_close = float(daily[-1]["close"])
+        # In market hours IBKR's last daily bar is today's partial one, which
+        # made "prior close" the current price (audit A1031-1453-1: AAOI
+        # 08-14, a rising gap-up read as a fully reversed gap-down). Use the
+        # last bar dated before the intraday bars' session.
+        session = str(intraday[0]["time"])[:10]
+        # Before today's first bar the 1-min request returns the previous
+        # session: no gap to judge yet (review of A1031-1453-1).
+        if today is None:
+            from zoneinfo import ZoneInfo
+            today = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+        if session != today:
+            return empty
+        before = [b for b in daily if str(b["time"])[:10] < session]
+        if not before:
+            log.warning(f"check_gap_confirmation({ticker}): no daily bar before {session}")
+            return empty
+        prior_close = float(before[-1]["close"])
         open_price = float(intraday[0]["open"])
         current_price = float(intraday[-1]["close"])
         bars_since_open = len(intraday)

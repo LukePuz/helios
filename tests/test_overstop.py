@@ -555,7 +555,9 @@ def test_a_profit_target_replacing_a_queued_buy_keeps_its_flat_read_protection()
         assert rec["intent"] == "PROFIT_TARGET" and rec["stop_price"] == 185.0 and rec["had_buy"] is True
     for old, new, expect in (({"intent": "BUY", "nonce": "a"}, {"intent": "RESTORE"}, True),
                              ({"intent": "RESTORE", "nonce": "a"}, {"intent": "PROFIT_TARGET"}, False),
-                             ({"intent": "BUY", "nonce": "a"}, {"intent": "EXIT", "id": 5}, False)):
+                             ({"intent": "BUY", "nonce": "a"}, {"intent": "EXIT", "id": 5}, False),
+                             ({"intent": "BUY", "nonce": "a"}, {"intent": "TRIM", "id": 6}, False),
+                             ({"intent": "BUY", "nonce": "a"}, {"intent": "MANUAL_SELL", "id": 7}, False)):
         state = {tasks._REPROTECT_STATE_KEY: json.dumps({"CRWD": old})}
         with patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
              patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \

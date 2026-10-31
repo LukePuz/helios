@@ -296,6 +296,8 @@ class RiskManager:
                 db.set_state(f"trading_halted_{TRADING_ENV}", "true")
                 db.set_state(f"halt_reason_{TRADING_ENV}",
                              f"Auto: drawdown {drawdown:.1%} from HWM ${baseline:,.2f}")
+                db.log_halt_event("auto_halt", "per_buy_check", "drawdown",
+                                  drawdown_pct=round(drawdown, 4))
             except Exception:
                 pass
             return True

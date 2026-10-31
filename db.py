@@ -1440,6 +1440,20 @@ def log_activity(
         _put_conn(conn)
 
 
+def log_halt_event(event: str, source: str, reason: str = "", **fields) -> None:
+    """A dated activity_feed row (stage "halt") each time trading is halted,
+    resumed or rebased, so halt periods can be reconstructed: system_state
+    only keeps the current flag (professor C33). fields carry ratios only
+    (drawdown_pct, hwm_change_ratio), never account values."""
+    try:
+        log_activity("halt", "", f"{event} ({source}){': ' + reason if reason else ''}",
+                     "alert" if event.endswith("halt") else "neutral",
+                     {"event": event, "source": source, "env": TRADING_ENV, "reason": reason,
+                      "at": datetime.now(timezone.utc).isoformat(), **fields})
+    except Exception as e:
+        logging.warning(f"log_halt_event({event}) failed: {e}")
+
+
 def get_activity_feed(limit: int = 120) -> list[dict]:
     """Return the most recent activity feed rows, newest first."""
     conn = _get_conn()

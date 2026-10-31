@@ -3765,6 +3765,8 @@ def check_portfolio_drawdown(self):
                     db.set_state(halted_key, "true")
                     db.set_state(reason_key, f"Auto: account value under half the HWM on "
                                              f"{implausible} checks; /rebase after checking")
+                    db.log_halt_event("auto_halt", "drawdown_task", "implausible reads",
+                                      implausible_reads=implausible)
                     log.critical(f"Drawdown check: {implausible} consecutive implausible reads "
                                  f"(value under half of {hwm_key}) — trading HALTED")
                     try:
@@ -3807,6 +3809,8 @@ def check_portfolio_drawdown(self):
                          f"Auto: drawdown {drawdown:.1%} from HWM ${hwm:,.2f}")
             log.critical(f"DRAWDOWN LIMIT HIT: {drawdown:.1%} — trading HALTED")
             if not already_halted:
+                db.log_halt_event("auto_halt", "drawdown_task", "drawdown",
+                                  drawdown_pct=round(drawdown, 4))
                 alerts.send_halt_alert(pv, hwm)
         else:
             db.set_state(breach_key, "0")

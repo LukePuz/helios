@@ -406,6 +406,7 @@ def _handle_mention(update: dict, is_urgent: bool) -> None:
             from config import TRADING_ENV
             db.set_state(f"trading_halted_{TRADING_ENV}", "true")
             db.set_state(f"halt_reason_{TRADING_ENV}", f"Manual halt by {display}")
+            db.log_halt_event("manual_halt", "telegram")
             _reply(chat_id, f"🛑 <b>Trading HALTED</b> ({TRADING_ENV}). No new BUY orders will "
                             "execute. Send /resume to lift the halt.", msg_id)
         except Exception as e:
@@ -421,11 +422,17 @@ def _handle_mention(update: dict, is_urgent: bool) -> None:
             if not cand:
                 _reply(chat_id, "No baseline reset is pending.", msg_id)
                 return
+            old_hwm = db.get_state(f"high_water_mark_{TRADING_ENV}", "")
             db.set_state(f"high_water_mark_{TRADING_ENV}", cand)
             db.set_state(f"hwm_rebase_candidate_{TRADING_ENV}", "")
             db.set_state(f"drawdown_implausible_count_{TRADING_ENV}", "0")
             db.set_state(f"trading_halted_{TRADING_ENV}", "false")
             db.set_state(f"halt_reason_{TRADING_ENV}", "")
+            try:
+                ratio = round(float(cand) / float(old_hwm), 4) if old_hwm and float(old_hwm) > 0 else None
+            except ValueError:
+                ratio = None
+            db.log_halt_event("rebase_resume", "telegram", hwm_change_ratio=ratio)
             _reply(chat_id, f"🟢 <b>Baseline reset</b> ({TRADING_ENV}) to ${float(cand):,.2f}, the last "
                             f"read account value; trading RESUMED.", msg_id)
         except Exception as e:
@@ -440,6 +447,7 @@ def _handle_mention(update: dict, is_urgent: bool) -> None:
             # Restart the implausible-read count, or the next check re-halts
             # at once while reads stay low (review of d3e403d).
             db.set_state(f"drawdown_implausible_count_{TRADING_ENV}", "0")
+            db.log_halt_event("resume", "telegram")
             _reply(chat_id, f"🟢 <b>Trading RESUMED</b> ({TRADING_ENV}). Halt flag cleared.", msg_id)
         except Exception as e:
             _reply(chat_id, f"⚠️ Could not clear halt flag: {e}", msg_id)

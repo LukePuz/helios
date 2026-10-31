@@ -692,6 +692,13 @@ app.conf.beat_schedule = {
         "schedule": crontab(hour=9, minute=0, day_of_week="sat"),
         "options":  {"queue": INGESTION_QUEUE, "expires": 48 * 3600},
     },
+    # Weekday catch-up for the above: only tickers more than 7 days stale,
+    # so it's a no-op after a completed weekly run (audit A1031-0053-12).
+    "refresh-sp500-history-catchup": {
+        "task":     "tasks.refresh_sp500_history_catchup",
+        "schedule": crontab(hour=5, minute=15, day_of_week="mon-fri"),
+        "options":  {"queue": INGESTION_QUEUE, "expires": 3600},
+    },
     # Broadened Comps peer universe — Saturday 9:30 AM, after
     # refresh-sp500-history so this reads the same-week price data.
     # Same down-all-weekend caveat as its sibling above (Monday 05:00
@@ -3134,13 +3141,39 @@ def refresh_sp500_history(self):
     (see ingestion/price_history.py's refresh_sp500_price_history docstring)."""
     try:
         from ingestion.price_history import refresh_sp500_price_history
-        count = refresh_sp500_price_history()
-        log.info(f"S&P 500 price history refreshed: {count} tickers updated")
-        _heartbeat_ok("sp500_history", count)
+
+        def run():
+            count = refresh_sp500_price_history()
+            log.info(f"S&P 500 price history refreshed: {count} tickers updated")
+            _heartbeat_ok("sp500_history", count)
+        # One run at a time with the weekday catch-up (ingestion runs 4 wide).
+        _run_singleton("sp500_history", run, max_hold_s=_SP500_REFRESH_HOLD_S)
     except Exception as e:
         log.error(f"refresh_sp500_history failed: {e}")
         _heartbeat_fail("sp500_history", str(e))
         raise self.retry(exc=e, countdown=600)
+
+
+_SP500_REFRESH_HOLD_S = 4 * 3600   # a full pass takes ~2.6 h
+
+
+@app.task(name="tasks.refresh_sp500_history_catchup", bind=True, max_retries=0)
+def refresh_sp500_history_catchup(self):
+    """Weekday 05:15: refetch only S&P 500 tickers more than 7 days stale.
+    The weekly run has no other catch-up if it dies partway or runs on a
+    Saturday the stack happens to be up (10-24: killed at the 19:00 stop,
+    stale until the next week). A no-op when the weekly run finished."""
+    try:
+        from ingestion.price_history import refresh_sp500_price_history
+
+        def run():
+            count = refresh_sp500_price_history(max_age_days=7)
+            log.info(f"S&P 500 price history catch-up: {count} tickers updated")
+            _heartbeat_ok("sp500_history", count)
+        _run_singleton("sp500_history", run, max_hold_s=_SP500_REFRESH_HOLD_S)
+    except Exception as e:
+        log.error(f"refresh_sp500_history_catchup failed: {e}")
+        _heartbeat_fail("sp500_history", str(e))
 
 
 @app.task(name="tasks.refresh_sp500_fundamentals", bind=True, max_retries=2)

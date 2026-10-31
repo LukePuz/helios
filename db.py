@@ -2851,6 +2851,24 @@ def get_fundamentals(ticker: str) -> dict | None:
         _put_conn(conn)
 
 
+def get_newest_bar_dates(tickers: list[str]) -> dict:
+    """{ticker: newest cached bar date} for tickers with any bars. {} on
+    error, so a caller that skips current tickers just refreshes them all."""
+    if not tickers:
+        return {}
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT ticker, MAX(date) FROM price_history WHERE ticker = ANY(%s) "
+                        "GROUP BY ticker", (list(tickers),))
+            return {t: d for t, d in cur.fetchall() if d is not None}
+    except Exception as e:
+        logging.error(f"get_newest_bar_dates failed: {e}")
+        return {}
+    finally:
+        _put_conn(conn)
+
+
 def upsert_price_bars(ticker: str, bars: list[dict]) -> int:
     """
     bars: list of {date (YYYY-MM-DD str or date), open, high, low, close, volume}.

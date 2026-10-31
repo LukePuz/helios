@@ -89,7 +89,17 @@ def refresh_all_price_history() -> int:
     return updated
 
 
-def refresh_sp500_price_history(skip_watchlist: bool = True) -> int:
+def _last_weekday_before(today):
+    """The last weekday strictly before today (holidays not excluded)."""
+    from datetime import timedelta
+    d = today - timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
+def refresh_sp500_price_history(skip_watchlist: bool = True, max_age_days: int | None = None,
+                                today=None) -> int:
     """
     Refreshes 1y daily bars for the full S&P 500 universe (added 2026-07-26
     for two new consumers, both of which need real per-ticker history
@@ -118,8 +128,20 @@ def refresh_sp500_price_history(skip_watchlist: bool = True) -> int:
         except Exception as e:
             log.debug(f"Could not load watchlist to dedupe S&P 500 refresh: {e}")
 
+    # Skip tickers already current, so a run killed partway (the 19:00 stop
+    # on 10-24 left 423 of 551 at 10-16) resumes instead of restarting the
+    # ~2.6 h pass. max_age_days set: only tickers older than that (the
+    # weekday catch-up), so it never becomes a daily full refresh.
+    from datetime import date, timedelta
+    today = today or date.today()
+    cutoff = (today - timedelta(days=max_age_days) if max_age_days is not None
+              else _last_weekday_before(today))
+    newest = db.get_newest_bar_dates(tickers)
+    due = [t for t in tickers if newest.get(t) is None or newest[t] < cutoff]
+    log.info(f"S&P 500 price history: {len(due)} of {len(tickers)} tickers due (bars before {cutoff})")
+
     updated = 0
-    for ticker in tickers:
+    for ticker in due:
         bars = _fetch_bars(ticker)
         if bars:
             n = db.upsert_price_bars(ticker, bars)

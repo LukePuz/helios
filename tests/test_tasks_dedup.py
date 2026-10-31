@@ -694,6 +694,10 @@ class TestReconcileUnconfirmedOrders:
         self._run_sell([], stop_rec=None, intent="EXIT", filled_qty=30.0, fill_price=170.0)
         assert self.extra["close"].call_args.kwargs["exit_price"] == 175.0
 
+    def test_late_backstop_remainder_closes_without_a_stop_record(self):
+        self._run_sell([], stop_rec=None, intent="BACKSTOP")
+        assert self.extra["close"].call_args.kwargs["exit_source"] == "late_backstop"
+
     def test_late_trim_already_cleaned_up_is_not_closed(self):
         self._run_sell([], stop_rec=None, intent="TRIM")
         self.extra["delete"].assert_not_called()

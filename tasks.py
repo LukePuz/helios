@@ -1681,7 +1681,7 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
         # left the outcome for this close (professor M121). Rows already
         # closed or flagged orphaned are skipped by close_trade_outcome.
         exit_price = exit_avg or fill_price
-        if exit_price and (had_record or (order.get("intent") or "").upper() == "EXIT"):
+        if exit_price and (had_record or (order.get("intent") or "").upper() in ("EXIT", "BACKSTOP")):
             try:
                 db.close_trade_outcome(ticker, exit_price=exit_price,
                                        exit_source=f"late_{(order.get('intent') or 'sell').lower()}",
@@ -2104,12 +2104,27 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
                      price_source="fill" if result.get("fill_price") else "quote",
                      reason=f"Backstop stop-breach sell (stop ${alert['stop_price']:.2f})"
                             + (" [retry]" if _is_retry else ""))
+        # An orders row like every other sale: a part fill stays 'partial' so
+        # reconcile_unconfirmed_orders closes the outcome from the cumulative
+        # fill once flat, and the stale-stop lookup leaves these fills out
+        # (professor, review of c13548c).
+        try:
+            local_id = db.log_order(ticker=ticker, side="SELL", order_type="MARKET", qty=owned,
+                                    broker_order_id=result.get("order_id"),
+                                    decision_price=alert.get("current_price"), status="submitted",
+                                    intent="BACKSTOP")
+            if local_id and local_id > 0:
+                db.update_order_fill(local_id, result.get("fill_price"), filled,
+                                     "filled" if filled >= owned - 1e-6 else "partial")
+        except Exception as e:
+            log.warning(f"[{ticker}] Backstop sale order logging failed: {e}")
         if resting <= 0:  # shares under a stuck stop are still held
             db.delete_position_stop(ticker)
             if filled < owned - 1e-6:
                 # Part filled: this part's price isn't the exit (professor
-                # M121). The rest is still working at the broker; the row
-                # stays open and is flagged once the position is flat.
+                # M121). The rest is still working at the broker; the order
+                # is 'partial', so reconcile closes the row from the
+                # cumulative fill once flat.
                 log.warning(f"[{ticker}] Backstop sell part-filled ({filled:g} of {owned:g}); "
                             f"outcome left open")
             else:

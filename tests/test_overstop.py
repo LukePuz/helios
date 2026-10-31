@@ -155,6 +155,28 @@ class TestBackstopSellReads:
         delete.assert_not_called(); close.assert_not_called()
 
 
+def test_backstop_sale_gets_an_orders_row_and_a_part_fill_waits_for_reconcile():
+    """Professor (review of c13548c): a part-filled backstop had no orders row,
+    so its remainder was never reconciled."""
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="AMD", qty=10)]
+    for filled, status, closes in ((6, "partial", False), (10, "filled", True)):
+        with patch("ibkr.get_client", return_value=client), \
+             patch("tasks.manage_cancel_stop_orders_for"), \
+             patch("ibkr.get_open_orders", return_value=[]), \
+             patch("ibkr.place_market_order",
+                   return_value={"order_id": 77, "filled_qty": filled, "fill_price": 140.0}), \
+             patch("db.log_trade"), patch("db.delete_position_stop"), \
+             patch("db.log_order", return_value=5) as log_order, \
+             patch("db.update_order_fill") as upd, \
+             patch("db.close_trade_outcome") as close, patch("alerts._send"):
+            assert tasks._execute_backstop_sell("AMD", TestBackstopSellReads._alert) is True
+        assert log_order.call_args.kwargs["intent"] == "BACKSTOP"
+        assert log_order.call_args.kwargs["broker_order_id"] == 77
+        upd.assert_called_once_with(5, 140.0, filled, status)
+        assert close.called is closes
+
+
 def test_cancel_failure_in_overcover_returns_a_line_not_a_crash():
     """A0253-7: label was unbound when the cancel raised."""
     client = MagicMock()

@@ -447,3 +447,30 @@ def test_retry_keeps_a_waiting_exit_without_counting_a_try():
     kept = json.loads(state[tasks._REPROTECT_STATE_KEY])["CRWD"]
     assert kept["waits"] == 1 and "tries" not in kept
     alert.assert_not_called()
+
+
+def test_a_queued_profit_target_keeps_a_later_exits_order_for_the_flat_close():
+    """Professor m111: the PROFIT_TARGET entry keeps priority, and the EXIT's
+    order row id rides along so its flat close still finds the order."""
+    import json
+    state = {tasks._REPROTECT_STATE_KEY: json.dumps(
+        {"CRWD": {"intent": "PROFIT_TARGET", "stop_price": 180.0, "nonce": "a"}})}
+    with patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
+         patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+         patch("stop_lock._redis", side_effect=RuntimeError("no redis")):
+        tasks._queue_reprotect("CRWD", {"intent": "EXIT", "id": 5}, 171.0)
+    rec = json.loads(state[tasks._REPROTECT_STATE_KEY])["CRWD"]
+    assert rec["intent"] == "PROFIT_TARGET" and rec["exit_order_id"] == 5
+    r, close, alert = _queued_flat("PROFIT_TARGET", {"status": "filled", "fill_price": 171.5,
+                                                     "broker_order_id": 77}, order_id=None)
+    close.assert_not_called()   # no exit fields: unchanged
+    client = MagicMock()
+    client.get_all_positions.return_value = []
+    with patch("ibkr.get_client", return_value=client), \
+         patch("db.get_position_stop", return_value=None), \
+         patch("db.get_order_fill_state", return_value={"status": "filled", "fill_price": 171.5,
+                                                         "broker_order_id": 77}) as row, \
+         patch("db.close_trade_outcome") as close:
+        tasks._reprotect_after_late_sell("CRWD", rec, 171.0, from_queue=True)
+    row.assert_called_once_with(5)
+    close.assert_called_once_with("CRWD", exit_price=171.5, exit_source="late_exit", exit_price_source="fill")

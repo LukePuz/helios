@@ -1404,6 +1404,10 @@ def _queue_reprotect(ticker: str, order: dict, fill_price: float | None) -> None
             # with the lower stop on record (professor M80).
             pending[ticker] = {**{k: v for k, v in old.items() if k != "tries"},
                                "nonce": entry["nonce"]}
+            if (entry["intent"] or "").upper() in ("EXIT", "BACKSTOP"):
+                # The flat close needs the exit's own order (professor m111).
+                pending[ticker]["exit_intent"] = entry["intent"]
+                pending[ticker]["exit_order_id"] = entry["order_id"]
         else:
             pending[ticker] = entry
         return pending
@@ -1526,8 +1530,11 @@ def _review_manual_actions() -> None:
     _manual_actions_edit(apply)
 
 
-_REPROTECT_MAX_TRIES = 4  # reconcile_stop_orders cycles, 15 min apart (~1 h)
-_BUY_FLAT_MAX_TRIES = 2   # ~30 min for a new BUY's position to show up
+# Queued re-protects are retried by reconcile_unconfirmed_orders, every 5 min
+# (the comments here used to assume 15, professor m112). Kept at 4 and 2: a
+# position left without a stop should reach Luke in ~20 min, not ~1 h.
+_REPROTECT_MAX_TRIES = 4  # ~20 min of failed placements
+_BUY_FLAT_MAX_TRIES = 2   # ~10 min for a new BUY's position to show up
 _EXIT_WAIT_MAX = 48       # 5-min reconcile runs a queued flat EXIT waits on its remainder (~4 h)
 
 
@@ -1735,29 +1742,29 @@ def _retry_pending_reprotects() -> None:
                 outcome[ticker] = (rec, None)
             continue
         tries = int(rec.get("tries", 0)) + 1
-        # A BUY that still reads flat is retried for 2 cycles (~30 min; they
-        # are 15 min apart, so the old 6 was ~90 min, professor m55), then
-        # handed to Luke like a failed retry (professor M60).
+        # A BUY that still reads flat is retried for 2 runs (~10 min; they
+        # are 5 min apart, professor m55/m112), then handed to Luke like a
+        # failed retry (professor M60).
         flat_buy = result is None and rec.get("intent") == "BUY"
         if flat_buy and tries >= _BUY_FLAT_MAX_TRIES:
             log.error(f"[{ticker}] reconcile: queued BUY stop still reads flat after {tries} tries")
             try:
                 import alerts
                 alerts._send(f"🚨 STOP NOT PLACED — <b>{ticker}</b>\nAfter a BUY the broker still "
-                             f"shows no position (~30 min), so no stop was placed. Check TWS: if the "
+                             f"shows no position (~10 min), so no stop was placed. Check TWS: if the "
                              f"shares are there, place the stop by hand.")
             except Exception:
                 pass
             open_manual_action(ticker, "the stop after a BUY was never placed", clear_on_flat=False)
             outcome[ticker] = (rec, None)
         elif result is False and tries >= _REPROTECT_MAX_TRIES:
-            # ~1 h of failures: stop retrying (each try cancels and re-places)
-            # and hand it to Luke (professor M79).
+            # ~20 min of failures: stop retrying (each try cancels and
+            # re-places) and hand it to Luke (professor M79, m112).
             log.error(f"[{ticker}] reconcile: queued re-protect failed {tries} times; giving up")
             try:
                 import alerts
                 alerts._send(f"🚨 STOP NOT RESTORED — <b>{ticker}</b>\nThe automatic stop retry "
-                             f"failed {tries} times (~1 h) and has stopped. Check the position and "
+                             f"failed {tries} times (~20 min) and has stopped. Check the position and "
                              f"place a stop in TWS; the stop check keeps flagging it until covered.")
             except Exception:
                 pass
@@ -1858,8 +1865,10 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
         # exited since by its stop: leave the close to reconcile_stop_orders'
         # stale-stop branch, which logs the real exit (A2253-2). A part-filled
         # EXIT/BACKSTOP deleted that record, so close from its order (M124).
-        if (order.get("intent") or "").upper() in ("EXIT", "BACKSTOP") and \
-                _close_queued_flat_exit(ticker, order):
+        exit_rec = (order if (order.get("intent") or "").upper() in ("EXIT", "BACKSTOP") else
+                    {"intent": order["exit_intent"], "order_id": order.get("exit_order_id")}
+                    if order.get("exit_intent") else None)
+        if exit_rec and _close_queued_flat_exit(ticker, exit_rec):
             return "wait"
         return None
     if remaining <= 0:

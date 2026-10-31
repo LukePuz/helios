@@ -1625,6 +1625,7 @@ def test_flag_orphan_outcomes_sql_flags_unheld_and_never_unflags():
     assert "orphaned_at = NOW(), orphan_reason = 'sweep'" in sqls[0] and "<> ALL" in sqls[0]
     assert "NOT EXISTS" in sqls[0] and "position_stops" in sqls[0]     # cache-lag guard
     assert "entry_date < NOW() - INTERVAL '30 minutes'" in sqls[0]
+    assert "o.status IN ('unconfirmed', 'partial')" in sqls[0] and "o.side = 'SELL'" in sqls[0]   # m110
     assert not any("orphaned_at = NULL" in q for q in sqls)            # professor M120
     assert cur.execute.call_args_list[0].args[1][1] == ["NVDA"]
     assert "exit_date IS NULL" in sqls[0] and "UPDATE" in sqls[0] and "exit_price" not in sqls[0]

@@ -4029,7 +4029,10 @@ def flag_orphan_outcomes(held: set[str]) -> tuple[int, int]:
     later position in the same ticker is a new position, and
     close_trade_outcome skips flagged rows (professor M120). Returns (newly
     flagged, total flagged open rows). Never closes a row: no exit price is
-    known (professor M111)."""
+    known (professor M111). Also skips a ticker with one of our SELLs from
+    the last 24 h still unconfirmed or partial: reconcile closes that exit
+    from the order's fill, and a flag first would make it skip the row
+    (professor m110)."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
@@ -4040,7 +4043,10 @@ def flag_orphan_outcomes(held: set[str]) -> tuple[int, int]:
                 "AND orphaned_at IS NULL AND entry_date < NOW() - INTERVAL '30 minutes' "
                 "AND UPPER(ticker) <> ALL(%s) AND NOT EXISTS ("
                 "SELECT 1 FROM position_stops ps WHERE UPPER(ps.ticker) = UPPER(trade_outcomes.ticker) "
-                "AND ps.trading_env = trade_outcomes.trading_env)",
+                "AND ps.trading_env = trade_outcomes.trading_env) AND NOT EXISTS ("
+                "SELECT 1 FROM orders o WHERE UPPER(o.ticker) = UPPER(trade_outcomes.ticker) "
+                "AND o.trading_env = trade_outcomes.trading_env AND o.side = 'SELL' "
+                "AND o.status IN ('unconfirmed', 'partial') AND o.created_at > NOW() - INTERVAL '24 hours')",
                 (TRADING_ENV, held_list),
             )
             newly = cur.rowcount

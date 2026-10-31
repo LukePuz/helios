@@ -2038,10 +2038,17 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
     if not stop_price:
         log.error(f"[{ticker}] reconcile: {remaining} shares left after a late sell, no stop on record")
         return False
+    open_orders = None
     try:
         import ibkr
-        selling = _working_mkt_sell_qty(ibkr.get_open_orders(), ticker)
+        open_orders = ibkr.get_open_orders()
+        selling = _working_mkt_sell_qty(open_orders, ticker)
     except Exception as e:
+        if from_queue:
+            # A queued retry waits rather than stop blind: it counts a try,
+            # and the last one alerts and opens a manual action (m116).
+            log.warning(f"[{ticker}] reconcile: open-order read failed ({e}); queued stop waits")
+            return False
         # Unprotected is worse than over-stopped: section 2b fixes the latter.
         log.warning(f"[{ticker}] reconcile: open-order read failed ({e}); stopping all {remaining} shares")
         selling = 0.0
@@ -2052,6 +2059,46 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
         if remaining <= 0:
             log.info(f"[{ticker}] reconcile: a working SELL covers the remaining shares; no stop placed")
             return True
+    if from_queue:
+        # Sized from the all-clients view (m116): a stop the cancel can't
+        # remove (another client's, or one placed in TWS) stays as cover, and
+        # ours goes on only the shares it leaves. position_stops.stop_price
+        # stays ours.
+        import execution
+        covered = execution._stops_still_resting(ticker)
+        if covered is None:
+            log.warning(f"[{ticker}] reconcile: resting stops could not be read; queued stop waits")
+            return False
+        if order.get("intent") != "PROFIT_TARGET" and covered >= remaining:
+            log.info(f"[{ticker}] reconcile: {remaining} shares already covered by resting stops "
+                     f"({covered:g}); nothing cancelled")
+            return True
+        if covered > 0:
+            # Cancel ours, then see what the cancel could not remove.
+            try:
+                manage_cancel_stop_orders_for(ticker)
+                left = _resting_sell_stops(ticker)
+            except Exception as e:
+                log.warning(f"[{ticker}] reconcile: queued stop could not cancel or re-read stops ({e}); waits")
+                return False
+        else:
+            left = []
+        others = round(sum(o["qty"] for o in left), 4)
+        need = round(remaining - others, 4)
+        if others > 0:
+            prices = ", ".join(f"${float(o['stop_price']):.2f}" if o.get("stop_price") else "?" for o in left)
+            log.warning(f"[{ticker}] reconcile: {others:g} shares stay covered by stop(s) the cancel did not "
+                        f"remove ({prices}); ours @ ${float(stop_price):.2f} goes on {max(need, 0):g}")
+        if need <= 0:
+            return True
+        try:
+            result = manage_stop_place(ticker, need, float(stop_price))
+            db.set_stop_broker_order_id(ticker, result["order_id"])
+            log.info(f"[{ticker}] reconcile: stop @ ${float(stop_price):.2f} placed for {need} shares")
+            return True
+        except Exception as e:
+            log.error(f"[{ticker}] reconcile: stop placement after a late sell failed: {e}")
+            return False
     if order.get("intent") != "PROFIT_TARGET":
         # Already covered (e.g. a stop Luke placed after a "place manually"
         # alert, or an earlier try that did land): cancelling it to re-place

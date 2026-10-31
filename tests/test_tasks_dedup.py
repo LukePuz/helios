@@ -405,6 +405,7 @@ class TestReconcileUnconfirmedOrders:
              patch("tasks.manage_stop_place",
                    return_value={"order_id": 900, "stop_price": 153.61}) as mock_stop, \
              patch("tasks.manage_cancel_stop_orders_for"), \
+             patch("ibkr.get_open_orders", return_value=[]), \
              patch("ibkr.get_client", return_value=self._client(144)), \
              patch("db.get_position_stop", side_effect=[None, {"stop_price": 153.61}]), \
              patch("tasks._retry_pending_reprotects"), \
@@ -612,6 +613,7 @@ class TestReconcileUnconfirmedOrders:
              patch("tasks.manage_stop_place", return_value={"order_id": 9}) as place, \
              patch("tasks.manage_cancel_stop_orders_for"), patch("tasks._retry_pending_reprotects"), \
              patch("db.get_position_stop", return_value={"stop_price": 153.61}), \
+             patch("ibkr.get_open_orders", return_value=[]), \
              patch("ibkr.get_client", return_value=self._client(100)), \
              patch("db.upsert_position_stop"), patch("db.set_stop_broker_order_id"), \
              patch("db.update_approval_status"), patch("alerts._send"):
@@ -631,6 +633,7 @@ class TestReconcileUnconfirmedOrders:
              patch("tasks.manage_stop_place", return_value={"order_id": 9}) as place, \
              patch("tasks.manage_cancel_stop_orders_for"), patch("tasks._retry_pending_reprotects"), \
              patch("db.get_position_stop", return_value={"stop_price": 153.61}), \
+             patch("ibkr.get_open_orders", return_value=[]), \
              patch("ibkr.get_client", return_value=self._client(144)), \
              patch("db.upsert_position_stop"), patch("db.set_stop_broker_order_id"), \
              patch("db.update_approval_status"), patch("alerts._send"):
@@ -1332,6 +1335,7 @@ def _queue_harness(place_effect):
          patch("db.set_stop_broker_order_id"), \
          patch("ibkr.get_client") as client, \
          patch("tasks.manage_cancel_stop_orders_for"), \
+         patch("ibkr.get_open_orders", return_value=[]), \
          patch("tasks.manage_stop_place", side_effect=place):
         client.return_value.get_all_positions.return_value = [_Pos("AMD", 5.0)]
         tasks._queue_reprotect("AMD", {"intent": "BUY"}, None)
@@ -1388,6 +1392,7 @@ def test_covered_position_is_not_cancelled_by_the_queue():
     alone; the entry completes."""
     import tasks
     with patch("execution._stops_still_resting", return_value=5.0), \
+         patch("ibkr.get_open_orders", return_value=[]), \
          patch("tasks.manage_cancel_stop_orders_for") as cancel:
         with patch("db.get_state", return_value=None), patch("db.set_state"), \
              patch("db.get_position_stop", return_value={"stop_price": 90.0}), \
@@ -1612,6 +1617,7 @@ def test_reprotect_does_not_confirm_a_lagging_read_after_a_manual_add():
     with patch("ibkr.get_client", return_value=client), \
          patch("db.get_position_stop", return_value={"stop_price": 150.0}), \
          patch("execution._stops_still_resting", return_value=100.0), \
+         patch("ibkr.get_open_orders", return_value=[]), \
          patch("tasks.manage_stop_place") as place:
         assert tasks._reprotect_after_late_sell("CRWD", {}, None, from_queue=True, expect_at_least=150) is False
         assert tasks._reprotect_after_late_sell("CRWD", {}, None, from_queue=True) is True

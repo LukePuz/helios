@@ -620,3 +620,95 @@ def test_the_newer_position_check_waits_when_a_read_fails():
         close.assert_not_called()
         delete.assert_not_called()
         assert stop.call_args.kwargs == {"strict": True}
+
+
+def _queued_restore(open_orders, before, after, intent="RESTORE", held=20):
+    """from_queue path with coverage read before the cancel (before) and the
+    stops left after it (after)."""
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="CRWD", qty=held)]
+    kw = {"side_effect": open_orders} if isinstance(open_orders, Exception) else {"return_value": open_orders}
+    with patch("ibkr.get_client", return_value=client), \
+         patch("ibkr.get_open_orders", **kw), \
+         patch("db.get_position_stop", return_value={"stop_price": 150.0}), \
+         patch("db.mark_profit_target_taken"), \
+         patch("execution._stops_still_resting", return_value=before), \
+         patch("tasks._resting_sell_stops", return_value=after), \
+         patch("tasks.manage_cancel_stop_orders_for") as cancel, \
+         patch("tasks.manage_stop_place", return_value={"order_id": 3}) as place, \
+         patch("db.set_stop_broker_order_id"):
+        ok = tasks._reprotect_after_late_sell("CRWD", {"intent": intent, "stop_price": 160.0}, None,
+                                              from_queue=True)
+    return ok, place, cancel
+
+
+def test_queued_restore_waits_when_open_orders_cannot_be_read():
+    """m116: a queued retry does not stop blind; it counts a try."""
+    ok, place, cancel = _queued_restore(TimeoutError("no reply"), 0.0, [])
+    assert ok is False
+    place.assert_not_called(); cancel.assert_not_called()
+
+
+def test_queued_restore_waits_when_resting_stops_cannot_be_read():
+    ok, place, cancel = _queued_restore([], None, [])
+    assert ok is False
+    place.assert_not_called(); cancel.assert_not_called()
+
+
+def test_queued_restore_covers_only_what_a_stop_it_cannot_cancel_leaves():
+    """m116: another client's stop on 8 shares stays; ours goes on 12."""
+    other = {"order_id": 5, "ticker": "CRWD", "qty": 8.0, "stop_price": 140.0}
+    ok, place, cancel = _queued_restore([], 8.0, [other])
+    assert ok is True
+    cancel.assert_called_once_with("CRWD")
+    place.assert_called_once_with("CRWD", 12.0, 150.0)
+
+
+def test_queued_restore_nets_a_working_market_sell():
+    """m116 / M129: remaining - selling - covered."""
+    mkt = {"order_id": 9, "ticker": "CRWD", "action": "SELL", "order_type": "MKT", "qty": 5.0,
+           "stop_price": None, "status": "Submitted", "remaining": 5.0}
+    other = {"order_id": 5, "ticker": "CRWD", "qty": 8.0, "stop_price": 140.0}
+    ok, place, _ = _queued_restore([mkt], 8.0, [other])
+    assert ok is True
+    place.assert_called_once_with("CRWD", 7.0, 150.0)
+
+
+def test_queued_restore_with_no_cover_places_without_a_cancel_round_trip():
+    ok, place, cancel = _queued_restore([], 0.0, [])
+    assert ok is True
+    cancel.assert_not_called()
+    place.assert_called_once_with("CRWD", 20.0, 150.0)
+
+
+def test_queued_profit_target_replaces_ours_and_sizes_to_what_is_left():
+    """A profit target still re-places (it raises the stop), sized net of a
+    stop the cancel could not remove."""
+    other = {"order_id": 5, "ticker": "CRWD", "qty": 8.0, "stop_price": 140.0}
+    ok, place, cancel = _queued_restore([], 20.0, [other], intent="PROFIT_TARGET")
+    assert ok is True
+    cancel.assert_called_once_with("CRWD")
+    place.assert_called_once_with("CRWD", 12.0, 160.0)
+
+
+def test_queued_restore_gives_up_with_an_alert_and_a_manual_action():
+    """m116 condition 1: unknown coverage ends in STOP NOT RESTORED plus a
+    manual action, not a silent drop."""
+    import json
+    state = {"reprotect_pending": json.dumps(
+        {"CRWD": {"intent": "RESTORE", "tries": tasks._REPROTECT_MAX_TRIES - 1, "nonce": "n"}})}
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="CRWD", qty=20)]
+    with patch("db.get_state", side_effect=lambda k: state.get(k)), \
+         patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+         patch("ibkr.get_client", return_value=client), \
+         patch("ibkr.get_open_orders", side_effect=TimeoutError("no reply")), \
+         patch("db.get_position_stop", return_value={"stop_price": 150.0}), \
+         patch("tasks.manage_stop_place") as place, \
+         patch("tasks.open_manual_action") as manual, \
+         patch("alerts._send") as send:
+        tasks._retry_pending_reprotects()
+    place.assert_not_called()
+    assert json.loads(state["reprotect_pending"]) == {}
+    assert "STOP NOT RESTORED" in send.call_args[0][0]
+    manual.assert_called_once()

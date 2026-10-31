@@ -260,9 +260,14 @@ def _udr_check(parsed: dict, brief: str) -> dict:
         from_targets = (round((target - price) / (price - floor), 2)
                         if price and target and floor and target > price > floor else None)
         computed = [v for v in (from_pcts, from_targets) if v is not None]
+        # Price at which the model's own target/floor give 2:1 (audit A2059-2):
+        # a WATCH under the gate becomes "buy at X"; touches are scored offline.
+        p2 = round((target + 2 * floor) / 3, 2) if target and floor and target > floor else None
         return {"model": model, "from_pcts": from_pcts, "from_targets": from_targets,
                 "gate_disagrees": (model is not None and bool(computed)
-                                   and any((v >= 2.0) != (model >= 2.0) for v in computed))}
+                                   and any((v >= 2.0) != (model >= 2.0) for v in computed)),
+                "price_for_2r": p2,
+                "price_for_2r_pct": round((p2 / price - 1) * 100, 2) if p2 and price else None}
     except Exception as e:
         return {"error": str(e)[:120]}
 

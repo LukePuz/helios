@@ -1041,6 +1041,11 @@ def retry_deferred_entry(self, approval_id: int, gap_retry_attempt: int = 1, pri
         log.info(f"retry_deferred_entry: approval #{approval_id} status is "
                  f"'{approval.get('status')}', not FAILED — skipping retry")
         return
+    if db.SWEPT_REASON_MARK in (approval.get("status_reason") or ""):
+        # Swept out of PROCESSING: its order may already be at the broker.
+        log.warning(f"retry_deferred_entry: approval #{approval_id} was swept out of PROCESSING "
+                    f"— not retried; check the broker")
+        return
 
     ticker = approval.get("ticker", "?")
 

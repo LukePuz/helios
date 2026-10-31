@@ -1604,6 +1604,9 @@ def analyze(
     provenance.update(_decision_inputs_record(ticker, regime_packet))
     try:
         provenance["brief_exposure"] = _brief_exposure(ticker, prompt)
+        # The held flag the gates used (crew sets it from broker positions
+        # before the call); the other held fields are read after it (M138).
+        provenance["brief_exposure"]["held_at_gate"] = candidate.get("held")
     except Exception as e:
         log.debug(f"[{ticker}] brief exposure record failed: {e}")
     try:

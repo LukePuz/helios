@@ -2015,7 +2015,7 @@ def test_claim_failed_sell_for_retry_sql():
     sql, params = cur.execute.call_args[0]
     assert "status='FAILED'" in sql and "IN ('TRIM','EXIT')" in sql and "NOT LIKE" in sql
     assert "RETURNING status_reason" in sql and "SET status='PROCESSING'" in sql
-    assert params == (81, "skipped: resting stops unreadable%", "%retried at%")
+    assert params == (81, "skipped: resting stops unreadable%", "%retried at%", "%swept:%")
 
 
 def test_has_newer_ticker_activity_checks_approvals_then_verdicts():
@@ -2074,3 +2074,29 @@ def test_held_sell_retry_leaves_a_final_status_when_execution_raises():
         except RuntimeError:
             pass
     assert upd.call_args.args[1] == "FAILED" and upd.call_args.kwargs["reason"].endswith("error before an outcome")
+
+
+def test_a_swept_approval_is_never_retried():
+    """Professor M139: a row swept out of PROCESSING may have sent its order."""
+    import db
+    import tasks
+    swept = {"id": 81, "ticker": "AMD", "action": "OPEN", "status": "FAILED",
+             "status_reason": "deferred | swept: stuck in PROCESSING over 60 min; check the broker for a fill"}
+    with patch("db.get_approval_by_id", return_value=swept), \
+         patch("execution.execute_approved") as ex:
+        tasks.retry_deferred_entry.run(81)
+    ex.assert_not_called()
+    assert db.SWEPT_REASON_MARK == "swept:"
+
+
+def test_held_sell_claim_excludes_swept_rows():
+    from unittest.mock import MagicMock
+    import db
+    cur = MagicMock()
+    cur.fetchone.return_value = None
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
+        db.claim_failed_sell_for_retry(5)
+    sql, params = cur.execute.call_args[0]
+    assert params[-1] == "%swept:%" and sql.count("NOT LIKE") == 2

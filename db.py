@@ -1527,8 +1527,9 @@ def claim_failed_sell_for_retry(approval_id: int) -> str | None:
             cur.execute(
                 "UPDATE pending_approvals SET status='PROCESSING', decided_at=NOW() "
                 "WHERE id=%s AND status='FAILED' AND action IN ('TRIM','EXIT') "
-                "AND status_reason LIKE %s AND status_reason NOT LIKE %s RETURNING status_reason",
-                (approval_id, HELD_SELL_REASON_PREFIX + "%", "%retried at%"),
+                "AND status_reason LIKE %s AND status_reason NOT LIKE %s "
+                "AND status_reason NOT LIKE %s RETURNING status_reason",
+                (approval_id, HELD_SELL_REASON_PREFIX + "%", "%retried at%", f"%{SWEPT_REASON_MARK}%"),
             )
             row = cur.fetchone()
         conn.commit()
@@ -1570,7 +1571,7 @@ def get_approval_by_id(approval_id: int) -> dict | None:
             cur.execute(
                 "SELECT id, ticker, action, conviction, thesis_bucket, position_size_pct, "
                 "stop_loss_price, entry_strategy, reasoning, analyst_json, risk_json, status, expires_at, "
-                "timestamp FROM pending_approvals WHERE id=%s",
+                "timestamp, status_reason FROM pending_approvals WHERE id=%s",
                 (approval_id,),
             )
             row = cur.fetchone()
@@ -1586,6 +1587,7 @@ def get_approval_by_id(approval_id: int) -> dict | None:
             # Before 2026-10-28 this was missing, so retry_deferred_entry's
             # 16 h age check always saw None and never fired.
             "timestamp": row[13],
+            "status_reason": row[14],
         }
     except Exception as e:
         logging.error(f"get_approval_by_id failed: {e}")
@@ -1618,6 +1620,11 @@ def expire_stale_approvals() -> int:
 STUCK_PROCESSING_MINUTES = 60   # an execution holds its ticker lock for at most 15 min
 
 
+# A swept row may have sent its order before it stuck: no retry path may act
+# on it (professor M139). Reconcile still flips it to APPROVED on a fill.
+SWEPT_REASON_MARK = "swept:"
+
+
 def sweep_stuck_processing(minutes: int = STUCK_PROCESSING_MINUTES) -> list[tuple]:
     """PROCESSING approvals claimed more than `minutes` ago -> FAILED, with
     a note. A process killed (or a status write lost) between the claim and
@@ -1632,7 +1639,7 @@ def sweep_stuck_processing(minutes: int = STUCK_PROCESSING_MINUTES) -> list[tupl
                 "status_reason=COALESCE(status_reason || ' | ', '') || %s "
                 "WHERE status='PROCESSING' AND trading_env=%s "
                 "AND decided_at < NOW() - make_interval(mins => %s) RETURNING id, ticker, action",
-                (f"swept: stuck in PROCESSING over {minutes} min; check the broker for a fill",
+                (f"{SWEPT_REASON_MARK} stuck in PROCESSING over {minutes} min; check the broker for a fill",
                  TRADING_ENV, minutes),
             )
             rows = cur.fetchall()

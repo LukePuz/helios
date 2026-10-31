@@ -1132,6 +1132,104 @@ def _approval_age_hours(approval: dict) -> float | None:
     return (datetime.now(timezone.utc) - ts).total_seconds() / 3600
 
 
+_DONE_UNFILLED = {"Cancelled", "ApiCancelled", "Inactive"}
+
+
+def _backfill_perm_ids(pending: list[dict]) -> None:
+    """A row logged before TWS assigned its permId has none (professor M127).
+    Fill it from the open orders while the order still works, only when
+    exactly one open order has that orderId, symbol and side (orderId alone
+    is per client, m102). Never raises."""
+    missing = [o for o in pending if not o.get("perm_id")]
+    if not missing:
+        return
+    import db
+    import ibkr
+    try:
+        open_orders = ibkr.get_open_orders()
+    except Exception as e:
+        log.warning(f"reconcile: open-order read for the permId backfill failed: {e}")
+        return
+    for order in missing:
+        hits = [o for o in open_orders if o.get("order_id") == order["broker_order_id"]
+                and o.get("ticker") == order["ticker"] and (o.get("action") or "").upper() == order["side"]
+                and o.get("perm_id")]
+        if len(hits) == 1:
+            try:
+                if db.set_order_perm_id(order["id"], hits[0]["perm_id"]):
+                    order["perm_id"] = hits[0]["perm_id"]
+            except Exception as e:
+                log.warning(f"[{order['ticker']}] reconcile: permId backfill failed: {e}")
+
+
+def _resolve_if_cancelled(order: dict, completed: dict) -> None:
+    """An unconfirmed/partial order with no new fill used to stay open forever
+    when the broker had cancelled or rejected it, so the stale-stop branch
+    waited on it until midnight and the stop fill was then missed as no_fill
+    (professor M127). Marks the row cancelled only when today's completed
+    orders show it Cancelled/ApiCancelled/Inactive (matched on permId, symbol
+    and side) with exactly the recorded fill. Not found, no permId, or any
+    error: unknown, so it keeps waiting. A larger broker fill than recorded is
+    a late fill the execution lookup missed: alerted, not marked."""
+    import db
+    import ibkr
+    ticker, perm = order["ticker"], order.get("perm_id")
+    if not perm:
+        return
+    if "rows" not in completed:
+        try:
+            completed["rows"] = ibkr.get_completed_orders()
+        except Exception as e:
+            log.warning(f"reconcile: completed-order read failed: {e}")
+            completed["rows"] = None
+    rows = completed["rows"]
+    if not rows:
+        return
+    hit = next((c for c in rows if c["perm_id"] == perm and c["ticker"] == ticker
+                and c["action"] == order["side"]), None)
+    if not hit or hit["status"] not in _DONE_UNFILLED or hit["filled_qty"] is None:
+        return
+    recorded = order.get("filled_qty") or 0.0
+    if hit["filled_qty"] > recorded + 1e-4:
+        log.error(f"[{ticker}] reconcile: order {order['broker_order_id']} is {hit['status']} with "
+                  f"{hit['filled_qty']:g} filled at the broker but {recorded:g} recorded, and no execution "
+                  f"was found; left open")
+        try:
+            if _reconcile_alert_due(f"fill_mismatch_{order['id']}"):
+                import alerts
+                alerts._send(f"⚠️ FILL NOT RECORDED — <b>{ticker}</b>\nThe broker shows "
+                             f"{hit['filled_qty']:g} shares filled on a {order['side']} it reports "
+                             f"{hit['status']}, but the bot recorded {recorded:g} and found no execution. "
+                             f"Check the trade in TWS.")
+        except Exception as e:
+            log.warning(f"[{ticker}] reconcile: fill-mismatch alert failed: {e}")
+        return
+    if hit["filled_qty"] < recorded - 1e-4:
+        log.warning(f"[{ticker}] reconcile: order {order['broker_order_id']} shows less filled at the broker "
+                    f"({hit['filled_qty']:g}) than recorded ({recorded:g}); left open")
+        return
+    if not db.mark_order_cancelled(order["id"], recorded):
+        return
+    log.warning(f"[{ticker}] reconcile: order {order['broker_order_id']} ({order['side']} "
+                f"{order.get('intent')}) is {hit['status']} at the broker with {recorded:g} filled; "
+                f"marked cancelled, the rest never sold")
+    intent = (order.get("intent") or "").upper()
+    if order["side"] == "SELL" and recorded > 0 and intent in ("EXIT", "BACKSTOP") and order.get("fill_price"):
+        # Flat with no other unrecorded sell today: its part fill was the
+        # whole exit, so close from it as the late-fill path does (professor
+        # M127 point 4). Another sale in the mix leaves it open: the exit
+        # price of a mixed close is Luke's open question.
+        try:
+            pos = next((p for p in ibkr.get_client().get_all_positions() if p.symbol == ticker), None)
+            if pos is None and not db.get_position_stop(ticker):
+                recorded_ids = db.recorded_sell_order_ids(ticker)
+                if recorded_ids is not None and not ibkr.get_recent_sell_fill(ticker, recorded_ids):
+                    db.close_trade_outcome(ticker, exit_price=order["fill_price"],
+                                           exit_source=f"late_{intent.lower()}", exit_price_source="fill")
+        except Exception as e:
+            log.warning(f"[{ticker}] reconcile: close after a cancelled part-filled {intent} failed: {e}")
+
+
 @app.task(name="tasks.reconcile_unconfirmed_orders", bind=True, max_retries=2)
 def reconcile_unconfirmed_orders(self):
     """
@@ -1196,6 +1294,9 @@ def _reconcile_unconfirmed_orders_locked(task):
         log.error(f"reconcile_unconfirmed_orders: could not load unconfirmed orders: {e}")
         raise task.retry(exc=e, countdown=120)
 
+    _backfill_perm_ids(pending)
+    completed: dict = {}   # today's completed orders, read once per run (M127)
+
     for order in pending:
         ticker = order["ticker"]
         try:
@@ -1211,7 +1312,8 @@ def _reconcile_unconfirmed_orders_locked(task):
                         f"order {order['broker_order_id']}: {e}")
             continue
         if not fill:
-            continue  # still genuinely unfilled (or cancelled/rejected) -- leave alone
+            _resolve_if_cancelled(order, completed)   # done only if the broker says so
+            continue
 
         # A 'partial' order already has some shares recorded: log only the
         # new ones, at their own average price (professor M-4).
@@ -1219,6 +1321,7 @@ def _reconcile_unconfirmed_orders_locked(task):
         prev_qty = order.get("filled_qty") or 0.0
         fill_qty = round(total_qty - prev_qty, 4)
         if fill_qty <= 0:
+            _resolve_if_cancelled(order, completed)
             continue
         fill_price = ((total_qty * total_avg - prev_qty * (order.get("fill_price") or total_avg))
                       / fill_qty) if prev_qty else total_avg

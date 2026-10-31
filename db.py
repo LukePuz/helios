@@ -2926,6 +2926,46 @@ def compute_slippage_pct(decision_price: float | None, fill_price: float | None,
     return raw if side == "BUY" else -raw
 
 
+def set_order_perm_id(order_id: int, perm_id: int) -> bool:
+    """Backfills a NULL orders.perm_id (professor M127). True if set."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE orders SET perm_id=%s WHERE id=%s AND perm_id IS NULL", (perm_id, order_id))
+            n = cur.rowcount
+        conn.commit()
+        return n > 0
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"set_order_perm_id failed: {e}")
+        return False
+    finally:
+        _put_conn(conn)
+
+
+def mark_order_cancelled(order_id: int, expect_filled_qty: float) -> bool:
+    """Marks an unconfirmed/partial orders row 'cancelled' once the broker
+    reports it done with exactly the recorded fill (professor M127). Applies
+    only while the row still has expect_filled_qty. True if it changed."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE orders SET status='cancelled', updated_at=NOW() WHERE id=%s "
+                "AND status IN ('unconfirmed', 'partial') AND ABS(COALESCE(filled_qty, 0) - %s) < 0.0001",
+                (order_id, expect_filled_qty),
+            )
+            n = cur.rowcount
+        conn.commit()
+        return n > 0
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"mark_order_cancelled failed: {e}")
+        return False
+    finally:
+        _put_conn(conn)
+
+
 def update_order_fill(order_id: int, fill_price: float, filled_qty: float, status: str,
                       expect_filled_qty: float | None = None) -> bool:
     """Records the fill and computes slippage_pct vs decision_price if one was logged.
@@ -3005,7 +3045,7 @@ def get_unconfirmed_orders(max_age_hours: int = 24) -> list[dict]:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT id, ticker, side, qty, broker_order_id, decision_price, approval_id, "
-                "intent, stop_price, created_at, filled_qty, fill_price "
+                "intent, stop_price, created_at, filled_qty, fill_price, perm_id "
                 "FROM orders WHERE status IN ('unconfirmed', 'partial') AND broker_order_id IS NOT NULL "
                 "AND trading_env=%s "
                 "AND created_at > NOW() - INTERVAL '%s hours' ORDER BY created_at",
@@ -3022,6 +3062,7 @@ def get_unconfirmed_orders(max_age_hours: int = 24) -> list[dict]:
                 "created_at": r[9],
                 "filled_qty": float(r[10]) if r[10] is not None else 0.0,
                 "fill_price": float(r[11]) if r[11] is not None else None,
+                "perm_id": r[12],
             }
             for r in rows
         ]

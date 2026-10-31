@@ -1746,3 +1746,88 @@ class TestBuyOutcomeRetry:
              patch("execution.log_buy_outcome", return_value=True) as write:
             tasks._retry_pending_buy_outcomes()
         assert write.call_args.kwargs == {"entry_date": first["entry_date"], "entry_benchmark_price": 580.0}
+
+
+class TestCancelledUnconfirmedOrder:
+    """Professor M127: a cancelled unconfirmed order was never resolved, so the
+    stale-stop branch waited on it until midnight."""
+
+    ORDER = {"id": 44, "ticker": "CRWD", "side": "SELL", "qty": 20.0, "broker_order_id": 900,
+             "decision_price": 180.0, "approval_id": None, "intent": "EXIT", "stop_price": None,
+             "created_at": None, "filled_qty": 0.0, "fill_price": None, "perm_id": 7700}
+
+    def _run(self, completed, fill=None, order=None, positions=(), other_sell=None):
+        from unittest.mock import MagicMock
+        client = MagicMock()
+        client.get_all_positions.return_value = list(positions)
+        kw = {"side_effect": completed} if isinstance(completed, Exception) else {"return_value": completed}
+        with patch("db.get_unconfirmed_orders", return_value=[order or self.ORDER]), \
+             patch("tasks._retry_pending_reprotects"), patch("tasks._retry_pending_buy_outcomes"), \
+             patch("ibkr.get_open_orders", return_value=[]), \
+             patch("ibkr.get_fill_for_order", return_value=fill), \
+             patch("ibkr.get_completed_orders", **kw) as read, \
+             patch("ibkr.get_client", return_value=client), \
+             patch("db.get_position_stop", return_value=None), \
+             patch("db.recorded_sell_order_ids", return_value={900}), \
+             patch("ibkr.get_recent_sell_fill", return_value=other_sell), \
+             patch("db.mark_order_cancelled", return_value=True) as mark, \
+             patch("db.close_trade_outcome") as close, \
+             patch("tasks._reconcile_alert_due", return_value=True), patch("alerts._send") as alert, \
+             patch("db.log_trade") as trade:
+            tasks.reconcile_unconfirmed_orders.run()
+        trade.assert_not_called()
+        return mark, close, alert, read
+
+    @staticmethod
+    def _done(status="Cancelled", filled=0.0, perm=7700, action="SELL", ticker="CRWD"):
+        return [{"perm_id": perm, "ticker": ticker, "action": action, "status": status, "filled_qty": filled}]
+
+    def test_a_cancelled_order_with_no_fill_is_marked_cancelled(self):
+        mark, close, alert, _ = self._run(self._done())
+        mark.assert_called_once_with(44, 0.0)
+        close.assert_not_called()
+        alert.assert_not_called()
+
+    def test_left_waiting_when_unknown(self):
+        for completed in ([], self._done(status="Filled"), self._done(perm=1), self._done(action="BUY"),
+                          self._done(filled=None), RuntimeError("gateway")):
+            mark, _, alert, _ = self._run(completed)
+            mark.assert_not_called()
+            alert.assert_not_called()
+        mark, _, _, read = self._run(self._done(), order={**self.ORDER, "perm_id": None})
+        mark.assert_not_called()
+        read.assert_not_called()   # no permId: nothing to match on
+
+    def test_a_larger_broker_fill_is_alerted_not_marked(self):
+        mark, close, alert, _ = self._run(self._done(filled=5.0))
+        mark.assert_not_called()
+        alert.assert_called_once()
+        assert "FILL NOT RECORDED" in alert.call_args.args[0]
+
+    def test_a_cancelled_part_filled_exit_closes_only_when_it_was_the_whole_exit(self):
+        part = {**self.ORDER, "filled_qty": 8.0, "fill_price": 181.0}
+        fill = {"filled_qty": 8.0, "fill_price": 181.0}
+        mark, close, _, _ = self._run(self._done(status="ApiCancelled", filled=8.0), fill=fill, order=part)
+        mark.assert_called_once_with(44, 8.0)
+        close.assert_called_once_with("CRWD", exit_price=181.0, exit_source="late_exit", exit_price_source="fill")
+        _, close, _, _ = self._run(self._done(status="ApiCancelled", filled=8.0), fill=fill, order=part,
+                                   other_sell={"filled_qty": 12.0, "fill_price": 179.0})
+        close.assert_not_called()   # mixed close: Luke's open question
+        from unittest.mock import MagicMock
+        _, close, _, _ = self._run(self._done(status="ApiCancelled", filled=8.0), fill=fill, order=part,
+                                   positions=[MagicMock(symbol="CRWD", qty=12)])
+        close.assert_not_called()   # rest still held: never sold
+
+
+def test_perm_id_backfill_needs_one_unambiguous_open_order():
+    from unittest.mock import patch as p
+    rows = [{"id": 1, "ticker": "CRWD", "side": "SELL", "broker_order_id": 900, "perm_id": None},
+            {"id": 2, "ticker": "AMD", "side": "SELL", "broker_order_id": 901, "perm_id": None}]
+    open_orders = [{"order_id": 900, "ticker": "CRWD", "action": "SELL", "perm_id": 7700},
+                   {"order_id": 901, "ticker": "AMD", "action": "SELL", "perm_id": 8800},
+                   {"order_id": 901, "ticker": "AMD", "action": "SELL", "perm_id": 8801}]   # two clients
+    with p("ibkr.get_open_orders", return_value=open_orders), \
+         p("db.set_order_perm_id", return_value=True) as setp:
+        tasks._backfill_perm_ids(rows)
+    setp.assert_called_once_with(1, 7700)
+    assert rows[0]["perm_id"] == 7700 and rows[1]["perm_id"] is None

@@ -465,3 +465,21 @@ def test_long_qty_counts_stock_only():
     pos = [MagicMock(contract=MagicMock(symbol="AMD", secType="STK"), position=5),
            MagicMock(contract=MagicMock(symbol="AMD", secType="OPT"), position=-2)]
     assert ibkr._long_qty(pos, "AMD") == 5
+
+
+def test_completed_orders_match_on_perm_id_and_read_unset_fill_as_unknown():
+    """Professor M127: completed orders carry no orderId; ib_async leaves an
+    unsent filledQuantity at UNSET_DOUBLE."""
+    import sys
+    from types import SimpleNamespace as NS
+    trades = [NS(order=NS(orderId=0, permId=7700, action="SELL", filledQuantity=8.0),
+                 contract=NS(symbol="CRWD"), orderStatus=NS(status="ApiCancelled")),
+              NS(order=NS(orderId=0, permId=0, action="BUY", filledQuantity=sys.float_info.max),
+                 contract=NS(symbol="AMD"), orderStatus=NS(status="Cancelled"))]
+    fake_ib = MagicMock()
+    fake_ib.reqCompletedOrders.return_value = trades
+    with patch("ibkr.get_ib", return_value=fake_ib):
+        rows = ibkr.get_completed_orders()
+    fake_ib.reqCompletedOrders.assert_called_once_with(False)
+    assert rows == [{"perm_id": 7700, "ticker": "CRWD", "action": "SELL", "status": "ApiCancelled", "filled_qty": 8.0},
+                    {"perm_id": None, "ticker": "AMD", "action": "BUY", "status": "Cancelled", "filled_qty": None}]

@@ -646,6 +646,7 @@ def get_open_orders() -> list[dict]:
         seen.add(key)
         results.append({
             "order_id":   o.orderId,
+            "perm_id":    int(getattr(o, "permId", 0) or 0) or None,
             "ticker":     trade.contract.symbol,
             "action":     o.action,
             "order_type": o.orderType,
@@ -708,6 +709,28 @@ def cancel_stop_orders_for(ticker: str) -> int:
             f"Cancel manually in TWS."
         )
     return confirmed
+
+
+def get_completed_orders() -> list[dict]:
+    """Today's completed orders (this TWS session only; the nightly restart
+    clears them): [{perm_id, ticker, action, status, filled_qty}]. TWS sends
+    no orderId for these, so they match on permId (professor M127). Raises
+    on a broker error."""
+    ib = get_ib()
+    out = []
+    for trade in ib.reqCompletedOrders(False):
+        o = trade.order
+        filled = getattr(o, "filledQuantity", None)
+        try:
+            filled = float(filled)
+        except (TypeError, ValueError):
+            filled = None
+        if filled is not None and (filled != filled or filled >= 1e300):   # NaN or UNSET_DOUBLE
+            filled = None
+        out.append({"perm_id": int(getattr(o, "permId", 0) or 0) or None,
+                    "ticker": trade.contract.symbol, "action": (o.action or "").upper(),
+                    "status": trade.orderStatus.status, "filled_qty": filled})
+    return out
 
 
 def get_fill_for_order(broker_order_id: int, ticker: str | None = None,

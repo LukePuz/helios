@@ -802,6 +802,33 @@ def test_exit_not_sent_while_a_stop_is_still_resting():
     assert "stop still resting" in execution.last_outcome_reason()
 
 
+def test_exit_not_sent_when_resting_stops_cannot_be_read():
+    """Review of 73494d1: the cancel sees only this client's stops, so a
+    read that fails (now a timeout, not a hang) must hold the EXIT even when
+    the cancel went through."""
+    approval = _approval(action="EXIT", shares_initial=100)
+    with patch("ibkr.get_ib"), patch("ibkr.get_client") as client, \
+         patch("ibkr.place_market_order") as order, \
+         patch("tasks.manage_cancel_stop_orders_for", return_value=0), \
+         patch("ibkr.get_open_orders", side_effect=TimeoutError("no reply")) as read, \
+         patch("ibkr.get_latest_price", return_value=100.0), \
+         patch("market_data.get_priced_quote", return_value=None), \
+         patch("alerts._send") as send:
+        client.return_value.get_open_position.return_value = MagicMock(qty=100)
+        assert execution.execute_approved(approval) is False
+    order.assert_not_called()
+    assert read.call_count >= 2                       # tried again after the drop
+    assert "could not be read" in send.call_args_list[0][0][0]
+
+
+def test_resting_stop_read_is_retried_once():
+    with patch("tasks._resting_sell_stops", side_effect=[TimeoutError("x"), [{"qty": 3.0}]]):
+        assert execution._stops_still_resting("AMD") == 3.0
+    with patch("tasks._resting_sell_stops", side_effect=TimeoutError("x")) as read:
+        assert execution._stops_still_resting("AMD") is None
+    assert read.call_count == 2
+
+
 def test_restore_covers_only_shares_without_a_resting_stop():
     resting = [{"order_id": 4, "ticker": "AMD", "action": "SELL", "order_type": "STP",
                 "qty": 60.0, "stop_price": 90.0, "status": "Submitted"}]

@@ -903,7 +903,9 @@ class TestStaleStopReconciliation:
              patch("db.get_all_position_stops", return_value=[stale_rec]), \
              patch("db.get_state", side_effect=fake_get_state), \
              patch("db.set_state", side_effect=fake_set_state), \
-             patch("ibkr.get_recent_sell_fill", return_value=fill_return) as mock_fill, \
+             patch("ibkr.get_recent_sell_fill",
+                   **({"side_effect": fill_return} if isinstance(fill_return, Exception)
+                      else {"return_value": fill_return})) as mock_fill, \
              patch("db.recorded_sell_order_ids", return_value=recorded), \
              patch("db.get_unconfirmed_orders",
                    **({"side_effect": unconfirmed} if isinstance(unconfirmed, Exception)
@@ -930,6 +932,22 @@ class TestStaleStopReconciliation:
         mock_delete.assert_not_called()
         mock_alert.assert_not_called()
         assert state.get("stale_stop_pending_DDOG")
+
+    def test_a_failed_exit_lookup_keeps_the_record_and_retries(self):
+        """Review of 73494d1: a timed-out execution read is unknown, not "no
+        SELL"; it must not label the outcome no_fill or delete the record."""
+        state = {}
+        self._run(state, fill_return=None)                                  # arms the marker
+        with patch("db.flag_orphan_outcomes_for") as flag:
+            mock_fill, mock_log_trade, mock_close_outcome, mock_delete, mock_alert = \
+                self._run(state, fill_return=TimeoutError("no reply"))
+        mock_fill.assert_called_once()
+        mock_log_trade.assert_not_called(); mock_close_outcome.assert_not_called()
+        mock_delete.assert_not_called(); mock_alert.assert_not_called(); flag.assert_not_called()
+        assert state.get("stale_stop_pending_DDOG")                          # still armed
+        fill = {"filled_qty": 84.0, "fill_price": 227.80}
+        _, mock_log_trade, _, _, _ = self._run(state, fill_return=fill)       # next cycle finds it
+        mock_log_trade.assert_called_once()
 
     def test_found_fill_is_logged_as_a_trade_and_closes_the_outcome(self):
         state = {}

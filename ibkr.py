@@ -98,7 +98,7 @@ def get_ib(max_attempts: int = 3) -> ibi.IB:
                 cid = _get_client_id()
                 try:
                     _ib.connect(IB_HOST, IB_PORT, clientId=cid,
-                                readonly=False, timeout=10)
+                                readonly=False, timeout=10, raiseSyncErrors=True)
                 except Exception as connect_err:
                     # Error 326: another process already holds this clientId
                     # (belt-and-braces on top of _resolve_client_id — covers
@@ -109,7 +109,7 @@ def get_ib(max_attempts: int = 3) -> ibi.IB:
                         log.warning(f"clientId {cid} already in use — retrying with {fallback}")
                         _client_id = fallback
                         _ib.connect(IB_HOST, IB_PORT, clientId=fallback,
-                                    readonly=False, timeout=10)
+                                    readonly=False, timeout=10, raiseSyncErrors=True)
                         cid = fallback
                     else:
                         raise

@@ -107,13 +107,15 @@ def _stops_still_resting(ticker: str) -> float | None:
     """Total quantity of SELL stops still working at the broker for ticker,
     or None if it can't be read. A sell must not go out on top of a resting
     stop: after an EXIT that stop would short the account (limitations audit
-    22:53, A2253-1)."""
+    22:53, A2253-1). A failed read is tried once more (a timed-out read drops
+    the session, so the second one reconnects)."""
     import tasks
-    try:
-        return sum(float(o["qty"]) for o in tasks._resting_sell_stops(ticker))
-    except Exception as e:
-        log.warning(f"[{ticker}] could not re-read resting stops: {e}")
-        return None
+    for attempt in (1, 2):
+        try:
+            return sum(float(o["qty"]) for o in tasks._resting_sell_stops(ticker))
+        except Exception as e:
+            log.warning(f"[{ticker}] could not re-read resting stops (try {attempt}/2): {e}")
+    return None
 
 
 def _alert_stop_unknown(ticker: str, qty: float, stop_price: float) -> None:
@@ -933,22 +935,27 @@ def execute_approved(
             # Cancel the existing broker stop only now that the sell is
             # definitely going ahead, so the fill can't race the stop and
             # leave an order that would short the account.
-            cancel_ok = True
             try:
                 cancelled = tasks.manage_cancel_stop_orders_for(ticker)
                 if cancelled:
                     log.info(f"[{ticker}] Cancelled {cancelled} stop order(s) before {action}")
             except Exception as e:
-                cancel_ok = False
                 log.warning(f"[{ticker}] Could not cancel existing stops before {action}: {e}")
+            # The cancel above sees only this client's stops; a resting stop
+            # another client placed shows only in this read, so an unreadable
+            # broker is treated as a stop still resting.
             resting = _stops_still_resting(ticker)
-            if resting or (resting is None and not cancel_ok):
-                log.error(f"[{ticker}] {action} not sent: stop(s) for {resting} shares still resting")
+            if resting or resting is None:
+                log.error(f"[{ticker}] {action} not sent: " + (
+                    "resting stops could not be read" if resting is None
+                    else f"stop(s) for {resting} shares still resting"))
                 try:
                     alert_module._send(
-                        f"⚠️ {action} NOT SENT — <b>{ticker}</b>\n"
-                        f"An existing stop could not be cancelled, and selling on top of it "
-                        f"could short the account. Check the stop orders in TWS."
+                        f"⚠️ {action} NOT SENT — <b>{ticker}</b>\n" + (
+                            "The broker's resting stops could not be read" if resting is None
+                            else "An existing stop could not be cancelled")
+                        + ", and selling on top of a stop could short the account. "
+                          "Check the stop orders in TWS."
                     )
                 except Exception:
                     pass
@@ -1353,20 +1360,20 @@ def execute_manual(
                                f"Send it again during market hours."}
         # Cancel existing stops first so the fill can't race the stop and
         # leave an order that would short the account.
-        cancel_ok = True
         try:
             cancelled = tasks.manage_cancel_stop_orders_for(ticker)
             if cancelled:
                 log.info(f"[{ticker}] Cancelled {cancelled} stop order(s) before manual SELL")
         except Exception as e:
-            cancel_ok = False
             log.warning(f"[{ticker}] Could not cancel existing stops before manual SELL: {e}")
         resting = _stops_still_resting(ticker)
-        if resting or (resting is None and not cancel_ok):
+        if resting or resting is None:
             _restore_stop_after_failed_sell(ticker)  # A0053-2
             return {"success": False, "filled_qty": 0, "fill_price": None, "stop_price": None,
-                    "message": f"SELL {ticker} not sent: an existing stop could not be "
-                               f"cancelled (selling on top of it could short). Check TWS."}
+                    "message": f"SELL {ticker} not sent: " + (
+                        "the broker's resting stops could not be read" if resting is None
+                        else "an existing stop could not be cancelled")
+                        + " (selling on top of a stop could short). Check TWS."}
 
     order_intent = f"MANUAL_{side}"
     held_before = 0.0

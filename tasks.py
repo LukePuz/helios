@@ -3817,13 +3817,16 @@ def _reconcile_stop_orders_body(self):
                     log.warning(f"[{ticker}] Stale stop record: recorded-sell lookup failed; retrying "
                                 f"next cycle")
                     continue
-                db.set_state(pending_key, "")
-                fill = None
                 try:
                     fill = ibkr.get_recent_sell_fill(ticker, *recorded)
                 except Exception as e:
+                    # Unknown is not "no SELL": keep the record and the marker and
+                    # look again next cycle, or a real exit is labelled no_fill
+                    # and its record deleted.
                     log.warning(f"[{ticker}] Exit-fill lookup failed while reconciling "
-                                f"stale stop record: {e}")
+                                f"stale stop record; retrying next cycle: {e}")
+                    continue
+                db.set_state(pending_key, "")
 
                 if fill:
                     db.log_trade(

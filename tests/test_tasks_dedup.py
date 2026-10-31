@@ -1746,36 +1746,3 @@ class TestBuyOutcomeRetry:
              patch("execution.log_buy_outcome", return_value=True) as write:
             tasks._retry_pending_buy_outcomes()
         assert write.call_args.kwargs == {"entry_date": first["entry_date"], "entry_benchmark_price": 580.0}
-
-
-class TestCancelledUnconfirmedOrder:
-    """Professor M127: a cancelled unconfirmed SELL was never resolved, so the
-    stale-stop branch waited on it until midnight."""
-
-    ORDER = {"id": 44, "ticker": "CRWD", "side": "SELL", "qty": 20.0, "broker_order_id": 900,
-             "decision_price": 180.0, "approval_id": None, "intent": "EXIT", "stop_price": None,
-             "created_at": None, "filled_qty": 0.0, "fill_price": None}
-
-    def _run(self, status, fill=None, order=None):
-        with patch("db.get_unconfirmed_orders", return_value=[order or self.ORDER]), \
-             patch("tasks._retry_pending_reprotects"), patch("tasks._retry_pending_buy_outcomes"), \
-             patch("ibkr.get_fill_for_order", return_value=fill), \
-             patch("ibkr.get_completed_order_status",
-                   **({"side_effect": status} if isinstance(status, Exception) else {"return_value": status})), \
-             patch("db.mark_order_cancelled", return_value=True) as mark, \
-             patch("db.log_trade") as trade:
-            tasks.reconcile_unconfirmed_orders.run()
-        trade.assert_not_called()
-        return mark
-
-    def test_a_cancelled_order_with_no_fill_is_marked_cancelled(self):
-        self._run("Cancelled").assert_called_once_with(44, 0.0)
-
-    def test_a_partial_whose_remainder_was_cancelled_keeps_its_fill(self):
-        order = {**self.ORDER, "filled_qty": 8.0, "fill_price": 181.0}
-        mark = self._run("ApiCancelled", fill={"filled_qty": 8.0, "fill_price": 181.0}, order=order)
-        mark.assert_called_once_with(44, 8.0)
-
-    def test_left_alone_while_working_unknown_or_on_error(self):
-        for status in (None, "Submitted", "Filled", RuntimeError("gateway")):
-            self._run(status).assert_not_called()

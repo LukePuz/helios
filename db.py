@@ -2921,30 +2921,6 @@ def compute_slippage_pct(decision_price: float | None, fill_price: float | None,
     return raw if side == "BUY" else -raw
 
 
-def mark_order_cancelled(order_id: int, expect_filled_qty: float) -> bool:
-    """Marks an unconfirmed/partial orders row 'cancelled' once the broker
-    reports it cancelled with no further fill, keeping its recorded fill.
-    Applies only while the row still has expect_filled_qty (another run may
-    have reconciled a fill meanwhile). True if the row changed (M127)."""
-    conn = _get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE orders SET status='cancelled', updated_at=NOW() WHERE id=%s "
-                "AND status IN ('unconfirmed', 'partial') AND ABS(COALESCE(filled_qty, 0) - %s) < 0.0001",
-                (order_id, expect_filled_qty),
-            )
-            n = cur.rowcount
-        conn.commit()
-        return n > 0
-    except Exception as e:
-        conn.rollback()
-        logging.error(f"mark_order_cancelled failed: {e}")
-        return False
-    finally:
-        _put_conn(conn)
-
-
 def update_order_fill(order_id: int, fill_price: float, filled_qty: float, status: str,
                       expect_filled_qty: float | None = None) -> bool:
     """Records the fill and computes slippage_pct vs decision_price if one was logged.

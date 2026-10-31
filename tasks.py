@@ -1132,29 +1132,6 @@ def _approval_age_hours(approval: dict) -> float | None:
     return (datetime.now(timezone.utc) - ts).total_seconds() / 3600
 
 
-_DONE_UNFILLED = {"Cancelled", "ApiCancelled", "Inactive"}
-
-
-def _resolve_if_cancelled(order: dict) -> None:
-    """An unconfirmed/partial order with no new fill stayed open forever when
-    it had been cancelled or rejected, so the stale-stop branch waited on it
-    until midnight and a stop fill was then missed as no_fill (professor
-    M127). Marks the row cancelled once the broker reports it done unfilled;
-    leaves it on any doubt (not among today's completed orders, an error)."""
-    import db
-    import ibkr
-    ticker = order["ticker"]
-    try:
-        status = ibkr.get_completed_order_status(order["broker_order_id"], ticker, order["side"])
-    except Exception as e:
-        log.warning(f"[{ticker}] reconcile: completed-order lookup failed for order "
-                    f"{order['broker_order_id']}: {e}")
-        return
-    if status in _DONE_UNFILLED and db.mark_order_cancelled(order["id"], order.get("filled_qty") or 0.0):
-        log.warning(f"[{ticker}] reconcile: order {order['broker_order_id']} ({order['side']}) is "
-                    f"{status} at the broker with {order.get('filled_qty') or 0:g} filled; marked cancelled")
-
-
 @app.task(name="tasks.reconcile_unconfirmed_orders", bind=True, max_retries=2)
 def reconcile_unconfirmed_orders(self):
     """
@@ -1234,8 +1211,7 @@ def _reconcile_unconfirmed_orders_locked(task):
                         f"order {order['broker_order_id']}: {e}")
             continue
         if not fill:
-            _resolve_if_cancelled(order)   # still unfilled: done only if the broker says so
-            continue
+            continue  # still genuinely unfilled (or cancelled/rejected) -- leave alone
 
         # A 'partial' order already has some shares recorded: log only the
         # new ones, at their own average price (professor M-4).
@@ -1243,7 +1219,6 @@ def _reconcile_unconfirmed_orders_locked(task):
         prev_qty = order.get("filled_qty") or 0.0
         fill_qty = round(total_qty - prev_qty, 4)
         if fill_qty <= 0:
-            _resolve_if_cancelled(order)
             continue
         fill_price = ((total_qty * total_avg - prev_qty * (order.get("fill_price") or total_avg))
                       / fill_qty) if prev_qty else total_avg

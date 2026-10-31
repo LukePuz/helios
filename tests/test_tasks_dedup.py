@@ -905,7 +905,9 @@ class TestStaleStopReconciliation:
              patch("db.set_state", side_effect=fake_set_state), \
              patch("ibkr.get_recent_sell_fill", return_value=fill_return) as mock_fill, \
              patch("db.recorded_sell_order_ids", return_value=recorded), \
-             patch("db.get_unconfirmed_orders", return_value=list(unconfirmed)), \
+             patch("db.get_unconfirmed_orders",
+                   **({"side_effect": unconfirmed} if isinstance(unconfirmed, Exception)
+                      else {"return_value": list(unconfirmed)})), \
              patch("db.log_trade") as mock_log_trade, \
              patch("db.close_trade_outcome") as mock_close_outcome, \
              patch("db.delete_position_stop") as mock_delete, \
@@ -974,6 +976,18 @@ class TestStaleStopReconciliation:
         mock_fill.assert_not_called()
         mock_delete.assert_not_called()
         assert state.get("stale_stop_pending_DDOG")                         # marker kept for the retry
+
+    def test_waits_when_the_unconfirmed_orders_are_unknown(self):
+        """Professor M126: a DB error read as "none pending" closed a live
+        exit as no_fill."""
+        state = {}
+        err = RuntimeError("pool exhausted")
+        self._run(state, fill_return=None, unconfirmed=err)                # arms the marker
+        mock_fill, mock_log_trade, mock_close, mock_delete, _ = self._run(state, fill_return=None, unconfirmed=err)
+        mock_fill.assert_not_called()
+        mock_close.assert_not_called()
+        mock_delete.assert_not_called()
+        assert state.get("stale_stop_pending_DDOG")
 
     def test_no_fill_found_does_not_fabricate_a_trade_and_alerts_instead(self):
         state = {}

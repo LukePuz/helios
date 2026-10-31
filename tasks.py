@@ -3448,8 +3448,9 @@ def _reconcile_stop_orders_body(self):
                 and o["created_at"].astimezone(_et).date() == _today_et
             }
         except Exception as e:
-            log.warning(f"reconcile_stop_orders: unconfirmed-SELL check failed, not waiting on any: {e}")
-            pending_sell_tickers = set()
+            # Unknown is not "none pending": skip stale records this cycle (M126).
+            log.warning(f"reconcile_stop_orders: unconfirmed-SELL check failed; stale records wait a cycle: {e}")
+            pending_sell_tickers = None
         for rec in db.get_all_position_stops():
             if rec["ticker"] not in held:
                 ticker = rec["ticker"]
@@ -3460,7 +3461,7 @@ def _reconcile_stop_orders_body(self):
                              f"position in this cycle's snapshot) — waiting for the next "
                              f"cycle to confirm before reconciling")
                     continue
-                if ticker in pending_sell_tickers:
+                if pending_sell_tickers is None or ticker in pending_sell_tickers:
                     # Leaving that order's fills out below would orphan the
                     # outcome, so wait for the late-fill reconcile.
                     log.info(f"[{ticker}] Stale stop record: an unconfirmed SELL order is still being "

@@ -3021,8 +3021,10 @@ def get_unconfirmed_orders(max_age_hours: int = 24) -> list[dict]:
             for r in rows
         ]
     except Exception as e:
+        # Raise, not []: both callers must tell "none pending" from "unknown"
+        # (an empty list let the stale-stop branch close a live exit, M126).
         logging.error(f"get_unconfirmed_orders failed: {e}")
-        return []
+        raise
     finally:
         _put_conn(conn)
 

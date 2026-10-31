@@ -279,7 +279,8 @@ def _whole_position_stop(ticker: str, new_stop: float, filled_qty: float):
     return stop, (avg_cost, total_qty)
 
 
-def log_buy_outcome(approval: dict, ticker: str, action: str, entry_price: float) -> bool:
+def log_buy_outcome(approval: dict, ticker: str, action: str, entry_price: float,
+                    entry_date=None, entry_benchmark_price: float | None = None) -> bool:
     """The trade_outcomes row for a filled BUY, with the analyst's scores from
     the approval. Called at the fill and by reconcile for a BUY that filled
     after the wait window (professor M123). False if the write failed."""
@@ -315,6 +316,8 @@ def log_buy_outcome(approval: dict, ticker: str, action: str, entry_price: float
         source_count=analyst_json.get("source_count"),
         weeks_to_catalyst=analyst_json.get("weeks_to_catalyst"),
         expected_return_per_week=analyst_json.get("expected_return_per_week"),
+        entry_date=entry_date,
+        entry_benchmark_price=entry_benchmark_price,
     )
 
 

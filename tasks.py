@@ -1550,8 +1550,9 @@ def _write_buy_outcome(approval_id: int, rec: dict, approval: dict | None = None
                         f"row; inserting if missing (a closed row keeps its part-fill entry price)")
         from execution import log_buy_outcome
         approval = approval or db.get_approval_by_id(approval_id)
-        return bool(approval) and bool(log_buy_outcome(approval, rec["ticker"], rec["action"],
-                                                       rec["entry_price"]))
+        return bool(approval) and bool(log_buy_outcome(
+            approval, rec["ticker"], rec["action"], rec["entry_price"],
+            entry_date=rec.get("entry_date"), entry_benchmark_price=rec.get("entry_benchmark_price")))
     except Exception as e:
         log.error(f"[{rec.get('ticker')}] outcome {rec.get('kind')} for approval "
                   f"{approval_id} failed: {e}")
@@ -1565,10 +1566,24 @@ def _apply_buy_outcome(approval_id: int, rec: dict, approval: dict | None = None
     if _write_buy_outcome(approval_id, rec, approval):
         return
     log.error(f"[{rec['ticker']}] BUY outcome {rec['kind']} failed; queued for retry")
+    # A row written by a retry keeps this attempt's time and SPY price, not
+    # the retry's (SEF, 10-30): alpha would otherwise mix times.
+    from datetime import datetime, timezone
+    stamp = {"entry_date": datetime.now(timezone.utc).isoformat()}
+    try:
+        import yfinance as yf
+        spy = yf.Ticker("SPY").fast_info.last_price
+        if spy:
+            stamp["entry_benchmark_price"] = float(spy)
+    except Exception:
+        pass
 
     def add(pending):
-        # A later re-average carries the newer price; either kind ends in a row.
-        pending[str(approval_id)] = {**rec, "tries": 0}
+        # A later re-average carries the newer price; the first attempt's
+        # stamp is kept, so either kind ends in a row timed at the fill.
+        old = pending.get(str(approval_id)) or {}
+        first = {k: old[k] for k in ("entry_date", "entry_benchmark_price") if k in old}
+        pending[str(approval_id)] = {**rec, **stamp, **first, "tries": 0}
         return pending
     try:
         _reprotect_queue_edit(add, key=_OUTCOME_STATE_KEY)

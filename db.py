@@ -3242,19 +3242,23 @@ def log_trade_outcome(
     source_count: int | None = None,
     weeks_to_catalyst: float | None = None,
     expected_return_per_week: float | None = None,
+    entry_date=None,
+    entry_benchmark_price: float | None = None,
 ) -> bool:
     """True once the approval has an outcome row (written now or already
-    there); False when the write failed, so a caller can retry (M125)."""
+    there); False when the write failed, so a caller can retry (M125).
+    A retry passes the first attempt's entry_date and SPY price, so a row
+    written late keeps the fill-time values."""
     # Stamp the SPY price at entry so we can compute alpha (return vs. benchmark)
     # when the trade eventually closes.
-    entry_benchmark_price = None
-    try:
-        import yfinance as yf
-        spy_price = yf.Ticker("SPY").fast_info.last_price
-        if spy_price:
-            entry_benchmark_price = float(spy_price)
-    except Exception as e:
-        logging.debug(f"log_trade_outcome: SPY benchmark price fetch failed: {e}")
+    if entry_benchmark_price is None:
+        try:
+            import yfinance as yf
+            spy_price = yf.Ticker("SPY").fast_info.last_price
+            if spy_price:
+                entry_benchmark_price = float(spy_price)
+        except Exception as e:
+            logging.debug(f"log_trade_outcome: SPY benchmark price fetch failed: {e}")
 
     conn = _get_conn()
     try:
@@ -3278,8 +3282,9 @@ def log_trade_outcome(
                 " chase_risk_pct_from_kijun, price_action, price_action_structure, "
                 " catalyst_event, catalyst_date, catalyst_is_priced_in, "
                 " expected_return_pct, expected_downside_pct, thesis_summary, "
-                " sources_json, source_count, weeks_to_catalyst, expected_return_per_week) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                " sources_json, source_count, weeks_to_catalyst, expected_return_per_week, entry_date) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
+                "COALESCE(%s::timestamptz, NOW()))",
                 (approval_id, TRADING_ENV, ticker, action, conviction, bucket, entry_price,
                  entry_benchmark_price, thesis_strength, catalyst_quality,
                  valuation_risk_reward, data_completeness, chase_risk,
@@ -3287,7 +3292,7 @@ def log_trade_outcome(
                  catalyst_event, catalyst_date, catalyst_is_priced_in,
                  expected_return_pct, expected_downside_pct, thesis_summary,
                  psycopg2.extras.Json(sources) if sources is not None else None, source_count,
-                 weeks_to_catalyst, expected_return_per_week),
+                 weeks_to_catalyst, expected_return_per_week, entry_date),
             )
         conn.commit()
         return True

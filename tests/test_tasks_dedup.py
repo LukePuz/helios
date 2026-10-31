@@ -1682,7 +1682,8 @@ class TestBuyOutcomeRetry:
         with gs, ss, patch("db.get_approval_by_id", return_value={"id": 59}), \
              patch("execution.log_buy_outcome", return_value=True) as write:
             tasks._retry_pending_buy_outcomes()
-        write.assert_called_once_with({"id": 59}, "CRWD", "OPEN", 181.3)
+        write.assert_called_once()
+        assert write.call_args.args == ({"id": 59}, "CRWD", "OPEN", 181.3)
         assert json.loads(state[tasks._OUTCOME_STATE_KEY]) == {}
 
     def test_a_success_queues_nothing(self):
@@ -1709,7 +1710,8 @@ class TestBuyOutcomeRetry:
         with gs, ss, patch("db.update_outcome_entry_price", return_value=False), \
              patch("execution.log_buy_outcome", return_value=True) as write:
             tasks._apply_buy_outcome(59, {**self.REC, "kind": "reaverage"}, {"id": 59})
-        write.assert_called_once_with({"id": 59}, "CRWD", "OPEN", 181.3)
+        write.assert_called_once()
+        assert write.call_args.args == ({"id": 59}, "CRWD", "OPEN", 181.3)
         assert tasks._OUTCOME_STATE_KEY not in state
 
     def test_a_failed_reaverage_is_retried_not_inserted(self):
@@ -1720,3 +1722,26 @@ class TestBuyOutcomeRetry:
             tasks._apply_buy_outcome(59, {**self.REC, "kind": "reaverage"})
         write.assert_not_called()
         assert json.loads(state[tasks._OUTCOME_STATE_KEY])["59"]["kind"] == "reaverage"
+
+    def test_a_retried_row_keeps_the_first_attempts_time_and_spy_price(self):
+        """SEF 10-30: entry_date and the SPY price used to be taken at the retry."""
+        import json
+        from unittest.mock import MagicMock
+        state, gs, ss = self._state()
+        spy = MagicMock(); spy.fast_info.last_price = 580.0
+        with gs, ss, patch("execution.log_buy_outcome", return_value=False), \
+             patch("yfinance.Ticker", return_value=spy):
+            tasks._apply_buy_outcome(59, self.REC, {"id": 59})
+        first = json.loads(state[tasks._OUTCOME_STATE_KEY])["59"]
+        assert first["entry_benchmark_price"] == 580.0 and first["entry_date"]
+        spy.fast_info.last_price = 590.0
+        with gs, ss, patch("execution.log_buy_outcome", return_value=False), \
+             patch("yfinance.Ticker", return_value=spy):
+            tasks._apply_buy_outcome(59, {**self.REC, "kind": "reaverage"}, {"id": 59})
+        again = json.loads(state[tasks._OUTCOME_STATE_KEY])["59"]
+        assert again["entry_benchmark_price"] == 580.0 and again["entry_date"] == first["entry_date"]
+        with gs, ss, patch("db.get_approval_by_id", return_value={"id": 59}), \
+             patch("db.update_outcome_entry_price", return_value=False), \
+             patch("execution.log_buy_outcome", return_value=True) as write:
+            tasks._retry_pending_buy_outcomes()
+        assert write.call_args.kwargs == {"entry_date": first["entry_date"], "entry_benchmark_price": 580.0}

@@ -277,3 +277,37 @@ def test_broker_flat_with_a_stop_row_is_recorded_and_the_plan_kept():
     assert all(c.args[1] != "CLOSED" for c in touch.call_args_list)
     assert r["held"] is True and r["held_broker"] is False and r["held_mismatch"] is True
     assert r["held_broker_reason"] == "snapshot"
+
+
+def test_held_hold_records_would_revise_when_its_levels_move():
+    """Audit A1031-0053-1a: a held name's HOLD can't REVISE; record when it would."""
+    plan = _plan(target_price=600.0)                     # verdict's bull target is $650: +8%
+    with patch("db.get_position_stop", return_value={"entry_price": 500.0, "stop_price": 450.0}), \
+         patch("db.get_active_plan", return_value=plan), patch("db.touch_plan"):
+        r = plans.observe("NVDA", PARSED, "HOLD", 6, "Current Price: $540.00", now=NOW)
+    assert r["relation"] == "FOLLOW" and r["would_revise"] is False
+    plan = _plan(target_price=560.0, catalyst_date=date(2026, 12, 15))
+    with patch("db.get_position_stop", return_value={"entry_price": 500.0, "stop_price": 450.0}), \
+         patch("db.get_active_plan", return_value=plan), patch("db.touch_plan"):
+        r = plans.observe("NVDA", PARSED, "HOLD", 6, "Current Price: $540.00", now=NOW)
+    assert r["relation"] == "FOLLOW"
+    assert r["would_revise"] is True and r["would_revise_why"] == ["target", "catalyst_date"]
+
+
+def test_held_seed_invalidation_is_the_stop_and_is_not_compared():
+    plan = _plan(source="held_seed", invalidation_price=300.0)
+    with patch("db.get_position_stop", return_value={"entry_price": 500.0, "stop_price": 300.0}), \
+         patch("db.get_active_plan", return_value=plan), patch("db.touch_plan"):
+        r = plans.observe("NVDA", PARSED, "HOLD", 6, "Current Price: $540.00", now=NOW)
+    assert "invalidation" not in r["would_revise_why"]
+
+
+def test_expiry_marks_the_decision_at_horizon():
+    """Audit A1031-0053-1b: expiry used to re-seed silently."""
+    old = _plan(source="held_seed", horizon_end=TODAY - timedelta(days=1))
+    with patch("db.get_position_stop", return_value={"entry_price": 500.0, "stop_price": 450.0}), \
+         patch("db.get_active_plan", return_value=old), patch("db.touch_plan") as touch, \
+         patch("db.insert_plan", return_value=12):
+        r = plans.observe("NVDA", PARSED, "HOLD", 6, "Current Price: $540.00", now=NOW)
+    touch.assert_called_once_with(1, "CLOSED", close_reason="expired")
+    assert r["relation"] == "SEEDED" and r["decision_at_horizon"] is True and r["expired_plan_id"] == 1

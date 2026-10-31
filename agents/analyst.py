@@ -455,7 +455,7 @@ def _gate_flags(ticker: str, action: str, conviction: int, source_count: int,
         et = ZoneInfo("America/New_York")
         today = (now or datetime.now(timezone.utc)).astimezone(et).date()
         out["verdicts_today"] = sum(
-            1 for v in db.get_recent_verdicts(ticker, hours=24, limit=200)
+            1 for v in db.get_recent_verdicts(ticker, hours=24, limit=200, strict=True)
             if v.get("timestamp") and v["timestamp"].astimezone(et).date() == today)
     except Exception:
         out["verdicts_today"] = None

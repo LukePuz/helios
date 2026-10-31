@@ -1893,7 +1893,8 @@ def get_position_stop(ticker: str, strict: bool = False) -> dict | None:
         _put_conn(conn)
 
 
-def get_recent_verdicts(ticker: str, hours: int = 72, limit: int = 20) -> list[dict]:
+def get_recent_verdicts(ticker: str, hours: int = 72, limit: int = 20,
+                        strict: bool = False) -> list[dict]:
     """Analyst verdicts on ticker in the last `hours` (this env; legacy NULL-env
     rows count, degraded ones don't), newest first: [{timestamp, signal,
     conviction, udr}]. udr is the model's stated upside/downside ratio from
@@ -1922,6 +1923,8 @@ def get_recent_verdicts(ticker: str, hours: int = 72, limit: int = 20) -> list[d
         return out
     except Exception as e:
         logging.error(f"get_recent_verdicts({ticker}) failed: {e}")
+        if strict:
+            raise
         return []
     finally:
         _put_conn(conn)

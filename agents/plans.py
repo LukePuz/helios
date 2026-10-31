@@ -145,6 +145,26 @@ def classify(plan: dict, action: str, new: dict | None, price: float | None,
     return out
 
 
+def _would_revise(plan: dict, parsed: dict, conviction: int, price: float, today: date,
+                  ticker: str) -> dict:
+    """Log-only (audit A1031-0053-1a): REVISE needs an OPEN/ADD, and held
+    names get almost only HOLDs, so their plans never revise. This says
+    whether this verdict's own levels moved enough that an OPEN/ADD would
+    have revised the plan. A held_seed plan's invalidation is the stop, not
+    a model level, so only its target and catalyst date are compared."""
+    cand = plan_from_verdict(ticker, parsed, conviction, price, today)
+    why = []
+    if _moved(plan.get("target_price"), cand.get("target_price")):
+        why.append("target")
+    if plan.get("source") != "held_seed" and _moved(plan.get("invalidation_price"),
+                                                    cand.get("invalidation_price")):
+        why.append("invalidation")
+    if plan.get("catalyst_date") and cand.get("catalyst_date") \
+            and plan["catalyst_date"] != cand["catalyst_date"]:
+        why.append("catalyst_date")
+    return {"would_revise": bool(why), "would_revise_why": why}
+
+
 def observe(ticker: str, parsed: dict, action: str, conviction: int, brief: str,
             now=None) -> dict:
     """Record one verdict against the ticker's plan. Never raises."""
@@ -183,6 +203,11 @@ def observe(ticker: str, parsed: dict, action: str, conviction: int, brief: str,
                 reason = "position closed"
             if reason:
                 db.touch_plan(plan["id"], "CLOSED", close_reason=reason)
+                if reason == "expired":
+                    # The plan's time stop: this verdict is the decision at
+                    # its horizon, though a held name re-seeds at once
+                    # (audit A1031-0053-1b). Recorded only.
+                    held_info.update(decision_at_horizon=True, expired_plan_id=plan["id"])
                 plan = None
 
         if plan is None:
@@ -210,6 +235,8 @@ def observe(ticker: str, parsed: dict, action: str, conviction: int, brief: str,
         out["would_coalesce"] = bool(
             out["relation"] == "FOLLOW" and last
             and (now - last).total_seconds() < _COALESCE_HOURS * 3600)
+        if held and price and out["relation"] not in ("REVISE", "INVALIDATE"):
+            out.update(_would_revise(plan, parsed, conviction, price, today, ticker))
         if out["relation"] == "REVISE":
             new.update(revision=(plan.get("revision") or 0) + 1, replaces_id=plan["id"])
             db.touch_plan(plan["id"], "REVISE")

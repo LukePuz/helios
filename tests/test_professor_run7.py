@@ -86,7 +86,8 @@ def test_failed_cancel_does_not_stack_a_restored_stop():
     rm._client = client
     rec = {"ticker": "NVDA", "stop_price": 112.0, "thesis_bucket": "Accelerator",
            "entry_price": 100.0, "trailing_active": False, "trailing_high": 130.0}
-    with patch("db.get_all_position_stops", return_value=[rec]), \
+    with patch("market_data.is_market_hours", return_value=True), \
+         patch("db.get_all_position_stops", return_value=[rec]), \
          patch("db.get_position_stop", return_value=rec), \
          patch("risk_manager.SETUP_GATES_ENABLED", False), \
          patch.object(risk_manager.RiskManager, "get_atr", return_value=4.0), \
@@ -106,7 +107,8 @@ def test_conversion_skipped_when_stop_moved_while_waiting():
     rm._client = client
     rec = {"ticker": "NVDA", "stop_price": 112.0, "thesis_bucket": "Accelerator",
            "entry_price": 100.0, "trailing_active": False, "trailing_high": 130.0}
-    with patch("db.get_all_position_stops", return_value=[rec]), \
+    with patch("market_data.is_market_hours", return_value=True), \
+         patch("db.get_all_position_stops", return_value=[rec]), \
          patch("db.get_position_stop", return_value={**rec, "stop_price": 118.0}), \
          patch("risk_manager.SETUP_GATES_ENABLED", False), \
          patch.object(risk_manager.RiskManager, "get_atr", return_value=4.0), \
@@ -142,3 +144,33 @@ def test_a_breached_stop_still_alerts_after_hours():
          patch("db.get_all_position_stops", return_value=[rec]):
         alerts = rm.check_trailing_stops()
     assert [a["action"] for a in alerts] == ["EXIT"]
+
+
+def _rth_rm(current=126.0, bucket="Accelerator"):
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="NVDA", qty=7, current_price=current)]
+    rm = object.__new__(risk_manager.RiskManager)
+    rm._client = client
+    return rm, {"ticker": "NVDA", "stop_price": 112.0, "thesis_bucket": bucket,
+                "entry_price": 100.0, "trailing_active": False}
+
+
+def test_ladder_does_not_ratchet_after_hours():
+    rm, rec = _rth_rm(bucket="Breakout")
+    with patch("market_data.is_market_hours", return_value=False), \
+         patch("db.get_all_position_stops", return_value=[rec]), \
+         patch("risk_manager.SETUP_GATES_ENABLED", True), \
+         patch.dict(risk_manager.CATEGORY_RISK_PCT_PER_TRADE, {"Breakout": 0.01}), \
+         patch.object(risk_manager.RiskManager, "_ratchet_ladder_stop") as ratchet:
+        rm.check_trailing_stops()
+    ratchet.assert_not_called()
+
+
+def test_an_unreadable_market_clock_counts_as_closed():
+    rm, rec = _rth_rm()
+    with patch("market_data.is_market_hours", side_effect=RuntimeError("tz")), \
+         patch("db.get_all_position_stops", return_value=[rec]), \
+         patch("tasks.manage_place_trailing_stop") as trail, \
+         patch("tasks.manage_cancel_stop_orders_for") as cancel:
+        assert rm.check_trailing_stops() == []
+    trail.assert_not_called(); cancel.assert_not_called()

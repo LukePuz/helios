@@ -1305,14 +1305,15 @@ class RiskManager:
                 })
                 continue
 
+            if not rth:
+                continue   # stops move on regular-hours prices only (see above)
+
             # Swing-trading cutover, Phase 4/5 (2026-10-11): when SETUP_
             # GATES_ENABLED, a position carrying a live setup category uses
             # the ladder-rung ratchet below INSTEAD OF the fixed ATR-
             # multiple trail-activation logic that follows — skip it
             # entirely for this ticker rather than letting both paths touch
             # the same stop in the same run.
-            if not rth:
-                continue
             if SETUP_GATES_ENABLED and bucket in CATEGORY_RISK_PCT_PER_TRADE:
                 self._ratchet_ladder_stop(ticker, pos, current, stop_px, alerts)
                 continue

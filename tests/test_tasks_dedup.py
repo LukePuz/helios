@@ -1991,6 +1991,7 @@ def test_claim_failed_sell_for_retry_sql():
         assert db.claim_failed_sell_for_retry(81) is None
     sql, params = cur.execute.call_args[0]
     assert "status='FAILED'" in sql and "IN ('TRIM','EXIT')" in sql and "NOT LIKE" in sql
+    assert "RETURNING status_reason" in sql and "SET status='PROCESSING'" in sql
     assert params == (81, "skipped: resting stops unreadable%", "%retried at%")
 
 

@@ -67,3 +67,16 @@ def test_a_failed_health_check_keeps_the_pool(monkeypatch, failure):
     pool.closeall.assert_not_called()
     if failure == "probe":
         pool.putconn.assert_called_once_with(conn, close=True)
+
+
+def test_a_failed_write_on_a_dead_connection_is_still_spilled(monkeypatch):
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value.execute.side_effect = psycopg2.OperationalError("gone")
+    conn.rollback.side_effect = psycopg2.InterfaceError("connection already closed")
+    monkeypatch.setattr(db, "_writer_conn", lambda writer, rec: conn)
+    monkeypatch.setattr(db, "_put_conn", lambda c: None)
+    spilled = []
+    monkeypatch.setattr(db, "_record_write_failure", lambda w, e, r: spilled.append(w))
+    db.log_trade("AAA", "BUY", 1, 10.0, "test")
+    db.log_signal("AAA", "HOLD", 5, "test")
+    assert spilled == ["log_trade", "log_signal"]

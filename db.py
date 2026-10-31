@@ -889,6 +889,15 @@ def _record_write_failure(writer: str, exc: Exception, record: dict) -> None:
         pass
 
 
+def _rollback_quietly(conn) -> None:
+    """Roll back, ignoring a dead connection: rollback() raising there
+    skipped the spill after it, losing the failed row."""
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+
+
 def _writer_conn(writer: str, record: dict):
     """A pooled connection for a writer, or None after spilling the record.
     Getting the connection used to sit outside the writers' try, so a DNS or
@@ -926,7 +935,7 @@ def log_trade(symbol: str, side: str, quantity: int, price: float, reason: str,
             )
         conn.commit()
     except Exception as e:
-        conn.rollback()
+        _rollback_quietly(conn)
         _record_write_failure("log_trade", e, rec)
     finally:
         _put_conn(conn)
@@ -1004,13 +1013,13 @@ def log_signal(symbol: str, signal: str, confidence: float, reasoning: str,
                 conn.commit()
                 logging.warning(f"log_signal: {symbol} stored as a degraded row (migrations pending)")
             except Exception as e:
-                conn.rollback()
+                _rollback_quietly(conn)
                 _record_write_failure("log_signal", e, rec)
         except Exception as e:
-            conn.rollback()
+            _rollback_quietly(conn)
             _record_write_failure("log_signal", e, rec)
     except Exception as e:
-        conn.rollback()
+        _rollback_quietly(conn)
         _record_write_failure("log_signal", e, rec)
     finally:
         _put_conn(conn)

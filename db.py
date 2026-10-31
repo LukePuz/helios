@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import threading
 import time as _time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -261,20 +262,31 @@ def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
         now = _time.monotonic()
         if now - _last_pool_health_check < _POOL_HEALTH_CHECK_INTERVAL_S:
             return _pool
+        # A failed probe discards only the probed connection. closeall() here
+        # closed connections other threads were still using, and their
+        # putconn into the new pool raised "unkeyed connection", dropping
+        # good reads and reporting committed writes as failed (audit
+        # A1031-1653 N2). An exhausted pool is busy, not broken. A connection
+        # lost mid-query comes back closed and the pool drops it on putconn.
+        _last_pool_health_check = now
         try:
             conn = _pool.getconn()
+        except psycopg2.pool.PoolError:
+            return _pool
+        except Exception as e:
+            logging.warning(f"DB pool health check could not connect: {e}")
+            return _pool
+        try:
             conn.cursor().execute("SELECT 1")
             conn.rollback()
             _pool.putconn(conn)
-            _last_pool_health_check = now
-            return _pool
         except Exception:
-            logging.warning("DB pool health check failed — recreating pool.")
+            logging.warning("DB pool health check failed — discarding that connection.")
             try:
-                _pool.closeall()
+                _pool.putconn(conn, close=True)
             except Exception:
                 pass
-            _pool = None
+        return _pool
 
     maxconn = int(os.getenv("DB_MAXCONN", "5"))
     for attempt in range(1, 4):
@@ -288,6 +300,9 @@ def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
                 user=os.getenv("SUPABASE_USER", "postgres"),
                 password=os.getenv("SUPABASE_PASSWORD"),
                 sslmode="require",
+                # Keep idle connections alive through the pooler and notice
+                # dead ones in about a minute.
+                keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3,
             )
             logging.info(f"DB connection pool created (maxconn={maxconn}).")
             _last_pool_health_check = _time.monotonic()
@@ -299,12 +314,46 @@ def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
     raise RuntimeError("Could not connect to PostgreSQL after 3 attempts.")
 
 
+_issued: dict[int, tuple] = {}   # id(conn) -> (conn, the pool that issued it)
+_issued_lock = threading.Lock()
+
+
 def _get_conn():
-    return _get_pool().getconn()
+    pool = _get_pool()
+    conn = pool.getconn()
+    with _issued_lock:
+        _issued[id(conn)] = (conn, pool)
+    return conn
 
 
 def _put_conn(conn) -> None:
-    _get_pool().putconn(conn)
+    """Return a connection to the pool that issued it, with no health check
+    (that could swap the pool mid-use, audit A1031-1653 N2). If that pool is
+    gone or refuses it, close the connection instead of raising: the caller's
+    work already finished."""
+    with _issued_lock:
+        entry = _issued.pop(id(conn), None)
+    pool = entry[1] if entry is not None and entry[0] is conn else _pool
+    try:
+        if pool is None or pool.closed:
+            raise psycopg2.pool.PoolError("pool gone")
+        pool.putconn(conn)
+        return
+    except psycopg2.pool.PoolError:
+        pass
+    except Exception:
+        # putconn's rollback of a dead connection raises before it frees the
+        # slot; with no pool rebuild, maxconn of those would leave the pool
+        # exhausted for good. close=True frees the slot without the rollback.
+        try:
+            pool.putconn(conn, close=True)
+            return
+        except Exception:
+            pass
+    try:
+        conn.close()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------

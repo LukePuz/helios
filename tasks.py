@@ -2459,6 +2459,7 @@ def check_profit_targets(self):
     target crossing isn't racing a live broker stop the way a stop-loss
     trigger is), so this wrapper's job is just invocation, alerting, and
     Celery retry/error handling."""
+    failed = False
     try:
         import alerts
         from risk_manager import RiskManager
@@ -2466,6 +2467,7 @@ def check_profit_targets(self):
         client = _get_client()
         rm = RiskManager(client)
         sold = rm.check_profit_targets()
+        failed = rm.monitor_read_failed is True
         for result in sold:
             if result.get("action") == "BREAKEVEN_STOP":
                 # No shares sold (the partial rounds to 0); only the stop moved.
@@ -2487,8 +2489,11 @@ def check_profit_targets(self):
                         + ("" if fill else " (fill price unavailable; price shown is the stop)")),
             )
     except Exception as e:
+        failed = True
         log.error(f"check_profit_targets failed: {e}")
         raise self.retry(exc=e, countdown=60)
+    finally:
+        _monitor_health("profit_targets", failed)
 
 
 @app.task(name="tasks.backfill_catalyst_tracking", bind=True, max_retries=1)
@@ -2743,6 +2748,7 @@ def check_trailing_stops(self):
     """Monitor open positions against their stop levels. Alert on triggers;
     if the stop level is breached and NO protective stop exists at the
     broker, execute a market sell (AUTO_EXECUTE_PROTECTIVE_SELLS)."""
+    failed = False
     try:
         from risk_manager import RiskManager
         import alerts
@@ -2750,6 +2756,7 @@ def check_trailing_stops(self):
         client = _get_client()
         rm = RiskManager(client)
         triggered = rm.check_trailing_stops()
+        failed = rm.monitor_read_failed is True
         if not triggered:
             return
 
@@ -2823,11 +2830,43 @@ def check_trailing_stops(self):
                 reason=alert["reason"] + (" — BACKSTOP SELL EXECUTED" if backstopped else ""),
             )
     except Exception as e:
+        failed = True
         log.error(f"check_trailing_stops failed: {e}")
         raise self.retry(exc=e, countdown=60)
+    finally:
+        _monitor_health("trailing_stops", failed)
 
 
 # ── Existing tasks (updated call signatures) ──────────────────────────────────
+
+MONITOR_FAILS_BEFORE_ALERT = 3
+
+
+def _monitor_health(name: str, failed: bool) -> None:
+    """Consecutive-failure count for a mechanical monitor (audit A1031-1053-8):
+    one alert when it reaches MONITOR_FAILS_BEFORE_ALERT, one when it
+    recovers. On 10-19 three monitors failed 99 times each with no alert."""
+    try:
+        import alerts
+        import db
+        from config import TRADING_ENV
+        key = f"monitor_fail_count_{name}_{TRADING_ENV}"
+        count = int(db.get_state(key, "0") or 0)
+        if failed:
+            count += 1
+            db.set_state(key, str(count))
+            if count == MONITOR_FAILS_BEFORE_ALERT:
+                alerts._send(
+                    f"⚠️ MONITOR BLIND — {name} failed {count} checks in a row.\n"
+                    f"Resting broker stops still protect positions, but this check isn't "
+                    f"running. See the celery logs; a recovery message follows when it works.")
+        elif count:
+            db.set_state(key, "0")
+            if count >= MONITOR_FAILS_BEFORE_ALERT:
+                alerts._send(f"✅ {name} monitor recovered after {count} failed checks.")
+    except Exception as e:
+        log.warning(f"_monitor_health({name}) failed: {e}")
+
 
 def _heartbeat_ok(source: str, count: int) -> None:
     try:
@@ -3658,6 +3697,7 @@ def check_portfolio_drawdown(self):
     Circuit breaker: sets the persisted trading_halted flag when drawdown
     from the high-water mark exceeds MAX_DRAWDOWN_PCT, and maintains the HWM.
     """
+    failed = False
     try:
         import db
         import alerts
@@ -3755,8 +3795,11 @@ def check_portfolio_drawdown(self):
             db.set_state(breach_key, "0")
             log.debug(f"Drawdown: {drawdown:.1%} (limit: {MAX_DRAWDOWN_PCT:.0%})")
     except Exception as e:
+        failed = True
         log.error(f"check_portfolio_drawdown failed: {e}")
         raise self.retry(exc=e, countdown=60)
+    finally:
+        _monitor_health("portfolio_drawdown", failed)
 
 
 @locked_by_ticker(lambda ticker: ticker,

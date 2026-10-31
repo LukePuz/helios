@@ -193,6 +193,9 @@ class RiskManager:
         # Set by is_halted(): True when it blocked because the state or the
         # account read was unusable, not because a halt is latched.
         self.halt_unknown: bool = False
+        # Set by check_trailing_stops / check_profit_targets when their reads
+        # failed, so an empty result isn't mistaken for "nothing triggered".
+        self.monitor_read_failed: bool = False
 
     def _get_account(self) -> object:
         return self._client.get_account()
@@ -1274,12 +1277,14 @@ class RiskManager:
         Returns list of {ticker, action, current_price, stop_price, reason}
         for any positions that should be exited or have trailing stop updated.
         """
+        self.monitor_read_failed = False
         try:
             import db
             stops    = db.get_all_position_stops()
             positions = {p.symbol: p for p in self._client.get_all_positions()}
         except Exception as e:
             log.warning(f"Trailing stop check failed: {e}")
+            self.monitor_read_failed = True
             return []
         # Stops move only on regular-hours prices: an after-hours print (an
         # earnings gap, say) would arm the trail or ratchet the ladder from a
@@ -1780,6 +1785,7 @@ class RiskManager:
         """
         import db
 
+        self.monitor_read_failed = False
         try:
             from agents.market_regime import get_cached_regime
             regime_packet = get_cached_regime()
@@ -1804,6 +1810,7 @@ class RiskManager:
             positions = {p.symbol: p for p in self._client.get_all_positions()}
         except Exception as e:
             log.warning(f"check_profit_targets: could not fetch positions: {e}")
+            self.monitor_read_failed = True
             return []
 
         results: list[dict] = []

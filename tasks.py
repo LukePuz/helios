@@ -2284,7 +2284,9 @@ def run_candidate_scan(self):
         top = result["candidates"][:5]
         if top:
             import alerts
-            lines = [f"Watchlist candidate scan: {result['scan_notes']}", ""]
+            lines = [f"Watchlist candidate scan: {result['scan_notes']}",
+                     f"Price bars as of {result.get('newest_bar') or 'unknown'}"
+                     + (" — STALE, movement scores are old" if result.get("stale_bars") else ""), ""]
             for c in top:
                 lines.append(
                     f"• {c['ticker']} ({c['company']}) — composite {c['composite_score']}, "

@@ -203,13 +203,42 @@ def run_candidate_scan(min_composite_score: int = 40, max_results: int = 25) -> 
 
     log.info(f"Candidate scan complete: {len(results)} candidates above threshold")
 
+    newest_bar, bar_age = _bars_age(bulk_bars)
+    if bar_age is None or bar_age > STALE_BAR_TRADING_DAYS:
+        log.warning(f"Candidate scan scored movement on stale bars (newest {newest_bar}, "
+                    f"{bar_age} trading days old)")
+
     return {
         "agent": "candidate_scanner",
         "screened": len(candidate_tickers),
         "candidates": results,
+        "newest_bar": newest_bar,
+        "stale_bars": bar_age is None or bar_age > STALE_BAR_TRADING_DAYS,
         "scan_notes": f"{len(results)} candidates scored >= {min_composite_score}/{MOVEMENT_MAX + THESIS_MAX} "
                       f"out of {len(candidate_tickers)} non-watchlist S&P 500 tickers screened.",
     }
+
+
+# Movement is scored on the weekly price_history refresh; past this many
+# weekdays the "movement" is old news (audit A1031-0453-5: stale since 10-18,
+# yet the 10-26 scan still alerted its top 5).
+STALE_BAR_TRADING_DAYS = 3
+
+
+def _bars_age(bulk_bars: dict, today=None) -> tuple[str | None, int | None]:
+    """Newest bar date across the scan and how many weekdays old it is
+    (holidays not excluded). (None, None) when there are no bars."""
+    from datetime import date
+    import numpy as np
+    dates = [b[-1]["date"] for b in bulk_bars.values() if b]
+    if not dates:
+        return None, None
+    newest = max(dates)[:10]
+    try:
+        age = int(np.busday_count(date.fromisoformat(newest), today or date.today()))
+    except ValueError:
+        return newest, None
+    return newest, max(age, 0)
 
 
 if __name__ == "__main__":

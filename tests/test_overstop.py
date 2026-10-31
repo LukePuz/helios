@@ -405,13 +405,16 @@ def test_queued_flat_exit_closes_at_its_orders_average_fill():
     r, close, alert = _queued_flat("EXIT", {"status": "filled", "fill_price": 171.5, "broker_order_id": 77})
     assert r is None
     close.assert_called_once_with("CRWD", exit_price=171.5, exit_source="late_exit", exit_price_source="fill")
+    alert.assert_not_called()
 
 
 def test_queued_flat_exit_waits_while_its_remainder_works_or_a_lookup_fails():
     row = {"status": "partial", "fill_price": 171.5, "broker_order_id": 77}
     working = {"order_id": 77, "status": "Submitted"}
-    for kw, alerted in (({"row": row, "open_orders": [working]}, True), ({"row": RuntimeError("db")}, False)):
-        with patch("tasks._reconcile_alert_due", return_value=True):
+    for kw, due, alerted in (({"row": row, "open_orders": [working]}, True, True),
+                             ({"row": row, "open_orders": [working]}, False, False),   # throttled
+                             ({"row": RuntimeError("db")}, True, False)):
+        with patch("tasks._reconcile_alert_due", return_value=due):
             r, close, alert = _queued_flat("BACKSTOP", **kw)
         assert r == "wait"
         close.assert_not_called()
@@ -426,6 +429,7 @@ def test_queued_flat_exit_leaves_mixed_and_owned_cases_alone():
         r, close, alert = _queued_flat("EXIT", **kw)
         assert r is None
         close.assert_not_called()
+        alert.assert_not_called()
     r, close, alert = _queued_flat("TRIM", {"status": "filled", "fill_price": 171.5, "broker_order_id": 77})
     assert r is None
     close.assert_not_called()

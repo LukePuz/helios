@@ -1573,15 +1573,15 @@ def _close_queued_flat_exit(ticker: str, rec: dict) -> bool:
         if working:
             # Flat while our sell still works: if it fills, it opens a short
             # (review of 11e2f26). Luke decides; one throttled alert.
-            if _reconcile_alert_due(f"flat_exit_working_{ticker}"):
-                try:
+            try:
+                if _reconcile_alert_due(f"flat_exit_working_{ticker}"):
                     import alerts
                     alerts._send(f"🚨 SELL STILL WORKING ON A FLAT POSITION — <b>{ticker}</b>\nThe "
                                  f"broker shows no shares, but the rest of our {rec.get('intent')} order "
                                  f"is still working. If it fills it opens a SHORT. Check TWS and cancel "
                                  f"it if the shares are gone.")
-                except Exception:
-                    pass
+            except Exception as e:
+                log.warning(f"[{ticker}] reconcile: flat-with-working-sell alert failed: {e}")
             return True
         # Either something else sold the rest (exit price for that mix is
         # undecided), or the remainder filled since this run started and the

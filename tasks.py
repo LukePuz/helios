@@ -1371,10 +1371,10 @@ def _reprotect_queue_edit(fn, key: str = _REPROTECT_STATE_KEY) -> None:
         lock = stop_lock._redis().lock(f"helios:{key}", timeout=30, blocking_timeout=35)
         if not lock.acquire():
             lock = None
-            log.error("reprotect queue lock still busy after 35 s; editing without it")
+            log.error(f"{key} queue lock still busy after 35 s; editing without it")
     except Exception as e:
         lock = None
-        log.warning(f"reprotect queue lock unavailable ({e}); editing without it")
+        log.warning(f"{key} queue lock unavailable ({e}); editing without it")
     try:
         try:
             pending = json.loads(db.get_state(key) or "{}")
@@ -1543,8 +1543,11 @@ def _write_buy_outcome(approval_id: int, rec: dict, approval: dict | None = None
                 return False          # write failed: retry
             if updated:
                 return True
-            # No open row: the part fill's own row was never written. Insert it
-            # at the whole order's average (deduped per approval; review of fed009b).
+            # No open row: the part fill's own row was never written, so insert
+            # it at the whole order's average (deduped per approval; review of
+            # fed009b). If the row exists but is closed, it keeps its entry.
+            log.warning(f"[{rec['ticker']}] outcome re-average for approval {approval_id}: no open "
+                        f"row; inserting if missing (a closed row keeps its part-fill entry price)")
         from execution import log_buy_outcome
         approval = approval or db.get_approval_by_id(approval_id)
         return bool(approval) and bool(log_buy_outcome(approval, rec["ticker"], rec["action"],

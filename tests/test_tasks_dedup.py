@@ -1660,3 +1660,45 @@ def test_close_trade_outcome_refuses_an_unusable_price_and_skips_orphaned_rows()
         db.close_trade_outcome("NVDA", exit_price=100.0)
     assert "orphaned_at IS NULL" in cur.execute.call_args_list[0].args[0]
 
+
+
+class TestBuyOutcomeRetry:
+    """Professor M125: a late BUY's outcome write failed once and was lost;
+    the order was already marked filled, so nothing ever retried it."""
+
+    REC = {"kind": "insert", "ticker": "CRWD", "action": "OPEN", "entry_price": 181.3}
+
+    def _state(self):
+        state = {}
+        return state, patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
+            patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v))
+
+    def test_a_failed_write_is_queued_and_a_later_success_clears_it(self):
+        import json
+        state, gs, ss = self._state()
+        with gs, ss, patch("execution.log_buy_outcome", return_value=False):
+            tasks._apply_buy_outcome(59, self.REC, {"id": 59})
+        assert json.loads(state[tasks._OUTCOME_STATE_KEY])["59"]["tries"] == 0
+        with gs, ss, patch("db.get_approval_by_id", return_value={"id": 59}), \
+             patch("execution.log_buy_outcome", return_value=True) as write:
+            tasks._retry_pending_buy_outcomes()
+        write.assert_called_once_with({"id": 59}, "CRWD", "OPEN", 181.3)
+        assert json.loads(state[tasks._OUTCOME_STATE_KEY]) == {}
+
+    def test_a_success_queues_nothing(self):
+        state, gs, ss = self._state()
+        with gs, ss, patch("db.update_outcome_entry_price", return_value=True) as reavg:
+            tasks._apply_buy_outcome(59, {**self.REC, "kind": "reaverage"})
+        reavg.assert_called_once_with(59, 181.3)
+        assert tasks._OUTCOME_STATE_KEY not in state
+
+    def test_gives_up_with_one_alert_after_the_last_try(self):
+        import json
+        state, gs, ss = self._state()
+        state[tasks._OUTCOME_STATE_KEY] = json.dumps(
+            {"59": {**self.REC, "tries": tasks._OUTCOME_MAX_TRIES - 1}})
+        with gs, ss, patch("db.get_approval_by_id", side_effect=RuntimeError("db down")), \
+             patch("alerts._send") as alert:
+            tasks._retry_pending_buy_outcomes()
+        alert.assert_called_once()
+        assert json.loads(state[tasks._OUTCOME_STATE_KEY]) == {}

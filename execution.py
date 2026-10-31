@@ -279,13 +279,13 @@ def _whole_position_stop(ticker: str, new_stop: float, filled_qty: float):
     return stop, (avg_cost, total_qty)
 
 
-def log_buy_outcome(approval: dict, ticker: str, action: str, entry_price: float) -> None:
+def log_buy_outcome(approval: dict, ticker: str, action: str, entry_price: float) -> bool:
     """The trade_outcomes row for a filled BUY, with the analyst's scores from
     the approval. Called at the fill and by reconcile for a BUY that filled
-    after the wait window (professor M123)."""
+    after the wait window (professor M123). False if the write failed."""
     import db
     analyst_json = approval.get("analyst_json") or {}
-    db.log_trade_outcome(
+    return db.log_trade_outcome(
         approval_id=approval["id"],
         ticker=ticker,
         action=action,

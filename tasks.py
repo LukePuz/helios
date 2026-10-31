@@ -1185,13 +1185,16 @@ def _reconcile_unconfirmed_orders_locked(task):
     import alerts
     from datetime import timedelta
 
+    # Queued retries first: they don't need the order list, and a failed
+    # load must not hold back a stop (review of 1492b13).
+    _retry_pending_reprotects()
+    _retry_pending_buy_outcomes()
+
     try:
         pending = db.get_unconfirmed_orders(max_age_hours=24 * 30)
     except Exception as e:
         log.error(f"reconcile_unconfirmed_orders: could not load unconfirmed orders: {e}")
         raise task.retry(exc=e, countdown=120)
-
-    _retry_pending_reprotects()
 
     for order in pending:
         ticker = order["ticker"]
@@ -1244,21 +1247,16 @@ def _reconcile_unconfirmed_orders_locked(task):
 
         stop_placed: bool | None = False
         approval = db.get_approval_by_id(order["approval_id"]) if order["approval_id"] else None
-        if order["side"] == "BUY" and approval and not prev_qty:
-            # Nothing of this order was recorded at the fill, so neither was
-            # its outcome row (professor M123). A part fill already has one.
-            try:
-                from execution import log_buy_outcome
-                log_buy_outcome(approval, ticker, approval.get("action") or intent or "OPEN", total_avg)
-            except Exception as e:
-                log.error(f"[{ticker}] reconcile: could not log the late BUY's outcome row: {e}")
-        elif order["side"] == "BUY" and approval and prev_qty:
-            # The row was logged at the part fill's price: re-average it over
-            # the whole order (professor M121, entry side).
-            try:
-                db.update_outcome_entry_price(approval["id"], total_avg)
-            except Exception as e:
-                log.error(f"[{ticker}] reconcile: could not re-average the outcome entry: {e}")
+        if order["side"] == "BUY" and approval:
+            # No part of this order was recorded at the fill, so neither was
+            # its outcome row (professor M123); a part fill's row was logged
+            # at the part price and is re-averaged over the whole order (M121).
+            # The order is already marked filled, so a failed write is queued,
+            # not lost (professor M125).
+            _apply_buy_outcome(approval["id"], {
+                "kind": "reaverage" if prev_qty else "insert", "ticker": ticker,
+                "action": approval.get("action") or intent or "OPEN", "entry_price": total_avg,
+            }, approval)
         if order["side"] == "BUY" and approval:
             risk_json = approval.get("risk_json") or {}
             stop_price = approval.get("stop_loss_price") or risk_json.get("stop_loss_price")
@@ -1530,6 +1528,73 @@ def _review_manual_actions() -> None:
 
 _REPROTECT_MAX_TRIES = 4  # reconcile_stop_orders cycles, 15 min apart (~1 h)
 _BUY_FLAT_MAX_TRIES = 2   # ~30 min for a new BUY's position to show up
+
+
+_OUTCOME_STATE_KEY = "buy_outcome_pending"
+_OUTCOME_MAX_TRIES = 8    # reconcile_unconfirmed_orders runs, ~2 h
+
+
+def _write_buy_outcome(approval_id: int, rec: dict, approval: dict | None = None) -> bool:
+    import db
+    try:
+        if rec["kind"] == "reaverage":
+            return bool(db.update_outcome_entry_price(approval_id, rec["entry_price"]))
+        from execution import log_buy_outcome
+        approval = approval or db.get_approval_by_id(approval_id)
+        return bool(approval) and bool(log_buy_outcome(approval, rec["ticker"], rec["action"],
+                                                       rec["entry_price"]))
+    except Exception as e:
+        log.error(f"[{rec.get('ticker')}] reconcile: outcome {rec.get('kind')} for approval "
+                  f"{approval_id} failed: {e}")
+        return False
+
+
+def _apply_buy_outcome(approval_id: int, rec: dict, approval: dict | None = None) -> None:
+    """Write a late BUY's outcome row (or re-average it); queue it for the
+    next runs if that fails (professor M125). Only reconcile_unconfirmed_orders
+    writes this queue, one run at a time, so it needs no lock."""
+    if _write_buy_outcome(approval_id, rec, approval):
+        return
+    import db
+    log.error(f"[{rec['ticker']}] reconcile: late BUY outcome {rec['kind']} failed; queued for retry")
+    try:
+        pending = json.loads(db.get_state(_OUTCOME_STATE_KEY) or "{}")
+        pending[str(approval_id)] = {**rec, "tries": 0}
+        db.set_state(_OUTCOME_STATE_KEY, json.dumps(pending))
+    except Exception as e:
+        log.error(f"[{rec['ticker']}] reconcile: could not queue the outcome retry: {e}")
+
+
+def _retry_pending_buy_outcomes() -> None:
+    import db
+    try:
+        pending = json.loads(db.get_state(_OUTCOME_STATE_KEY) or "{}")
+    except Exception:
+        return
+    if not pending:
+        return
+    keep = {}
+    for aid, rec in pending.items():
+        if _write_buy_outcome(int(aid), rec):
+            log.info(f"[{rec['ticker']}] reconcile: queued outcome {rec['kind']} for approval {aid} done")
+            continue
+        tries = int(rec.get("tries", 0)) + 1
+        if tries < _OUTCOME_MAX_TRIES:
+            keep[aid] = {**rec, "tries": tries}
+            continue
+        log.error(f"[{rec['ticker']}] reconcile: outcome {rec['kind']} for approval {aid} gave up "
+                  f"after {tries} tries")
+        try:
+            import alerts
+            alerts._send(f"⚠️ OUTCOME NOT RECORDED — <b>{rec['ticker']}</b>\nA late-filled BUY "
+                         f"(approval {aid}) could not be written to trade_outcomes after {tries} tries. "
+                         f"Trading is unaffected; the research record needs a manual fix.")
+        except Exception:
+            pass
+    try:
+        db.set_state(_OUTCOME_STATE_KEY, json.dumps(keep))
+    except Exception as e:
+        log.error(f"reconcile: could not save the outcome retry queue: {e}")
 
 
 def _retry_pending_reprotects() -> None:
@@ -3464,8 +3529,9 @@ def _reconcile_stop_orders_body(self):
                 if pending_sell_tickers is None or ticker in pending_sell_tickers:
                     # Leaving that order's fills out below would orphan the
                     # outcome, so wait for the late-fill reconcile.
-                    log.info(f"[{ticker}] Stale stop record: an unconfirmed SELL order is still being "
-                             f"reconciled; waiting")
+                    log.info(f"[{ticker}] Stale stop record: " + (
+                        "unconfirmed SELLs unknown (read failed); waiting" if pending_sell_tickers is None
+                        else "an unconfirmed SELL order is still being reconciled; waiting"))
                     continue
                 try:
                     recorded = db.recorded_sell_order_ids(ticker)   # professor M122

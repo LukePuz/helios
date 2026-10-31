@@ -3242,7 +3242,9 @@ def log_trade_outcome(
     source_count: int | None = None,
     weeks_to_catalyst: float | None = None,
     expected_return_per_week: float | None = None,
-) -> None:
+) -> bool:
+    """True once the approval has an outcome row (written now or already
+    there); False when the write failed, so a caller can retry (M125)."""
     # Stamp the SPY price at entry so we can compute alpha (return vs. benchmark)
     # when the trade eventually closes.
     entry_benchmark_price = None
@@ -3267,7 +3269,7 @@ def log_trade_outcome(
                 logging.warning(f"log_trade_outcome: approval {approval_id} already has an "
                                 f"outcome row — not adding another")
                 conn.rollback()
-                return
+                return True
             cur.execute(
                 "INSERT INTO trade_outcomes "
                 "(approval_id, trading_env, ticker, action, conviction, thesis_bucket, entry_price, "
@@ -3288,9 +3290,11 @@ def log_trade_outcome(
                  weeks_to_catalyst, expected_return_per_week),
             )
         conn.commit()
+        return True
     except Exception as e:
         conn.rollback()
         logging.error(f"log_trade_outcome failed: {e}")
+        return False
     finally:
         _put_conn(conn)
 

@@ -4,6 +4,8 @@ Helios is an autonomous trading research system. It watches market events, has a
 
 It is a personal research project, not a product and not financial advice. It trades real money at deliberately small size and can lose it.
 
+A one-page overview is in [`docs/helios-overview.pdf`](docs/helios-overview.pdf).
+
 ## Research question
 
 Does the conviction an LLM states for a trade predict that trade's return?
@@ -27,31 +29,16 @@ Known limits: the live sample is small (4 closed trades and 2 open as of 2026-10
 
 ```mermaid
 flowchart LR
-    subgraph Ingestion["Ingestion (Celery, scheduled)"]
-        E[SEC EDGAR filings]
-        O[Options flow]
-        C[Congressional trades]
-        I[Insider buys]
-        N[News and arXiv papers]
-        M[Macro data, FRED]
-    end
-
-    subgraph Pipeline["Agent pipeline (local LLMs via Ollama)"]
-        S[Screener<br/><i>7B model</i>]
-        B[Context engine<br/><i>situation brief</i>]
-        A[Analyst<br/><i>72B model: thesis and conviction 1-10</i>]
-        R[Risk manager<br/><i>rule-based sizing and stops</i>]
-    end
-
-    subgraph Execution["Execution"]
-        IB[Interactive Brokers<br/><i>order plus stop</i>]
-        T[Telegram alert<br/><i>sent after the fact</i>]
-    end
-
-    Ingestion --> S --> B --> A --> R --> IB --> T
-
-    REG[Market regime model] -.->|scales size| R
-    REG -.->|context| A
+    D["Data sources<br/>SEC filings, news, options flow<br/>insider buys, congressional trades<br/>macro (FRED), arXiv"]
+    S["Screener<br/>Qwen 2.5 7B"]
+    C["Context brief"]
+    A["Analyst<br/>Qwen 2.5 72B<br/>conviction 1-10"]
+    R["Risk manager<br/>fixed rules"]
+    IB["Interactive Brokers"]
+    T["Telegram alert"]
+    G["Market regime"]
+    D --> S --> C --> A --> R --> IB --> T
+    G -->|scales size| R
 ```
 
 1. An event arrives, for example an 8-K filing or an unusual options trade on a watchlist ticker.

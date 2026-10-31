@@ -1418,6 +1418,10 @@ def _queue_reprotect(ticker: str, order: dict, fill_price: float | None) -> None
                 pending[ticker]["had_buy"] = True
         else:
             pending[ticker] = entry
+            if entry["intent"] == "PROFIT_TARGET" and (old.get("had_buy") or old.get("intent") == "BUY"):
+                # A target sale never empties the position, so it doesn't
+                # explain a flat read after the BUY (review of b6b6a77).
+                pending[ticker]["had_buy"] = True
             if (entry["intent"] or "").upper() not in ("EXIT", "BACKSTOP", "BUY"):
                 # A RESTORE replacing a queued exit keeps that exit's order for
                 # the flat close (review of 03efab7, as m111). Never a BUY: its

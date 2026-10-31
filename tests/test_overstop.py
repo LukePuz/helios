@@ -538,3 +538,18 @@ def test_an_exit_after_a_merged_buy_clears_the_buy_flag():
         tasks._queue_reprotect("CRWD", {"intent": "EXIT", "id": 5}, 171.0)
     rec = json.loads(state[tasks._REPROTECT_STATE_KEY])["CRWD"]
     assert "had_buy" not in rec and rec["exit_order_id"] == 5
+
+
+def test_a_profit_target_replacing_a_queued_buy_keeps_its_flat_read_protection():
+    """Review of b6b6a77: a target sale leaves shares, so a flat read after a
+    BUY is still unexplained."""
+    import json
+    for old in ({"intent": "BUY", "nonce": "a"},
+                {"intent": "PROFIT_TARGET", "stop_price": 180.0, "had_buy": True, "nonce": "a"}):
+        state = {tasks._REPROTECT_STATE_KEY: json.dumps({"CRWD": old})}
+        with patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
+             patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+             patch("stop_lock._redis", side_effect=RuntimeError("no redis")):
+            tasks._queue_reprotect("CRWD", {"intent": "PROFIT_TARGET", "stop_price": 185.0}, 190.0)
+        rec = json.loads(state[tasks._REPROTECT_STATE_KEY])["CRWD"]
+        assert rec["intent"] == "PROFIT_TARGET" and rec["stop_price"] == 185.0 and rec["had_buy"] is True

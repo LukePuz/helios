@@ -3338,8 +3338,9 @@ def _reconcile_stop_orders_body(self):
         from datetime import datetime, timezone
 
         client    = ibkr.get_client()
-        held      = {p.symbol: round(abs(float(p.qty)), 4)
-                     for p in client.get_all_positions()}
+        positions = client.get_all_positions()
+        held      = {p.symbol: round(abs(float(p.qty)), 4) for p in positions}
+        longs     = {p.symbol for p in positions if float(p.qty) > 0}
         open_ords = ibkr.get_open_orders()
         # Section 1 (orphans) cancels any stop order; coverage (2b, 3) counts
         # only working stops by their remainder, as _fix_overstop does.
@@ -3542,7 +3543,8 @@ def _reconcile_stop_orders_body(self):
         for ticker, qty in held.items():
             pending_key = f"overstop_pending_{ticker}"
             covered = stop_qty.get(ticker, 0.0)
-            qty = max(round(qty - _working_mkt_sell_qty(open_ords, ticker), 4), 0.0)   # professor M129
+            if ticker in longs:   # a short's SELL adds to it; _fix_overstop alerts on that
+                qty = max(round(qty - _working_mkt_sell_qty(open_ords, ticker), 4), 0.0)   # professor M129
             if covered <= 0 or abs(covered - qty) <= 1e-6:
                 db.set_state(pending_key, "")
                 continue

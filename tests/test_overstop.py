@@ -247,6 +247,35 @@ def test_late_sell_reprotect_sizes_the_stop_net_of_the_working_remainder():
     place.assert_called_once_with("CRWD", 5.0, 150.0)
 
 
+def _late_sell_reprotect(open_orders):
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="CRWD", qty=20)]
+    kw = {"side_effect": open_orders} if isinstance(open_orders, Exception) else {"return_value": open_orders}
+    with patch("ibkr.get_client", return_value=client), \
+         patch("ibkr.get_open_orders", **kw), \
+         patch("db.get_position_stop", return_value={"stop_price": 150.0}), \
+         patch("execution._stops_still_resting", return_value=0.0), \
+         patch("tasks.manage_cancel_stop_orders_for"), patch("time.sleep"), \
+         patch("tasks.manage_stop_place", return_value={"order_id": 3}) as place, \
+         patch("db.set_stop_broker_order_id"):
+        ok = tasks._reprotect_after_late_sell("CRWD", {"intent": "TRIM"}, 175.0)
+    return ok, place
+
+
+def test_late_sell_reprotect_stops_everything_when_open_orders_cannot_be_read():
+    ok, place = _late_sell_reprotect(RuntimeError("gateway down"))
+    assert ok is True
+    place.assert_called_once_with("CRWD", 20.0, 150.0)
+
+
+def test_late_sell_reprotect_places_nothing_when_the_working_sell_covers_all():
+    mkt = {"order_id": 9, "ticker": "CRWD", "action": "SELL", "order_type": "MKT", "qty": 20.0,
+           "stop_price": None, "status": "Submitted", "remaining": 20.0}
+    ok, place = _late_sell_reprotect([mkt])
+    assert ok is True
+    place.assert_not_called()
+
+
 def test_cancel_failure_in_overcover_returns_a_line_not_a_crash():
     """A0253-7: label was unbound when the cancel raised."""
     client = MagicMock()

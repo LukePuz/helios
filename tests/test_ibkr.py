@@ -90,7 +90,7 @@ class TestPlaceMarketOrderWaitTiming:
     def test_returns_the_permanent_id_once_tws_assigns_it(self):
         """Professor M127: permId is unique across clientIds; 0 means not yet
         assigned and is stored as unknown."""
-        for perm, expect in ((1847293, 1847293), (0, None)):
+        for perm, status_perm, expect in ((1847293, 0, 1847293), (0, 0, None), (0, 5550001, 5550001)):
             fake_ib = MagicMock()
             fake_trade = _FakeTrade()
             fake_trade.isDone = MagicMock(return_value=True)
@@ -98,6 +98,7 @@ class TestPlaceMarketOrderWaitTiming:
             fake_trade.orderStatus.filled = 10.0
             fake_trade.orderStatus.avgFillPrice = 181.30
             fake_trade.order.permId = perm
+            fake_trade.orderStatus.permId = status_perm   # only orderStatus arrived
             fake_ib.placeOrder.return_value = fake_trade
             with patch("ibkr.get_ib", return_value=fake_ib), \
                  patch("ibkr._stock", return_value=MagicMock()), \

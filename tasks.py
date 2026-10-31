@@ -2093,10 +2093,19 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
         # A SELL of ours still working (an earlier backstop's or an EXIT's
         # remainder) will sell its shares; selling them again would short
         # once both fill (review of 16009ad). Same remainder rule as stops.
-        working = sum(float(o["qty"]) for o in _resting_sell_stops(ticker, types=("MKT", "LMT")))
+        # Market orders only: the bot places no limit sells, and a manual limit
+        # above the market (TWS) would not sell into a stop breach.
+        working = sum(float(o["qty"]) for o in _resting_sell_stops(ticker, types=("MKT",)))
         if working > 0:
             log.warning(f"[{ticker}] Backstop: a SELL for {working:g} shares is still working; "
                         f"selling only what it doesn't cover")
+            try:
+                import alerts
+                alerts._send(f"⚠️ BACKSTOP — <b>{ticker}</b>\nA market SELL for {working:g} of "
+                             f"{owned:g} shares is still working, so only the rest is sold. "
+                             f"Check TWS if it doesn't fill.")
+            except Exception:
+                pass
             owned = round(owned - working, 4)
             if owned <= 0:
                 return False

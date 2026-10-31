@@ -197,6 +197,17 @@ def test_backstop_does_not_sell_shares_a_working_sell_already_covers():
             order.assert_not_called()
         else:
             order.assert_called_once_with("AMD", "SELL", sold)
+    # A manual limit sell (e.g. above the market in TWS) is not cover.
+    lmt = [{**working[0], "order_type": "LMT", "remaining": 10.0}]
+    with patch("ibkr.get_client", return_value=client), \
+         patch("tasks.manage_cancel_stop_orders_for"), \
+         patch("ibkr.get_open_orders", return_value=lmt), \
+         patch("ibkr.place_market_order",
+               return_value={"order_id": 79, "filled_qty": 10, "fill_price": 140.0}) as order, \
+         patch("db.log_trade"), patch("db.delete_position_stop"), patch("db.log_order", return_value=5), \
+         patch("db.update_order_fill"), patch("db.close_trade_outcome"), patch("alerts._send"):
+        tasks._execute_backstop_sell("AMD", TestBackstopSellReads._alert)
+    order.assert_called_once_with("AMD", "SELL", 10.0)
 
 
 def test_cancel_failure_in_overcover_returns_a_line_not_a_crash():

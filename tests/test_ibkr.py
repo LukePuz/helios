@@ -530,3 +530,27 @@ class TestBoundedReq:
         fake_ib.reqCompletedOrders.side_effect = TimeoutError()
         with patch("ibkr.get_ib", return_value=fake_ib), pytest.raises(TimeoutError):
             ibkr.get_completed_orders()
+
+
+class TestFillTime:
+    """Professor M110: a late close carries the broker's execution time, not
+    only the time it was recorded."""
+
+    def test_recent_sell_fill_reports_the_last_execution_time(self):
+        from datetime import datetime, timezone
+        t1 = datetime(2026, 10, 30, 14, 0, tzinfo=timezone.utc)
+        t2 = datetime(2026, 10, 30, 14, 5, tzinfo=timezone.utc)
+        fake_ib = MagicMock()
+        fake_ib.reqExecutions.return_value = [
+            _FakeFillRecord("DDOG", order_id=11, shares=40.0, avg_price=227.0, side="SLD", time=t1),
+            _FakeFillRecord("DDOG", order_id=11, shares=44.0, avg_price=228.0, side="SLD", time=t2),
+        ]
+        with patch("ibkr.get_ib", return_value=fake_ib):
+            assert ibkr.get_recent_sell_fill("DDOG")["fill_time"] == t2
+
+    def test_no_time_on_the_executions_means_no_fill_time(self):
+        fake_ib = MagicMock()
+        fake_ib.reqExecutions.return_value = [
+            _FakeFillRecord("DDOG", order_id=11, shares=84.0, avg_price=227.8, side="SLD")]
+        with patch("ibkr.get_ib", return_value=fake_ib):
+            assert "fill_time" not in ibkr.get_recent_sell_fill("DDOG")

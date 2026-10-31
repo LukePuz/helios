@@ -463,7 +463,7 @@ class TestReconcileUnconfirmedOrders:
         mock_log_trade.assert_called_once()
         assert mock_log_trade.call_args.kwargs["quantity"] == 144.0
         assert mock_log_trade.call_args.kwargs["price"] == 181.3
-        mock_update_fill.assert_called_once_with(44, fill_price=181.3, filled_qty=144.0, status="filled", expect_filled_qty=0.0)
+        mock_update_fill.assert_called_once_with(44, fill_price=181.3, filled_qty=144.0, status="filled", expect_filled_qty=0.0, filled_at=None)
         mock_stop.assert_called_once_with("CRWD", 144.0, 153.61)
         mock_upsert_stop.assert_called_once()
         mock_set_stop_id.assert_called_once_with("CRWD", 900)
@@ -663,7 +663,7 @@ class TestReconcileUnconfirmedOrders:
              patch("db.upsert_position_stop"), patch("db.set_stop_broker_order_id"), \
              patch("db.update_approval_status"), patch("alerts._send"):
             tasks.reconcile_unconfirmed_orders.run()
-        update_fill.assert_called_once_with(44, fill_price=181.0, filled_qty=100.0, status="partial", expect_filled_qty=0.0)
+        update_fill.assert_called_once_with(44, fill_price=181.0, filled_qty=100.0, status="partial", expect_filled_qty=0.0, filled_at=None)
         assert log_trade.call_args.kwargs["quantity"] == 100.0
         place.assert_called_once_with("CRWD", 100.0, 153.61)
 
@@ -686,7 +686,7 @@ class TestReconcileUnconfirmedOrders:
         kw = log_trade.call_args.kwargs
         assert kw["quantity"] == 44.0
         assert abs(kw["price"] - (144 * 182.0 - 100 * 181.0) / 44) < 1e-9
-        update_fill.assert_called_once_with(44, fill_price=182.0, filled_qty=144.0, status="filled", expect_filled_qty=100.0)
+        update_fill.assert_called_once_with(44, fill_price=182.0, filled_qty=144.0, status="filled", expect_filled_qty=100.0, filled_at=None)
         place.assert_called_once_with("CRWD", 144.0, 153.61)  # whole position (A2253-3)
 
     def test_no_new_shares_on_partial_order_does_nothing(self):
@@ -726,7 +726,7 @@ class TestReconcileUnconfirmedOrders:
         self._run_sell([], intent="EXIT")
         self.extra["delete"].assert_called_once_with("CRWD")
         self.extra["close"].assert_called_once_with("CRWD", exit_price=175.0, exit_source="late_exit",
-                                                         exit_price_source="fill")
+                                                         exit_price_source="fill", exit_fill_at=None)
 
     def test_late_exit_without_a_stop_record_closes_from_the_cumulative_fill(self):
         """Professor M121: a part-filled EXIT deleted the record and left the
@@ -1011,7 +1011,7 @@ class TestStaleStopReconciliation:
         assert mock_log_trade.call_args.kwargs["quantity"] == 84.0
         assert mock_log_trade.call_args.kwargs["price"] == 227.80
         mock_close_outcome.assert_called_once_with("DDOG", exit_price=227.80, exit_source="broker_exit",
-                                                   exit_price_source="fill")
+                                                   exit_price_source="fill", exit_fill_at=None)
         mock_delete.assert_called_once_with("DDOG")
         # A reconciled exit is real information, not an emergency -- no Telegram ping.
         mock_alert.assert_not_called()
@@ -1282,7 +1282,7 @@ def test_conditional_fill_update_reports_a_lost_race():
     cur.fetchone.return_value = (180.0, "BUY")
     cur.rowcount = 0
     with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
-        assert db.update_order_fill(44, 181.0, 144.0, "filled", expect_filled_qty=0.0) is False
+        assert db.update_order_fill(44, 181.0, 144.0, "filled", expect_filled_qty=0.0, filled_at=None) is False
     assert "AND status IN ('unconfirmed', 'partial')" in cur.execute.call_args[0][0]
 
 

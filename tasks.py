@@ -1334,7 +1334,7 @@ def _reconcile_unconfirmed_orders_locked(task):
         # (professor M51). A failed log_trade after this is spilled.
         if db.update_order_fill(order["id"], fill_price=total_avg, filled_qty=total_qty,
                                 status="filled" if complete else "partial",
-                                expect_filled_qty=prev_qty) is False:
+                                expect_filled_qty=prev_qty, filled_at=fill.get("fill_time")) is False:
             log.error(f"[{ticker}] reconcile: could not mark order {order['id']} filled; "
                       f"trade not logged this cycle")
             continue
@@ -1432,7 +1432,8 @@ def _reconcile_unconfirmed_orders_locked(task):
             # A late SELL fill (partial sale or TRIM whose stop was cancelled
             # before the sale) leaves the rest without a stop. Re-protect it at
             # the recorded stop (professor C12, 2026-10-28).
-            stop_placed = _reprotect_after_late_sell(ticker, order, fill_price, exit_avg=total_avg)
+            stop_placed = _reprotect_after_late_sell(ticker, order, fill_price, exit_avg=total_avg,
+                                                     exit_fill_at=fill.get("fill_time"))
             if stop_placed is False:
                 # Busy ticker or a failed placement: the order is already
                 # marked filled, so remember to retry (professor M50).
@@ -1707,7 +1708,7 @@ def _close_queued_flat_exit(ticker: str, rec: dict) -> bool:
         try:
             db.close_trade_outcome(ticker, exit_price=row["fill_price"],
                                    exit_source=f"late_{(rec.get('intent') or 'sell').lower()}",
-                                   exit_price_source="fill")
+                                   exit_price_source="fill", exit_fill_at=row.get("filled_at"))
             db.delete_position_stop(ticker)
         except Exception as e:
             log.warning(f"[{ticker}] reconcile: close after a queued flat exit failed: {e}; waiting")
@@ -1956,7 +1957,8 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
                                fill_price: float | None = None,
                                from_queue: bool = False,
                                expect_at_least: float | None = None,
-                               exit_avg: float | None = None) -> bool | None | str:
+                               exit_avg: float | None = None,
+                               exit_fill_at=None) -> bool | None | str:
     """After a late SELL fill, finish what the selling path would have done
     (professor M-3, 2026-10-28):
     - nothing left: delete the stop record and close the outcome at the fill
@@ -2027,7 +2029,8 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
             try:
                 db.close_trade_outcome(ticker, exit_price=exit_price,
                                        exit_source=f"late_{(order.get('intent') or 'sell').lower()}",
-                                       exit_price_source="fill")   # broker average fill
+                                       exit_price_source="fill",   # broker average fill
+                                       exit_fill_at=exit_fill_at)
             except Exception as e:
                 log.warning(f"[{ticker}] reconcile: close_trade_outcome failed: {e}")
         return None
@@ -3908,7 +3911,7 @@ def _reconcile_stop_orders_body(self):
                     )
                     try:
                         db.close_trade_outcome(ticker, exit_price=fill["fill_price"], exit_source="broker_exit",
-                                               exit_price_source="fill")
+                                               exit_price_source="fill", exit_fill_at=fill.get("fill_time"))
                     except Exception as e:
                         log.error(f"[{ticker}] close_trade_outcome failed after reconciling "
                                   f"exit: {e}")

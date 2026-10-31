@@ -807,7 +807,8 @@ def get_fill_for_order(broker_order_id: int, ticker: str | None = None,
     total_qty = sum(float(e.execution.shares) for e in matches)
     if total_qty <= 0:
         return None
-    return {"filled_qty": total_qty, "fill_price": _weighted_exec_price(matches, total_qty)}
+    return _with_fill_time({"filled_qty": total_qty, "fill_price": _weighted_exec_price(matches, total_qty)},
+                           matches)
 
 
 def _weighted_exec_price(fills, total_qty: float) -> float:
@@ -815,6 +816,15 @@ def _weighted_exec_price(fills, total_qty: float) -> float:
     order's running average up to that execution, so weighting it by shares
     overweights early fills (review of c13548c)."""
     return sum(float(e.execution.shares) * float(e.execution.price) for e in fills) / total_qty
+
+
+def _with_fill_time(result: dict, records) -> dict:
+    """Adds fill_time, the last execution's time, when the executions carry
+    one (professor M110: a late close otherwise has only its recording time)."""
+    times = [t for t in (_exec_time(r) for r in records) if t is not None]
+    if times:
+        result["fill_time"] = max(times)
+    return result
 
 
 def _exec_time(record):
@@ -870,7 +880,8 @@ def get_recent_sell_fill(ticker: str, exclude_order_ids=frozenset(),
     total_qty = sum(float(e.execution.shares) for e in sells)
     if total_qty <= 0:
         return None
-    return {"filled_qty": total_qty, "fill_price": _weighted_exec_price(sells, total_qty)}
+    return _with_fill_time({"filled_qty": total_qty, "fill_price": _weighted_exec_price(sells, total_qty)},
+                           sells)
 
 
 # ---------------------------------------------------------------------------

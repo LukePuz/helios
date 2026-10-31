@@ -753,6 +753,12 @@ _MIGRATIONS: list[tuple[int, str]] = [
     # The broker's permanent order id: unique across clientIds and sessions,
     # unlike orderId (professor M127, m102). NULL when unknown at logging.
     (70, "ALTER TABLE orders ADD COLUMN IF NOT EXISTS perm_id BIGINT;"),
+    # The broker's time of the last execution, where a late or reconciled
+    # fill was read from the execution record. NULL when not captured.
+    # exit_date keeps its meaning (the time the close was recorded); which
+    # time an outcome uses is a study choice (professor M110).
+    (71, "ALTER TABLE orders ADD COLUMN IF NOT EXISTS filled_at TIMESTAMPTZ;"),
+    (72, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS exit_fill_at TIMESTAMPTZ;"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -2972,7 +2978,7 @@ def mark_order_cancelled(order_id: int, expect_filled_qty: float) -> bool:
 
 
 def update_order_fill(order_id: int, fill_price: float, filled_qty: float, status: str,
-                      expect_filled_qty: float | None = None) -> bool:
+                      expect_filled_qty: float | None = None, filled_at=None) -> bool:
     """Records the fill and computes slippage_pct vs decision_price if one was logged.
     Returns False if the write failed (reconcile relies on it, professor M51).
     With expect_filled_qty, the update applies only while the row is still
@@ -2988,9 +2994,9 @@ def update_order_fill(order_id: int, fill_price: float, filled_qty: float, statu
                 decision_price = float(row[0]) if row[0] else None
                 slippage_pct = compute_slippage_pct(decision_price, fill_price, row[1])
 
-            sql = ("UPDATE orders SET fill_price=%s, filled_qty=%s, status=%s, "
-                   "slippage_pct=%s, updated_at=NOW() WHERE id=%s")
-            params = [fill_price, filled_qty, status, slippage_pct, order_id]
+            sql = ("UPDATE orders SET fill_price=%s, filled_qty=%s, status=%s, slippage_pct=%s, "
+                   "filled_at=COALESCE(%s, filled_at), updated_at=NOW() WHERE id=%s")
+            params = [fill_price, filled_qty, status, slippage_pct, filled_at, order_id]
             if expect_filled_qty is not None:
                 sql += (" AND status IN ('unconfirmed', 'partial') "
                         "AND ABS(COALESCE(filled_qty, 0) - %s) < 0.0001")
@@ -3091,19 +3097,19 @@ def get_unconfirmed_orders(max_age_hours: int = 24) -> list[dict]:
 
 
 def get_order_fill_state(order_id: int) -> dict | None:
-    """status, fill_price, filled_qty, broker_order_id and created_at of one orders row
-    (professor M124), or None if there is no such row. Raises on error."""
+    """status, fill_price, filled_qty, broker_order_id, created_at and filled_at of one
+    orders row (professor M124), or None if there is no such row. Raises on error."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT status, fill_price, filled_qty, broker_order_id, created_at FROM orders "
-                        "WHERE id=%s AND trading_env=%s", (order_id, TRADING_ENV))
+            cur.execute("SELECT status, fill_price, filled_qty, broker_order_id, created_at, filled_at "
+                        "FROM orders WHERE id=%s AND trading_env=%s", (order_id, TRADING_ENV))
             r = cur.fetchone()
         if not r:
             return None
         return {"status": r[0], "fill_price": float(r[1]) if r[1] is not None else None,
                 "filled_qty": float(r[2]) if r[2] is not None else 0.0, "broker_order_id": r[3],
-                "created_at": r[4]}
+                "created_at": r[4], "filled_at": r[5]}
     except Exception as e:
         logging.error(f"get_order_fill_state failed: {e}")
         raise
@@ -3520,7 +3526,8 @@ def compute_outcome_metrics(
 
 
 def close_trade_outcome(ticker: str, exit_price: float, exit_date=None,
-                        exit_source: str | None = None, exit_price_source: str | None = None) -> bool:
+                        exit_source: str | None = None, exit_price_source: str | None = None,
+                        exit_fill_at=None) -> bool:
     """
     Closes every still-open (exit_date IS NULL) trade_outcomes row for this
     ticker: computes outcome_pct, was_correct, and alpha vs. SPY over each
@@ -3587,9 +3594,10 @@ def close_trade_outcome(ticker: str, exit_price: float, exit_date=None,
                 cur.execute(
                     "UPDATE trade_outcomes SET exit_price=%s, exit_date=%s, outcome_pct=%s, "
                     "was_correct=%s, exit_benchmark_price=%s, benchmark_return_pct=%s, alpha_pct=%s, "
-                    "exit_source=%s, exit_price_source=%s WHERE id=%s",
+                    "exit_source=%s, exit_price_source=%s, exit_fill_at=%s WHERE id=%s",
                     (exit_price, exit_date, outcome_pct, was_correct, exit_benchmark_price,
-                     benchmark_return_pct, alpha_pct, exit_source, exit_price_source, outcome_id),
+                     benchmark_return_pct, alpha_pct, exit_source, exit_price_source, exit_fill_at,
+                     outcome_id),
                 )
         conn.commit()
         logging.info(

@@ -412,7 +412,7 @@ def test_queued_flat_exit_closes_at_its_orders_average_fill():
     stale-stop branch never closed the outcome."""
     r, close, alert = _queued_flat("EXIT", {"status": "filled", "fill_price": 171.5, "broker_order_id": 77, "created_at": _T0})
     assert r is None
-    close.assert_called_once_with("CRWD", exit_price=171.5, exit_source="late_exit", exit_price_source="fill")
+    close.assert_called_once_with("CRWD", exit_price=171.5, exit_source="late_exit", exit_price_source="fill", exit_fill_at=None)
     alert.assert_not_called()
 
 
@@ -481,7 +481,7 @@ def test_a_queued_profit_target_keeps_a_later_exits_order_for_the_flat_close():
          patch("db.close_trade_outcome") as close:
         tasks._reprotect_after_late_sell("CRWD", rec, 171.0, from_queue=True)
     row.assert_called_once_with(5)
-    close.assert_called_once_with("CRWD", exit_price=171.5, exit_source="late_exit", exit_price_source="fill")
+    close.assert_called_once_with("CRWD", exit_price=171.5, exit_source="late_exit", exit_price_source="fill", exit_fill_at=None)
 
 
 def test_a_restore_replacing_a_queued_exit_keeps_the_exits_order():
@@ -588,7 +588,7 @@ def test_a_queued_flat_backstop_with_its_kept_record_closes_from_its_fill():
         r = tasks._reprotect_after_late_sell("CRWD", {"intent": "BACKSTOP", "order_id": 5}, 171.0,
                                              from_queue=True)
     assert r is None
-    close.assert_called_once_with("CRWD", exit_price=171.5, exit_source="late_backstop", exit_price_source="fill")
+    close.assert_called_once_with("CRWD", exit_price=171.5, exit_source="late_backstop", exit_price_source="fill", exit_fill_at=None)
     delete.assert_called_once_with("CRWD")
 
 
@@ -738,3 +738,11 @@ def test_queued_restore_takes_a_second_look_at_a_pending_cancel():
          patch("db.set_stop_broker_order_id"):
         assert tasks._reprotect_after_late_sell("CRWD", {"intent": "RESTORE"}, None, from_queue=True) is True
     place.assert_called_once_with("CRWD", 20.0, 150.0)
+
+
+def test_queued_flat_exit_passes_its_orders_fill_time():
+    """Professor M110: the queued close can run ~4 h after the fill."""
+    r, close, _ = _queued_flat("EXIT", {"status": "filled", "fill_price": 171.5, "broker_order_id": 77,
+                                        "created_at": _T0, "filled_at": "FILLED-AT"})
+    assert r is None
+    assert close.call_args.kwargs["exit_fill_at"] == "FILLED-AT"

@@ -236,7 +236,13 @@ def observe(ticker: str, parsed: dict, action: str, conviction: int, brief: str,
             out["relation"] == "FOLLOW" and last
             and (now - last).total_seconds() < _COALESCE_HOURS * 3600)
         if held and price and out["relation"] not in ("REVISE", "INVALIDATE"):
-            out.update(_would_revise(plan, parsed, conviction, price, today, ticker))
+            # Its own guard: malformed model fields must not skip the
+            # touch_plan below (review of eed0fcb).
+            try:
+                out.update(_would_revise(plan, parsed, conviction, price, today, ticker))
+            except Exception as e:
+                log.debug(f"[{ticker}] would_revise failed: {e}")
+                out["would_revise"] = None
         if out["relation"] == "REVISE":
             new.update(revision=(plan.get("revision") or 0) + 1, replaces_id=plan["id"])
             db.touch_plan(plan["id"], "REVISE")

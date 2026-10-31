@@ -311,3 +311,13 @@ def test_expiry_marks_the_decision_at_horizon():
         r = plans.observe("NVDA", PARSED, "HOLD", 6, "Current Price: $540.00", now=NOW)
     touch.assert_called_once_with(1, "CLOSED", close_reason="expired")
     assert r["relation"] == "SEEDED" and r["decision_at_horizon"] is True and r["expired_plan_id"] == 1
+
+
+def test_malformed_fields_on_a_held_hold_still_touch_the_plan():
+    """Review of eed0fcb: a would_revise failure must not turn FOLLOW into ERROR."""
+    bad = {**PARSED, "valuation": "n/a"}
+    with patch("db.get_position_stop", return_value={"entry_price": 500.0, "stop_price": 450.0}), \
+         patch("db.get_active_plan", return_value=_plan()), patch("db.touch_plan") as touch:
+        r = plans.observe("NVDA", bad, "HOLD", 6, "Current Price: $540.00", now=NOW)
+    assert r["relation"] == "FOLLOW" and r["would_revise"] is None
+    touch.assert_called_once_with(1, "FOLLOW")

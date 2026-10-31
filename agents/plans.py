@@ -156,7 +156,19 @@ def observe(ticker: str, parsed: dict, action: str, conviction: int, brief: str,
         et = ZoneInfo("America/New_York")
         today = now.astimezone(et).date()   # trading dates are ET, not UTC
         price = brief_price(brief)
-        held = db.get_position_stop(ticker) is not None
+        # Held per the broker when a fresh snapshot says so; the stop row is
+        # the fallback. A broker position with no stop row is the riskiest
+        # case and used to get no plan (audit A1031-0453-2).
+        stop = db.get_position_stop(ticker)
+        try:
+            import tasks
+            broker, broker_reason, position = tasks._broker_held(ticker)
+        except Exception:
+            broker, broker_reason, position = None, "error", {}
+        held = broker if broker is not None else stop is not None
+        held_info = {"held_source": "broker" if broker is not None else "stop_row",
+                     "held_reason": broker_reason, "has_stop_row": stop is not None,
+                     "held_mismatch": broker is not None and broker != (stop is not None)}
         plan = db.get_active_plan(ticker)
         new = (plan_from_verdict(ticker, parsed, conviction, price, today)
                if price and action in ("OPEN", "ADD") else None)
@@ -176,23 +188,28 @@ def observe(ticker: str, parsed: dict, action: str, conviction: int, brief: str,
         if plan is None:
             if new:
                 return {"relation": "NEW_PLAN", "plan_id": db.insert_plan(new), "price": price,
-                        "held": held, "plan_live": held}
-            stop = db.get_position_stop(ticker) if held else None
-            if stop and price:
+                        "held": held, "plan_live": held, **held_info}
+            if held and price and (stop or position):
                 seed = plan_from_verdict(ticker, parsed, conviction, price, today)
-                seed.update(source="held_seed", entry_price=stop["entry_price"],
-                            invalidation_price=stop["stop_price"],
-                            bucket=stop.get("thesis_bucket") or seed["bucket"])
+                if stop:
+                    seed.update(source="held_seed", entry_price=stop["entry_price"],
+                                invalidation_price=stop["stop_price"],
+                                bucket=stop.get("thesis_bucket") or seed["bucket"])
+                else:
+                    # No stop row: entry from the broker, invalidation from
+                    # the verdict's own downside.
+                    seed.update(source="held_seed",
+                                entry_price=position.get("avg_entry_price") or seed["entry_price"])
                 return {"relation": "SEEDED", "plan_id": db.insert_plan(seed), "price": price,
-                        "held": held, "plan_live": True}
-            return {"relation": "NO_PLAN", "price": price, "held": held}
+                        "held": held, "plan_live": True, **held_info}
+            return {"relation": "NO_PLAN", "price": price, "held": held, **held_info}
 
         out = classify(plan, action, new, price, today, held)
         out["price"] = price
         # A plan written by an OPEN that never filled (sized to 0 shares) is
         # not a live plan: WATCH/HOLD on it reads as FOLLOW (audit A0100-4).
         # Count FOLLOW/DIVERGE on plan_live rows only.
-        out.update(held=held, plan_source=plan.get("source"), plan_live=held)
+        out.update(held=held, plan_source=plan.get("source"), plan_live=held, **held_info)
         out["plan_age_days"] = ((today - plan["created_at"].astimezone(et).date()).days
                                 if plan.get("created_at") else None)
         last = plan.get("last_seen_at") or plan.get("created_at")

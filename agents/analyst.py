@@ -438,7 +438,7 @@ def _brief_exposure(ticker: str, prompt: str) -> dict:
     -1/-2). Read from the prompt text, so it is what the model saw. Since
     BRIEF_POSITION_CONTEXT, repeats on held names see their last verdicts and
     aren't independent draws; the section keys on a stop row, not the broker.
-    held_broker is None when there is no fresh snapshot (or no positions)."""
+    held_broker is None when unknown; held_broker_reason says why."""
     out = {"position_context_shown": False, "prior_verdicts_shown": []}
     # Only inside the position section: event text above it is raw news.
     in_section = False
@@ -457,14 +457,9 @@ def _brief_exposure(ticker: str, prompt: str) -> dict:
         out["has_stop_row"] = None
     try:
         import tasks
-        positions = tasks._fresh_snapshot_positions()
-        if positions:
-            p = positions.get(ticker.upper()) or positions.get(ticker) or {}
-            out["held_broker"] = float(p.get("qty") or 0) > 0 if isinstance(p, dict) else False
-        else:
-            out["held_broker"] = None
+        out["held_broker"], out["held_broker_reason"], _ = tasks._broker_held(ticker)
     except Exception:
-        out["held_broker"] = None
+        out["held_broker"], out["held_broker_reason"] = None, "error"
     return out
 
 

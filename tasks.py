@@ -767,6 +767,12 @@ def _held_tickers() -> set[str]:
 def _fresh_snapshot_positions(max_age_min: float = 15) -> dict:
     """positions_json of the latest portfolio snapshot if it is fresh, else
     {}. No IBKR call: the ingestion worker must not open broker connections."""
+    return _snapshot_positions_or_none(max_age_min) or {}
+
+
+def _snapshot_positions_or_none(max_age_min: float = 15) -> dict | None:
+    """Like _fresh_snapshot_positions, but None when there is no fresh
+    snapshot, so an empty portfolio ({}) can be told apart from unknown."""
     import db
     from datetime import datetime, timezone
     from config import TRADING_ENV
@@ -781,12 +787,33 @@ def _fresh_snapshot_positions(max_age_min: float = 15) -> dict:
             row = cur.fetchone()
     finally:
         db._put_conn(conn)
-    if not row or not row[0] or not row[1]:
-        return {}
+    if not row or row[0] is None or not row[1]:
+        return None
     ts = row[1] if row[1].tzinfo else row[1].replace(tzinfo=timezone.utc)
     if (datetime.now(timezone.utc) - ts).total_seconds() > max_age_min * 60:
-        return {}
+        return None
     return row[0]
+
+
+def _broker_held(ticker: str, max_age_min: float = 15) -> tuple[bool | None, str, dict]:
+    """Whether the broker holds ticker, from the fresh portfolio snapshot:
+    (held, reason, position). held is None when unknown; reason is
+    "snapshot", "empty" (no positions at all), "no_snapshot" or "error"
+    (audit A1031-0453-2: "held" used to mean "has a stop row")."""
+    try:
+        positions = _snapshot_positions_or_none(max_age_min)
+    except Exception:
+        return None, "error", {}
+    if positions is None:
+        return None, "no_snapshot", {}
+    if not positions:
+        return False, "empty", {}
+    p = positions.get(ticker.upper()) or positions.get(ticker) or {}
+    try:
+        return (isinstance(p, dict) and float(p.get("qty") or 0) > 0), "snapshot", \
+            (p if isinstance(p, dict) else {})
+    except (TypeError, ValueError):
+        return None, "error", {}
 
 
 def _held_qty_tickers(max_age_min: float = 15) -> set[str]:

@@ -31,8 +31,20 @@ class TestComputeWeeksToCatalyst:
     def test_month_only_defaults_to_the_1st(self):
         # "2026-09" -> strptime("%Y-%m") defaults the day to 1 ->
         # 2026-09-01, 2 days after 2026-08-30 -> 2/7 weeks
-        weeks = compute_weeks_to_catalyst("2026-09", as_of=_AS_OF)
+        weeks = compute_weeks_to_catalyst("2026-09", as_of=_AS_OF, month_midpoint=False)
         assert abs(weeks - 2 / 7) < 1e-9
+
+    def test_month_only_reads_the_15th_with_the_midpoint_switch(self):
+        # 2026-09-15 is 16 days after 2026-08-30 (audit A1031-0253-1)
+        weeks = compute_weeks_to_catalyst("2026-09", as_of=_AS_OF, month_midpoint=True)
+        assert abs(weeks - 16 / 7) < 1e-9
+        # a full date is unaffected by the switch
+        assert abs(compute_weeks_to_catalyst("2026-09-20", as_of=_AS_OF, month_midpoint=True) - 3.0) < 1e-9
+
+    def test_the_switch_ships_off(self):
+        import config
+        assert config.CATALYST_MONTH_MIDPOINT_ENABLED is False
+        assert abs(compute_weeks_to_catalyst("2026-09", as_of=_AS_OF) - 2 / 7) < 1e-9
 
     def test_ongoing_returns_none(self):
         assert compute_weeks_to_catalyst("ongoing", as_of=_AS_OF) is None

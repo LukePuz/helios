@@ -826,13 +826,15 @@ def _catalyst_check(ticker: str, parsed: dict) -> dict:
     return out
 
 
-def compute_weeks_to_catalyst(catalyst_date: str | None, as_of: datetime | None = None) -> float | None:
+def compute_weeks_to_catalyst(catalyst_date: str | None, as_of: datetime | None = None,
+                              month_midpoint: bool | None = None) -> float | None:
     """Pure helper for the minimum-expected-return-rate gate (2026-08-30,
     user request). Parses the model's catalyst.date field, trying the
     most precise format first:
       - "YYYY-MM-DD": exact date.
-      - "YYYY-MM": month known, day unknown -- assumes the 15th (a
-        reasonable midpoint, not a real prediction of the exact day).
+      - "YYYY-MM": month known, day unknown -- read as the 1st (strptime's
+        default), or the 15th when month_midpoint (default:
+        CATALYST_MONTH_MIDPOINT_ENABLED, off) is set (audit A1031-0253-1).
       - "ongoing", empty, or anything unparseable: no defined timeframe
         at all -- returns None. Callers must treat None as "can't compute
         a rate," not as passing or failing the gate on its own; analyze()
@@ -861,6 +863,13 @@ def compute_weeks_to_catalyst(catalyst_date: str | None, as_of: datetime | None 
             continue
     if parsed is None:
         return None
+    if month_midpoint is None:
+        try:
+            from config import CATALYST_MONTH_MIDPOINT_ENABLED as month_midpoint
+        except ImportError:
+            month_midpoint = False
+    if month_midpoint and re.fullmatch(r"\d{4}-\d{2}", catalyst_date.strip()):
+        parsed = parsed.replace(day=15)
 
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)

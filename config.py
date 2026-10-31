@@ -523,6 +523,13 @@ ETF_FUNDAMENTALS_CAP_EXEMPT = os.getenv("ETF_FUNDAMENTALS_CAP_EXEMPT", "false").
 # it on: it adds analyst runs and a new trigger (audit A0903-1 step 3).
 PLAN_LEVEL_REVIEW_ENABLED = os.getenv("PLAN_LEVEL_REVIEW_ENABLED", "false").lower() == "true"
 
+# The rate gate reads a month-only catalyst date ("YYYY-MM") as the 1st of
+# that month, so within the month it floors to 1 day and any expected return
+# clears the 1%/week bar. On, it uses the 15th, as _catalyst_check's
+# provenance already does. Changes which verdicts pass the gate, so it is
+# off until Luke decides (audit A1031-0253-1).
+CATALYST_MONTH_MIDPOINT_ENABLED = os.getenv("CATALYST_MONTH_MIDPOINT_ENABLED", "false").lower() == "true"
+
 # Risk-per-trade-of-equity by LIVE setup category (Breakout/Catalyst/
 # Continuation) -- the SETUP_GATES_ENABLED equivalent of RISK_PCT_PER_TRADE
 # above, which stays exactly as-is and keeps governing Compounder/

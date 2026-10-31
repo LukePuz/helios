@@ -22,7 +22,8 @@ def _failed_conversion(place_side_effect):
     # trailing_high above current, so the old fallback condition is false
     rec = {"ticker": "NVDA", "stop_price": 112.0, "thesis_bucket": "Accelerator",
            "entry_price": 100.0, "trailing_active": False, "trailing_high": 130.0}
-    with patch("db.get_all_position_stops", return_value=[rec]), \
+    with patch("market_data.is_market_hours", return_value=True), \
+         patch("db.get_all_position_stops", return_value=[rec]), \
          patch("db.get_position_stop", return_value=rec), \
          patch("risk_manager.SETUP_GATES_ENABLED", False), \
          patch.object(risk_manager.RiskManager, "get_atr", return_value=4.0), \
@@ -112,3 +113,32 @@ def test_conversion_skipped_when_stop_moved_while_waiting():
          patch("tasks.manage_cancel_stop_orders_for") as cancel:
         rm.check_trailing_stops()
     cancel.assert_not_called()
+
+
+def test_trail_does_not_arm_on_an_after_hours_price():
+    """Audit A1031-0053-8: a +26% after-hours print must not arm the trail."""
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="NVDA", qty=7, current_price=126.0)]
+    rm = object.__new__(risk_manager.RiskManager)
+    rm._client = client
+    rec = {"ticker": "NVDA", "stop_price": 112.0, "thesis_bucket": "Accelerator",
+           "entry_price": 100.0, "trailing_active": False}
+    with patch("market_data.is_market_hours", return_value=False), \
+         patch("db.get_all_position_stops", return_value=[rec]), \
+         patch("tasks.manage_place_trailing_stop") as trail, \
+         patch("tasks.manage_cancel_stop_orders_for") as cancel:
+        assert rm.check_trailing_stops() == []
+    trail.assert_not_called(); cancel.assert_not_called()
+
+
+def test_a_breached_stop_still_alerts_after_hours():
+    """The breach check (which feeds the backstop for an unprotected position) still runs."""
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="NVDA", qty=7, current_price=100.0)]
+    rm = object.__new__(risk_manager.RiskManager)
+    rm._client = client
+    rec = {"ticker": "NVDA", "stop_price": 112.0, "thesis_bucket": "Accelerator", "entry_price": 120.0}
+    with patch("market_data.is_market_hours", return_value=False), \
+         patch("db.get_all_position_stops", return_value=[rec]):
+        alerts = rm.check_trailing_stops()
+    assert [a["action"] for a in alerts] == ["EXIT"]

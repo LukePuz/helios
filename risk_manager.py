@@ -1273,6 +1273,15 @@ class RiskManager:
         except Exception as e:
             log.warning(f"Trailing stop check failed: {e}")
             return []
+        # Stops move only on regular-hours prices: an after-hours print (an
+        # earnings gap, say) would arm the trail or ratchet the ladder from a
+        # price the open may not confirm (audit A1031-0053-8). Unknown counts
+        # as closed. The stop-breach check below still runs.
+        try:
+            import market_data
+            rth = bool(market_data.is_market_hours())
+        except Exception:
+            rth = False
 
         alerts: list[dict] = []
         for stop_record in stops:
@@ -1302,6 +1311,8 @@ class RiskManager:
             # multiple trail-activation logic that follows — skip it
             # entirely for this ticker rather than letting both paths touch
             # the same stop in the same run.
+            if not rth:
+                continue
             if SETUP_GATES_ENABLED and bucket in CATEGORY_RISK_PCT_PER_TRADE:
                 self._ratchet_ladder_stop(ticker, pos, current, stop_px, alerts)
                 continue

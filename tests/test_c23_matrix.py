@@ -40,7 +40,8 @@ def _trail_conversion(trail_effect, place_effect=({"order_id": 3},)):
     rm._client = client
     rec = {"ticker": "NVDA", "stop_price": 112.0, "thesis_bucket": "Accelerator",
            "entry_price": 100.0, "trailing_active": False, "trailing_high": 130.0}
-    with patch("db.get_all_position_stops", return_value=[rec]), \
+    with patch("market_data.is_market_hours", return_value=True), \
+         patch("db.get_all_position_stops", return_value=[rec]), \
          patch("db.get_position_stop", return_value=rec), \
          patch("risk_manager.SETUP_GATES_ENABLED", False), \
          patch.object(risk_manager.RiskManager, "get_atr", return_value=4.0), \

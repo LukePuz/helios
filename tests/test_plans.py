@@ -257,33 +257,23 @@ def test_two_level_kinds_on_one_ticker_queue_one_review_per_day():
     assert queued.call_count == 1
 
 
-def test_broker_position_without_a_stop_row_is_seeded_from_the_broker():
-    """Audit A1031-0453-2: the riskiest case (no stop row) used to get no plan."""
-    with patch("tasks._broker_held", return_value=(True, "snapshot", {"qty": 3, "avg_entry_price": 510.0})), \
+def test_broker_position_without_a_stop_row_is_recorded_not_seeded():
+    """Audit A1031-0453-2: logged only; plan behavior still keys on the stop row."""
+    with patch("tasks._broker_held", return_value=(True, "snapshot", {"qty": 3})), \
          patch("db.get_position_stop", return_value=None), \
-         patch("db.get_active_plan", return_value=None), \
-         patch("db.insert_plan", return_value=4) as ins:
+         patch("db.get_active_plan", return_value=None), patch("db.insert_plan") as ins:
         r = plans.observe("MSFT", PARSED, "HOLD", 6, "Current Price: $540.00", now=NOW)
-    assert r["relation"] == "SEEDED" and r["plan_live"] is True
-    assert r["held_source"] == "broker" and r["has_stop_row"] is False and r["held_mismatch"] is True
-    seed = ins.call_args.args[0]
-    assert seed["source"] == "held_seed" and seed["entry_price"] == 510.0
+    ins.assert_not_called()
+    assert r["relation"] == "NO_PLAN" and r["held"] is False
+    assert r["held_broker"] is True and r["held_mismatch"] is True
 
 
-def test_broker_flat_closes_a_held_plan_even_with_a_lingering_stop_row():
+def test_broker_flat_with_a_stop_row_is_recorded_and_the_plan_kept():
     seeded = _plan(source="held_seed")
     with patch("tasks._broker_held", return_value=(False, "snapshot", {})), \
          patch("db.get_position_stop", return_value={"entry_price": 500.0, "stop_price": 450.0}), \
          patch("db.get_active_plan", return_value=seeded), patch("db.touch_plan") as touch:
-        r = plans.observe("NVDA", PARSED, "WATCH", 6, "Current Price: $540.00", now=NOW)
-    touch.assert_called_once_with(1, "CLOSED", close_reason="position closed")
-    assert r["relation"] == "NO_PLAN" and r["held"] is False and r["held_mismatch"] is True
-
-
-def test_unknown_broker_falls_back_to_the_stop_row():
-    seeded = _plan(source="held_seed")
-    with patch("db.get_position_stop", return_value={"entry_price": 500.0, "stop_price": 450.0}), \
-         patch("db.get_active_plan", return_value=seeded), patch("db.touch_plan") as touch:
         r = plans.observe("NVDA", PARSED, "HOLD", 6, "Current Price: $540.00", now=NOW)
     assert all(c.args[1] != "CLOSED" for c in touch.call_args_list)
-    assert r["held"] is True and r["held_source"] == "stop_row" and r["held_reason"] == "no_snapshot"
+    assert r["held"] is True and r["held_broker"] is False and r["held_mismatch"] is True
+    assert r["held_broker_reason"] == "snapshot"

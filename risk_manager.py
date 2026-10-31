@@ -1665,6 +1665,7 @@ class RiskManager:
             try:
                 db.log_order(ticker=ticker, side="SELL", order_type="MARKET", qty=sell_qty,
                              broker_order_id=order_result.get("order_id"),
+                             perm_id=order_result.get("perm_id"),
                              decision_price=decision_price, status="unconfirmed",
                              intent="PROFIT_TARGET", stop_price=new_stop)
             except Exception as e:
@@ -1687,6 +1688,7 @@ class RiskManager:
                          ("decision" if decision_price else None))
             local_id = db.log_order(ticker=ticker, side="SELL", order_type="MARKET",
                                     qty=sell_qty, broker_order_id=order_result.get("order_id"),
+                                    perm_id=order_result.get("perm_id"),
                                     decision_price=decision_price, status="submitted",
                                     intent="PROFIT_TARGET", stop_price=new_stop)
             if local_id and local_id > 0 and order_result.get("fill_price"):

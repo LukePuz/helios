@@ -65,3 +65,19 @@ class TestOutcomeMetrics:
         assert m["outcome_pct"] == pytest.approx(0.0)
         assert m["benchmark_return_pct"] == pytest.approx(-0.10)
         assert m["alpha_pct"] == pytest.approx(0.10)
+
+
+def test_log_order_stores_the_permanent_id():
+    """Professor M127: orders.perm_id (migration 70); 0 is stored as unknown."""
+    from unittest.mock import MagicMock, patch
+    import db
+    for perm, stored in ((1847293, 1847293), (0, None), (None, None)):
+        cur = MagicMock()
+        cur.fetchone.return_value = (7,)
+        conn = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = cur
+        with patch("db._writer_conn", return_value=conn), patch("db._put_conn"):
+            assert db.log_order("NVDA", "SELL", "MARKET", 3, broker_order_id=12, perm_id=perm) == 7
+        sql, params = cur.execute.call_args.args
+        assert "perm_id" in sql and sql.count("%s") == len(params)
+        assert params[-1] == stored

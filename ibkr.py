@@ -347,6 +347,9 @@ def place_market_order(ticker: str, side: str, qty: float, fill_timeout: float =
 
     return {
         "order_id":   trade.order.orderId,
+        # Assigned by TWS after placeOrder, so 0 until its first status
+        # message; read after the fill wait (professor M127).
+        "perm_id":    int(getattr(trade.order, "permId", 0) or 0) or None,
         "ticker":     ticker,
         "side":       side.upper(),
         "qty":        qty,

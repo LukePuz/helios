@@ -1025,6 +1025,7 @@ def execute_approved(
                     db.log_order(
                         ticker=ticker, side=side, order_type="MARKET",
                         qty=shares, broker_order_id=order_result.get("order_id"),
+                        perm_id=order_result.get("perm_id"),
                         decision_price=price_at_sizing, approval_id=approval["id"],
                         status="unconfirmed", intent=action,
                     )
@@ -1074,6 +1075,7 @@ def execute_approved(
                 ticker=ticker, side=side,
                 order_type="BRACKET" if bracket_used else "MARKET",
                 qty=shares, broker_order_id=order_result.get("order_id"),
+                perm_id=order_result.get("perm_id"),
                 decision_price=price_at_sizing, approval_id=approval["id"],
                 status="submitted", intent=action,
             )
@@ -1429,6 +1431,7 @@ def execute_manual(
         try:
             db.log_order(ticker=ticker, side=side, order_type="MARKET", qty=qty,
                          broker_order_id=order_result.get("order_id"),
+                         perm_id=order_result.get("perm_id"),
                          status="unconfirmed", intent=order_intent)
         except Exception as e:
             log.warning(f"[{ticker}] Could not log the unconfirmed manual order: {e}")
@@ -1446,6 +1449,7 @@ def execute_manual(
     try:
         local_order_id = db.log_order(ticker=ticker, side=side, order_type="MARKET", qty=qty,
                                       broker_order_id=order_result.get("order_id"),
+                                      perm_id=order_result.get("perm_id"),
                                       status="submitted", intent=order_intent)
         if local_order_id > 0 and filled_qty > 0:
             # A part fill stays 'partial' so reconcile books the rest (M53);

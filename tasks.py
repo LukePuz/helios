@@ -2366,6 +2366,7 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
         try:
             local_id = db.log_order(ticker=ticker, side="SELL", order_type="MARKET", qty=owned,
                                     broker_order_id=result.get("order_id"),
+                                    perm_id=result.get("perm_id"),
                                     decision_price=alert.get("current_price"), status="submitted",
                                     intent="BACKSTOP")
             if local_id and local_id > 0:

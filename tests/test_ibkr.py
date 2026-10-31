@@ -87,6 +87,23 @@ class TestPlaceMarketOrderWaitTiming:
         assert result["filled_qty"] == 10.0
         assert result["fill_price"] == 181.30
 
+    def test_returns_the_permanent_id_once_tws_assigns_it(self):
+        """Professor M127: permId is unique across clientIds; 0 means not yet
+        assigned and is stored as unknown."""
+        for perm, expect in ((1847293, 1847293), (0, None)):
+            fake_ib = MagicMock()
+            fake_trade = _FakeTrade()
+            fake_trade.isDone = MagicMock(return_value=True)
+            fake_trade.orderStatus.status = "Filled"
+            fake_trade.orderStatus.filled = 10.0
+            fake_trade.orderStatus.avgFillPrice = 181.30
+            fake_trade.order.permId = perm
+            fake_ib.placeOrder.return_value = fake_trade
+            with patch("ibkr.get_ib", return_value=fake_ib), \
+                 patch("ibkr._stock", return_value=MagicMock()), \
+                 patch("ibkr.ibi.MarketOrder", return_value=_FakeOrder()):
+                assert ibkr.place_market_order("NVDA", "BUY", 10, fill_timeout=5.0)["perm_id"] == expect
+
 
 class TestCancelOrderPollsForTerminalStatus:
     """Regression coverage for the 2026-08-04 MRVL incident: cancel_order

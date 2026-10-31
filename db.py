@@ -750,6 +750,9 @@ _MIGRATIONS: list[tuple[int, str]] = [
     # average fill price) or quote (a fallback last price). NULL before 10-30
     # and for callers that don't say (professor M119).
     (69, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS exit_price_source VARCHAR(10);"),
+    # The broker's permanent order id: unique across clientIds and sessions,
+    # unlike orderId (professor M127, m102). NULL when unknown at logging.
+    (70, "ALTER TABLE orders ADD COLUMN IF NOT EXISTS perm_id BIGINT;"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -2874,13 +2877,14 @@ def log_order(
     parent_order_id: int | None = None,
     status: str = "submitted",
     intent: str | None = None,
+    perm_id: int | None = None,
 ) -> int:
     """Logs a newly-placed order. Returns the local orders.id (-1 on failure)."""
     conn = _writer_conn("log_order", {
         "ticker": ticker, "side": side, "order_type": order_type, "qty": qty,
         "broker_order_id": broker_order_id, "stop_price": stop_price,
         "decision_price": decision_price, "approval_id": approval_id, "status": status,
-        "intent": intent})
+        "intent": intent, "perm_id": perm_id})
     if conn is None:
         return -1
     try:
@@ -2889,12 +2893,13 @@ def log_order(
                 """
                 INSERT INTO orders
                     (broker_order_id, trading_env, ticker, side, order_type, qty, limit_price,
-                     stop_price, decision_price, approval_id, parent_order_id, status, intent)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     stop_price, decision_price, approval_id, parent_order_id, status, intent, perm_id)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 RETURNING id
                 """,
                 (broker_order_id, TRADING_ENV, ticker, side, order_type, qty, limit_price,
-                 stop_price, decision_price, approval_id, parent_order_id, status, intent),
+                 stop_price, decision_price, approval_id, parent_order_id, status, intent,
+                 perm_id or None),
             )
             order_id = cur.fetchone()[0]
         conn.commit()

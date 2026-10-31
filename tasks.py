@@ -3807,12 +3807,16 @@ def check_portfolio_drawdown(self):
                 db.set_state(rebase_key, str(pv))
                 # Plain read: a failed one returns "false" and sets the halt (fails closed).
                 if db.get_state(halted_key, "false") != "true":
-                    db.set_state(halted_key, "true")
                     from config import IMPLAUSIBLE_HALT_REASON_PREFIX
-                    db.set_state(reason_key, f"{IMPLAUSIBLE_HALT_REASON_PREFIX} on "
-                                             f"{implausible} checks; /rebase after checking")
+                    not_saved = db.set_state_verified([
+                        (halted_key, "true"),
+                        (reason_key, f"{IMPLAUSIBLE_HALT_REASON_PREFIX} on {implausible} checks; "
+                                     f"/rebase after checking")])
+                    # Logged and alerted either way, marked when the flag couldn't be
+                    # confirmed saved (M149): a retry would see it set and stay silent.
+                    halt_saved = halted_key not in not_saved
                     db.log_halt_event("auto_halt", "drawdown_task", "implausible reads",
-                                      implausible_reads=implausible)
+                                      implausible_reads=implausible, verified=halt_saved)
                     log.critical(f"Drawdown check: {implausible} consecutive implausible reads "
                                  f"(value under half of {hwm_key}) — trading HALTED")
                     try:
@@ -3825,6 +3829,8 @@ def check_portfolio_drawdown(self):
                             f"without touching the baseline, but each buy still re-checks and is "
                             f"blocked while the value reads under half of it, and the halt returns "
                             f"after 3 more low reads (about 90 min)."
+                            + ("" if halt_saved else "\n⚠️ The halt flag could not be confirmed "
+                               "saved; check /status and send /halt if it isn't set.")
                         )
                     except Exception:
                         pass
@@ -3850,14 +3856,19 @@ def check_portfolio_drawdown(self):
                            f"before halting")
                 return
             already_halted = db.get_state(halted_key, "false") == "true"
-            db.set_state(halted_key, "true")
-            db.set_state(reason_key,
-                         f"Auto: drawdown {drawdown:.1%} from HWM ${hwm:,.2f}")
-            log.critical(f"DRAWDOWN LIMIT HIT: {drawdown:.1%} — trading HALTED")
+            not_saved = db.set_state_verified([
+                (halted_key, "true"),
+                (reason_key, f"Auto: drawdown {drawdown:.1%} from HWM ${hwm:,.2f}")])
+            halt_saved = halted_key not in not_saved
+            log.critical(f"DRAWDOWN LIMIT HIT: {drawdown:.1%} — trading HALTED"
+                         + ("" if halt_saved else " (flag not confirmed saved)"))
             if not already_halted:
                 db.log_halt_event("auto_halt", "drawdown_task", "drawdown",
-                                  drawdown_pct=round(drawdown, 4))
+                                  drawdown_pct=round(drawdown, 4), verified=halt_saved)
                 alerts.send_halt_alert(pv, hwm)
+                if not halt_saved:
+                    alerts._send("⚠️ The drawdown halt flag could not be confirmed saved; check "
+                                 "/status and send /halt if it isn't set.")
         else:
             db.set_state(breach_key, "0")
             log.debug(f"Drawdown: {drawdown:.1%} (limit: {MAX_DRAWDOWN_PCT:.0%})")

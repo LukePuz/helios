@@ -371,18 +371,9 @@ def _execute_chat_order(
 # ---------------------------------------------------------------------------
 
 def _write_state_checked(writes: list[tuple[str, str]]) -> list[str]:
-    """Write each system_state key and read it back; the keys that didn't
-    land. db.set_state swallows its own errors (professor M145)."""
+    """The keys that didn't land (db.set_state_verified; professor M145)."""
     import db
-    failed = []
-    for key, value in writes:
-        db.set_state(key, value)
-        try:
-            if db.get_state_strict(key, "") != value:
-                failed.append(key)
-        except Exception:
-            failed.append(key)
-    return failed
+    return db.set_state_verified(writes)
 
 
 def _handle_mention(update: dict, is_urgent: bool) -> None:
@@ -419,8 +410,12 @@ def _handle_mention(update: dict, is_urgent: bool) -> None:
         try:
             import db
             from config import TRADING_ENV
-            db.set_state(f"trading_halted_{TRADING_ENV}", "true")
-            db.set_state(f"halt_reason_{TRADING_ENV}", f"Manual halt by {display}")
+            failed = _write_state_checked([(f"trading_halted_{TRADING_ENV}", "true"),
+                                           (f"halt_reason_{TRADING_ENV}", f"Manual halt by {display}")])
+            if f"trading_halted_{TRADING_ENV}" in failed:
+                _reply(chat_id, "⚠️ <b>Halt NOT set</b>: the halt flag didn't save. Try /halt again "
+                                "and check /status.", msg_id)
+                return
             db.log_halt_event("manual_halt", "telegram")
             _reply(chat_id, f"🛑 <b>Trading HALTED</b> ({TRADING_ENV}). No new BUY orders will "
                             "execute. Send /resume to lift the halt.", msg_id)
@@ -480,11 +475,15 @@ def _handle_mention(update: dict, is_urgent: bool) -> None:
         try:
             import db
             from config import TRADING_ENV
-            db.set_state(f"trading_halted_{TRADING_ENV}", "false")
-            db.set_state(f"halt_reason_{TRADING_ENV}", "")
-            # Restart the implausible-read count, or the next check re-halts
-            # at once while reads stay low (review of d3e403d).
-            db.set_state(f"drawdown_implausible_count_{TRADING_ENV}", "0")
+            # Restart the implausible-read count too, or the next check
+            # re-halts at once while reads stay low (review of d3e403d).
+            failed = _write_state_checked([(f"trading_halted_{TRADING_ENV}", "false"),
+                                           (f"halt_reason_{TRADING_ENV}", ""),
+                                           (f"drawdown_implausible_count_{TRADING_ENV}", "0")])
+            if f"trading_halted_{TRADING_ENV}" in failed:
+                _reply(chat_id, "⚠️ <b>Halt NOT cleared</b>: the flag didn't save; trading is still "
+                                "halted. Try /resume again.", msg_id)
+                return
             db.log_halt_event("resume", "telegram")
             _reply(chat_id, f"🟢 <b>Trading RESUMED</b> ({TRADING_ENV}). Halt flag cleared.", msg_id)
         except Exception as e:

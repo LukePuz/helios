@@ -2526,6 +2526,21 @@ def get_state_strict(key: str, default: str | None = None) -> str | None:
         _put_conn(conn)
 
 
+def set_state_verified(writes: list[tuple[str, str]]) -> list[str]:
+    """Write each system_state key and read it back strictly; the keys that
+    didn't land. set_state swallows its own errors, so a caller that reports
+    or logs success must check (professor M145, M149)."""
+    failed = []
+    for key, value in writes:
+        try:   # set_state's _get_conn can raise before its own try
+            set_state(key, value)
+            if get_state_strict(key, "") != value:
+                failed.append(key)
+        except Exception:
+            failed.append(key)
+    return failed
+
+
 def set_state(key: str, value: str) -> None:
     conn = _get_conn()
     try:

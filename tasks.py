@@ -2076,7 +2076,7 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
         if covered > 0:
             # Cancel ours, then see what the cancel could not remove.
             try:
-                manage_cancel_stop_orders_for(ticker)
+                cancelled = int(manage_cancel_stop_orders_for(ticker) or 0)
             except Exception as e:
                 log.warning(f"[{ticker}] reconcile: queued stop could not cancel stops ({e}); waits")
                 return False
@@ -2092,10 +2092,22 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
                 except Exception as e:
                     log.warning(f"[{ticker}] reconcile: re-read after the cancel failed (try {attempt}/2): {e}")
             if left is None:
-                # Ours is gone and only cover went down: unprotected is worse
-                # than over-stopped, so stop all of it; _fix_overstop trims.
-                log.warning(f"[{ticker}] reconcile: stops unreadable after the cancel; stopping all {remaining}")
-                left = []
+                if not cancelled:
+                    # Nothing of ours went away, so cover is as read before.
+                    log.warning(f"[{ticker}] reconcile: stops unreadable after a cancel that removed none; "
+                                f"sizing to the earlier read ({covered:g} covered)")
+                    left = [{"qty": covered, "stop_price": None}]
+                else:
+                    # Ours is gone and only cover went down: unprotected is
+                    # worse than over-stopped, so stop all of it; _fix_overstop trims.
+                    log.warning(f"[{ticker}] reconcile: stops unreadable after the cancel; stopping all {remaining}")
+                    left = []
+            elif any(o.get("status") == "PendingCancel" for o in left):
+                # Almost always ours (the cancel only reaches our stops): if it
+                # lands, the shares it covered go naked. Keep the entry and
+                # look again next cycle (~5 min).
+                log.warning(f"[{ticker}] reconcile: a stop is still PendingCancel after the cancel; queued stop waits")
+                return False
         else:
             left = []
         others = round(sum(o["qty"] for o in left), 4)

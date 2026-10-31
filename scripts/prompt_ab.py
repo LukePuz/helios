@@ -232,7 +232,8 @@ def main():
     summary["skipped_signal_ids"] = skipped
     print("summary:", summary)
     if out:
-        out.write(f"# summary: {json.dumps(summary)}\n")
+        # The summary lives in the provenance sidecar only: a trailing line
+        # here made the CSV unreadable by a plain read_csv (SEF, 10-30).
         out.close()
         meta["finished"] = datetime.now(timezone.utc).isoformat()
         meta["summary"] = summary

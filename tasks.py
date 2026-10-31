@@ -1686,6 +1686,23 @@ def _close_queued_flat_exit(ticker: str, rec: dict) -> bool:
     if not row:
         return False
     if row["status"] == "filled" and row.get("fill_price"):
+        # Only this exit's own position: a record or an open outcome newer than
+        # the order belongs to a position opened since, and closing it here
+        # would book the old exit's price (review of 6f48241).
+        try:
+            placed = row.get("created_at")
+            rec_stop = db.get_position_stop(ticker) or {}
+            newer = placed is None or any(
+                t is not None and t > placed
+                for t in [rec_stop.get("opened_at")] + [o.get("entry_date") for o in db.get_open_outcomes()
+                                                         if o.get("ticker") == ticker])
+        except Exception as e:
+            log.warning(f"[{ticker}] reconcile: queued flat exit position check failed ({e}); waiting")
+            return True
+        if newer:
+            log.warning(f"[{ticker}] reconcile: a position newer than the queued {rec.get('intent')} order "
+                        f"exists; its flat close is left to the stale-stop branch")
+            return False
         try:
             db.close_trade_outcome(ticker, exit_price=row["fill_price"],
                                    exit_source=f"late_{(rec.get('intent') or 'sell').lower()}",

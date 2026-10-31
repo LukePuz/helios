@@ -386,7 +386,11 @@ def test_queued_reprotect_places_no_stop_on_a_short():
 
 
 
-def _queued_flat(intent, row, open_orders=(), stop=None, order_id=5):
+from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+_T0 = _dt(2026, 10, 30, 15, 0, tzinfo=_tz.utc)
+
+
+def _queued_flat(intent, row, open_orders=(), stop=None, order_id=5, outcomes=()):
     client = MagicMock()
     client.get_all_positions.return_value = []
     with patch("ibkr.get_client", return_value=client), \
@@ -395,6 +399,7 @@ def _queued_flat(intent, row, open_orders=(), stop=None, order_id=5):
                                             else {"return_value": row})), \
          patch("ibkr.get_open_orders", return_value=list(open_orders)), \
          patch("ibkr.get_recent_sell_fill") as fill, patch("db.delete_position_stop"), \
+         patch("db.get_open_outcomes", return_value=list(outcomes)), \
          patch("db.close_trade_outcome") as close, patch("alerts._send") as alert:
         r = tasks._reprotect_after_late_sell("CRWD", {"intent": intent, "order_id": order_id}, 175.0,
                                              from_queue=True)
@@ -405,7 +410,7 @@ def _queued_flat(intent, row, open_orders=(), stop=None, order_id=5):
 def test_queued_flat_exit_closes_at_its_orders_average_fill():
     """Professor M124: the part-filled EXIT deleted the stop record, so the
     stale-stop branch never closed the outcome."""
-    r, close, alert = _queued_flat("EXIT", {"status": "filled", "fill_price": 171.5, "broker_order_id": 77})
+    r, close, alert = _queued_flat("EXIT", {"status": "filled", "fill_price": 171.5, "broker_order_id": 77, "created_at": _T0})
     assert r is None
     close.assert_called_once_with("CRWD", exit_price=171.5, exit_source="late_exit", exit_price_source="fill")
     alert.assert_not_called()
@@ -432,7 +437,7 @@ def test_queued_flat_exit_leaves_mixed_and_owned_cases_alone():
         assert r is None
         close.assert_not_called()
         alert.assert_not_called()
-    r, close, alert = _queued_flat("TRIM", {"status": "filled", "fill_price": 171.5, "broker_order_id": 77})
+    r, close, alert = _queued_flat("TRIM", {"status": "filled", "fill_price": 171.5, "broker_order_id": 77, "created_at": _T0})
     assert r is None
     close.assert_not_called()
 
@@ -464,14 +469,15 @@ def test_a_queued_profit_target_keeps_a_later_exits_order_for_the_flat_close():
     rec = json.loads(state[tasks._REPROTECT_STATE_KEY])["CRWD"]
     assert rec["intent"] == "PROFIT_TARGET" and rec["exit_order_id"] == 5
     r, close, alert = _queued_flat("PROFIT_TARGET", {"status": "filled", "fill_price": 171.5,
-                                                     "broker_order_id": 77}, order_id=None)
+                                                     "broker_order_id": 77, "created_at": _T0}, order_id=None)
     close.assert_not_called()   # no exit fields: unchanged
     client = MagicMock()
     client.get_all_positions.return_value = []
     with patch("ibkr.get_client", return_value=client), \
          patch("db.get_position_stop", return_value=None), \
+         patch("db.get_open_outcomes", return_value=[]), patch("db.delete_position_stop"), \
          patch("db.get_order_fill_state", return_value={"status": "filled", "fill_price": 171.5,
-                                                         "broker_order_id": 77}) as row, \
+                                                         "broker_order_id": 77, "created_at": _T0}) as row, \
          patch("db.close_trade_outcome") as close:
         tasks._reprotect_after_late_sell("CRWD", rec, 171.0, from_queue=True)
     row.assert_called_once_with(5)
@@ -574,12 +580,24 @@ def test_a_queued_flat_backstop_with_its_kept_record_closes_from_its_fill():
     client = MagicMock()
     client.get_all_positions.return_value = []
     with patch("ibkr.get_client", return_value=client), \
-         patch("db.get_position_stop", return_value={"stop_price": 150.0}), \
+         patch("db.get_position_stop", return_value={"stop_price": 150.0, "opened_at": _T0 - _td(days=2)}), \
+         patch("db.get_open_outcomes", return_value=[{"ticker": "CRWD", "entry_date": _T0 - _td(days=2)}]), \
          patch("db.get_order_fill_state", return_value={"status": "filled", "fill_price": 171.5,
-                                                         "broker_order_id": 77}), \
+                                                         "broker_order_id": 77, "created_at": _T0}), \
          patch("db.close_trade_outcome") as close, patch("db.delete_position_stop") as delete:
         r = tasks._reprotect_after_late_sell("CRWD", {"intent": "BACKSTOP", "order_id": 5}, 171.0,
                                              from_queue=True)
     assert r is None
     close.assert_called_once_with("CRWD", exit_price=171.5, exit_source="late_backstop", exit_price_source="fill")
     delete.assert_called_once_with("CRWD")
+
+
+def test_a_queued_flat_exit_never_closes_a_position_opened_after_it():
+    """Review of 6f48241: a newer record or outcome is another position's."""
+    filled = {"status": "filled", "fill_price": 171.5, "broker_order_id": 77, "created_at": _T0}
+    for kw, closes in (({"stop": {"stop_price": 150.0, "opened_at": _T0 + _td(minutes=20)}}, False),
+                       ({"outcomes": [{"ticker": "CRWD", "entry_date": _T0 + _td(minutes=20)}]}, False),
+                       ({"outcomes": [{"ticker": "CRWD", "entry_date": _T0 - _td(days=1)}]}, True)):
+        r, close, alert = _queued_flat("EXIT", filled, **kw)
+        assert r is None
+        assert close.called is closes

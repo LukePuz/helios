@@ -601,3 +601,22 @@ def test_a_queued_flat_exit_never_closes_a_position_opened_after_it():
         r, close, alert = _queued_flat("EXIT", filled, **kw)
         assert r is None
         assert close.called is closes
+
+
+def test_the_newer_position_check_waits_when_a_read_fails():
+    """Professor m114: a swallowed DB error used to pass as "nothing newer"."""
+    filled = {"status": "filled", "fill_price": 171.5, "broker_order_id": 77, "created_at": _T0}
+    client = MagicMock()
+    client.get_all_positions.return_value = []
+    for stop_kw, outcomes_kw in (({"side_effect": RuntimeError("db")}, {"return_value": []}),
+                                 ({"return_value": None}, {"side_effect": RuntimeError("db")})):
+        with patch("ibkr.get_client", return_value=client), \
+             patch("db.get_order_fill_state", return_value=filled), \
+             patch("db.get_position_stop", **stop_kw) as stop, \
+             patch("db.get_open_outcomes", **outcomes_kw) as outcomes, \
+             patch("db.close_trade_outcome") as close, patch("db.delete_position_stop") as delete:
+            r = tasks._reprotect_after_late_sell("CRWD", {"intent": "EXIT", "order_id": 5}, 171.0, from_queue=True)
+        assert r == "wait"
+        close.assert_not_called()
+        delete.assert_not_called()
+        assert stop.call_args.kwargs == {"strict": True}

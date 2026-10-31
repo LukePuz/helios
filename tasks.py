@@ -1691,10 +1691,11 @@ def _close_queued_flat_exit(ticker: str, rec: dict) -> bool:
         # would book the old exit's price (review of 6f48241).
         try:
             placed = row.get("created_at")
-            rec_stop = db.get_position_stop(ticker) or {}
+            # strict: a failed read must wait, not pass as "nothing newer" (m114).
+            rec_stop = db.get_position_stop(ticker, strict=True) or {}
             newer = placed is None or any(
                 t is not None and t > placed
-                for t in [rec_stop.get("opened_at")] + [o.get("entry_date") for o in db.get_open_outcomes()
+                for t in [rec_stop.get("opened_at")] + [o.get("entry_date") for o in db.get_open_outcomes(strict=True)
                                                          if o.get("ticker") == ticker])
         except Exception as e:
             log.warning(f"[{ticker}] reconcile: queued flat exit position check failed ({e}); waiting")

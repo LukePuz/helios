@@ -1775,7 +1775,10 @@ def touch_plan(plan_id: int, relation: str, close_reason: str | None = None) -> 
         _put_conn(conn)
 
 
-def get_position_stop(ticker: str) -> dict | None:
+def get_position_stop(ticker: str, strict: bool = False) -> dict | None:
+    """The ticker's stop record, or None. strict: raise on a DB error instead
+    of returning None, for a caller that must tell "no record" from
+    "unknown" (professor m114)."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
@@ -1797,6 +1800,8 @@ def get_position_stop(ticker: str) -> dict | None:
         }
     except Exception as e:
         logging.error(f"get_position_stop failed: {e}")
+        if strict:
+            raise
         return None
     finally:
         _put_conn(conn)
@@ -3734,8 +3739,9 @@ def update_outcome_entry_price(approval_id: int, entry_price: float) -> bool | N
         _put_conn(conn)
 
 
-def get_open_outcomes() -> list[dict]:
-    """Returns trade outcomes where exit_date is NULL (position still open)."""
+def get_open_outcomes(strict: bool = False) -> list[dict]:
+    """Returns trade outcomes where exit_date is NULL (position still open).
+    strict: raise on a DB error instead of returning [] (professor m114)."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
@@ -3759,6 +3765,8 @@ def get_open_outcomes() -> list[dict]:
         ]
     except Exception as e:
         logging.error(f"get_open_outcomes failed: {e}")
+        if strict:
+            raise
         return []
     finally:
         _put_conn(conn)

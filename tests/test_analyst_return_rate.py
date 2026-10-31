@@ -38,6 +38,7 @@ class TestComputeWeeksToCatalyst:
         # 2026-09-15 is 16 days after 2026-08-30 (audit A1031-0253-1)
         weeks = compute_weeks_to_catalyst("2026-09", as_of=_AS_OF, month_midpoint=True)
         assert abs(weeks - 16 / 7) < 1e-9
+        assert abs(compute_weeks_to_catalyst("2026-9", as_of=_AS_OF, month_midpoint=True) - 16 / 7) < 1e-9
         # a full date is unaffected by the switch
         assert abs(compute_weeks_to_catalyst("2026-09-20", as_of=_AS_OF, month_midpoint=True) - 3.0) < 1e-9
 

@@ -868,7 +868,7 @@ def compute_weeks_to_catalyst(catalyst_date: str | None, as_of: datetime | None 
             from config import CATALYST_MONTH_MIDPOINT_ENABLED as month_midpoint
         except ImportError:
             month_midpoint = False
-    if month_midpoint and re.fullmatch(r"\d{4}-\d{2}", catalyst_date.strip()):
+    if month_midpoint and re.fullmatch(r"\d{4}-\d{1,2}", catalyst_date.strip()):
         parsed = parsed.replace(day=15)
 
     if parsed.tzinfo is None:

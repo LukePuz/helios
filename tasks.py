@@ -2077,10 +2077,25 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
             # Cancel ours, then see what the cancel could not remove.
             try:
                 manage_cancel_stop_orders_for(ticker)
-                left = _resting_sell_stops(ticker)
             except Exception as e:
-                log.warning(f"[{ticker}] reconcile: queued stop could not cancel or re-read stops ({e}); waits")
+                log.warning(f"[{ticker}] reconcile: queued stop could not cancel stops ({e}); waits")
                 return False
+            left = None
+            for attempt in (1, 2):   # a timed-out read drops the session; the second reconnects
+                try:
+                    left = _resting_sell_stops(ticker)
+                    if attempt == 1 and any(o.get("status") == "PendingCancel" for o in left):
+                        import time
+                        time.sleep(5)   # a slow cancel; same second look as _fix_overstop
+                        continue
+                    break
+                except Exception as e:
+                    log.warning(f"[{ticker}] reconcile: re-read after the cancel failed (try {attempt}/2): {e}")
+            if left is None:
+                # Ours is gone and only cover went down: unprotected is worse
+                # than over-stopped, so stop all of it; _fix_overstop trims.
+                log.warning(f"[{ticker}] reconcile: stops unreadable after the cancel; stopping all {remaining}")
+                left = []
         else:
             left = []
         others = round(sum(o["qty"] for o in left), 4)

@@ -633,7 +633,8 @@ def _queued_restore(open_orders, before, after, intent="RESTORE", held=20):
          patch("db.get_position_stop", return_value={"stop_price": 150.0}), \
          patch("db.mark_profit_target_taken"), \
          patch("execution._stops_still_resting", return_value=before), \
-         patch("tasks._resting_sell_stops", return_value=after), \
+         patch("tasks._resting_sell_stops",
+               **({"side_effect": after} if isinstance(after, Exception) else {"return_value": after})), \
          patch("tasks.manage_cancel_stop_orders_for") as cancel, \
          patch("tasks.manage_stop_place", return_value={"order_id": 3}) as place, \
          patch("db.set_stop_broker_order_id"):
@@ -712,3 +713,28 @@ def test_queued_restore_gives_up_with_an_alert_and_a_manual_action():
     assert json.loads(state["reprotect_pending"]) == {}
     assert "STOP NOT RESTORED" in send.call_args[0][0]
     manual.assert_called_once()
+
+
+def test_queued_restore_stops_everything_if_the_re_read_after_its_cancel_fails():
+    """Review of 48581aa: ours is already cancelled, so a failed re-read must
+    not leave the shares naked."""
+    ok, place, cancel = _queued_restore([], 8.0, TimeoutError("no reply"))
+    assert ok is True
+    cancel.assert_called_once_with("CRWD")
+    place.assert_called_once_with("CRWD", 20.0, 150.0)
+
+
+def test_queued_restore_takes_a_second_look_at_a_pending_cancel():
+    ours = {"order_id": 4, "ticker": "CRWD", "qty": 20.0, "stop_price": 150.0, "status": "PendingCancel"}
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="CRWD", qty=20)]
+    with patch("ibkr.get_client", return_value=client), \
+         patch("ibkr.get_open_orders", return_value=[]), \
+         patch("db.get_position_stop", return_value={"stop_price": 150.0}), \
+         patch("execution._stops_still_resting", return_value=5.0), \
+         patch("tasks._resting_sell_stops", side_effect=[[ours], []]), \
+         patch("tasks.manage_cancel_stop_orders_for"), patch("time.sleep"), \
+         patch("tasks.manage_stop_place", return_value={"order_id": 3}) as place, \
+         patch("db.set_stop_broker_order_id"):
+        assert tasks._reprotect_after_late_sell("CRWD", {"intent": "RESTORE"}, None, from_queue=True) is True
+    place.assert_called_once_with("CRWD", 20.0, 150.0)

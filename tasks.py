@@ -2845,25 +2845,41 @@ MONITOR_FAILS_BEFORE_ALERT = 3
 def _monitor_health(name: str, failed: bool) -> None:
     """Consecutive-failure count for a mechanical monitor (audit A1031-1053-8):
     one alert when it reaches MONITOR_FAILS_BEFORE_ALERT, one when it
-    recovers. On 10-19 three monitors failed 99 times each with no alert."""
+    recovers. On 10-19 three monitors failed 99 times each with no alert.
+    A spell that alerted gets activity_feed rows (stage "monitor_blind") at
+    its start and end, so blind time is measurable later (SEF ask)."""
     try:
+        from datetime import datetime, timezone
         import alerts
         import db
         from config import TRADING_ENV
         key = f"monitor_fail_count_{name}_{TRADING_ENV}"
+        since_key = f"monitor_fail_since_{name}_{TRADING_ENV}"
         count = int(db.get_state(key, "0") or 0)
+        now = datetime.now(timezone.utc).isoformat()
+        spell = {"check": name, "env": TRADING_ENV}
         if failed:
             count += 1
             db.set_state(key, str(count))
+            if count == 1:
+                db.set_state(since_key, now)
             if count == MONITOR_FAILS_BEFORE_ALERT:
                 alerts._send(
                     f"⚠️ MONITOR BLIND — {name} failed {count} checks in a row.\n"
                     f"Resting broker stops still protect positions, but this check isn't "
                     f"running. See the celery logs; a recovery message follows when it works.")
+                db.log_activity("monitor_blind", "", f"{name} blind ({count} failed checks)",
+                                "alert", {**spell, "event": "start",
+                                             "first_fail_at": db.get_state(since_key) or None,
+                                             "alerted_at": now})
         elif count:
             db.set_state(key, "0")
             if count >= MONITOR_FAILS_BEFORE_ALERT:
                 alerts._send(f"✅ {name} monitor recovered after {count} failed checks.")
+                db.log_activity("monitor_blind", "", f"{name} recovered after {count} failed checks",
+                                "neutral", {**spell, "event": "end",
+                                             "first_fail_at": db.get_state(since_key) or None,
+                                             "recovered_at": now, "failed_attempts": count})
     except Exception as e:
         log.warning(f"_monitor_health({name}) failed: {e}")
 

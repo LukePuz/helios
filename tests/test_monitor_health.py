@@ -4,12 +4,29 @@ from unittest.mock import MagicMock, patch
 import tasks
 
 
+FEED = []
+
+
 def _health(state, failed):
     with patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
          patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+         patch("db.log_activity", side_effect=lambda *a: FEED.append(a)), \
          patch("config.TRADING_ENV", "live"), patch("alerts._send") as send:
         tasks._monitor_health("trailing_stops", failed)
     return send
+
+
+def test_an_alerted_spell_logs_start_and_end_rows():
+    FEED.clear()
+    state = {}
+    for _ in range(3):
+        _health(state, True)
+    _health(state, False)
+    assert [r[0] for r in FEED] == ["monitor_blind", "monitor_blind"]
+    start, end = FEED[0][4], FEED[1][4]
+    assert start["event"] == "start" and end["event"] == "end" and end["failed_attempts"] == 3
+    assert start["first_fail_at"] == state["monitor_fail_since_trailing_stops_live"] == end["first_fail_at"]
+    assert start["check"] == "trailing_stops" and start["env"] == "live"
 
 
 def test_alerts_once_at_three_and_once_on_recovery():
@@ -25,8 +42,10 @@ def test_alerts_once_at_three_and_once_on_recovery():
 
 
 def test_a_short_failure_streak_recovers_silently():
+    FEED.clear()
     state = {"monitor_fail_count_trailing_stops_live": "2"}
     _health(state, False).assert_not_called()
+    assert FEED == []
     assert state["monitor_fail_count_trailing_stops_live"] == "0"
 
 

@@ -3555,7 +3555,8 @@ def auto_expire_approvals(self):
             log.error(f"Swept {len(stuck)} approval(s) stuck in PROCESSING: {names}")
             alerts._send(f"⚠️ STUCK APPROVAL(S) CLEARED\n{names} sat in PROCESSING over "
                          f"{db.STUCK_PROCESSING_MINUTES} min and are now FAILED. Check TWS for a fill "
-                         f"on each: one may have executed.")
+                         f"on each: one may have executed. They won't be retried automatically "
+                         f"(a scheduled retry is skipped); re-approve if still wanted.")
     except Exception as e:
         log.error(f"auto_expire_approvals failed: {e}")
         raise self.retry(exc=e, countdown=60)

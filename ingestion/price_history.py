@@ -140,12 +140,16 @@ def refresh_sp500_price_history(skip_watchlist: bool = True, max_age_days: int |
     due = [t for t in tickers if newest.get(t) is None or newest[t] < cutoff]
     log.info(f"S&P 500 price history: {len(due)} of {len(tickers)} tickers due (bars before {cutoff})")
 
+    # Counted only when the newest bar moved forward: the upsert also counts
+    # re-written old bars, so a ticker Yahoo still serves stale would count
+    # every day and keep the heartbeat green (professor M141).
     updated = 0
     for ticker in due:
         bars = _fetch_bars(ticker)
-        if bars:
-            n = db.upsert_price_bars(ticker, bars)
-            if n:
+        if bars and db.upsert_price_bars(ticker, bars):
+            latest = max(str(b["date"])[:10] for b in bars)
+            prev = newest.get(ticker)
+            if prev is None or latest > str(prev)[:10]:
                 updated += 1
         time.sleep(0.2)  # be polite to Yahoo's unofficial endpoint
     return updated

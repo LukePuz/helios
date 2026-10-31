@@ -759,6 +759,11 @@ _MIGRATIONS: list[tuple[int, str]] = [
     # time an outcome uses is a study choice (professor M110).
     (71, "ALTER TABLE orders ADD COLUMN IF NOT EXISTS filled_at TIMESTAMPTZ;"),
     (72, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS exit_fill_at TIMESTAMPTZ;"),
+    # Per-share risk as sized (sizing price - stop) and at the fill (fill -
+    # the stop placed for the new shares): log-only, so drift at the open
+    # that raises the risk taken is measurable (audit A1031-1053-1).
+    (73, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS planned_risk_per_share NUMERIC;"),
+    (74, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS fill_risk_per_share NUMERIC;"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -3465,6 +3470,8 @@ def log_trade_outcome(
     expected_return_per_week: float | None = None,
     entry_date=None,
     entry_benchmark_price: float | None = None,
+    planned_risk_per_share: float | None = None,
+    fill_risk_per_share: float | None = None,
 ) -> bool:
     """True once the approval has an outcome row (written now or already
     there); False when the write failed, so a caller can retry (M125).
@@ -3503,9 +3510,10 @@ def log_trade_outcome(
                 " chase_risk_pct_from_kijun, price_action, price_action_structure, "
                 " catalyst_event, catalyst_date, catalyst_is_priced_in, "
                 " expected_return_pct, expected_downside_pct, thesis_summary, "
-                " sources_json, source_count, weeks_to_catalyst, expected_return_per_week, entry_date) "
+                " sources_json, source_count, weeks_to_catalyst, expected_return_per_week, entry_date, "
+                " planned_risk_per_share, fill_risk_per_share) "
                 "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
-                "COALESCE(%s::timestamptz, NOW()))",
+                "COALESCE(%s::timestamptz, NOW()),%s,%s)",
                 (approval_id, TRADING_ENV, ticker, action, conviction, bucket, entry_price,
                  entry_benchmark_price, thesis_strength, catalyst_quality,
                  valuation_risk_reward, data_completeness, chase_risk,
@@ -3513,7 +3521,8 @@ def log_trade_outcome(
                  catalyst_event, catalyst_date, catalyst_is_priced_in,
                  expected_return_pct, expected_downside_pct, thesis_summary,
                  psycopg2.extras.Json(sources) if sources is not None else None, source_count,
-                 weeks_to_catalyst, expected_return_per_week, entry_date),
+                 weeks_to_catalyst, expected_return_per_week, entry_date,
+                 planned_risk_per_share, fill_risk_per_share),
             )
         conn.commit()
         return True

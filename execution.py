@@ -319,6 +319,11 @@ def log_buy_outcome(approval: dict, ticker: str, action: str, entry_price: float
     after the wait window (professor M123). False if the write failed."""
     import db
     analyst_json = approval.get("analyst_json") or {}
+    try:
+        planned_rps, fill_rps = _risk_per_share(approval, entry_price)
+    except Exception as e:                 # log-only: never block the outcome row
+        log.debug(f"[{ticker}] risk-per-share record failed: {e}")
+        planned_rps, fill_rps = None, None
     return db.log_trade_outcome(
         approval_id=approval["id"],
         ticker=ticker,
@@ -351,6 +356,8 @@ def log_buy_outcome(approval: dict, ticker: str, action: str, entry_price: float
         expected_return_per_week=analyst_json.get("expected_return_per_week"),
         entry_date=entry_date,
         entry_benchmark_price=entry_benchmark_price,
+        planned_risk_per_share=planned_rps,
+        fill_risk_per_share=fill_rps,
     )
 
 
@@ -535,14 +542,37 @@ def _stop_anchored_to_fill(ticker: str, stop: float, sized_at: float | None,
     at, above or within 1% of the fill, move it to the planned distance below
     the fill. A stop still safely below the fill keeps its level, so a
     structural stop at support isn't moved (28323dd review #2/#3)."""
+    anchored = _anchored_stop(stop, sized_at, fill)
+    if anchored != stop:
+        log.warning(f"[{ticker}] Stop moved from ${stop:.2f} to ${anchored:.2f}: filled at "
+                    f"${fill:.2f}, below the ${sized_at:.2f} sizing price")
+    return anchored
+
+
+def _anchored_stop(stop: float, sized_at: float | None, fill: float | None) -> float:
+    """_stop_anchored_to_fill's rule, without the log line."""
     if not (sized_at and fill and 0 < stop < sized_at and fill < sized_at):
         return stop
     if stop < fill * (1 - _STOP_MIN_GAP_BELOW_FILL):
         return stop
-    anchored = round(min(stop, fill * stop / sized_at), 2)
-    log.warning(f"[{ticker}] Stop moved from ${stop:.2f} to ${anchored:.2f}: filled at "
-                f"${fill:.2f}, below the ${sized_at:.2f} sizing price")
-    return anchored
+    return round(min(stop, fill * stop / sized_at), 2)
+
+
+def _risk_per_share(approval: dict, fill: float | None) -> tuple[float | None, float | None]:
+    """(as sized, at the fill) per-share risk to the stop for a BUY, log-only
+    (audit A1031-1053-1). The fill side uses the stop placed for the new
+    shares (anchored to a lower fill), before an ADD merges stops."""
+    risk_json = approval.get("risk_json") or {}
+    try:
+        stop = float(approval.get("stop_loss_price") or risk_json.get("stop_loss_price") or 0)
+        sized_at = float(risk_json.get("price_at_sizing") or 0) or None
+    except (TypeError, ValueError):
+        return None, None
+    if stop <= 0:
+        return None, None
+    planned = round(sized_at - stop, 4) if sized_at and sized_at > stop else None
+    at_fill = round(float(fill) - _anchored_stop(stop, sized_at, float(fill)), 4) if fill else None
+    return planned, at_fill
 
 
 def _log_skipped_sell(ticker: str, action: str, shares, approval: dict) -> None:

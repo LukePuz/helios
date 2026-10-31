@@ -522,3 +522,19 @@ def test_a_buy_merged_into_a_profit_target_gets_the_flat_buy_retry():
         tasks._retry_pending_reprotects()
     alert.assert_called_once()
     assert "STOP NOT PLACED" in alert.call_args.args[0]
+
+
+def test_an_exit_after_a_merged_buy_clears_the_buy_flag():
+    """Review of ec2fffb: PROFIT_TARGET, then BUY, then EXIT; the exit's own
+    sale makes the flat read expected, so no STOP NOT PLACED alert."""
+    import json
+    state = {tasks._REPROTECT_STATE_KEY: json.dumps(
+        {"CRWD": {"intent": "PROFIT_TARGET", "stop_price": 180.0, "nonce": "a"}})}
+    with patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
+         patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+         patch("stop_lock._redis", side_effect=RuntimeError("no redis")):
+        tasks._queue_reprotect("CRWD", {"intent": "BUY"}, None)
+        assert json.loads(state[tasks._REPROTECT_STATE_KEY])["CRWD"]["had_buy"] is True
+        tasks._queue_reprotect("CRWD", {"intent": "EXIT", "id": 5}, 171.0)
+    rec = json.loads(state[tasks._REPROTECT_STATE_KEY])["CRWD"]
+    assert "had_buy" not in rec and rec["exit_order_id"] == 5

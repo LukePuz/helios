@@ -1408,6 +1408,7 @@ def _queue_reprotect(ticker: str, order: dict, fill_price: float | None) -> None
                 # The flat close needs the exit's own order (professor m111).
                 pending[ticker]["exit_intent"] = entry["intent"]
                 pending[ticker]["exit_order_id"] = entry["order_id"]
+                pending[ticker].pop("had_buy", None)   # the exit explains a flat read
             elif entry["intent"] == "BUY":
                 # New shares: an old exit's fill must never close what reads
                 # flat next (review of 245c9af). The entry keeps the target's

@@ -166,7 +166,7 @@ def test_backstop_sale_gets_an_orders_row_and_a_part_fill_waits_for_reconcile():
              patch("ibkr.get_open_orders", return_value=[]), \
              patch("ibkr.place_market_order",
                    return_value={"order_id": 77, "filled_qty": filled, "fill_price": 140.0}), \
-             patch("db.log_trade"), patch("db.delete_position_stop"), \
+             patch("db.log_trade"), patch("db.delete_position_stop") as delete, \
              patch("db.log_order", return_value=5) as log_order, \
              patch("db.update_order_fill") as upd, \
              patch("db.close_trade_outcome") as close, patch("alerts._send"):
@@ -175,6 +175,9 @@ def test_backstop_sale_gets_an_orders_row_and_a_part_fill_waits_for_reconcile():
         assert log_order.call_args.kwargs["broker_order_id"] == 77
         upd.assert_called_once_with(5, 140.0, filled, status)
         assert close.called is closes
+        # A part fill keeps the stop record: a broker-cancelled remainder
+        # leaves held shares the next cycle must see (professor, M128 class).
+        assert delete.called is closes
 
 
 def test_backstop_does_not_sell_shares_a_working_sell_already_covers():

@@ -2479,15 +2479,18 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
         # backstopped next cycle) and leave the outcome for whichever sale
         # finishes the position (professor M128).
         if resting <= 0 and working <= 0:
-            db.delete_position_stop(ticker)
             if filled < owned - 1e-6:
                 # Part filled: this part's price isn't the exit (professor
                 # M121). The rest is still working at the broker; the order
                 # is 'partial', so reconcile closes the row from the
-                # cumulative fill once flat.
+                # cumulative fill once flat. The record stays: if the broker
+                # cancels the rest, the held shares are backstopped or
+                # re-protected next cycle, and while it works the working-sell
+                # subtraction stops a second sale (professor, M128 class).
                 log.warning(f"[{ticker}] Backstop sell part-filled ({filled:g} of {owned:g}); "
-                            f"outcome left open")
+                            f"outcome and stop record kept")
             else:
+                db.delete_position_stop(ticker)
                 try:
                     db.close_trade_outcome(ticker, exit_price=fill_price, exit_source="backstop_sell",
                                            exit_price_source="fill" if result.get("fill_price") else "quote")

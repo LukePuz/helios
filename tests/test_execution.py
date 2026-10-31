@@ -908,6 +908,23 @@ def test_exit_unreadable_before_the_cancel_leaves_the_stop_in_place():
     assert "stop left in place" in execution.last_outcome_reason()
 
 
+def test_a_held_sell_schedules_one_retry_but_the_retry_does_not():
+    """m127: the hold schedules retry_held_sell; a hold inside the retry doesn't."""
+    approval = _approval(action="EXIT", shares_initial=100)
+    for trigger, expect in (("auto", 1), ("held_sell_retry", 0)):
+        with patch("ibkr.get_ib"), patch("ibkr.get_client") as client, \
+             patch("ibkr.place_market_order"), patch("tasks.manage_cancel_stop_orders_for"), \
+             patch("execution._stops_still_resting", return_value=None), \
+             patch("ibkr.get_latest_price", return_value=100.0), \
+             patch("market_data.get_priced_quote", return_value=None), \
+             patch("alerts._send"), patch("tasks.retry_held_sell.apply_async") as sched:
+            client.return_value.get_open_position.return_value = MagicMock(qty=100)
+            assert execution.execute_approved(approval, trigger=trigger) is False
+        assert sched.call_count == expect, trigger
+        if expect:
+            assert sched.call_args.kwargs["countdown"] == 300
+
+
 def test_skipped_exit_restores_stops_the_cancel_already_took():
     """A0053-2: two stops, one cancelled and one stuck; the skipped EXIT
     puts the cancelled shares back under a stop."""

@@ -1514,6 +1514,55 @@ def has_newer_buy_approval(ticker: str, approval_id: int) -> bool:
         _put_conn(conn)
 
 
+HELD_SELL_REASON_PREFIX = "skipped: resting stops unreadable"
+
+
+def claim_failed_sell_for_retry(approval_id: int) -> bool:
+    """FAILED -> PROCESSING for a TRIM/EXIT held because resting stops were
+    unreadable, once only: a reason already marked "retried at" never matches
+    (m127). True only for the call that won."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE pending_approvals SET status='PROCESSING', decided_at=NOW() "
+                "WHERE id=%s AND status='FAILED' AND action IN ('TRIM','EXIT') "
+                "AND status_reason LIKE %s AND status_reason NOT LIKE %s RETURNING id",
+                (approval_id, HELD_SELL_REASON_PREFIX + "%", "%retried at%"),
+            )
+            claimed = cur.fetchone() is not None
+        conn.commit()
+        return claimed
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"claim_failed_sell_for_retry failed: {e}")
+        return False
+    finally:
+        _put_conn(conn)
+
+
+def has_newer_ticker_activity(ticker: str, approval_id: int, since) -> bool | None:
+    """True if a later approval (any action) or a later analyst verdict
+    exists for ticker, so a held sell must not fire on an old decision
+    (m127). None on error: the caller doesn't retry."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM pending_approvals WHERE ticker=%s AND trading_env=%s AND id>%s LIMIT 1",
+                        (ticker, TRADING_ENV, approval_id))
+            if cur.fetchone() is not None:
+                return True
+            cur.execute("SELECT 1 FROM signals WHERE symbol=%s AND signal NOT IN %s AND trading_env=%s "
+                        "AND timestamp > %s LIMIT 1",
+                        (ticker, _NON_ANALYST_SIGNALS, TRADING_ENV, since))
+            return cur.fetchone() is not None
+    except Exception as e:
+        logging.error(f"has_newer_ticker_activity({ticker}) failed: {e}")
+        return None
+    finally:
+        _put_conn(conn)
+
+
 def get_approval_by_id(approval_id: int) -> dict | None:
     conn = _get_conn()
     try:

@@ -1913,3 +1913,63 @@ def test_perm_id_backfill_needs_one_unambiguous_open_order():
         tasks._backfill_perm_ids(rows)
     setp.assert_called_once_with(1, 7700)
     assert rows[0]["perm_id"] == 7700 and rows[1]["perm_id"] is None
+
+
+class TestRetryHeldSell:
+    """m127: one re-execution of a TRIM/EXIT held on unreadable stops, under
+    the professor's conditions (once, still held, nothing newer, market hours,
+    attempt recorded)."""
+
+    APPROVAL = {"id": 81, "ticker": "AMD", "action": "EXIT", "status": "FAILED", "timestamp": "T0"}
+
+    def _run(self, approval=None, market=True, held=5.0, newer=False, claim=True, success=True):
+        from unittest.mock import MagicMock
+        client = MagicMock()
+        client.get_open_position.return_value = MagicMock(qty=held)
+        with patch("db.get_approval_by_id", return_value=approval or self.APPROVAL), \
+             patch("market_data.is_market_hours", return_value=market), \
+             patch("ibkr.get_client", return_value=client), \
+             patch("db.has_newer_ticker_activity", return_value=newer), \
+             patch("db.claim_failed_sell_for_retry", return_value=claim) as claim_m, \
+             patch("execution.execute_approved", return_value=success) as ex, \
+             patch("execution.last_outcome_reason", return_value="skipped: x"), \
+             patch("db.update_approval_status") as upd:
+            tasks.retry_held_sell.run(81)
+        return ex, upd, claim_m
+
+    def test_retries_once_and_records_the_attempt(self):
+        ex, upd, _ = self._run()
+        ex.assert_called_once()
+        assert ex.call_args.kwargs["trigger"] == "held_sell_retry"
+        status, reason = upd.call_args.args[1], upd.call_args.kwargs["reason"]
+        assert status == "APPROVED" and "retried at" in reason and reason.endswith("executed")
+
+    def test_a_failed_retry_stays_failed_with_its_reason(self):
+        _, upd, _ = self._run(success=False)
+        assert upd.call_args.args[1] == "FAILED" and upd.call_args.kwargs["reason"].endswith("skipped: x")
+
+    def test_no_retry_outside_market_hours(self):
+        ex, upd, claim = self._run(market=False)
+        ex.assert_not_called(); upd.assert_not_called(); claim.assert_not_called()
+
+    def test_no_retry_when_nothing_is_held(self):
+        ex, upd, _ = self._run(held=0.0)
+        ex.assert_not_called()
+        assert "no position held" in upd.call_args.kwargs["reason"]
+
+    def test_no_retry_when_a_newer_decision_exists(self):
+        ex, upd, _ = self._run(newer=True)
+        ex.assert_not_called()
+        assert "superseded" in upd.call_args.kwargs["reason"]
+
+    def test_no_retry_when_the_activity_check_fails(self):
+        ex, upd, claim = self._run(newer=None)
+        ex.assert_not_called(); upd.assert_not_called(); claim.assert_not_called()
+
+    def test_no_retry_when_the_claim_is_lost(self):
+        ex, upd, _ = self._run(claim=False)
+        ex.assert_not_called(); upd.assert_not_called()
+
+    def test_a_non_failed_approval_is_left_alone(self):
+        ex, upd, claim = self._run(approval={**self.APPROVAL, "status": "APPROVED"})
+        ex.assert_not_called(); claim.assert_not_called()

@@ -103,6 +103,18 @@ def _remaining_after_sell(ticker: str, owned: float, filled_qty: float) -> float
     return min(round(abs(float(held.qty)), 4), expected)
 
 
+def _schedule_held_sell_retry(approval: dict, trigger: str) -> None:
+    """One retry ~5 min after a TRIM/EXIT held on unreadable stops (m127);
+    never from the retry itself."""
+    if trigger == "held_sell_retry" or approval.get("id") is None:
+        return
+    try:
+        from tasks import retry_held_sell, HELD_SELL_RETRY_DELAY_S
+        retry_held_sell.apply_async(args=[approval["id"]], countdown=HELD_SELL_RETRY_DELAY_S, queue="ops")
+    except Exception as e:
+        log.error(f"[{approval.get('ticker')}] could not schedule the held-sell retry: {e}")
+
+
 def _stops_still_resting(ticker: str) -> float | None:
     """Total quantity of SELL stops still working at the broker for ticker,
     or None if it can't be read. A sell must not go out on top of a resting
@@ -954,6 +966,7 @@ def execute_approved(
                 )
             except Exception:
                 pass
+            _schedule_held_sell_retry(approval, trigger)
             return _outcome("skipped: resting stops unreadable, sell not sent (stop left in place)")
 
         if side == "SELL":
@@ -987,6 +1000,8 @@ def execute_approved(
                 # The cancel may have taken some stops before one stuck;
                 # put back what is now uncovered (A0053-2).
                 _restore_stop_after_failed_sell(ticker)
+                if resting is None:
+                    _schedule_held_sell_retry(approval, trigger)
                 return _outcome("skipped: resting stops unreadable, sell not sent" if resting is None
                                 else "skipped: stop still resting, sell not sent")
 

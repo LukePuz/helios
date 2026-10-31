@@ -1068,6 +1068,60 @@ def retry_deferred_entry(self, approval_id: int, gap_retry_attempt: int = 1, pri
              f"(gap_attempt={gap_retry_attempt}, price_attempt={price_retry_attempt})")
 
 
+HELD_SELL_RETRY_DELAY_S = 300
+
+
+@app.task(name="tasks.retry_held_sell", bind=True, max_retries=0)
+def retry_held_sell(self, approval_id: int):
+    """One re-execution of a model TRIM/EXIT that was held because the
+    broker's resting stops couldn't be read (m127). Not a new decision: it
+    runs only during market hours, while the position is still held, and
+    when no newer approval or verdict exists for the ticker. The attempt and
+    its outcome are appended to status_reason."""
+    import db
+    import ibkr
+    from datetime import datetime, timezone
+    from execution import execute_approved, last_outcome_reason
+    from market_data import is_market_hours
+
+    approval = db.get_approval_by_id(approval_id)
+    if not approval or approval.get("status") != "FAILED":
+        log.info(f"retry_held_sell: approval #{approval_id} is not FAILED; nothing to retry")
+        return
+    ticker = approval["ticker"]
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    def note(outcome: str, status: str = "FAILED") -> None:
+        db.update_approval_status(approval_id, status, reason=(
+            f"{db.HELD_SELL_REASON_PREFIX}, sell not sent | retried at {stamp}: {outcome}"))
+
+    if not is_market_hours():
+        log.info(f"retry_held_sell: [{ticker}] #{approval_id} not retried, market closed")
+        return
+    try:
+        held = abs(float(ibkr.get_client().get_open_position(ticker).qty))
+    except Exception as e:
+        log.warning(f"retry_held_sell: [{ticker}] #{approval_id} position read failed ({e}); not retried")
+        return
+    if held <= 0:
+        if db.claim_failed_sell_for_retry(approval_id):
+            note("not sent, no position held")
+        return
+    newer = db.has_newer_ticker_activity(ticker, approval_id, approval.get("timestamp"))
+    if newer is not False:
+        if newer and db.claim_failed_sell_for_retry(approval_id):
+            note("not sent, superseded by a newer approval or verdict")
+        log.info(f"retry_held_sell: [{ticker}] #{approval_id} not retried "
+                 f"({'superseded' if newer else 'activity check failed'})")
+        return
+    if not db.claim_failed_sell_for_retry(approval_id):
+        log.info(f"retry_held_sell: [{ticker}] #{approval_id} already retried or changed; skipping")
+        return
+    success = execute_approved(approval, trigger="held_sell_retry")
+    note("executed" if success else last_outcome_reason(), "APPROVED" if success else "FAILED")
+    log.info(f"retry_held_sell: [{ticker}] #{approval_id} {'executed' if success else 'still failed'} on retry")
+
+
 DEFERRED_ENTRY_MAX_AGE_HOURS = 16
 
 

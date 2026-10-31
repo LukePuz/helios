@@ -10,6 +10,7 @@ filled for real 12 seconds later, live and untracked at the broker.
 """
 import time
 from unittest.mock import MagicMock, patch
+import pytest
 
 import ibkr
 
@@ -497,3 +498,35 @@ def test_completed_orders_match_on_perm_id_and_read_unset_fill_as_unknown():
     fake_ib.reqCompletedOrders.assert_called_once_with(False)
     assert rows == [{"perm_id": 7700, "ticker": "CRWD", "action": "SELL", "status": "ApiCancelled", "filled_qty": 8.0},
                     {"perm_id": None, "ticker": "AMD", "action": "BUY", "status": "Cancelled", "filled_qty": None}]
+
+
+class TestBoundedReq:
+    """A read TWS never answers used to hang the task (RequestTimeout 0).
+    On a timeout the session is dropped, since a late reply on the shared
+    request key would cut the next read short."""
+
+    def test_sets_the_bound_for_the_call_and_restores_it(self):
+        fake_ib = MagicMock(RequestTimeout=0)
+        seen = []
+        fake_ib.reqAllOpenOrders.side_effect = lambda: seen.append(fake_ib.RequestTimeout) or ["t"]
+        assert ibkr._bounded_req(fake_ib, "reqAllOpenOrders", fake_ib.reqAllOpenOrders) == ["t"]
+        assert seen == [ibkr._REQ_TIMEOUT_S]
+        assert fake_ib.RequestTimeout == 0
+        fake_ib.disconnect.assert_not_called()
+
+    def test_a_timeout_drops_the_session_and_raises(self):
+        fake_ib = MagicMock(RequestTimeout=0)
+        fake_ib.reqCompletedOrders.side_effect = TimeoutError()
+        with patch.object(ibkr, "_ib", fake_ib):
+            with pytest.raises(TimeoutError):
+                ibkr._bounded_req(fake_ib, "reqCompletedOrders", fake_ib.reqCompletedOrders, False)
+            assert ibkr._ib is None
+        fake_ib.reqCompletedOrders.assert_called_once_with(False)
+        fake_ib.disconnect.assert_called_once()
+        assert fake_ib.RequestTimeout == 0
+
+    def test_get_completed_orders_raises_on_a_timeout(self):
+        fake_ib = MagicMock(RequestTimeout=0)
+        fake_ib.reqCompletedOrders.side_effect = TimeoutError()
+        with patch("ibkr.get_ib", return_value=fake_ib), pytest.raises(TimeoutError):
+            ibkr.get_completed_orders()

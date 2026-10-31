@@ -55,6 +55,7 @@ _last_heartbeat: float = 0.0   # time.monotonic() of last successful heartbeat
 
 _HEARTBEAT_INTERVAL_S = 30
 _HEARTBEAT_TIMEOUT_S  = 8
+_REQ_TIMEOUT_S        = 30   # one account-wide read (open/completed orders, executions, positions)
 
 
 def _resolve_client_id() -> int:
@@ -152,6 +153,32 @@ def disconnect() -> None:
         _ib.disconnect()
         _ib = None
         log.info("Disconnected from IBKR TWS.")
+
+
+def _bounded_req(ib: ibi.IB, what: str, fn, *args):
+    """Runs one IB read with a bound. ib_async waits for the reply with no
+    timeout by default (RequestTimeout 0), so a read TWS never answers hangs
+    the task. On a timeout the session is dropped before raising: open
+    orders, completed orders and positions share one fixed request key, so
+    a late reply to the timed-out read would end the next one early and it
+    would come back short (a resting stop read as missing)."""
+    global _ib, _last_heartbeat
+    prev = ib.RequestTimeout
+    ib.RequestTimeout = _REQ_TIMEOUT_S
+    try:
+        return fn(*args)
+    except TimeoutError:
+        log.warning(f"IBKR {what} got no reply in {_REQ_TIMEOUT_S}s; dropping the session")
+        try:
+            ib.disconnect()
+        except Exception:
+            pass
+        if _ib is ib:
+            _ib = None
+            _last_heartbeat = 0.0
+        raise TimeoutError(f"IBKR {what} timed out after {_REQ_TIMEOUT_S}s") from None
+    finally:
+        ib.RequestTimeout = prev
 
 
 def _stock(ib: ibi.IB, ticker: str) -> ibi.Stock:
@@ -255,7 +282,7 @@ def _refuse_sell_on_short(ib, ticker: str, qty: float | None = None) -> None:
     bad, held = short_of(ib.positions())
     if bad:
         try:
-            bad, held = short_of(ib.reqPositions())
+            bad, held = short_of(_bounded_req(ib, "reqPositions", ib.reqPositions))
         except Exception:
             pass
     if bad:
@@ -634,7 +661,7 @@ def get_open_orders() -> list[dict]:
     # this process's cache is never pruned for orders another client
     # (the orders worker) cancels, so a cancelled stop would still read as
     # resting here (audit 00:53 A0053-1).
-    trades = ib.reqAllOpenOrders()
+    trades = _bounded_req(ib, "reqAllOpenOrders", ib.reqAllOpenOrders)
     ib.sleep(1)
     results = []
     seen = set()
@@ -718,7 +745,7 @@ def get_completed_orders() -> list[dict]:
     on a broker error."""
     ib = get_ib()
     out = []
-    for trade in ib.reqCompletedOrders(False):
+    for trade in _bounded_req(ib, "reqCompletedOrders", ib.reqCompletedOrders, False):
         o = trade.order
         filled = getattr(o, "filledQuantity", None)
         try:
@@ -766,7 +793,7 @@ def get_fill_for_order(broker_order_id: int, ticker: str | None = None,
     placement time; an execution must agree on each one given.
     """
     ib = get_ib()
-    execs = ib.reqExecutions()
+    execs = _bounded_req(ib, "reqExecutions", ib.reqExecutions)
     want_side = {"BUY": "BOT", "SELL": "SLD"}.get(side) if side else None
     matches = [
         e for e in execs
@@ -834,7 +861,7 @@ def get_recent_sell_fill(ticker: str, exclude_order_ids=frozenset(),
     # exclude_perm_ids is the same for orders logged with a perm_id: orderIds
     # collide across clientIds, permIds don't (professor m102).
     ib = get_ib()
-    execs = ib.reqExecutions()
+    execs = _bounded_req(ib, "reqExecutions", ib.reqExecutions)
     sells = [e for e in execs if e.contract.symbol == ticker and e.execution.side == "SLD"
              and (getattr(e.execution, "permId", 0) or None) not in exclude_perm_ids
              and e.execution.orderId not in exclude_order_ids]

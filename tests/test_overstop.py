@@ -396,14 +396,13 @@ def _queued_flat(intent, row, open_orders=(), stop=None, order_id=5):
         r = tasks._reprotect_after_late_sell("CRWD", {"intent": intent, "order_id": order_id}, 175.0,
                                              from_queue=True)
     fill.assert_not_called()   # never the execution-blend lookup
-    alert.assert_not_called()
-    return r, close
+    return r, close, alert
 
 
 def test_queued_flat_exit_closes_at_its_orders_average_fill():
     """Professor M124: the part-filled EXIT deleted the stop record, so the
     stale-stop branch never closed the outcome."""
-    r, close = _queued_flat("EXIT", {"status": "filled", "fill_price": 171.5, "broker_order_id": 77})
+    r, close, alert = _queued_flat("EXIT", {"status": "filled", "fill_price": 171.5, "broker_order_id": 77})
     assert r is None
     close.assert_called_once_with("CRWD", exit_price=171.5, exit_source="late_exit", exit_price_source="fill")
 
@@ -411,10 +410,12 @@ def test_queued_flat_exit_closes_at_its_orders_average_fill():
 def test_queued_flat_exit_waits_while_its_remainder_works_or_a_lookup_fails():
     row = {"status": "partial", "fill_price": 171.5, "broker_order_id": 77}
     working = {"order_id": 77, "status": "Submitted"}
-    for kw in ({"row": row, "open_orders": [working]}, {"row": RuntimeError("db")}):
-        r, close = _queued_flat("BACKSTOP", **kw)
+    for kw, alerted in (({"row": row, "open_orders": [working]}, True), ({"row": RuntimeError("db")}, False)):
+        with patch("tasks._reconcile_alert_due", return_value=True):
+            r, close, alert = _queued_flat("BACKSTOP", **kw)
         assert r == "wait"
         close.assert_not_called()
+        assert alert.called is alerted   # flat + working sell = a short if it fills
 
 
 def test_queued_flat_exit_leaves_mixed_and_owned_cases_alone():
@@ -422,10 +423,10 @@ def test_queued_flat_exit_leaves_mixed_and_owned_cases_alone():
     for kw in ({"row": row, "open_orders": [{"order_id": 77, "status": "Cancelled"}]},   # mixed close
                {"row": row, "stop": {"stop_price": 150.0}},                              # stale branch's
                {"row": row, "order_id": None}):                                          # old entry
-        r, close = _queued_flat("EXIT", **kw)
+        r, close, alert = _queued_flat("EXIT", **kw)
         assert r is None
         close.assert_not_called()
-    r, close = _queued_flat("TRIM", {"status": "filled", "fill_price": 171.5, "broker_order_id": 77})
+    r, close, alert = _queued_flat("TRIM", {"status": "filled", "fill_price": 171.5, "broker_order_id": 77})
     assert r is None
     close.assert_not_called()
 

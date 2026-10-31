@@ -1571,9 +1571,27 @@ def _close_queued_flat_exit(ticker: str, rec: dict) -> bool:
             log.warning(f"[{ticker}] reconcile: open-order read failed ({e}); queued flat EXIT waiting")
             return True
         if working:
+            # Flat while our sell still works: if it fills, it opens a short
+            # (review of 11e2f26). Luke decides; one throttled alert.
+            if _reconcile_alert_due(f"flat_exit_working_{ticker}"):
+                try:
+                    import alerts
+                    alerts._send(f"🚨 SELL STILL WORKING ON A FLAT POSITION — <b>{ticker}</b>\nThe "
+                                 f"broker shows no shares, but the rest of our {rec.get('intent')} order "
+                                 f"is still working. If it fills it opens a SHORT. Check TWS and cancel "
+                                 f"it if the shares are gone.")
+                except Exception:
+                    pass
             return True
-        log.warning(f"[{ticker}] reconcile: flat after a part-filled {rec.get('intent')} whose remainder "
-                    f"is no longer working; outcome left open (exit price for a mixed close is undecided)")
+        # Either something else sold the rest (exit price for that mix is
+        # undecided), or the remainder filled since this run started and the
+        # order loop below closes it.
+        log.info(f"[{ticker}] reconcile: flat after a part-filled {rec.get('intent')} whose remainder "
+                 f"is not working; leaving the close to the order loop or as an open mixed close")
+        return False
+    if row["status"] == "filled":
+        log.warning(f"[{ticker}] reconcile: queued flat {rec.get('intent')} order {oid} is filled "
+                    f"with no fill price; outcome not closed")
     return False
 
 

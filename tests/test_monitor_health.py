@@ -72,3 +72,34 @@ def test_risk_manager_flags_a_failed_read():
     with patch("db.get_all_position_stops", return_value=[]):
         rm = risk_manager.RiskManager(client)
         assert rm.check_trailing_stops() == [] and rm.monitor_read_failed is True
+
+
+def test_strict_stop_read_raises_on_a_db_error():
+    """Professor M146: [] from a failed read looked like nothing to check."""
+    import db
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value.execute.side_effect = RuntimeError("timeout")
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
+        assert db.get_all_position_stops() == []
+        import pytest
+        with pytest.raises(RuntimeError):
+            db.get_all_position_stops(strict=True)
+
+
+def test_only_the_last_attempt_counts_as_a_failed_check():
+    """Professor M146: a run's retries are one check, not three."""
+    import pytest
+    task = tasks.check_trailing_stops
+    with patch("tasks._get_client", side_effect=RuntimeError("gateway down")), \
+         patch("tasks._monitor_health") as health:
+        # Called directly, Celery's retry re-raises the error instead of Retry.
+        with pytest.raises(Exception):
+            task.run()                                       # retries left: not counted
+        health.assert_not_called()
+        task.push_request(retries=task.max_retries)
+        try:
+            with pytest.raises(RuntimeError):
+                task.run()                                   # last attempt: counted
+        finally:
+            task.pop_request()
+    health.assert_called_once_with("trailing_stops", True)

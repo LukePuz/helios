@@ -2029,7 +2029,10 @@ def delete_position_stop(ticker: str) -> None:
         _put_conn(conn)
 
 
-def get_all_position_stops() -> list[dict]:
+def get_all_position_stops(strict: bool = False) -> list[dict]:
+    """strict=True raises on a failed read instead of returning [], for the
+    stop and target monitors: an empty list there means nothing to check,
+    so a DB error read as a clean pass (professor M146)."""
     conn = _get_conn()
     try:
         base = ("SELECT ticker, entry_price, stop_price, stop_method, trailing_active, "
@@ -2064,6 +2067,8 @@ def get_all_position_stops() -> list[dict]:
         ]
     except Exception as e:
         logging.error(f"get_all_position_stops failed: {e}")
+        if strict:
+            raise
         return []
     finally:
         _put_conn(conn)

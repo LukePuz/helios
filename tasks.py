@@ -2459,7 +2459,7 @@ def check_profit_targets(self):
     target crossing isn't racing a live broker stop the way a stop-loss
     trigger is), so this wrapper's job is just invocation, alerting, and
     Celery retry/error handling."""
-    failed = False
+    failed = will_retry = False
     try:
         import alerts
         from risk_manager import RiskManager
@@ -2490,10 +2490,13 @@ def check_profit_targets(self):
             )
     except Exception as e:
         failed = True
+        # Only a run with no retry left counts as a failed check (M146).
+        will_retry = self.request.retries < self.max_retries
         log.error(f"check_profit_targets failed: {e}")
         raise self.retry(exc=e, countdown=60)
     finally:
-        _monitor_health("profit_targets", failed)
+        if not (failed and will_retry):
+            _monitor_health("profit_targets", failed)
 
 
 @app.task(name="tasks.backfill_catalyst_tracking", bind=True, max_retries=1)
@@ -2748,7 +2751,7 @@ def check_trailing_stops(self):
     """Monitor open positions against their stop levels. Alert on triggers;
     if the stop level is breached and NO protective stop exists at the
     broker, execute a market sell (AUTO_EXECUTE_PROTECTIVE_SELLS)."""
-    failed = False
+    failed = will_retry = False
     try:
         from risk_manager import RiskManager
         import alerts
@@ -2831,10 +2834,13 @@ def check_trailing_stops(self):
             )
     except Exception as e:
         failed = True
+        # Only a run with no retry left counts as a failed check (M146).
+        will_retry = self.request.retries < self.max_retries
         log.error(f"check_trailing_stops failed: {e}")
         raise self.retry(exc=e, countdown=60)
     finally:
-        _monitor_health("trailing_stops", failed)
+        if not (failed and will_retry):
+            _monitor_health("trailing_stops", failed)
 
 
 # ── Existing tasks (updated call signatures) ──────────────────────────────────
@@ -3713,7 +3719,7 @@ def check_portfolio_drawdown(self):
     Circuit breaker: sets the persisted trading_halted flag when drawdown
     from the high-water mark exceeds MAX_DRAWDOWN_PCT, and maintains the HWM.
     """
-    failed = False
+    failed = will_retry = False
     try:
         import db
         import alerts
@@ -3818,10 +3824,13 @@ def check_portfolio_drawdown(self):
             log.debug(f"Drawdown: {drawdown:.1%} (limit: {MAX_DRAWDOWN_PCT:.0%})")
     except Exception as e:
         failed = True
+        # Only a run with no retry left counts as a failed check (M146).
+        will_retry = self.request.retries < self.max_retries
         log.error(f"check_portfolio_drawdown failed: {e}")
         raise self.retry(exc=e, countdown=60)
     finally:
-        _monitor_health("portfolio_drawdown", failed)
+        if not (failed and will_retry):
+            _monitor_health("portfolio_drawdown", failed)
 
 
 @locked_by_ticker(lambda ticker: ticker,

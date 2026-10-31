@@ -1282,7 +1282,7 @@ class RiskManager:
         self.monitor_read_failed = False
         try:
             import db
-            stops    = db.get_all_position_stops()
+            stops    = db.get_all_position_stops(strict=True)
             positions = {p.symbol: p for p in self._client.get_all_positions()}
         except Exception as e:
             log.warning(f"Trailing stop check failed: {e}")
@@ -1808,7 +1808,7 @@ class RiskManager:
             return style if style in PROFIT_TARGET_PCT_BY_STYLE else market_trade_style
 
         try:
-            stops = db.get_all_position_stops()
+            stops = db.get_all_position_stops(strict=True)
             positions = {p.symbol: p for p in self._client.get_all_positions()}
         except Exception as e:
             log.warning(f"check_profit_targets: could not fetch positions: {e}")

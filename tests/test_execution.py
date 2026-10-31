@@ -854,8 +854,8 @@ def test_restore_places_nothing_when_resting_stops_cannot_be_read():
         client.return_value.get_open_position.return_value = MagicMock(qty=100)
         execution._restore_stop_after_failed_sell("AMD")
     place.assert_not_called()
-    queue.assert_called_once_with("AMD", {"intent": "RESTORE"}, None)   # retried, not left naked
-    assert "CHECK STOPS" in send.call_args[0][0] and "queued" in send.call_args[0][0]
+    queue.assert_not_called()   # the queue's retry would place a full stop on unknown coverage
+    assert "CHECK STOPS" in send.call_args[0][0]
 
 
 def test_manual_sell_not_sent_when_resting_stops_cannot_be_read():

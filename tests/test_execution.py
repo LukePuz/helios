@@ -854,23 +854,54 @@ def test_restore_places_nothing_when_resting_stops_cannot_be_read():
         client.return_value.get_open_position.return_value = MagicMock(qty=100)
         execution._restore_stop_after_failed_sell("AMD")
     place.assert_not_called()
-    queue.assert_not_called()   # the queue's retry would place a full stop on unknown coverage
-    assert "CHECK STOPS" in send.call_args[0][0]
+    queue.assert_called_once_with("AMD", {"intent": "RESTORE"}, None)   # M131: the queue waits, then sizes
+    assert "CHECK STOPS" in send.call_args[0][0] and "queued" in send.call_args[0][0]
 
 
-def test_manual_sell_not_sent_when_resting_stops_cannot_be_read():
-    """Review of 73494d1: same hold as the EXIT path."""
+def _manual_sell(reads):
     with patch("ibkr.get_ib"), patch("ibkr.get_client") as client, \
          patch("ibkr.place_market_order") as order, \
-         patch("tasks.manage_cancel_stop_orders_for", return_value=0), \
-         patch("execution._stops_still_resting", return_value=None), \
+         patch("tasks.manage_cancel_stop_orders_for", return_value=0) as cancel, \
+         patch("execution._stops_still_resting", side_effect=reads), \
          patch("execution._restore_stop_after_failed_sell") as restore, \
          patch("db.get_state", return_value=None), \
          patch("market_data.is_market_hours", return_value=True):
         client.return_value.get_open_position.return_value = MagicMock(qty=5)
         r = execution.execute_manual("NVDA", "SELL", 5, "test")
+    order.assert_not_called()
+    return r, cancel, restore
+
+
+def test_manual_sell_unreadable_before_the_cancel_leaves_the_stop_in_place():
+    """Professor M131: hold before cancelling, not after."""
+    r, cancel, restore = _manual_sell([None])
+    assert r["success"] is False and "left in place" in r["message"]
+    cancel.assert_not_called(); restore.assert_not_called()
+
+
+def test_manual_sell_not_sent_when_resting_stops_cannot_be_read_after_the_cancel():
+    """Review of 73494d1: same hold as the EXIT path."""
+    r, cancel, restore = _manual_sell([0.0, None])
     assert r["success"] is False and "could not be read" in r["message"]
-    order.assert_not_called(); restore.assert_called_once_with("NVDA")
+    cancel.assert_called_once(); restore.assert_called_once_with("NVDA")
+
+
+def test_exit_unreadable_before_the_cancel_leaves_the_stop_in_place():
+    """Professor M131."""
+    approval = _approval(action="EXIT", shares_initial=100)
+    with patch("ibkr.get_ib"), patch("ibkr.get_client") as client, \
+         patch("ibkr.place_market_order") as order, \
+         patch("tasks.manage_cancel_stop_orders_for") as cancel, \
+         patch("execution._stops_still_resting", return_value=None), \
+         patch("execution._restore_stop_after_failed_sell") as restore, \
+         patch("ibkr.get_latest_price", return_value=100.0), \
+         patch("market_data.get_priced_quote", return_value=None), \
+         patch("alerts._send") as send:
+        client.return_value.get_open_position.return_value = MagicMock(qty=100)
+        assert execution.execute_approved(approval) is False
+    order.assert_not_called(); cancel.assert_not_called(); restore.assert_not_called()
+    assert "left in place" in send.call_args[0][0]
+    assert "stop left in place" in execution.last_outcome_reason()
 
 
 def test_skipped_exit_restores_stops_the_cancel_already_took():

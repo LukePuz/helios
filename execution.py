@@ -201,16 +201,24 @@ def _restore_stop_after_failed_sell(ticker: str) -> None:
         if covered is None:
             # Unknown coverage: a full stop on top of one that is still
             # working would oversell, so place nothing and say so (A0053-2).
-            # Not queued for the reprotect retry: that path places a full stop
-            # when coverage is unreadable, which is this case. Reconcile
-            # section 3 re-places a stop once a cycle reads the shares naked.
+            # Queued: the reprotect retry waits while coverage is unreadable
+            # and sizes to what other stops leave once it can read (m116), so
+            # the stop comes back in ~5 min rather than at reconcile section 3
+            # (professor M131).
             log.error(f"[{ticker}] Stop restore skipped: resting stops could not be read")
+            queued = False
+            try:
+                tasks._queue_reprotect(ticker, {"intent": "RESTORE"}, None)
+                queued = True
+            except Exception as e2:
+                log.error(f"[{ticker}] Could not queue the stop restore: {e2}")
             try:
                 alert_module._send(
                     f"⚠️ CHECK STOPS — {ticker}\n"
                     f"A sell did not go through and the resting stops could not be read, "
-                    f"so no stop was restored. Check TWS; recorded stop "
-                    f"${float(stop_rec['stop_price']):.2f}."
+                    f"so no stop was restored"
+                    + (" yet; it is queued and retried every reconcile cycle" if queued else "")
+                    + f". Check TWS; recorded stop ${float(stop_rec['stop_price']):.2f}."
                 )
             except Exception:
                 pass
@@ -934,6 +942,20 @@ def execute_approved(
                     pass
                 return _outcome(f"skipped: {room_block}")
 
+        if side == "SELL" and _stops_still_resting(ticker) is None:
+            # Unreadable before the cancel: hold the sell with the stop still
+            # in place, rather than cancel it and then find out (professor M131).
+            log.error(f"[{ticker}] {action} not sent: resting stops could not be read; stop left in place")
+            try:
+                alert_module._send(
+                    f"⚠️ {action} NOT SENT — <b>{ticker}</b>\n"
+                    f"The broker's resting stops could not be read, so the sell was held and the "
+                    f"stop left in place. Check TWS."
+                )
+            except Exception:
+                pass
+            return _outcome("skipped: resting stops unreadable, sell not sent (stop left in place)")
+
         if side == "SELL":
             # Cancel the existing broker stop only now that the sell is
             # definitely going ahead, so the fill can't race the stop and
@@ -1362,6 +1384,11 @@ def execute_manual(
             return {"success": False, "filled_qty": 0, "fill_price": None, "stop_price": None,
                     "message": f"Market is closed: SELL {ticker} not sent, stop left in place. "
                                f"Send it again during market hours."}
+        if _stops_still_resting(ticker) is None:
+            # Unreadable before the cancel: hold with the stop in place (M131).
+            return {"success": False, "filled_qty": 0, "fill_price": None, "stop_price": None,
+                    "message": f"SELL {ticker} not sent: the broker's resting stops could not be "
+                               f"read, so the stop was left in place. Check TWS."}
         # Cancel existing stops first so the fill can't race the stop and
         # leave an order that would short the account.
         try:

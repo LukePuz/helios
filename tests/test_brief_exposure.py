@@ -72,7 +72,9 @@ def test_gate_flags():
     assert f == {"model_sell_pass_unconfirmed": True, "rubric_gate_conflict": False, "verdicts_today": 1}
     with patch("db.get_recent_verdicts", return_value=[]):
         assert analyst._gate_flags("NVDA", "TRIM", 4, 0, True, now=now)["model_sell_pass_unconfirmed"] is False
-        assert analyst._gate_flags("NVDA", "OPEN", 7, 2, True, now=now)["rubric_gate_conflict"] is True
-        assert analyst._gate_flags("NVDA", "OPEN", 8, 2, True, now=now)["rubric_gate_conflict"] is False
+        # the model's own c7 OPEN citing 2 sources counts even if a gate later capped it
+        assert analyst._gate_flags("NVDA", "OPEN", 6, 2, True, "OPEN", 7, now=now)["rubric_gate_conflict"] is True
+        assert analyst._gate_flags("NVDA", "WATCH", 7, 1, False, "OPEN", 7, now=now)["rubric_gate_conflict"] is False
+        assert analyst._gate_flags("NVDA", "OPEN", 8, 2, True, "OPEN", 8, now=now)["rubric_gate_conflict"] is False
     with patch("db.get_recent_verdicts", side_effect=RuntimeError("db down")):
         assert analyst._gate_flags("NVDA", "HOLD", 6, 2, False, now=now)["verdicts_today"] is None

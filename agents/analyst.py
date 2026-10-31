@@ -433,20 +433,23 @@ def redact_account_figures(prompt: str) -> str:
 
 
 def _gate_flags(ticker: str, action: str, conviction: int, source_count: int,
-                passes: bool, now=None) -> dict:
+                passes: bool, model_action: str | None = None, model_conviction: int | None = None,
+                now=None) -> dict:
     """Log-only counters for gate questions that are Luke's (audits
     A1031-0253-2, A1031-0453-3/-4), on the final action and conviction:
     model_sell_pass_unconfirmed  a c>=5 TRIM/EXIT passing on the model's own
                                  flag, with no confirming verdict;
-    rubric_gate_conflict         an OPEN/ADD at c7 citing >=2 sources (the
-                                 rubric's 7 is one piece of evidence);
+    rubric_gate_conflict         the model's own OPEN/ADD at c7 citing >=2
+                                 sources, before the gates (the rubric's 7 is
+                                 one piece of evidence; review of 7756153);
     verdicts_today               earlier verdicts on the ticker this ET day,
                                  i.e. how many draws came before this one."""
     from datetime import datetime, timezone
     from zoneinfo import ZoneInfo
     out = {"model_sell_pass_unconfirmed": bool(passes and action in ("TRIM", "EXIT")
                                                and conviction > LOW_CONVICTION_SELL_MAX),
-           "rubric_gate_conflict": action in ("OPEN", "ADD") and conviction == 7 and source_count >= 2}
+           "rubric_gate_conflict": model_action in ("OPEN", "ADD") and model_conviction == 7
+                                   and source_count >= 2}
     try:
         import db
         et = ZoneInfo("America/New_York")
@@ -1605,7 +1608,8 @@ def analyze(
         log.debug(f"[{ticker}] brief exposure record failed: {e}")
     try:
         provenance["gate_flags"] = _gate_flags(ticker, action, conviction, source_count,
-                                               bool(parsed.get("pass_to_risk")))
+                                               bool(parsed.get("pass_to_risk")),
+                                               model_action, model_conviction)
     except Exception as e:
         log.debug(f"[{ticker}] gate flags record failed: {e}")
     provenance["trigger"] = trigger

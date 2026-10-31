@@ -37,6 +37,18 @@ def _no_real_database(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _strict_state_reads_follow_get_state(monkeypatch):
+    """db.get_state_strict reads through whatever db.get_state is patched to
+    in a test, so existing state mocks cover both; a mock that raises makes
+    the strict read raise (professor M142). test_get_state_strict tests the
+    real one."""
+    import db
+    real = getattr(db, "_real_get_state_strict", None) or db.get_state_strict
+    monkeypatch.setattr(db, "_real_get_state_strict", real, raising=False)
+    monkeypatch.setattr(db, "get_state_strict", lambda key, default=None: db.get_state(key, default))
+
+
+@pytest.fixture(autouse=True)
 def _static_provenance(monkeypatch):
     """analyst._provenance shells out to git and asks Ollama for the model
     digest once per process; tests use a fixed stub instead."""

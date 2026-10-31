@@ -2486,6 +2486,26 @@ def get_state(key: str, default: str | None = None) -> str | None:
         _put_conn(conn)
 
 
+def get_state_strict(key: str, default: str | None = None) -> str | None:
+    """get_state that raises on a failed read instead of returning the
+    default, for callers that must fail closed (the halt checks): a query
+    timeout under /halt read as "false" (professor M142)."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM system_state WHERE key=%s", (key,))
+            row = cur.fetchone()
+        return row[0] if row else default
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        _put_conn(conn)
+
+
 def set_state(key: str, value: str) -> None:
     conn = _get_conn()
     try:

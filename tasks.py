@@ -3737,7 +3737,7 @@ def check_portfolio_drawdown(self):
 
         # Maintain the persisted high-water mark (seed from START_VALUE,
         # which is itself TRADING_ENV-derived — see config.py)
-        hwm = float(db.get_state(hwm_key) or START_VALUE)
+        hwm = float(db.get_state_strict(hwm_key) or START_VALUE)   # M142: no default on a failed read
 
         # Plausibility guard: a transient broker read of $0 (e.g. an IBKR
         # clientId collision or cold-morning connection race) previously
@@ -3756,10 +3756,11 @@ def check_portfolio_drawdown(self):
             # A1031-0853-4). Now it fails closed: halt buys, alert, and keep
             # the value as a candidate that /rebase applies after a human
             # looks.
-            implausible = int(db.get_state(implausible_key, "0") or 0) + 1 if pv > 0 else 0
+            implausible = int(db.get_state_strict(implausible_key, "0") or 0) + 1 if pv > 0 else 0
             db.set_state(implausible_key, str(implausible))
             if implausible >= IMPLAUSIBLE_READS_BEFORE_HALT:
                 db.set_state(rebase_key, str(pv))
+                # Plain read: a failed one returns "false" and sets the halt (fails closed).
                 if db.get_state(halted_key, "false") != "true":
                     db.set_state(halted_key, "true")
                     db.set_state(reason_key, f"Auto: account value under half the HWM on "
@@ -3794,7 +3795,7 @@ def check_portfolio_drawdown(self):
             # Require 2 consecutive breaching reads (this task runs every 30
             # min) before halting — a single noisy tick shouldn't be enough,
             # only a sustained drawdown.
-            breach_count = int(db.get_state(breach_key, "0") or 0) + 1
+            breach_count = int(db.get_state_strict(breach_key, "0") or 0) + 1
             db.set_state(breach_key, str(breach_count))
             if breach_count < 2:
                 log.warning(f"Drawdown {drawdown:.1%} breach #1 — waiting for confirmation "

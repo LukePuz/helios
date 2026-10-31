@@ -256,10 +256,10 @@ class RiskManager:
         # Persisted halt flag (set manually via /halt or by the drawdown task)
         try:
             import db
-            if db.get_state(f"trading_halted_{TRADING_ENV}", "false") == "true":
+            if db.get_state_strict(f"trading_halted_{TRADING_ENV}", "false") == "true":
                 log.warning(f"HALT — trading_halted_{TRADING_ENV} flag is set in system_state")
                 return True
-            hwm_str = db.get_state(f"high_water_mark_{TRADING_ENV}")
+            hwm_str = db.get_state_strict(f"high_water_mark_{TRADING_ENV}")
         except Exception as e:
             # Fail closed (audit A1031-1053-2): an unread flag may be a /halt,
             # and the fallback baseline is the account value at construction,

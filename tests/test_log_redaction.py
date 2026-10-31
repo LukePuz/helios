@@ -72,3 +72,18 @@ def test_heartbeat_fail_stores_the_error_redacted():
         tasks._heartbeat_fail("fred", "HTTPError for url: https://x/series?api_key=abc123&file_type=json")
     stored = rec.call_args[0][1]
     assert "abc123" not in stored and "api_key=[REDACTED]" in stored
+
+
+def test_telegram_alert_text_is_redacted_before_it_is_sent():
+    """Alert text embeds raw exceptions, which skip log redaction."""
+    from unittest.mock import patch, MagicMock
+    import alerts
+    resp = MagicMock()
+    resp.json.return_value = {"result": {"message_id": 1}}
+    with patch.object(alerts, "_TOKEN", "t"), patch.object(alerts, "_CHAT_ID", "c"), \
+         patch("alerts.requests.post", return_value=resp) as post:
+        alerts._send("failed: https://x/v2?apiKey=abc123&limit=1")
+        alerts._send_with_buttons("failed: https://x/v2?apiKey=abc123", [])
+    for call in post.call_args_list:
+        sent = call.kwargs["json"]["text"]
+        assert "abc123" not in sent and "apiKey=[REDACTED]" in sent

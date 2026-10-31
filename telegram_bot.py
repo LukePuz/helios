@@ -85,7 +85,7 @@ def _send_chat_action(chat_id: str | int, action: str = "typing") -> None:
 
 
 def _reply(chat_id: str | int, text: str, reply_to: int | None = None) -> None:
-    payload: dict = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    payload: dict = {"chat_id": chat_id, "text": log_redaction.redact(text), "parse_mode": "HTML"}
     if reply_to:
         payload["reply_to_message_id"] = reply_to
     try:

@@ -2783,8 +2783,8 @@ def _heartbeat_ok(source: str, count: int) -> None:
 
 def _heartbeat_fail(source: str, error: str) -> None:
     # Redacted before it is stored: the error text can carry a request URL
-    # with a credential in it, and ingestion_health is shown in alerts
-    # (professor m139). Log redaction only covers log records.
+    # with a credential in it, and ingestion_health is shown on the
+    # dashboard (professor m139). Log redaction only covers log records.
     try:
         import db
         import log_redaction

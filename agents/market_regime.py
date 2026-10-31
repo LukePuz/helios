@@ -888,6 +888,7 @@ def assess_sector_regime(
     vix = macro.get("VIXCLS", {}).get("value")
     volatility_raw, volatility_notes = _score_volatility(vix, trend_raw, None)
 
+    breadth_freshness = None
     if breadth_tickers is not None:
         try:
             import db
@@ -895,7 +896,18 @@ def assess_sector_regime(
             breadth_bars = [bars for bars in bulk.values() if len(bars) >= 200]
         except Exception as e:
             log.debug(f"Sector breadth sample fetch failed for {sector_etf}: {e}")
-            breadth_bars = []
+            bulk, breadth_bars = {}, []
+        # Log-only: how old the sample's own bars are. last_bar_date is the
+        # sector ETF's, so a stale S&P 500 cache didn't show (SEF 10-31:
+        # 205 of 220 sampled tickers at or before 10-23).
+        try:
+            from agents.candidate_scanner import _bars_age
+            newest, median_age, stale_share = _bars_age(bulk)
+            breadth_freshness = {"sample": len(breadth_tickers), "with_bars": len(bulk),
+                                 "newest_bar": newest, "median_age_weekdays": median_age,
+                                 "stale_share": round(stale_share, 3)}
+        except Exception as e:
+            log.debug(f"Sector breadth freshness for {sector_etf} unavailable: {e}")
     else:
         breadth_bars = _fetch_watchlist_bars_for_breadth()
     breadth_raw, breadth_notes = _score_breadth(sector_bars, breadth_bars)
@@ -987,6 +999,7 @@ def assess_sector_regime(
         "signals": {
             **{name: {"score": raw, "notes": notes} for name, (raw, notes) in scores_map.items()},
             "last_bar_date": sector_bars[-1].get("date") if sector_bars else None,  # A1053-2
+            "breadth_freshness": breadth_freshness,
             "trade_style": {"label": trade_style, "efficiency_ratio": efficiency_ratio,
                              "notes": trade_style_notes},
         },

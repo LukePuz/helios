@@ -799,7 +799,8 @@ def _exec_time(record):
     return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
 
 
-def get_recent_sell_fill(ticker: str, exclude_order_ids=frozenset()) -> dict | None:
+def get_recent_sell_fill(ticker: str, exclude_order_ids=frozenset(),
+                         exclude_perm_ids=frozenset()) -> dict | None:
     """Looks up today's SELL execution(s) for a ticker by symbol rather than
     a specific orderId, aggregating same-day partials into one (filled_qty,
     fill_price). Returns None if there's no SELL execution for this ticker
@@ -830,9 +831,12 @@ def get_recent_sell_fill(ticker: str, exclude_order_ids=frozenset()) -> dict | N
     # exclude_order_ids: orders this system already recorded (a same-day
     # TRIM, say). Their executions aren't part of the unrecorded exit; they
     # were logged twice and blended into the exit price (professor M122).
+    # exclude_perm_ids is the same for orders logged with a perm_id: orderIds
+    # collide across clientIds, permIds don't (professor m102).
     ib = get_ib()
     execs = ib.reqExecutions()
     sells = [e for e in execs if e.contract.symbol == ticker and e.execution.side == "SLD"
+             and (getattr(e.execution, "permId", 0) or None) not in exclude_perm_ids
              and e.execution.orderId not in exclude_order_ids]
     if not sells:
         return None

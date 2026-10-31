@@ -3007,21 +3007,31 @@ def update_order_fill(order_id: int, fill_price: float, filled_qty: float, statu
         _put_conn(conn)
 
 
-def recorded_sell_order_ids(ticker: str, max_age_hours: int = 24) -> set[int] | None:
-    """Broker order ids of the SELL orders logged for this ticker in this env
-    (market/bracket orders; stops aren't logged here). Their fills are
-    recorded by the execution or late-fill paths, so a symbol-wide execution
-    lookup must leave them out (professor M122). None on error, so the
-    caller can wait rather than blend those fills back in."""
+def recorded_sell_order_ids(ticker: str, max_age_hours: int = 24) -> tuple[set[int], set[int]] | None:
+    """The SELL orders logged for this ticker in this env (market/bracket
+    orders; stops aren't logged here), as (order_ids, perm_ids). Their fills
+    are recorded by the execution or late-fill paths, so a symbol-wide
+    execution lookup must leave them out (professor M122). A row with a
+    perm_id is matched on it alone, since orderIds collide across clientIds
+    (professor m102); order_ids holds only the rows that have no perm_id.
+    None on error, so the caller can wait rather than blend those fills back
+    in."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT broker_order_id FROM orders WHERE ticker=%s AND side='SELL' AND trading_env=%s "
-                "AND broker_order_id IS NOT NULL AND created_at > NOW() - make_interval(hours => %s)",
+                "SELECT broker_order_id, perm_id FROM orders WHERE ticker=%s AND side='SELL' "
+                "AND trading_env=%s AND (broker_order_id IS NOT NULL OR perm_id IS NOT NULL) "
+                "AND created_at > NOW() - make_interval(hours => %s)",
                 (ticker, TRADING_ENV, max_age_hours),
             )
-            return {int(r[0]) for r in cur.fetchall()}
+            order_ids, perm_ids = set(), set()
+            for oid, perm in cur.fetchall():
+                if perm is not None:
+                    perm_ids.add(int(perm))
+                else:
+                    order_ids.add(int(oid))
+            return order_ids, perm_ids
     except Exception as e:
         logging.error(f"recorded_sell_order_ids({ticker}) failed: {e}")
         return None

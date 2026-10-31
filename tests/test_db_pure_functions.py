@@ -81,3 +81,27 @@ def test_log_order_stores_the_permanent_id():
         sql, params = cur.execute.call_args.args
         assert "perm_id" in sql and sql.count("%s") == len(params)
         assert params[-1] == stored
+
+
+class TestRecordedSellOrderIds:
+    """Professor m102: a row with a perm_id is matched on it alone, since
+    orderIds collide across clientIds; only rows without one fall back to
+    their orderId."""
+
+    def _run(self, rows):
+        from unittest.mock import MagicMock, patch
+        cur = MagicMock()
+        if isinstance(rows, Exception):
+            cur.execute.side_effect = rows
+        else:
+            cur.fetchall.return_value = rows
+        conn = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = cur
+        with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
+            return db.recorded_sell_order_ids("DDOG")
+
+    def test_splits_rows_by_whether_they_carry_a_perm_id(self):
+        assert self._run([(40, 5001), (41, None), (None, 5002)]) == ({41}, {5001, 5002})
+
+    def test_a_query_error_returns_none(self):
+        assert self._run(RuntimeError("down")) is None

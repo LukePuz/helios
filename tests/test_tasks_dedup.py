@@ -885,7 +885,7 @@ class TestStaleStopReconciliation:
     call .run() an extra time to reach the confirmed cycle before
     asserting, same pattern as TestReconciliationAlertThrottle above."""
 
-    def _run(self, state, fill_return, alert_due=True, unconfirmed=(), recorded=frozenset({40})):
+    def _run(self, state, fill_return, alert_due=True, unconfirmed=(), recorded=(frozenset({40}), frozenset())):
         client = MagicMock()
         client.get_all_positions.return_value = []  # DDOG no longer held
 
@@ -938,7 +938,7 @@ class TestStaleStopReconciliation:
         mock_fill, mock_log_trade, mock_close_outcome, mock_delete, mock_alert = \
             self._run(state, fill_return=fill)  # cycle 2: confirmed -> reconciles
 
-        mock_fill.assert_called_once_with("DDOG", {40})   # recorded orders left out (M122)
+        mock_fill.assert_called_once_with("DDOG", {40}, set())   # recorded orders left out (M122)
         mock_log_trade.assert_called_once()
         assert mock_log_trade.call_args.kwargs["symbol"] == "DDOG"
         assert mock_log_trade.call_args.kwargs["side"] == "SELL"
@@ -1768,7 +1768,7 @@ class TestCancelledUnconfirmedOrder:
              patch("ibkr.get_completed_orders", **kw) as read, \
              patch("ibkr.get_client", return_value=client), \
              patch("db.get_position_stop", return_value=None), \
-             patch("db.recorded_sell_order_ids", return_value={900}), \
+             patch("db.recorded_sell_order_ids", return_value=({900}, set())), \
              patch("ibkr.get_recent_sell_fill", return_value=other_sell), \
              patch("db.mark_order_cancelled", return_value=True) as mark, \
              patch("db.close_trade_outcome") as close, \

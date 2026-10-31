@@ -177,9 +177,10 @@ class TestCancelOrderPollsForTerminalStatus:
 
 
 class _FakeExecution:
-    def __init__(self, order_id, shares, avg_price, side, time=None, price=None):
+    def __init__(self, order_id, shares, avg_price, side, time=None, price=None, perm_id=0):
         self.time = time
         self.orderId = order_id
+        self.permId = perm_id
         self.shares = shares
         self.avgPrice = avg_price             # the order's running average
         self.price = avg_price if price is None else price   # this execution's own price
@@ -187,9 +188,9 @@ class _FakeExecution:
 
 
 class _FakeFillRecord:
-    def __init__(self, symbol, order_id, shares, avg_price, side, time=None):
+    def __init__(self, symbol, order_id, shares, avg_price, side, time=None, perm_id=0):
         self.contract = MagicMock(symbol=symbol)
-        self.execution = _FakeExecution(order_id, shares, avg_price, side, time)
+        self.execution = _FakeExecution(order_id, shares, avg_price, side, time, perm_id=perm_id)
 
 
 class TestGetRecentSellFill:
@@ -252,6 +253,19 @@ class TestGetRecentSellFill:
         ]
         with patch("ibkr.get_ib", return_value=fake_ib):
             result = ibkr.get_recent_sell_fill("DDOG", {40})
+        assert result == {"filled_qty": 64.0, "fill_price": 227.80}
+
+    def test_a_recorded_perm_id_is_left_out_but_its_orderid_on_another_client_is_not(self):
+        """Professor m102: orderIds collide across clientIds. The logged TRIM
+        (perm 5001) is left out; another client's stop that reuses orderId 40
+        is the exit and is kept."""
+        fake_ib = MagicMock()
+        fake_ib.reqExecutions.return_value = [
+            _FakeFillRecord("DDOG", order_id=40, shares=20.0, avg_price=240.00, side="SLD", perm_id=5001),
+            _FakeFillRecord("DDOG", order_id=40, shares=64.0, avg_price=227.80, side="SLD", perm_id=6002),
+        ]
+        with patch("ibkr.get_ib", return_value=fake_ib):
+            result = ibkr.get_recent_sell_fill("DDOG", set(), {5001})
         assert result == {"filled_qty": 64.0, "fill_price": 227.80}
 
     def test_no_sell_execution_today_returns_none(self):

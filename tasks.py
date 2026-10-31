@@ -3820,7 +3820,7 @@ def _reconcile_stop_orders_body(self):
                 db.set_state(pending_key, "")
                 fill = None
                 try:
-                    fill = ibkr.get_recent_sell_fill(ticker, recorded)
+                    fill = ibkr.get_recent_sell_fill(ticker, *recorded)
                 except Exception as e:
                     log.warning(f"[{ticker}] Exit-fill lookup failed while reconciling "
                                 f"stale stop record: {e}")

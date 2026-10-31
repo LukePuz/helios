@@ -2422,6 +2422,28 @@ def _scan_summary(regime: dict, candidates: list[dict]) -> str:
             + f", last bar {(regime.get('signals') or {}).get('last_bar_date')}")
 
 
+def _log_exit_routes() -> None:
+    """One activity row per review run: for each held position, which
+    automatic exit routes its bucket has (exempt_by_bucket, audit
+    A1031-1453 N3), and how many have none beyond the stop and a model
+    TRIM/EXIT. Log-only; never raises."""
+    try:
+        import db
+        from risk_manager import exit_routes_for_bucket
+        held = {}
+        for rec in db.get_all_position_stops():
+            routes = exit_routes_for_bucket(rec.get("thesis_bucket"))
+            held[rec["ticker"]] = {"bucket": rec.get("thesis_bucket"),
+                                   "exempt": sorted(k for k, on in routes.items() if not on)}
+        no_route = sorted(t for t, h in held.items()
+                          if not {"profit_target", "stale_flag", "swap_eligible"} - set(h["exempt"]))
+        db.log_activity("exit_routes", "",
+                        f"{len(no_route)} of {len(held)} held have no target, stale or swap route",
+                        "neutral", {"held": held, "no_auto_exit_route": no_route})
+    except Exception as e:
+        log.warning(f"exit_routes log failed: {e}")
+
+
 @app.task(name="tasks.review_positions", bind=True, max_retries=2)
 def review_positions(self):
     """Scheduled reassessment of already-held positions for TRIM/EXIT/HOLD
@@ -2445,6 +2467,7 @@ def review_positions(self):
         except Exception as e:
             log.warning(f"review_positions: stale-position flagging failed, "
                         f"proceeding without priority: {e}")
+        _log_exit_routes()
         review_all_held_positions(max_per_run=10, priority_tickers=stale_tickers)
     except Exception as e:
         log.error(f"review_positions failed: {e}")

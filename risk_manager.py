@@ -2068,6 +2068,21 @@ class RiskManager:
 
         return flagged
 
+
+def exit_routes_for_bucket(bucket: str | None) -> dict:
+    """Which automatic exit and discipline routes apply to a held position of
+    this bucket, read from the same tables the checks use (audit
+    A1031-1453 N3). Log-only: nothing acts on it."""
+    targets = (SETUP_GATES_ENABLED and bucket in CATEGORY_RISK_PCT_PER_TRADE) or any(
+        bucket in t for t in PROFIT_TARGET_PCT_BY_STYLE.values())
+    return {
+        "profit_target": bool(targets),
+        "stale_flag": any(bucket in w for w in STALE_WINDOW_DAYS_BY_STYLE.values()),
+        "swap_eligible": bucket in ("Accelerator", "Moonshot"),
+        "trailing_stop": bucket in TRAILING_STOP_ACTIVATE,
+    }
+
+
 if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv(dotenv_path=Path(__file__).parent / ".env")

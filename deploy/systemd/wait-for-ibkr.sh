@@ -17,7 +17,8 @@
 # script time out and helios-local.service fail to start at all.
 set -euo pipefail
 
-ENV_FILE="/home/YOUR_USER/Desktop/trading_bot/.env"
+# The repo root .env, found from this script's own location (deploy/systemd/).
+ENV_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/.env"
 
 _env_var() {
     # Last matching line wins, matching how python-dotenv/Python's own

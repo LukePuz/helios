@@ -6,6 +6,11 @@ directly, Ctrl+C stops everything).
 
 ## Install
 
+The unit files use `YOUR_USER` for the account that runs Helios and assume the repo is at
+`/home/YOUR_USER/Desktop/trading_bot`. Replace it when you copy them, e.g.
+`sed "s/YOUR_USER/$USER/g" deploy/systemd/helios-standby.service | sudo tee /etc/systemd/system/helios-standby.service`.
+`install-auto-schedule.sh` does this for the units it installs.
+
 ```bash
 # 1. Deploy the code (adjust the path to wherever you actually put it)
 sudo mkdir -p /opt/helios

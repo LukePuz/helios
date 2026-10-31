@@ -11,12 +11,13 @@ sudo apt-get install -y xvfb
 echo "[2/3] Installing systemd units..."
 sudo cp ~/ibc/xvfb.service.template            /etc/systemd/system/xvfb.service
 sudo cp ~/ibc/ibc.service.template             /etc/systemd/system/ibc.service
-sudo cp deploy/systemd/helios-local.service        /etc/systemd/system/helios-local.service
+# Unit files in the repo say YOUR_USER; fill in the account that runs Helios.
+sed "s/YOUR_USER/$USER/g" deploy/systemd/helios-local.service | sudo tee /etc/systemd/system/helios-local.service >/dev/null
 sudo cp deploy/systemd/helios-evening-stop.service  /etc/systemd/system/helios-evening-stop.service
 sudo cp deploy/systemd/helios-start.timer           /etc/systemd/system/helios-start.timer
 sudo cp deploy/systemd/helios-evening-stop.timer    /etc/systemd/system/helios-evening-stop.timer
 
-echo "[3/3] Enabling timers (services themselves stay disabled — only the timers trigger them)..."
+echo "[3/3] Enabling timers (services themselves stay disabled; only the timers trigger them)..."
 sudo systemctl daemon-reload
 sudo systemctl enable --now helios-start.timer
 sudo systemctl enable --now helios-evening-stop.timer

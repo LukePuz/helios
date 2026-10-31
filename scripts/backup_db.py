@@ -18,6 +18,7 @@ Keeps 14 daily and 8 weekly (Sunday) backups.
     venv/bin/python scripts/backup_db.py --check    # verify the newest one decrypts and lists
 Run from ~/Desktop/trading_bot (config loads .env from there).
 """
+import getpass
 import os
 import shutil
 import sqlite3
@@ -33,7 +34,7 @@ sys.path.insert(0, str(ROOT))
 
 PASS_FILE = Path.home() / ".config" / "helios" / "backup.pass"
 OUT_DIR = Path.home() / "helios-db-backups" / "nightly"
-USB_DIR = Path(os.getenv("BACKUP_USB_DIR", f"/media/{os.getenv('USER', 'YOUR_USER')}/HELIOS-BACKUP"))
+USB_DIR = Path(os.getenv("BACKUP_USB_DIR", f"/media/{os.getenv('USER') or getpass.getuser()}/HELIOS-BACKUP"))
 KEEP_DAILY, KEEP_WEEKLY = 14, 8
 
 

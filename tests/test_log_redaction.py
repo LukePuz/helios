@@ -62,3 +62,13 @@ def test_polygon_failure_logs_no_url(caplog):
          patch("requests.get", side_effect=err), caplog.at_level("WARNING"):
         assert polygon_stream._get("/v2/snapshot/NVDA") == {}
     assert "SECRETKEY2" not in caplog.text and "HTTP 500" in caplog.text
+
+
+def test_heartbeat_fail_stores_the_error_redacted():
+    """Professor m139: ingestion_health.last_error kept the raw request URL."""
+    from unittest.mock import patch
+    import tasks
+    with patch("db.record_ingestion_error") as rec:
+        tasks._heartbeat_fail("fred", "HTTPError for url: https://x/series?api_key=abc123&file_type=json")
+    stored = rec.call_args[0][1]
+    assert "abc123" not in stored and "api_key=[REDACTED]" in stored

@@ -705,6 +705,22 @@ def cancel_stop_orders_for(ticker: str) -> int:
     return confirmed
 
 
+def get_completed_order_status(broker_order_id: int, ticker: str, side: str) -> str | None:
+    """Final status ("Cancelled", "Filled", "Inactive", ...) of one of today's
+    completed orders, matched by orderId, symbol and side, or None if the
+    order isn't among them (still working, or from an earlier session).
+    Raises on a broker error. Lets reconcile tell a cancelled unconfirmed
+    order from one still working (professor M127)."""
+    ib = get_ib()
+    trades = ib.reqCompletedOrders(False)
+    for trade in trades:
+        o = trade.order
+        if (o.orderId == broker_order_id and trade.contract.symbol == ticker
+                and (o.action or "").upper() == (side or "").upper()):
+            return trade.orderStatus.status
+    return None
+
+
 def get_fill_for_order(broker_order_id: int, ticker: str | None = None,
                        side: str | None = None, placed_at=None) -> dict | None:
     """Looks up actual executions for a specific order by id, aggregating

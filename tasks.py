@@ -630,19 +630,20 @@ app.conf.beat_schedule = {
         "schedule": crontab(hour=16, minute=30, day_of_week="mon-fri"),
         "options":  {"expires": 24 * 3600},
     },
-    # Vector store pruning — Sunday 3:00 AM. Stack is down all weekend;
-    # actually runs via catch-up Monday 05:00 (~26h later).
+    # Vector store pruning — Friday 17:45, inside the weekday run window.
+    # It was Sunday 03:00, which only ran as a Monday 05:00 catch-up next to
+    # the pre-market pollers (audit A1031-1253-7). 72h expiry: a Friday the
+    # stack is down still runs at Monday's start.
     "prune-vector-store": {
         "task":     "tasks.prune_vector_store",
-        "schedule": crontab(hour=3, minute=0, day_of_week="sun"),
-        "options":  {"expires": 36 * 3600},
+        "schedule": crontab(hour=17, minute=45, day_of_week="fri"),
+        "options":  {"expires": 72 * 3600},
     },
-    # seen_items dedup table — same slot as vector store pruning, same
-    # down-all-weekend caveat (runs via Monday 05:00 catch-up).
+    # seen_items dedup table — right after vector store pruning.
     "prune-seen-items": {
         "task":     "tasks.prune_seen_items",
-        "schedule": crontab(hour=3, minute=15, day_of_week="sun"),
-        "options":  {"expires": 36 * 3600},
+        "schedule": crontab(hour=17, minute=50, day_of_week="fri"),
+        "options":  {"expires": 72 * 3600},
     },
     # News (yfinance + Google News RSS) — every 15 minutes
     # IPO watch (Luke, 2026-10-28): is a pending company listed yet?
@@ -682,9 +683,9 @@ app.conf.beat_schedule = {
         "schedule": crontab(hour=17, minute=15, day_of_week="mon-fri"),
         "options":  {"queue": INGESTION_QUEUE, "expires": 2 * 3600},
     },
-    # S&P 500 universe price history — weekly, Saturday 9:00 AM. Same
-    # down-all-weekend caveat as prune-vector-store/prune-seen-items above:
-    # actually runs via Monday 05:00 catch-up (~44h later), which is fine —
+    # S&P 500 universe price history — weekly, Saturday 9:00 AM. The stack
+    # is down all weekend, so it actually runs via the Monday 05:00 catch-up
+    # (~44h later), which is fine —
     # feeds GICS-sector breadth + candidate_scanner, neither of which needs
     # day-fresh data (see refresh_sp500_history's docstring).
     "refresh-sp500-history": {
@@ -721,12 +722,14 @@ app.conf.beat_schedule = {
         "schedule": crontab(hour=16, minute=15, day_of_week="mon-fri"),
         "options":  {"expires": 3 * 3600},
     },
-    # Weekly self-review — Sunday 6:00 PM ET (stack is down then; catch-up
-    # runs it Monday 05:00). LLM-heavy → llm bulk lane.
+    # Weekly self-review — Friday 18:00, after the week's last close and
+    # before the 19:00 stop (~1 min run). It was Sunday 18:00, which ran at
+    # Monday 05:00 against pre-market analyses (A1031-1253-7). LLM-heavy →
+    # llm bulk lane; 72h expiry so a missed Friday runs at Monday's start.
     "weekly-self-review": {
         "task":     "tasks.weekly_self_review",
-        "schedule": crontab(hour=18, minute=0, day_of_week="sun"),
-        "options":  {"queue": LLM_QUEUE_BULK, "expires": 24 * 3600},
+        "schedule": crontab(hour=18, minute=0, day_of_week="fri"),
+        "options":  {"queue": LLM_QUEUE_BULK, "expires": 72 * 3600},
     },
 }
 

@@ -1950,9 +1950,10 @@ class TestRetryHeldSell:
         _, upd, _ = self._run(success=False)
         assert upd.call_args.args[1] == "FAILED" and upd.call_args.kwargs["reason"].endswith("skipped: x")
 
-    def test_no_retry_outside_market_hours(self):
-        ex, upd, claim = self._run(market=False)
-        ex.assert_not_called(); upd.assert_not_called(); claim.assert_not_called()
+    def test_no_retry_outside_market_hours_and_the_row_says_so(self):
+        ex, upd, _ = self._run(market=False)
+        ex.assert_not_called()
+        assert upd.call_args.kwargs["reason"].endswith("not retried: market closed")
 
     def test_no_retry_when_nothing_is_held(self):
         ex, upd, _ = self._run(held=0.0)
@@ -1964,9 +1965,28 @@ class TestRetryHeldSell:
         ex.assert_not_called()
         assert "superseded" in upd.call_args.kwargs["reason"]
 
-    def test_no_retry_when_the_activity_check_fails(self):
-        ex, upd, claim = self._run(newer=None)
-        ex.assert_not_called(); upd.assert_not_called(); claim.assert_not_called()
+    def test_no_retry_when_the_activity_check_fails_and_the_row_says_so(self):
+        ex, upd, _ = self._run(newer=None)
+        ex.assert_not_called()
+        assert upd.call_args.kwargs["reason"].endswith("not retried: newer-activity check failed")
+
+    def test_a_failed_position_read_is_noted(self):
+        from unittest.mock import MagicMock
+        client = MagicMock()
+        client.get_all_positions.side_effect = RuntimeError("down")
+        with patch("db.get_approval_by_id", return_value=self.APPROVAL), \
+             patch("market_data.is_market_hours", return_value=True), \
+             patch("ibkr.get_client", return_value=client), \
+             patch("db.claim_failed_sell_for_retry", return_value=self.HELD), \
+             patch("execution.execute_approved") as ex, \
+             patch("db.update_approval_status") as upd:
+            tasks.retry_held_sell.run(81)
+        ex.assert_not_called()
+        assert upd.call_args.kwargs["reason"].endswith("not retried: position read failed")
+
+    def test_a_lost_claim_on_a_skip_writes_nothing(self):
+        ex, upd, _ = self._run(market=False, claim=None)
+        ex.assert_not_called(); upd.assert_not_called()
 
     def test_no_retry_when_the_claim_is_lost(self):
         ex, upd, _ = self._run(claim=None)

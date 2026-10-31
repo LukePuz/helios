@@ -2861,7 +2861,8 @@ def _monitor_health(name: str, failed: bool) -> None:
         from config import TRADING_ENV
         key = f"monitor_fail_count_{name}_{TRADING_ENV}"
         since_key = f"monitor_fail_since_{name}_{TRADING_ENV}"
-        count = int(db.get_state(key, "0") or 0)
+        # Strict: a failed read must not restart the count (SEF, after M146).
+        count = int(db.get_state_strict(key, "0") or 0)
         now = datetime.now(timezone.utc).isoformat()
         spell = {"check": name, "env": TRADING_ENV}
         if failed:

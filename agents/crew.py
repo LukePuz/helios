@@ -903,11 +903,26 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
         # enter risk automatically but never exit it). The catalyst gate and
         # concentration/correlation checks are buy gates; a sell must never
         # be blocked by them.
-        try:
-            pos   = trading_client.get_open_position(ticker)
-            owned = abs(float(pos.qty))
-        except Exception:
-            owned = 0.0
+        # A failed broker read is not "no position": it used to drop the
+        # sell silently as SELL_NO_POSITION (audit A1031-1253-5).
+        positions = _get_positions(trading_client, strict=True)
+        if positions is None:
+            log.warning(f"[{ticker}] {action} recommended but broker positions unreadable — not sold")
+            try:
+                db.log_signal(ticker, "SELL_POSITION_UNREADABLE", conviction / 10.0,
+                              result.get("reasoning", "")[:500])
+            except Exception:
+                pass
+            try:
+                import alerts
+                alerts._send(f"⚠️ SELL NOT SENT — {ticker}\nThe model recommended {action}, but broker "
+                             f"positions couldn't be read, so nothing was sold. Check TWS; the next "
+                             f"review of {ticker} decides again.")
+            except Exception:
+                pass
+            return
+        pos = positions.get(ticker) or {}
+        owned = abs(float(pos.get("qty") or 0))
         if owned <= 0:
             log.info(f"[{ticker}] {action} recommended but no position held — signal logged only")
             try:
@@ -923,7 +938,7 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
             TRIM_FRACTION = 0.33
         sell_qty = owned if action == "EXIT" else min(owned, max(1, int(owned * TRIM_FRACTION)))
 
-        price = _get_price(ticker, trading_client) or float(getattr(pos, "current_price", 0) or 0)
+        price = _get_price(ticker, trading_client) or float(pos.get("current_price") or 0)
         sizing = {
             "ticker":            ticker,
             "position_size_pct": 0,

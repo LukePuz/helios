@@ -38,9 +38,9 @@ class TestSellRouting:
         at-target held name, which used to silently drop every analyst
         sell recommendation."""
         result = _analyst_result(action="TRIM")
-        position = MagicMock(qty=90.0)
         client = MagicMock()
-        client.get_open_position.return_value = position
+        client.get_all_positions.return_value = [MagicMock(
+            symbol="NVDA", qty=90.0, avg_entry_price=100.0, current_price=100.0, market_value=9000.0)]
 
         with patch("db.has_active_approval", return_value=False), \
              patch("db.log_pending_approval", return_value=10), \
@@ -68,7 +68,7 @@ class TestSellRouting:
         fall through to buy sizing — just log and stop."""
         result = _analyst_result(action="EXIT")
         client = MagicMock()
-        client.get_open_position.side_effect = Exception("No open position in NVDA")
+        client.get_all_positions.return_value = []
 
         with patch("db.has_active_approval", return_value=False), \
              patch("db.log_signal") as mock_log_signal, \
@@ -79,6 +79,23 @@ class TestSellRouting:
         mock_log_approval.assert_not_called()
         mock_rm_cls.return_value.size_position.assert_not_called()
         assert mock_log_signal.call_args[0][1] == "SELL_NO_POSITION"
+
+
+    def test_unreadable_positions_alert_instead_of_dropping_the_sell(self):
+        """Audit A1031-1253-5: a broker read error is not "no position"."""
+        result = _analyst_result(action="EXIT")
+        client = MagicMock()
+        client.get_all_positions.side_effect = ConnectionError("gateway down")
+
+        with patch("db.has_active_approval", return_value=False), \
+             patch("db.log_signal") as mock_log_signal, \
+             patch("db.log_pending_approval") as mock_log_approval, \
+             patch("alerts._send") as send:
+            crew._route_to_approval(result, {"regime": "Neutral"}, client)
+
+        mock_log_approval.assert_not_called()
+        assert mock_log_signal.call_args[0][1] == "SELL_POSITION_UNREADABLE"
+        assert "SELL NOT SENT" in send.call_args[0][0]
 
 
 class TestRebuyCooldown:

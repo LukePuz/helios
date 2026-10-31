@@ -1061,6 +1061,7 @@ def get_chat_history(user_id: str, limit: int = 12, max_age_hours: float = 4) ->
 
 # Signal types crew.py logs for routing decisions, not analyst verdicts.
 _NON_ANALYST_SIGNALS = ("SCREENED_OUT", "CATALYST_BLOCKED", "COOLDOWN_SKIPPED", "SELL_NO_POSITION",
+                        "SELL_POSITION_UNREADABLE",
                         "EARNINGS_BLOCKED", "ROUTE_APPROVAL_PENDING", "ROUTE_NO_PRICE",
                         "ROUTE_ZERO_SHARES", "ROUTE_CONCENTRATION_ZERO",
                         # Written at 0.0: read as a verdict it made a healthy

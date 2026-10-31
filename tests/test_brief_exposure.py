@@ -78,3 +78,14 @@ def test_gate_flags():
         assert analyst._gate_flags("NVDA", "OPEN", 8, 2, True, "OPEN", 8, now=now)["rubric_gate_conflict"] is False
     with patch("db.get_recent_verdicts", side_effect=RuntimeError("db down")):
         assert analyst._gate_flags("NVDA", "HOLD", 6, 2, False, now=now)["verdicts_today"] is None
+
+
+def test_held_at_gate_records_the_read_time_and_age():
+    """Professor M138: how old the broker read was when the gates used it."""
+    from datetime import datetime, timezone
+    now = datetime(2026, 11, 2, 14, 5, tzinfo=timezone.utc)
+    cand = {"held": True, "held_as_of": "2026-11-02T14:01:30+00:00"}
+    assert analyst._held_at_gate(cand, now=now) == {
+        "held_at_gate": True, "held_at_gate_as_of": "2026-11-02T14:01:30+00:00", "held_at_gate_age_s": 210}
+    assert analyst._held_at_gate({"held": None}, now=now) == {
+        "held_at_gate": None, "held_at_gate_as_of": None, "held_at_gate_age_s": None}

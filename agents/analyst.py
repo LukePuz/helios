@@ -462,6 +462,16 @@ def _gate_flags(ticker: str, action: str, conviction: int, source_count: int,
     return out
 
 
+def _held_at_gate(candidate: dict, now=None) -> dict:
+    """The held flag the gates used, when that broker read was taken, and
+    its age here (M138): the 72B call sits between the read and the gates."""
+    as_of = candidate.get("held_as_of")
+    now = now or datetime.now(timezone.utc)
+    return {"held_at_gate": candidate.get("held"), "held_at_gate_as_of": as_of,
+            "held_at_gate_age_s": (round((now - datetime.fromisoformat(as_of)).total_seconds())
+                                   if as_of else None)}
+
+
 def _brief_exposure(ticker: str, prompt: str) -> dict:
     """Log-only: what the brief showed the model about its own position and
     past verdicts, and whether the broker holds the ticker (audit A1031-0453
@@ -1606,7 +1616,7 @@ def analyze(
         provenance["brief_exposure"] = _brief_exposure(ticker, prompt)
         # The held flag the gates used (crew sets it from broker positions
         # before the call); the other held fields are read after it (M138).
-        provenance["brief_exposure"]["held_at_gate"] = candidate.get("held")
+        provenance["brief_exposure"].update(_held_at_gate(candidate))
     except Exception as e:
         log.debug(f"[{ticker}] brief exposure record failed: {e}")
     try:

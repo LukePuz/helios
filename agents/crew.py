@@ -115,10 +115,12 @@ def deep_analyze(event: dict, screening: dict | None = None) -> dict:
     log.info(f"[{ticker}] Deep analysis: {event.get('source','?')} — {event.get('title','')[:60]}")
 
     # ── Assemble situation brief ──────────────────────────────────────────────
+    held_as_of = None
     try:
         from ibkr import IBKRClient
         client = IBKRClient()
         positions = _get_positions(client, strict=True)
+        held_as_of = datetime.now(timezone.utc).isoformat()
         if positions is None:
             log.warning(f"[{ticker}] Broker positions unavailable — skipping analysis "
                         f"rather than analysing against an empty book")
@@ -147,6 +149,7 @@ def deep_analyze(event: dict, screening: dict | None = None) -> dict:
         "composite_score": 60,  # event-triggered, score is nominal
         # None when the brief failed; analyze() only coerces on a known value
         "held":            (ticker in positions) if client is not None else None,
+        "held_as_of":      held_as_of if client is not None else None,   # M138
     }
 
     # ── Analyze ────────────────────────────────────────────────────────────────

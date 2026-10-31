@@ -1408,11 +1408,17 @@ def _queue_reprotect(ticker: str, order: dict, fill_price: float | None) -> None
                 # The flat close needs the exit's own order (professor m111).
                 pending[ticker]["exit_intent"] = entry["intent"]
                 pending[ticker]["exit_order_id"] = entry["order_id"]
+            elif entry["intent"] == "BUY":
+                # New shares: an old exit's fill must never close what reads
+                # flat next (review of 245c9af).
+                pending[ticker].pop("exit_intent", None)
+                pending[ticker].pop("exit_order_id", None)
         else:
             pending[ticker] = entry
-            if (entry["intent"] or "").upper() not in ("EXIT", "BACKSTOP"):
-                # A RESTORE/BUY replacing a queued exit keeps that exit's
-                # order for the flat close (review of 03efab7, as m111).
+            if (entry["intent"] or "").upper() not in ("EXIT", "BACKSTOP", "BUY"):
+                # A RESTORE replacing a queued exit keeps that exit's order for
+                # the flat close (review of 03efab7, as m111). Never a BUY: its
+                # new shares make an old exit's fill the wrong close.
                 if (old.get("intent") or "").upper() in ("EXIT", "BACKSTOP"):
                     pending[ticker].update(exit_intent=old["intent"], exit_order_id=old.get("order_id"))
                 elif old.get("exit_intent"):

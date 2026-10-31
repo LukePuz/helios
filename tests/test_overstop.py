@@ -487,3 +487,19 @@ def test_a_restore_replacing_a_queued_exit_keeps_the_exits_order():
         tasks._queue_reprotect("CRWD", {"intent": "RESTORE"}, None)
     rec = json.loads(state[tasks._REPROTECT_STATE_KEY])["CRWD"]
     assert rec["intent"] == "RESTORE" and rec["exit_intent"] == "EXIT" and rec["exit_order_id"] == 5
+
+
+def test_a_buy_never_inherits_a_queued_exits_order():
+    """Review of 245c9af: a flat read after a re-entry would close the new
+    position's outcome at the old exit's fill."""
+    import json
+    for old in ({"intent": "EXIT", "order_id": 5, "nonce": "a"},
+                {"intent": "PROFIT_TARGET", "stop_price": 180.0, "exit_intent": "EXIT",
+                 "exit_order_id": 5, "nonce": "a"}):
+        state = {tasks._REPROTECT_STATE_KEY: json.dumps({"CRWD": old})}
+        with patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
+             patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+             patch("stop_lock._redis", side_effect=RuntimeError("no redis")):
+            tasks._queue_reprotect("CRWD", {"intent": "BUY"}, None)
+        rec = json.loads(state[tasks._REPROTECT_STATE_KEY])["CRWD"]
+        assert "exit_intent" not in rec and "exit_order_id" not in rec

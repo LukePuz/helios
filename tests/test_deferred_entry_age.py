@@ -1,9 +1,18 @@
 """Deferred entries older than 16 h are re-analysed, not executed (2026-10-27,
 limitations audit finding 13)."""
+import pytest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import tasks
+
+
+@pytest.fixture(autouse=True)
+def _claim_wins():
+    """retry_deferred_entry claims the row before executing (FAILED -> PROCESSING)."""
+    with patch("db.claim_deferred_entry_for_retry", return_value=True):
+        yield
+
 
 
 def _approval(hours_old):

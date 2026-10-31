@@ -1,9 +1,18 @@
 """A deferred OPEN/ADD is dropped at the open when a newer buy approval or a
 newer non-buy verdict exists for the ticker (audit 2026-10-28 10:53 #2)."""
+import pytest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import tasks
+
+
+@pytest.fixture(autouse=True)
+def _claim_wins():
+    """retry_deferred_entry claims the row before executing (FAILED -> PROCESSING)."""
+    with patch("db.claim_deferred_entry_for_retry", return_value=True):
+        yield
+
 
 
 def _approval(action="OPEN"):

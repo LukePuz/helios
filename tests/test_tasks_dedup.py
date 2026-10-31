@@ -274,6 +274,11 @@ class TestRetryDeferredEntry:
     execute_approved's own safety checks (price drift, drawdown halt)
     rather than re-running the 72B analysis."""
 
+    @pytest.fixture(autouse=True)
+    def _claim_wins(self):
+        with patch("db.claim_deferred_entry_for_retry", return_value=True):
+            yield
+
     def test_retries_failed_approval(self):
         approval = {"id": 1, "ticker": "NVDA", "status": "FAILED"}
         with patch("db.get_approval_by_id", return_value=approval), \
@@ -2100,3 +2105,34 @@ def test_held_sell_claim_excludes_swept_rows():
         db.claim_failed_sell_for_retry(5)
     sql, params = cur.execute.call_args[0]
     assert params[-1] == "%swept:%" and sql.count("NOT LIKE") == 2
+
+
+def test_a_deferred_retry_that_loses_its_claim_does_not_execute():
+    """A duplicate delivery of retry_deferred_entry must not execute twice."""
+    import tasks
+    approval = {"id": 7, "ticker": "NVDA", "action": "OPEN", "status": "FAILED", "status_reason": "deferred"}
+    with patch("db.get_approval_by_id", return_value=approval), \
+         patch("tasks._approval_age_hours", return_value=1.0), \
+         patch("tasks._deferred_buy_superseded", return_value=None), \
+         patch("tasks._deferred_buy_shares_now", return_value=None), \
+         patch("db.claim_deferred_entry_for_retry", return_value=False), \
+         patch("execution.execute_approved") as ex, patch("db.update_approval_status") as upd:
+        tasks.retry_deferred_entry.run(7)
+    ex.assert_not_called()
+    upd.assert_not_called()
+
+
+def test_claim_deferred_entry_sql():
+    from unittest.mock import MagicMock
+    import db
+    cur = MagicMock()
+    cur.fetchone.return_value = (7,)
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
+        assert db.claim_deferred_entry_for_retry(7) is True
+        cur.fetchone.return_value = None
+        assert db.claim_deferred_entry_for_retry(7) is False
+    sql, params = cur.execute.call_args[0]
+    assert "SET status='PROCESSING', decided_at=NOW()" in sql and "status='FAILED'" in sql
+    assert params == (7, "%swept:%")

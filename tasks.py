@@ -1094,6 +1094,13 @@ def retry_deferred_entry(self, approval_id: int, gap_retry_attempt: int = 1, pri
             # risk_json keeps the approved size; record why fewer were bought.
             resized = f"reduced {approved} -> {shares_now} shares at execution"
 
+    # Claim it first: the retry used to execute while the row sat FAILED, so a
+    # duplicate delivery of this task could execute it twice. A crash after
+    # this leaves it PROCESSING for the sweep, which never retries it.
+    if not db.claim_deferred_entry_for_retry(approval_id):
+        log.info(f"retry_deferred_entry: [{ticker}] approval #{approval_id} not claimed "
+                 f"(already taken, swept or unreadable) — skipping")
+        return
     success = execute_approved(
         approval, trigger="auto_retry",
         gap_retry_attempt=gap_retry_attempt, price_retry_attempt=price_retry_attempt,

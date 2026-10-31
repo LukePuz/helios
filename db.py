@@ -1517,6 +1517,31 @@ def has_newer_buy_approval(ticker: str, approval_id: int) -> bool:
 HELD_SELL_REASON_PREFIX = "skipped: resting stops unreadable"
 
 
+def claim_deferred_entry_for_retry(approval_id: int) -> bool:
+    """FAILED -> PROCESSING for a deferred-entry retry, so a duplicate
+    delivery of the same retry task can't execute it twice (review of
+    fd36f3a, M139 class). Swept rows never match. decided_at is reset so the
+    PROCESSING sweep measures from this claim. False on error."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE pending_approvals SET status='PROCESSING', decided_at=NOW() "
+                "WHERE id=%s AND status='FAILED' "
+                "AND COALESCE(status_reason, '') NOT LIKE %s RETURNING id",
+                (approval_id, f"%{SWEPT_REASON_MARK}%"),
+            )
+            won = cur.fetchone() is not None
+        conn.commit()
+        return won
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"claim_deferred_entry_for_retry failed: {e}")
+        return False
+    finally:
+        _put_conn(conn)
+
+
 def claim_failed_sell_for_retry(approval_id: int) -> str | None:
     """FAILED -> PROCESSING for a TRIM/EXIT held because resting stops were
     unreadable, once only: a reason already marked "retried at" never matches

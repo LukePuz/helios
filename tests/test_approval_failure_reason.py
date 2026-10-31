@@ -1,9 +1,18 @@
 """Why an execution returned False reaches status_reason (professor M-6)."""
+import pytest
 from unittest.mock import patch
 
 import execution
 import stop_lock
 from conftest import _FakeLock
+
+
+@pytest.fixture(autouse=True)
+def _claim_wins():
+    """retry_deferred_entry claims the row before executing (FAILED -> PROCESSING)."""
+    with patch("db.claim_deferred_entry_for_retry", return_value=True):
+        yield
+
 
 
 def test_ibkr_unreachable_reason():

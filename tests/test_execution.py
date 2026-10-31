@@ -11,6 +11,16 @@ import execution
 
 
 @pytest.fixture(autouse=True)
+def _gap_check_reads_no_gap(monkeypatch):
+    """The gap check now returns "unreadable" without bars (M148), which
+    blocks a BUY; tests that aren't about it get "no_gap". Tests that are
+    patch market_data.check_gap_confirmation themselves, which wins."""
+    import market_data
+    monkeypatch.setattr(market_data, "check_gap_confirmation",
+                        lambda ticker, today=None: {"status": "no_gap"})
+
+
+@pytest.fixture(autouse=True)
 def _regular_hours():
     """Default to regular hours; tests about closed markets patch it themselves."""
     with patch("market_data.is_market_hours", return_value=True):
@@ -533,14 +543,14 @@ class TestGapConfirmationGuard:
         mock_retry_task.apply_async.assert_not_called()
         assert "Gap Unconfirmed" in mock_alert.call_args[0][0]
 
-    def _gap_raises(self, attempt):
+    def _gap_raises(self, attempt, gap_patch=None):
         approval = _approval(action="ADD", price_at_sizing=108.0)
         with patch("ibkr.get_ib"), \
              patch("ibkr.get_client"), \
              patch("risk_manager.RiskManager") as mock_rm_cls, \
              patch("ibkr.place_market_order") as mock_order, \
              patch("market_data.get_priced_quote", return_value=self._fresh_quote()), \
-             patch("market_data.check_gap_confirmation", side_effect=RuntimeError("no bars")), \
+             (gap_patch or patch("market_data.check_gap_confirmation", side_effect=RuntimeError("no bars"))), \
              patch("market_data.is_market_hours", return_value=True), \
              patch("tasks.retry_deferred_entry") as mock_retry_task, \
              patch("alerts._send") as mock_alert:
@@ -553,6 +563,12 @@ class TestGapConfirmationGuard:
     def test_buy_defers_when_gap_check_errors(self):
         """Audit 2026-10-28 14:53 #8: used to proceed with the BUY unchecked."""
         retry, _ = self._gap_raises(1)
+        assert retry.apply_async.call_args.kwargs["args"][1] == 2
+
+    def test_an_unreadable_gap_check_defers_like_an_error(self):
+        """Professor M148: "unreadable" used to read as no_gap and buy."""
+        unreadable = patch("market_data.check_gap_confirmation", return_value={"status": "unreadable"})
+        retry, _ = self._gap_raises(1, unreadable)
         assert retry.apply_async.call_args.kwargs["args"][1] == 2
 
     def test_buy_skips_when_gap_check_keeps_erroring(self):

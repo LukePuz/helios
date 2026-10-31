@@ -183,11 +183,14 @@ def check_gap_confirmation(ticker: str, today: str | None = None) -> dict:
 
     empty = {"status": "no_gap", "gap_pct": None, "retracement_pct": None,
              "open_price": None, "prior_close": None, "current_price": None}
+    # Missing bars or an error is "can't tell", not "no gap": the BUY path
+    # treats it like its own check failure, retry then skip (professor M148).
+    unreadable = {**empty, "status": "unreadable"}
     try:
         daily = get_historical_bars(ticker, duration="5 D", bar_size="1 day")
         intraday = get_historical_bars(ticker, duration="1 D", bar_size="1 min")
         if not daily or not intraday:
-            return empty
+            return unreadable
 
         # In market hours IBKR's last daily bar is today's partial one, which
         # made "prior close" the current price (audit A1031-1453-1: AAOI
@@ -204,14 +207,14 @@ def check_gap_confirmation(ticker: str, today: str | None = None) -> dict:
         before = [b for b in daily if str(b["time"])[:10] < session]
         if not before:
             log.warning(f"check_gap_confirmation({ticker}): no daily bar before {session}")
-            return empty
+            return unreadable
         prior_close = float(before[-1]["close"])
         open_price = float(intraday[0]["open"])
         current_price = float(intraday[-1]["close"])
         bars_since_open = len(intraday)
 
         if not prior_close:
-            return empty
+            return unreadable
 
         gap_pct = (open_price - prior_close) / prior_close
         if abs(gap_pct) < GAP_CONFIRMATION_THRESHOLD_PCT:
@@ -235,7 +238,7 @@ def check_gap_confirmation(ticker: str, today: str | None = None) -> dict:
         return result
     except Exception as e:
         log.warning(f"check_gap_confirmation({ticker}) failed: {e}")
-        return empty
+        return unreadable
 
 
 _SESSION_QUOTE_CACHE: dict[str, tuple[float, dict | None]] = {}

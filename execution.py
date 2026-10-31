@@ -928,6 +928,9 @@ def execute_approved(
                 from market_data import check_gap_confirmation
                 from config import GAP_CONFIRMATION_MAX_RETRIES, GAP_CONFIRMATION_RETRY_MINUTES
                 gap = check_gap_confirmation(ticker)
+                if gap["status"] == "unreadable":
+                    # Same path as a raised check: retry, then skip (M148).
+                    raise RuntimeError("gap check could not read the bars")
                 if gap["status"] == "failed":
                     log.error(
                         f"[{ticker}] Opening gap already reversing "

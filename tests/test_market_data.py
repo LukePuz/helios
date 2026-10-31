@@ -178,7 +178,7 @@ class TestGapConfirmation:
         with patch("market_data.get_historical_bars",
                    side_effect=lambda t, duration="20 D", bar_size="1 day", **k:
                    daily if bar_size == "1 day" else intraday):
-            assert market_data.check_gap_confirmation("AAPL", today="2026-07-29")["status"] == "no_gap"
+            assert market_data.check_gap_confirmation("AAPL", today="2026-07-29")["status"] == "unreadable"
 
     def test_before_todays_first_bar_is_no_gap(self):
         """Pre-open the 1-min bars are yesterday's session: don't judge yesterday's gap."""
@@ -187,7 +187,11 @@ class TestGapConfirmation:
         with patch("market_data.get_historical_bars", side_effect=fake):
             assert market_data.check_gap_confirmation("AAPL", today="2026-07-30")["status"] == "no_gap"
 
-    def test_no_data_available_is_no_gap_not_an_error(self):
+    def test_no_data_available_is_unreadable_not_no_gap(self):
+        """Professor M148: missing bars mean "can't tell", which the BUY path
+        retries and then skips, not "no gap"."""
         with patch("market_data.get_historical_bars", return_value=[]):
             result = market_data.check_gap_confirmation("AAPL", today="2026-07-29")
-        assert result["status"] == "no_gap"
+        assert result["status"] == "unreadable"
+        with patch("market_data.get_historical_bars", side_effect=RuntimeError("pacing")):
+            assert market_data.check_gap_confirmation("AAPL", today="2026-07-29")["status"] == "unreadable"

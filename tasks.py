@@ -1091,34 +1091,40 @@ def retry_held_sell(self, approval_id: int):
     ticker = approval["ticker"]
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    def note(outcome: str, status: str = "FAILED") -> None:
-        db.update_approval_status(approval_id, status, reason=(
-            f"{db.HELD_SELL_REASON_PREFIX}, sell not sent | retried at {stamp}: {outcome}"))
+    def note(held_reason: str, outcome: str, status: str = "FAILED") -> None:
+        # Appended, so the original hold (before or after the cancel) stays readable.
+        db.update_approval_status(approval_id, status, reason=f"{held_reason} | retried at {stamp}: {outcome}")
 
     if not is_market_hours():
         log.info(f"retry_held_sell: [{ticker}] #{approval_id} not retried, market closed")
         return
     try:
-        held = abs(float(ibkr.get_client().get_open_position(ticker).qty))
+        # All positions, not get_open_position: that raises when the stop
+        # filled meanwhile, which is the "nothing held" case.
+        pos = next((p for p in ibkr.get_client().get_all_positions() if p.symbol == ticker), None)
+        held = abs(float(pos.qty)) if pos else 0.0
     except Exception as e:
         log.warning(f"retry_held_sell: [{ticker}] #{approval_id} position read failed ({e}); not retried")
         return
     if held <= 0:
-        if db.claim_failed_sell_for_retry(approval_id):
-            note("not sent, no position held")
+        held_reason = db.claim_failed_sell_for_retry(approval_id)
+        if held_reason:
+            note(held_reason, "not sent, no position held")
         return
     newer = db.has_newer_ticker_activity(ticker, approval_id, approval.get("timestamp"))
     if newer is not False:
-        if newer and db.claim_failed_sell_for_retry(approval_id):
-            note("not sent, superseded by a newer approval or verdict")
+        held_reason = db.claim_failed_sell_for_retry(approval_id) if newer else None
+        if held_reason:
+            note(held_reason, "not sent, superseded by a newer approval or verdict")
         log.info(f"retry_held_sell: [{ticker}] #{approval_id} not retried "
                  f"({'superseded' if newer else 'activity check failed'})")
         return
-    if not db.claim_failed_sell_for_retry(approval_id):
+    held_reason = db.claim_failed_sell_for_retry(approval_id)
+    if not held_reason:
         log.info(f"retry_held_sell: [{ticker}] #{approval_id} already retried or changed; skipping")
         return
     success = execute_approved(approval, trigger="held_sell_retry")
-    note("executed" if success else last_outcome_reason(), "APPROVED" if success else "FAILED")
+    note(held_reason, "executed" if success else last_outcome_reason(), "APPROVED" if success else "FAILED")
     log.info(f"retry_held_sell: [{ticker}] #{approval_id} {'executed' if success else 'still failed'} on retry")
 
 

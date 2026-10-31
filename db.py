@@ -1517,26 +1517,26 @@ def has_newer_buy_approval(ticker: str, approval_id: int) -> bool:
 HELD_SELL_REASON_PREFIX = "skipped: resting stops unreadable"
 
 
-def claim_failed_sell_for_retry(approval_id: int) -> bool:
+def claim_failed_sell_for_retry(approval_id: int) -> str | None:
     """FAILED -> PROCESSING for a TRIM/EXIT held because resting stops were
     unreadable, once only: a reason already marked "retried at" never matches
-    (m127). True only for the call that won."""
+    (m127). Returns the held reason for the call that won, else None."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE pending_approvals SET status='PROCESSING', decided_at=NOW() "
                 "WHERE id=%s AND status='FAILED' AND action IN ('TRIM','EXIT') "
-                "AND status_reason LIKE %s AND status_reason NOT LIKE %s RETURNING id",
+                "AND status_reason LIKE %s AND status_reason NOT LIKE %s RETURNING status_reason",
                 (approval_id, HELD_SELL_REASON_PREFIX + "%", "%retried at%"),
             )
-            claimed = cur.fetchone() is not None
+            row = cur.fetchone()
         conn.commit()
-        return claimed
+        return row[0] if row else None
     except Exception as e:
         conn.rollback()
         logging.error(f"claim_failed_sell_for_retry failed: {e}")
-        return False
+        return None
     finally:
         _put_conn(conn)
 

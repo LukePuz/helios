@@ -1922,10 +1922,12 @@ class TestRetryHeldSell:
 
     APPROVAL = {"id": 81, "ticker": "AMD", "action": "EXIT", "status": "FAILED", "timestamp": "T0"}
 
-    def _run(self, approval=None, market=True, held=5.0, newer=False, claim=True, success=True):
+    HELD = "skipped: resting stops unreadable, sell not sent (stop left in place)"
+
+    def _run(self, approval=None, market=True, held=5.0, newer=False, claim=HELD, success=True):
         from unittest.mock import MagicMock
         client = MagicMock()
-        client.get_open_position.return_value = MagicMock(qty=held)
+        client.get_all_positions.return_value = [MagicMock(symbol="AMD", qty=held)] if held else []
         with patch("db.get_approval_by_id", return_value=approval or self.APPROVAL), \
              patch("market_data.is_market_hours", return_value=market), \
              patch("ibkr.get_client", return_value=client), \
@@ -1942,7 +1944,7 @@ class TestRetryHeldSell:
         ex.assert_called_once()
         assert ex.call_args.kwargs["trigger"] == "held_sell_retry"
         status, reason = upd.call_args.args[1], upd.call_args.kwargs["reason"]
-        assert status == "APPROVED" and "retried at" in reason and reason.endswith("executed")
+        assert status == "APPROVED" and reason.startswith(self.HELD + " | retried at ") and reason.endswith("executed")
 
     def test_a_failed_retry_stays_failed_with_its_reason(self):
         _, upd, _ = self._run(success=False)
@@ -1967,9 +1969,43 @@ class TestRetryHeldSell:
         ex.assert_not_called(); upd.assert_not_called(); claim.assert_not_called()
 
     def test_no_retry_when_the_claim_is_lost(self):
-        ex, upd, _ = self._run(claim=False)
+        ex, upd, _ = self._run(claim=None)
         ex.assert_not_called(); upd.assert_not_called()
 
     def test_a_non_failed_approval_is_left_alone(self):
         ex, upd, claim = self._run(approval={**self.APPROVAL, "status": "APPROVED"})
         ex.assert_not_called(); claim.assert_not_called()
+
+
+def test_claim_failed_sell_for_retry_sql():
+    """m127: once only, TRIM/EXIT, the held reason prefix; returns that reason."""
+    from unittest.mock import MagicMock
+    import db
+    cur = MagicMock()
+    cur.fetchone.return_value = ("skipped: resting stops unreadable, sell not sent",)
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
+        assert db.claim_failed_sell_for_retry(81) == "skipped: resting stops unreadable, sell not sent"
+        cur.fetchone.return_value = None
+        assert db.claim_failed_sell_for_retry(81) is None
+    sql, params = cur.execute.call_args[0]
+    assert "status='FAILED'" in sql and "IN ('TRIM','EXIT')" in sql and "NOT LIKE" in sql
+    assert params == (81, "skipped: resting stops unreadable%", "%retried at%")
+
+
+def test_has_newer_ticker_activity_checks_approvals_then_verdicts():
+    from unittest.mock import MagicMock
+    import db
+    cur = MagicMock()
+    cur.fetchone.side_effect = [None, (1,)]
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
+        assert db.has_newer_ticker_activity("AMD", 81, "T0") is True
+    first, second = cur.execute.call_args_list
+    assert "pending_approvals" in first[0][0] and first[0][1][2] == 81
+    assert "signals" in second[0][0] and "timestamp > %s" in second[0][0] and second[0][1][-1] == "T0"
+    cur.execute.side_effect = RuntimeError("down")
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
+        assert db.has_newer_ticker_activity("AMD", 81, "T0") is None

@@ -31,7 +31,9 @@ load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env")
 log = logging.getLogger(__name__)
 
 _WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-HEADERS = {"User-Agent": "Mozilla/5.0 (trading-bot; +245081114+LukePuz@users.noreply.github.com)"}
+from ingestion.contact import BROWSER_USER_AGENT
+
+HEADERS = {"User-Agent": BROWSER_USER_AGENT}
 
 _CACHE_PATH = Path(__file__).parent / ".sp500_cache.json"
 _CACHE_TTL_SECONDS = 7 * 24 * 3600

@@ -26,7 +26,9 @@ log = logging.getLogger(__name__)
 _SOURCE = "news"
 _TITLE_SOURCE = "news_title"   # cross-source dedup: same headline via both feeds
 GOOGLE_NEWS_RSS = "https://news.google.com/rss/search"
-HEADERS = {"User-Agent": "Mozilla/5.0 (trading-bot; +245081114+LukePuz@users.noreply.github.com)"}
+from ingestion.contact import BROWSER_USER_AGENT
+
+HEADERS = {"User-Agent": BROWSER_USER_AGENT}
 # Older items are dropped: a days-old "beats on earnings" story was being
 # analysed as a fresh trigger (limitations audit 2026-10-28, finding 6).
 MAX_ITEM_AGE = timedelta(hours=48)

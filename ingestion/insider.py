@@ -30,7 +30,9 @@ log = logging.getLogger(__name__)
 
 EDGAR_RSS = "https://www.sec.gov/cgi-bin/browse-edgar"
 EDGAR_BASE = "https://www.sec.gov"
-HEADERS = {"User-Agent": "trading-bot 245081114+LukePuz@users.noreply.github.com"}
+from ingestion.contact import SEC_USER_AGENT
+
+HEADERS = {"User-Agent": SEC_USER_AGENT}
 
 from ingestion.edgar import TICKER_TO_CIK
 

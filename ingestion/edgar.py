@@ -66,7 +66,9 @@ _STATIC_TICKER_TO_CIK: dict[str, str] = {
 FILING_FORMS = ["8-K", "10-Q", "10-K", "4"]  # Form 4 = insider trades
 EDGAR_RSS = "https://www.sec.gov/cgi-bin/browse-edgar"
 EDGAR_DOC = "https://www.sec.gov"
-HEADERS = {"User-Agent": "trading-bot 245081114+LukePuz@users.noreply.github.com"}  # SEC requires this
+from ingestion.contact import SEC_USER_AGENT
+
+HEADERS = {"User-Agent": SEC_USER_AGENT}  # SEC requires this
 
 _SEC_COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 _CIK_CACHE_PATH = Path(__file__).parent / ".cik_cache.json"

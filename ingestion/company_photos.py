@@ -29,7 +29,9 @@ import requests
 
 log = logging.getLogger(__name__)
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (trading-bot; +245081114+LukePuz@users.noreply.github.com)"}
+from ingestion.contact import BROWSER_USER_AGENT
+
+HEADERS = {"User-Agent": BROWSER_USER_AGENT}
 _CACHE_PATH = Path(__file__).parent / ".company_photo_cache.json"
 _CACHE_TTL_SECONDS = 30 * 24 * 3600  # a month -- these barely ever change
 

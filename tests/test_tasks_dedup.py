@@ -359,6 +359,26 @@ class TestBackstopStaleStopCache:
         mock_backstop = self._run(held_qty=110.0, stop_orders=[])
         mock_backstop.assert_called_once()
 
+    def test_a_stop_sized_net_of_a_working_sale_is_trusted(self):
+        """Professor M132: 110 held, a market SELL working on 40, our stop on
+        the other 70 (M129) is full cover, not a stale stop."""
+        orders = [{"ticker": "AMKR", "action": "SELL", "order_type": "STP", "qty": 70.0,
+                   "stop_price": 34.66, "order_id": 6, "status": "PreSubmitted"},
+                  {"ticker": "AMKR", "action": "SELL", "order_type": "MKT", "qty": 40.0,
+                   "stop_price": None, "order_id": 9, "status": "Submitted", "remaining": 40.0}]
+        self._run(held_qty=110.0, stop_orders=orders).assert_not_called()
+
+    def test_a_cancelled_stop_is_not_cover(self):
+        orders = [{"ticker": "AMKR", "action": "SELL", "order_type": "STP", "qty": 110.0,
+                   "stop_price": 34.66, "order_id": 6, "status": "Cancelled"}]
+        self._run(held_qty=110.0, stop_orders=orders).assert_called_once()
+
+    def test_a_part_filled_stop_counts_its_remainder(self):
+        """186-share stop with 76 filled leaves 110 working: full cover."""
+        orders = [{"ticker": "AMKR", "action": "SELL", "order_type": "STP", "qty": 186.0,
+                   "stop_price": 34.66, "order_id": 6, "status": "Submitted", "remaining": 110.0}]
+        self._run(held_qty=110.0, stop_orders=orders).assert_not_called()
+
 
 class TestReconcileUnconfirmedOrders:
     """2026-07-28 (CRWD): a market order can fill *after*

@@ -2647,11 +2647,17 @@ def check_trailing_stops(self):
         # firing the backstop rather than trusting a number that doesn't
         # match reality.
         import ibkr
+        # Cover is working stops plus working market SELLs: a stop sized net
+        # of a sale still in progress (M129) is valid, not stale (professor M132).
         try:
+            open_orders = ibkr.get_open_orders()
             open_stop_qty: dict[str, float] = {}
-            for o in ibkr.get_open_orders():
-                if o["action"] == "SELL" and o["order_type"] in ("STP", "STP LMT", "TRAIL"):
-                    open_stop_qty[o["ticker"]] = open_stop_qty.get(o["ticker"], 0.0) + o["qty"]
+            for o in _working_sell_stops(open_orders):
+                open_stop_qty[o["ticker"]] = open_stop_qty.get(o["ticker"], 0.0) + o["qty"]
+            for t in {o["ticker"] for o in open_orders}:
+                selling = _working_mkt_sell_qty(open_orders, t)
+                if selling:
+                    open_stop_qty[t] = open_stop_qty.get(t, 0.0) + selling
         except Exception as e:
             log.warning(f"Could not fetch open orders for backstop check: {e}")
             open_stop_qty = None  # unknown — don't sell blind
@@ -2671,7 +2677,7 @@ def check_trailing_stops(self):
                 covered = held_qty > 0 and abs(stop_qty - held_qty) < max(0.01, held_qty * 0.02)
                 if held_qty > 0 and not covered:
                     if stop_qty:
-                        log.warning(f"[{ticker}] Cached stop covers {stop_qty} shares but "
+                        log.warning(f"[{ticker}] Working stops and sells cover {stop_qty} shares but "
                                     f"{held_qty} are actually held — treating as stale/unreliable")
                     backstopped = _execute_backstop_sell(ticker, alert)
             alerts.send_stop_triggered(

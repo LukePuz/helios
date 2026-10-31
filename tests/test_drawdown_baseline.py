@@ -65,7 +65,7 @@ def test_rebase_command_applies_the_candidate_and_resumes(monkeypatch):
     text = _rebase(state, monkeypatch)
     assert state["high_water_mark_live"] == "1900.0" and state["trading_halted_live"] == "false"
     assert state["hwm_rebase_candidate_live"] == "" and state["drawdown_implausible_count_live"] == "0"
-    assert "Baseline reset" in text
+    assert "Baseline reset" in text and "$1,900.00" in text
 
 
 def test_rebase_without_a_candidate_changes_nothing(monkeypatch):
@@ -73,3 +73,23 @@ def test_rebase_without_a_candidate_changes_nothing(monkeypatch):
     text = _rebase(state, monkeypatch)
     assert state == {"high_water_mark_live": "2000", "trading_halted_live": "true"}
     assert "No baseline reset is pending" in text
+
+
+def test_a_plausible_read_leaves_the_halt_set():
+    state = {"high_water_mark_live": "2000", "trading_halted_live": "true",
+             "hwm_rebase_candidate_live": "900"}
+    _run(state)
+    assert state["trading_halted_live"] == "true"
+
+
+def test_resume_restarts_the_implausible_count(monkeypatch):
+    import telegram_bot
+    monkeypatch.setattr(telegram_bot, "_ALLOWED_USER_IDS", {99})
+    state = {"trading_halted_live": "true", "drawdown_implausible_count_live": "4"}
+    update = {"message": {"chat": {"id": 1}, "message_id": 2, "from": {"id": 99}, "text": "/resume"}}
+    with patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
+         patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+         patch("config.TRADING_ENV", "live"), patch.object(telegram_bot, "_reply"), \
+         patch.object(telegram_bot, "_send_chat_action"):
+        telegram_bot._handle_mention(update, is_urgent=False)
+    assert state["trading_halted_live"] == "false" and state["drawdown_implausible_count_live"] == "0"

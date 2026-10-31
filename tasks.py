@@ -3703,7 +3703,8 @@ def check_portfolio_drawdown(self):
                             f"Either the baseline is stale or the account really fell. Check TWS. "
                             f"If the value is right and the baseline is stale, send /rebase to "
                             f"make it the new high-water mark and resume; /resume lifts the halt "
-                            f"without touching the baseline."
+                            f"without touching the baseline, and the halt returns after 3 more low "
+                            f"reads (about 90 min) while the value stays under half of it."
                         )
                     except Exception:
                         pass

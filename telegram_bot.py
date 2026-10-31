@@ -426,8 +426,8 @@ def _handle_mention(update: dict, is_urgent: bool) -> None:
             db.set_state(f"drawdown_implausible_count_{TRADING_ENV}", "0")
             db.set_state(f"trading_halted_{TRADING_ENV}", "false")
             db.set_state(f"halt_reason_{TRADING_ENV}", "")
-            _reply(chat_id, f"🟢 <b>Baseline reset</b> ({TRADING_ENV}) to the last read account value; "
-                            f"trading RESUMED.", msg_id)
+            _reply(chat_id, f"🟢 <b>Baseline reset</b> ({TRADING_ENV}) to ${float(cand):,.2f}, the last "
+                            f"read account value; trading RESUMED.", msg_id)
         except Exception as e:
             _reply(chat_id, f"⚠️ Could not reset the baseline: {e}", msg_id)
         return
@@ -437,6 +437,9 @@ def _handle_mention(update: dict, is_urgent: bool) -> None:
             from config import TRADING_ENV
             db.set_state(f"trading_halted_{TRADING_ENV}", "false")
             db.set_state(f"halt_reason_{TRADING_ENV}", "")
+            # Restart the implausible-read count, or the next check re-halts
+            # at once while reads stay low (review of d3e403d).
+            db.set_state(f"drawdown_implausible_count_{TRADING_ENV}", "0")
             _reply(chat_id, f"🟢 <b>Trading RESUMED</b> ({TRADING_ENV}). Halt flag cleared.", msg_id)
         except Exception as e:
             _reply(chat_id, f"⚠️ Could not clear halt flag: {e}", msg_id)

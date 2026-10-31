@@ -309,6 +309,37 @@ def test_inactive_stop_is_not_protection_in_reconcile():
     fix.assert_called_once_with("AMD")
 
 
+def _run_2b(position_qty):
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="AMD", qty=position_qty)]
+    mkt = {"order_id": 7, "ticker": "AMD", "action": "SELL", "order_type": "MKT", "qty": 10.0,
+           "stop_price": None, "status": "Submitted", "remaining": 10.0}
+    state = {}
+    with patch("ibkr.get_client", return_value=client), \
+         patch("ibkr.get_open_orders", return_value=_orders(10) + [mkt]), \
+         patch("db.get_all_position_stops", return_value=[]), \
+         patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
+         patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+         patch("tasks._fix_overstop_safe", return_value=None) as fix, \
+         patch("alerts._send"):
+        tasks.reconcile_stop_orders.run()
+    return state.get("overstop_pending_AMD"), fix
+
+
+def test_2b_counts_a_working_market_sell_as_cover_for_a_long():
+    """Professor M129: 20 held, 10 under a stop, 10 being sold now."""
+    pending, fix = _run_2b(20)
+    assert not pending
+    fix.assert_not_called()
+
+
+def test_2b_does_not_net_a_market_sell_against_a_short():
+    """Review of 6e6d169: a SELL adds to a short; the mismatch must surface."""
+    pending, fix = _run_2b(-20)
+    assert pending
+    fix.assert_not_called()   # confirmed next cycle
+
+
 def test_slow_cancel_gets_a_second_look():
     client = MagicMock()
     client.get_all_positions.return_value = [MagicMock(symbol="AMD", qty=10)]

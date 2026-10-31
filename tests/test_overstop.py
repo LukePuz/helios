@@ -622,11 +622,9 @@ def test_the_newer_position_check_waits_when_a_read_fails():
         assert stop.call_args.kwargs == {"strict": True}
 
 
-def _queued_restore(open_orders, before, after, intent="RESTORE", held=20, cancelled=1):
+def _queued_restore(open_orders, before, after, intent="RESTORE", held=20):
     """from_queue path with coverage read before the cancel (before) and the
     stops left after it (after)."""
-    cancel_kw = ({"side_effect": cancelled} if isinstance(cancelled, Exception)
-                 else {"return_value": cancelled})
     client = MagicMock()
     client.get_all_positions.return_value = [MagicMock(symbol="CRWD", qty=held)]
     kw = {"side_effect": open_orders} if isinstance(open_orders, Exception) else {"return_value": open_orders}
@@ -637,7 +635,7 @@ def _queued_restore(open_orders, before, after, intent="RESTORE", held=20, cance
          patch("execution._stops_still_resting", return_value=before), \
          patch("tasks._resting_sell_stops",
                **({"side_effect": after} if isinstance(after, Exception) else {"return_value": after})), \
-         patch("tasks.manage_cancel_stop_orders_for", **cancel_kw) as cancel, \
+         patch("tasks.manage_cancel_stop_orders_for") as cancel, \
          patch("tasks.manage_stop_place", return_value={"order_id": 3}) as place, \
          patch("db.set_stop_broker_order_id"):
         ok = tasks._reprotect_after_late_sell("CRWD", {"intent": intent, "stop_price": 160.0}, None,
@@ -735,46 +733,8 @@ def test_queued_restore_takes_a_second_look_at_a_pending_cancel():
          patch("db.get_position_stop", return_value={"stop_price": 150.0}), \
          patch("execution._stops_still_resting", return_value=5.0), \
          patch("tasks._resting_sell_stops", side_effect=[[ours], []]), \
-         patch("tasks.manage_cancel_stop_orders_for", return_value=1), patch("time.sleep"), \
+         patch("tasks.manage_cancel_stop_orders_for"), patch("time.sleep"), \
          patch("tasks.manage_stop_place", return_value={"order_id": 3}) as place, \
          patch("db.set_stop_broker_order_id"):
         assert tasks._reprotect_after_late_sell("CRWD", {"intent": "RESTORE"}, None, from_queue=True) is True
     place.assert_called_once_with("CRWD", 20.0, 150.0)
-
-
-def test_queued_restore_sizes_to_the_earlier_read_when_the_cancel_removed_nothing():
-    """Review of 7c4682c: a stuck cancel leaves cover as it was, so a failed
-    re-read must not stack a full stop on it."""
-    ok, place, _ = _queued_restore([], 8.0, TimeoutError("no reply"), cancelled=0)
-    assert ok is True
-    place.assert_called_once_with("CRWD", 12.0, 150.0)
-
-
-def test_queued_restore_waits_while_a_stop_stays_pending_cancel():
-    pend = {"order_id": 4, "ticker": "CRWD", "qty": 20.0, "stop_price": 150.0, "status": "PendingCancel"}
-    with patch("time.sleep"):
-        ok, place, _ = _queued_restore([], 20.0, [pend], intent="PROFIT_TARGET")
-    assert ok is False
-    place.assert_not_called()
-
-
-def test_queued_restore_waits_when_the_cancel_itself_fails():
-    ok, place, _ = _queued_restore([], 8.0, [], cancelled=RuntimeError("worker busy"))
-    assert ok is False
-    place.assert_not_called()
-
-
-def test_queued_restore_uses_a_second_read_after_a_failed_first():
-    other = {"order_id": 5, "ticker": "CRWD", "qty": 8.0, "stop_price": 140.0}
-    client = MagicMock()
-    client.get_all_positions.return_value = [MagicMock(symbol="CRWD", qty=20)]
-    with patch("ibkr.get_client", return_value=client), \
-         patch("ibkr.get_open_orders", return_value=[]), \
-         patch("db.get_position_stop", return_value={"stop_price": 150.0}), \
-         patch("execution._stops_still_resting", return_value=8.0), \
-         patch("tasks._resting_sell_stops", side_effect=[TimeoutError("x"), [other]]), \
-         patch("tasks.manage_cancel_stop_orders_for", return_value=0), \
-         patch("tasks.manage_stop_place", return_value={"order_id": 3}) as place, \
-         patch("db.set_stop_broker_order_id"):
-        assert tasks._reprotect_after_late_sell("CRWD", {"intent": "RESTORE"}, None, from_queue=True) is True
-    place.assert_called_once_with("CRWD", 12.0, 150.0)

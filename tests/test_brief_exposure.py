@@ -59,3 +59,20 @@ def test_broker_held_reasons():
         assert tasks._broker_held("AMD")[:2] == (False, "snapshot")
     with patch("tasks._snapshot_positions_or_none", side_effect=RuntimeError("db down")):
         assert tasks._broker_held("NVDA")[:2] == (None, "error")
+
+
+def test_gate_flags():
+    """Audits A1031-0253-2, A1031-0453-3/-4: log-only counters."""
+    from datetime import datetime, timezone
+    now = datetime(2026, 11, 2, 18, 0, tzinfo=timezone.utc)          # 13:00 ET
+    earlier = [{"timestamp": datetime(2026, 11, 2, 14, 0, tzinfo=timezone.utc)},   # today ET
+               {"timestamp": datetime(2026, 11, 2, 3, 0, tzinfo=timezone.utc)}]    # 11-01 ET
+    with patch("db.get_recent_verdicts", return_value=earlier):
+        f = analyst._gate_flags("NVDA", "EXIT", 6, 2, True, now=now)
+    assert f == {"model_sell_pass_unconfirmed": True, "rubric_gate_conflict": False, "verdicts_today": 1}
+    with patch("db.get_recent_verdicts", return_value=[]):
+        assert analyst._gate_flags("NVDA", "TRIM", 4, 0, True, now=now)["model_sell_pass_unconfirmed"] is False
+        assert analyst._gate_flags("NVDA", "OPEN", 7, 2, True, now=now)["rubric_gate_conflict"] is True
+        assert analyst._gate_flags("NVDA", "OPEN", 8, 2, True, now=now)["rubric_gate_conflict"] is False
+    with patch("db.get_recent_verdicts", side_effect=RuntimeError("db down")):
+        assert analyst._gate_flags("NVDA", "HOLD", 6, 2, False, now=now)["verdicts_today"] is None

@@ -196,17 +196,20 @@ def _log_route_exit(ticker: str, kind: str, result: dict, reason: str) -> None:
         log.warning(f"[{ticker}] route-exit signal log failed: {e}")
 
 
+_VERDICT_ONLY_PROVENANCE = ("plan", "brief_exposure", "gate_flags")
+
+
 def _route_row_fields(result: dict, kind: str) -> dict:
     """Model and provenance of the verdict a routing row belongs to, so the
     row stands on its own (SEF run 13, 2026-10-28: ROUTE_* rows had NULL model
     and provenance and had to be joined to the preceding verdict). The
     prompt_sha in provenance identifies that verdict's signals row."""
     prov = result.get("provenance") or None
-    if prov and ("plan" in prov or "brief_exposure" in prov):
+    if prov and any(k in prov for k in _VERDICT_ONLY_PROVENANCE):
         # The plan observation belongs to the verdict row only; copied onto
         # routing rows it was counted 2-3 times (pre-pull review 10-29).
-        # brief_exposure likewise.
-        prov = {k: v for k, v in prov.items() if k not in ("plan", "brief_exposure")}
+        # brief_exposure and gate_flags likewise.
+        prov = {k: v for k, v in prov.items() if k not in _VERDICT_ONLY_PROVENANCE}
     return {
         "model": (prov or {}).get("model"),
         "provenance": prov,

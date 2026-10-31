@@ -432,6 +432,33 @@ def redact_account_figures(prompt: str) -> str:
     return _ACCOUNT_FIGURE_RE.sub(r"\1$[REDACTED]", prompt or "")
 
 
+def _gate_flags(ticker: str, action: str, conviction: int, source_count: int,
+                passes: bool, now=None) -> dict:
+    """Log-only counters for gate questions that are Luke's (audits
+    A1031-0253-2, A1031-0453-3/-4), on the final action and conviction:
+    model_sell_pass_unconfirmed  a c>=5 TRIM/EXIT passing on the model's own
+                                 flag, with no confirming verdict;
+    rubric_gate_conflict         an OPEN/ADD at c7 citing >=2 sources (the
+                                 rubric's 7 is one piece of evidence);
+    verdicts_today               earlier verdicts on the ticker this ET day,
+                                 i.e. how many draws came before this one."""
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+    out = {"model_sell_pass_unconfirmed": bool(passes and action in ("TRIM", "EXIT")
+                                               and conviction > LOW_CONVICTION_SELL_MAX),
+           "rubric_gate_conflict": action in ("OPEN", "ADD") and conviction == 7 and source_count >= 2}
+    try:
+        import db
+        et = ZoneInfo("America/New_York")
+        today = (now or datetime.now(timezone.utc)).astimezone(et).date()
+        out["verdicts_today"] = sum(
+            1 for v in db.get_recent_verdicts(ticker, hours=24, limit=200)
+            if v.get("timestamp") and v["timestamp"].astimezone(et).date() == today)
+    except Exception:
+        out["verdicts_today"] = None
+    return out
+
+
 def _brief_exposure(ticker: str, prompt: str) -> dict:
     """Log-only: what the brief showed the model about its own position and
     past verdicts, and whether the broker holds the ticker (audit A1031-0453
@@ -1576,6 +1603,11 @@ def analyze(
         provenance["brief_exposure"] = _brief_exposure(ticker, prompt)
     except Exception as e:
         log.debug(f"[{ticker}] brief exposure record failed: {e}")
+    try:
+        provenance["gate_flags"] = _gate_flags(ticker, action, conviction, source_count,
+                                               bool(parsed.get("pass_to_risk")))
+    except Exception as e:
+        log.debug(f"[{ticker}] gate flags record failed: {e}")
     provenance["trigger"] = trigger
     est = _estimate_tokens(prompt)
     llm = {**_LAST_CALL_STATS, "prompt_tokens_est": est}

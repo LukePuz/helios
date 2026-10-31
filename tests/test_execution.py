@@ -809,16 +809,19 @@ def test_exit_not_sent_when_resting_stops_cannot_be_read():
     approval = _approval(action="EXIT", shares_initial=100)
     with patch("ibkr.get_ib"), patch("ibkr.get_client") as client, \
          patch("ibkr.place_market_order") as order, \
-         patch("tasks.manage_cancel_stop_orders_for", return_value=0), \
-         patch("ibkr.get_open_orders", side_effect=TimeoutError("no reply")) as read, \
+         patch("tasks.manage_cancel_stop_orders_for", return_value=0) as cancel, \
+         patch("ibkr.get_open_orders",
+               side_effect=[[], TimeoutError("no reply"), TimeoutError("no reply")]) as read, \
+         patch("execution._restore_stop_after_failed_sell") as restore, \
          patch("ibkr.get_latest_price", return_value=100.0), \
          patch("market_data.get_priced_quote", return_value=None), \
          patch("alerts._send") as send:
         client.return_value.get_open_position.return_value = MagicMock(qty=100)
         assert execution.execute_approved(approval) is False
     order.assert_not_called()
-    assert read.call_count >= 2                       # tried again after the drop
-    assert "unreadable" in execution.last_outcome_reason()
+    cancel.assert_called_once(); restore.assert_called_once()   # readable before, unreadable after
+    assert read.call_count == 3                       # pre-read, then the post-cancel read and its retry
+    assert execution.last_outcome_reason() == "skipped: resting stops unreadable, sell not sent"
     assert "could not be read" in send.call_args_list[0][0][0]
 
 

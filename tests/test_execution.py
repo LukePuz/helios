@@ -818,6 +818,7 @@ def test_exit_not_sent_when_resting_stops_cannot_be_read():
         assert execution.execute_approved(approval) is False
     order.assert_not_called()
     assert read.call_count >= 2                       # tried again after the drop
+    assert "unreadable" in execution.last_outcome_reason()
     assert "could not be read" in send.call_args_list[0][0][0]
 
 
@@ -848,11 +849,28 @@ def test_restore_places_nothing_when_resting_stops_cannot_be_read():
          patch("ibkr.get_client") as client, \
          patch("ibkr.get_open_orders", side_effect=RuntimeError("down")), \
          patch("tasks.manage_stop_place") as place, \
+         patch("tasks._queue_reprotect") as queue, \
          patch("alerts._send") as send:
         client.return_value.get_open_position.return_value = MagicMock(qty=100)
         execution._restore_stop_after_failed_sell("AMD")
     place.assert_not_called()
-    assert "CHECK STOPS" in send.call_args[0][0]
+    queue.assert_called_once_with("AMD", {"intent": "RESTORE"}, None)   # retried, not left naked
+    assert "CHECK STOPS" in send.call_args[0][0] and "queued" in send.call_args[0][0]
+
+
+def test_manual_sell_not_sent_when_resting_stops_cannot_be_read():
+    """Review of 73494d1: same hold as the EXIT path."""
+    with patch("ibkr.get_ib"), patch("ibkr.get_client") as client, \
+         patch("ibkr.place_market_order") as order, \
+         patch("tasks.manage_cancel_stop_orders_for", return_value=0), \
+         patch("execution._stops_still_resting", return_value=None), \
+         patch("execution._restore_stop_after_failed_sell") as restore, \
+         patch("db.get_state", return_value=None), \
+         patch("market_data.is_market_hours", return_value=True):
+        client.return_value.get_open_position.return_value = MagicMock(qty=5)
+        r = execution.execute_manual("NVDA", "SELL", 5, "test")
+    assert r["success"] is False and "could not be read" in r["message"]
+    order.assert_not_called(); restore.assert_called_once_with("NVDA")
 
 
 def test_skipped_exit_restores_stops_the_cancel_already_took():

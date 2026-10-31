@@ -201,13 +201,22 @@ def _restore_stop_after_failed_sell(ticker: str) -> None:
         if covered is None:
             # Unknown coverage: a full stop on top of one that is still
             # working would oversell, so place nothing and say so (A0053-2).
+            # The reconcile queue retries every ~5 min and re-reads coverage
+            # under the lock, so the stop comes back once the broker answers.
             log.error(f"[{ticker}] Stop restore skipped: resting stops could not be read")
+            queued = False
+            try:
+                tasks._queue_reprotect(ticker, {"intent": "RESTORE"}, None)
+                queued = True
+            except Exception as e2:
+                log.error(f"[{ticker}] Could not queue the stop restore: {e2}")
             try:
                 alert_module._send(
                     f"⚠️ CHECK STOPS — {ticker}\n"
                     f"A sell did not go through and the resting stops could not be read, "
-                    f"so no stop was restored. Check TWS; recorded stop "
-                    f"${float(stop_rec['stop_price']):.2f}."
+                    f"so no stop was restored yet"
+                    + ("; it is queued and retried every reconcile cycle" if queued else "")
+                    + f". Check TWS; recorded stop ${float(stop_rec['stop_price']):.2f}."
                 )
             except Exception:
                 pass
@@ -962,7 +971,8 @@ def execute_approved(
                 # The cancel may have taken some stops before one stuck;
                 # put back what is now uncovered (A0053-2).
                 _restore_stop_after_failed_sell(ticker)
-                return _outcome("skipped: stop still resting, sell not sent")
+                return _outcome("skipped: resting stops unreadable, sell not sent" if resting is None
+                                else "skipped: stop still resting, sell not sent")
 
         stop_price_for_entry = approval.get("stop_loss_price") or risk_json.get("stop_loss_price")
 

@@ -373,6 +373,31 @@ class TestBackstopStaleStopCache:
                    "stop_price": 34.66, "order_id": 6, "status": "Cancelled"}]
         self._run(held_qty=110.0, stop_orders=orders).assert_called_once()
 
+    @staticmethod
+    def _mkt(qty, status="Submitted", ticker="AMKR"):
+        return {"ticker": ticker, "action": "SELL", "order_type": "MKT", "qty": qty, "stop_price": None,
+                "order_id": 9, "status": status, "remaining": qty}
+
+    @staticmethod
+    def _stp(qty):
+        return {"ticker": "AMKR", "action": "SELL", "order_type": "STP", "qty": qty,
+                "stop_price": 34.66, "order_id": 6, "status": "PreSubmitted"}
+
+    def test_a_full_stop_plus_a_working_sale_is_over_cover_and_backstops(self):
+        """Both would fill and short; the backstop nets the working sale."""
+        self._run(held_qty=110.0, stop_orders=[self._stp(110.0), self._mkt(40.0)]).assert_called_once()
+
+    def test_a_working_sale_for_the_whole_position_is_cover(self):
+        self._run(held_qty=110.0, stop_orders=[self._mkt(110.0)]).assert_not_called()
+
+    def test_a_dead_market_sell_is_not_cover(self):
+        for status in ("Cancelled", "Filled"):
+            self._run(held_qty=110.0, stop_orders=[self._stp(70.0), self._mkt(40.0, status)]).assert_called_once()
+
+    def test_another_tickers_sale_is_not_cover(self):
+        self._run(held_qty=110.0,
+                  stop_orders=[self._stp(70.0), self._mkt(40.0, ticker="NVDA")]).assert_called_once()
+
     def test_a_part_filled_stop_counts_its_remainder(self):
         """186-share stop with 76 filled leaves 110 working: full cover."""
         orders = [{"ticker": "AMKR", "action": "SELL", "order_type": "STP", "qty": 186.0,

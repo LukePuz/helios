@@ -318,7 +318,9 @@ def _treatment_config() -> dict:
         # Added 10-29 (professor M96): switches that shipped that evening.
         "REGIME_COMPLETED_BARS", "QUIVER_ENABLED", "ONE_SHARE_MAX_PCT_OF_CASH",
         "TIER_MAX_CONCURRENT_POSITIONS", "MAX_TRADE_PCT_OF_CASH_RESERVE",
-        "ETF_FUNDAMENTALS_CAP_EXEMPT", "PLAN_LEVEL_REVIEW_ENABLED")}
+        "ETF_FUNDAMENTALS_CAP_EXEMPT", "PLAN_LEVEL_REVIEW_ENABLED",
+        # Added 10-31 (A1031-0253-1): the month-only catalyst reading.
+        "CATALYST_MONTH_MIDPOINT_ENABLED")}
 
 
 def _provenance(prompt: str) -> dict:

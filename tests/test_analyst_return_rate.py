@@ -203,3 +203,8 @@ class TestExpectedReturnRateGateIntegration:
             result = analyze(_CANDIDATE, situation_brief="brief")
         assert result["action"] == "OPEN"
         assert result["expected_return_per_week"] > 1.0
+
+
+def test_the_midpoint_switch_is_in_the_provenance_config():
+    from agents.analyst import _treatment_config
+    assert _treatment_config()["CATALYST_MONTH_MIDPOINT_ENABLED"] is False

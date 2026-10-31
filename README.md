@@ -1,167 +1,147 @@
-# Helios Hedgefund
+# Helios
 
-An autonomous **trading research system** that watches markets around the clock, generates AI-scored investment theses, sizes positions under a rule-based risk framework, and executes without a human approval gate.
+Helios is an autonomous trading research system. It watches market events, has a local large language model write an investment thesis with a stated conviction score (1 to 10), sizes any resulting trade under fixed rules written in code, and places the order with Interactive Brokers without a human approval step. Every decision, including the ones it passes on, is logged with its thesis and conviction before the outcome is known.
 
-This is a personal research project studying whether an LLM-driven agent pipeline can make consistently good trading decisions. Every decision, conviction score, and outcome is logged to build a long-term dataset for analysis.
+It is a personal research project, not a product and not financial advice. It trades real money at deliberately small size and can lose it.
 
-**Live since August 2026, at deliberately small size.** The system ran paper-only from June to August 2026; a `TRADING_ENV` switch now selects paper or live, and every stateful table is scoped by environment so the two track records never mix. Position sizing rescales with account size, so the percentage caps quoted below are the large-account values. Small balances get different limits (looser, because of whole-share granularity). See `config.py`.
+## Research question
 
-> **Not financial advice. Not a product.** Nothing here is a recommendation to buy or sell anything. This trades real money at small size and can lose it. Run at your own risk.
+Does the conviction an LLM states for a trade predict that trade's return?
 
----
+The model's 1 to 10 conviction score is recorded at the moment of decision, and each position's outcome (return and return relative to SPY at 30, 60 and 90 days, and at exit) is recorded against it later. The question is whether higher stated conviction goes with better outcomes, or whether the number carries no information.
+
+### Why evaluation is forward only
+
+There is no backtest, by design. The analyst is a general-purpose LLM whose training data almost certainly includes the price history, news and filings of the stocks it reasons about. A backtest over any period before its training cutoff can't separate reasoning from memory, and no choice of window fixes that, because the contamination is in the model weights rather than in the data pipeline. Only decisions made before their outcomes existed count as evidence.
+
+To make that forward record usable:
+
+- each decision stores the full thesis as JSON, the stated conviction and sub-scores, the risk verdict, the position size and the stop;
+- SPY is recorded at entry, so return relative to SPY is computed for every trade at exit;
+- slippage between the decision price and the fill is recorded for each order;
+- the code version (git commit) that made each decision is stored with it.
+
+Known limits: the live sample is small (4 closed trades and 2 open as of 2026-10-31), so it has little statistical power yet; transaction costs beyond measured slippage are not modeled; and the market regime model is fit on the same history it is applied to.
 
 ## How it works
 
-Market events flow through a pipeline of specialized agents. Each stage can kill a candidate; only trades that survive every gate reach the broker. There is no human approval step: a Telegram alert is sent after the fact.
-
 ```mermaid
 flowchart LR
-    subgraph Ingestion["Ingestion (Celery, 24/7)"]
+    subgraph Ingestion["Ingestion (Celery, scheduled)"]
         E[SEC EDGAR filings]
-        O[Options flow / dark pool]
+        O[Options flow]
         C[Congressional trades]
         I[Insider buys]
-        N[News + arXiv papers]
-        M[Macro / FRED]
+        N[News and arXiv papers]
+        M[Macro data, FRED]
     end
 
     subgraph Pipeline["Agent pipeline (local LLMs via Ollama)"]
-        S[Screener<br/><i>fast 7B model</i>]
-        B[Context Engine<br/><i>situation brief</i>]
-        A[Analyst<br/><i>72B model, thesis + conviction 1-10</i>]
-        R[Risk Manager<br/><i>rule-based sizing + stops</i>]
+        S[Screener<br/><i>7B model</i>]
+        B[Context engine<br/><i>situation brief</i>]
+        A[Analyst<br/><i>72B model: thesis and conviction 1-10</i>]
+        R[Risk manager<br/><i>rule-based sizing and stops</i>]
     end
 
     subgraph Execution["Execution"]
-        IB[IBKR account<br/><i>market orders + stops</i>]
+        IB[Interactive Brokers<br/><i>order plus stop</i>]
         T[Telegram alert<br/><i>sent after the fact</i>]
     end
 
     Ingestion --> S --> B --> A --> R --> IB --> T
 
-    REG[Market Regime Agent<br/><i>6 macro signals + Markov persistence</i>] -.->|gates sizing| R
+    REG[Market regime model] -.->|scales size| R
     REG -.->|context| A
 ```
 
-### The pipeline in one trade
+1. An event arrives, for example an 8-K filing or an unusual options trade on a watchlist ticker.
+2. The screener (Qwen 2.5 7B) decides whether it is relevant enough to analyze.
+3. The context engine builds a brief: price action, fundamentals, the catalyst calendar and past theses retrieved from a vector store.
+4. The analyst (Qwen 2.5 72B) writes a thesis with a conviction score, an upside and downside estimate and a bucket (Compounder, Accelerator or Moonshot). It recommends OPEN, ADD, HOLD, WATCH, TRIM or EXIT.
+5. The risk manager sizes the trade from fixed tables, scaled by the market regime, sets a stop and enforces the limits below.
+6. Orders that pass go to Interactive Brokers automatically, with a stop. A Telegram message reports the trade afterwards.
 
-1. **An event fires**, say an 8-K filing or an unusual options sweep on a watchlist ticker.
-2. **Screener** (fast local LLM) decides in seconds whether it's relevant and urgent.
-3. **Context Engine** assembles a situation brief: price action, fundamentals, catalyst calendar, prior theses from the vector store.
-4. **Analyst** (large local LLM) writes an investment thesis with a 1–10 conviction score, an upside/downside estimate, and a bucket classification (Compounder / Accelerator / Moonshot). Below conviction 5 or 2:1 upside/downside, it dies here.
-5. **Risk Manager** sizes the position from a bucket × conviction table, scaled by the current market regime multiplier, and computes an ATR-based stop. Concentration caps (per-position, per-theme, total moonshot exposure) are enforced here.
-6. **Execution is automatic.** Trades that clear the Analyst and Risk Manager gates execute immediately against **Interactive Brokers**. A stop is placed, the trailing-stop monitor takes over, and a Telegram alert is sent after the fact rather than an approval request beforehand. (Earlier versions gated every trade on a Telegram Approve/Reject tap; that gate was removed on 2026-07-14 while the system was paper-only. Unattended live execution requires two separate opt-ins (`TRADING_ENV=live` *and* `LIVE_TRADING_ENABLED`), so flipping one value cannot by itself start trading real money. Drawdown halt, concentration caps, and price-drift-abort checks are unchanged in both environments.)
-7. At 30/60/90 days, outcomes are recorded against the original thesis. That dataset is what makes this research rather than gambling.
+All model inference runs locally on two consumer GPUs. No cloud AI service is used.
 
----
+## Rules the model can't override
 
-## The interesting parts
+These are deterministic code, covered by unit tests. The model's output is an input to them; it has no path to change a limit.
 
-**Market regime engine.** Seven weighted signals (trend, VIX with a contrarian guard, liquidity, credit spreads, breadth, volume, and an empirical **Markov persistence signal**) produce a 0–100 score mapped to five regimes, from Strong Risk-On to Strong Risk-Off. The regime scales every position size: a 9/10-conviction idea in a Risk-Off regime still gets cut in half.
-
-**Markov persistence signal.** Classifies each day into bull/sideways/bear from 20-day SPY returns and estimates a transition matrix from **non-overlapping windows** (overlapping windows share 19/20 closes and wildly overstate trend stickiness, a subtle bias most retail backtests have). The current state's `P(→bull) − P(→bear)` feeds the regime score.
-
-**Risk framework as code.** Drawdown halt at −10% from the high-water mark, per-bucket entry caps (12% / 7% / 2% at standard account size), a 2%-of-equity risk budget per trade under a 7% total portfolio heat cap, theme concentration limits, correlation-based size reduction, ATR stops by bucket, trailing stops that activate after gains, and a startup reconciliation pass that detects positions the broker knows about but the database doesn't, then adopts them with a conservative stop and flags them for human review. Sizing is deterministic and unit-tested; the LLM has no path to change a limit.
-
-**Account-size tiers.** Percentage caps tuned for a large account produce sub-one-share allocations on a small one, which silently drops trades. Caps, minimum conviction, and max concurrent positions therefore rescale across three tiers (Standard / Reduced / Micro), preserving the ratios between buckets rather than just raising the ceiling. A consequence worth stating plainly: at small balances, per-position concentration is *much* higher than the headline 12% / 7% / 2%.
-
-**Local-first AI.** All LLM inference runs locally on Ollama (Qwen 2.5 at 7B/72B/3B for screening/analysis/chat), on two consumer GPUs; sentence-transformer embeddings for the vector store run locally on CPU. No cloud AI APIs, no API costs, no data leaves the machine, and every agent degrades gracefully to keyword heuristics if the model server is down.
-
-**Knowledge base as strategy.** The watchlist, sector theses, risk rules, and portfolio philosophy live in versioned markdown (`knowledge/`), loaded into agent prompts and a ChromaDB vector store. Changing strategy is a git commit, not a code change.
-
-**Self-calibration loop.** Closed trades are grouped by the conviction the Analyst *stated at entry*, and the realized win rate and average alpha vs. SPY for each conviction level are fed back into the Analyst's own prompt, which is told to calibrate against that record "not against how confident you feel." The same loop runs per sub-score. If conviction-9 calls historically realized conviction-6 outcomes, the model is shown that before it scores the next one.
-
-**Fault tolerance.** Position/stop reconciliation every 15 minutes, approval auto-expiry, implausible-price rejection, schema-versioned migrations, and a process manager that supervises every service with logs surfaced in the dashboard.
-
----
-
-## Evaluation, and why there are no backtests
-
-**This system is evaluated forward only.** There is no backtest harness, and that is a deliberate choice rather than a missing feature.
-
-The Analyst is a general-purpose LLM whose pretraining corpus almost certainly contains the price history, news, and filings for the tickers it reasons about. Backtesting it over any period before its training cutoff cannot distinguish reasoning from recall: the model may simply remember what happened. No amount of careful windowing fixes that, because the contamination is in the weights, not in the data pipeline. So historical "performance" would be unfalsifiable, and the honest move is not to report it.
-
-What *is* trustworthy is the forward record: every decision was made before its outcome existed. That record is built deliberately rather than incidentally:
-
-- Each decision stores the full thesis JSON, the full risk verdict, the stated conviction and sub-scores, the position size, and the stop.
-- SPY is stamped at entry, so **alpha vs. SPY** is computed per trade at exit, not just raw return.
-- Outcomes are recorded at 30 / 60 / 90 days against the original thesis.
-- Realized slippage between the decision price and the fill is recorded per order, cost-signed for both sides.
-
-Known limitations, stated rather than buried: the live sample is small and has limited statistical power; transaction costs beyond measured slippage are not modeled; and the Markov regime model's transition matrix is fit on history and applied to that same history, so it is in-sample. The one methodological care taken there is that its transition matrix is estimated from **non-overlapping** 20-day windows, since overlapping windows share 19 of 20 closes and badly overstate trend persistence.
-
----
-
-## Stack
-
-| Layer | Tech |
+| Rule | Value in code (`config.py`, `risk_manager.py`) |
 |---|---|
-| Agents / LLMs | Ollama (Qwen 2.5 3B/7B/72B), custom pipeline in Python |
-| Execution | Interactive Brokers TWS API (`ib_async`), paper + live environments |
-| Orchestration | Celery + Redis, ~20 scheduled tasks, from 5-min portfolio snapshots to weekly calendar refreshes |
-| Data | Postgres (Supabase), ChromaDB vector store, SQLite catalyst calendar |
-| Market data | Polygon, Alpaca data API, yfinance, FRED, SEC EDGAR, Unusual Whales, Quiver |
-| UI | Streamlit dashboard (portfolio, regime, signals, logs, manual trade) + Telegram bot |
-| Ops | systemd service, single-command launch, ~28k lines of Python, 27 test files (313 tests), CI via GitHub Actions |
+| Analyst conviction needed to pass a buy on | 5 or higher, with upside/downside at least 2:1 |
+| Conviction needed to queue a buy, by account size | 5 (25,000 and up), 6 (5,000 to 25,000), 7 (under 5,000) |
+| Drawdown checked before every buy | at 10% below the high-water mark, buying halts until a person resumes it |
+| Drawdown checked every 30 minutes | at 15% below the high-water mark on 2 reads in a row, the same halt is set |
+| What a halt stops | new buys only; sells and protective stops keep working |
+| Maximum entry size by bucket | Compounder 12%, Accelerator 7%, Moonshot 2% (large-account values) |
+| Risk per trade | a stop-out may cost at most 2% of equity |
+| Total open risk ("portfolio heat") | 7% of equity |
+| Concentration | 35% per theme, 60% total AI infrastructure, 10% total Moonshots |
+| Cash per trade | at most 20% of the cash on hand |
+| Correlation | size cut by 25% when a new name's returns correlate at 0.7 or more with 2 or more held positions |
+| Stops | ATR-based for Compounders (2 to 3 ATR) and Accelerators (1.5 to 2 ATR); Moonshots at a 20% maximum loss |
+| Trailing stops | Compounders from a 30% gain (15 to 20% trail), Accelerators from a 20% gain (10 to 15% trail) |
 
----
+Small accounts: percentage caps sized for a large account round down to zero shares on a small one, so caps rescale in three tiers (under 5,000, 5,000 to 25,000, and 25,000 and up). The live account is in the smallest tier, where single positions can be a much larger share of the account than the table shows, and the conviction bar is 7.
 
-## Running it
+## Status
+
+- Paper trading from June to August 2026; live since 2026-08-17. A `TRADING_ENV` setting selects paper or live, and every stateful table is separated by environment so the two records never mix. Live trading also needs a second, separate opt-in.
+- Live record so far: 6 buys (the last on 2026-09-17), 4 closed trades, 2 open positions. Most recent analyst passes size to zero or one share at the current account size, which is why there have been no new live entries since mid-September.
+- Code: about 49,000 lines of Python in 166 files; 93 test files with 974 tests, run on every push by GitHub Actions; 730 commits since 2026-06-20.
+
+## Running the tests
+
+```bash
+python3 -m venv venv
+venv/bin/pip install -r requirements.txt
+venv/bin/python -m pytest -q tests
+```
+
+The tests don't need a broker, a database or a GPU; anything that would touch the real database is blocked by a test fixture.
+
+## Running the system
 
 ```bash
 # Ubuntu prerequisites
 sudo apt install -y python3-venv python3-pip build-essential redis-server
 curl -fsSL https://ollama.ai/install.sh | sh
 
-# Setup: venv, dependencies, .env template, Ollama models
+# venv, dependencies, a .env template and the Ollama models
 bash setup.sh
 
-# Fill in .env (Supabase, Telegram, market-data API keys). Set TRADING_ENV=paper
-# (the default) to start; it derives the broker port and client ID for you.
-# Start IBKR TWS/Gateway with the API enabled, then:
+# Fill in .env (database, Telegram, market-data keys, CONTACT_EMAIL).
+# TRADING_ENV=paper is the default. Start IBKR TWS or IB Gateway with the API enabled, then:
 ./launch.sh          # dashboard at http://localhost:8501
 ```
 
 For unattended operation, see [`deploy/systemd/`](deploy/systemd/).
 
-Verification: `python scripts/test_connection.py` (broker), `python scripts/smoke_test.py` (models/data), `python -m pytest tests/` (unit tests).
+## Repository layout
 
----
+| Path | Contents |
+|---|---|
+| `main.py`, `tasks.py` | Entry point and the Celery task schedule (ingestion, pipeline runs, monitors) |
+| `agents/` | Screener, analyst, market regime model, candidate scanner, pipeline orchestration |
+| `risk_manager.py`, `execution.py`, `ibkr.py` | Sizing and stops, order execution, broker client |
+| `context_engine.py`, `vector_store.py`, `knowledge_loader.py` | Situation briefs, vector-store retrieval, knowledge base loading |
+| `ingestion/` | One module per data source (EDGAR, options flow, insider, congressional, macro, news) |
+| `catalyst_service/` | Earnings, sector and macro event calendar |
+| `knowledge/` | Watchlist, sector theses and risk rules in markdown, loaded into prompts |
+| `db.py`, `config.py` | Postgres schema and migrations; every tunable limit |
+| `dashboard.py`, `telegram_bot.py` | Streamlit dashboard and Telegram bot |
+| `deploy/` | systemd units, watchdog and log rotation |
+| `scripts/` | Manual checks, readouts and one-off setup |
+| `tests/` | Unit tests |
+| `research-log/` | AI usage log |
 
 ## AI assistance
 
-Parts of this codebase were written with AI coding assistants (Claude Code).
-Since October 2026, every AI session on this repository is logged: each
-request, the AI-refined version of it, what was changed, and the commit, in
-[`research-log/`](research-log/). Entries name the files and functions the AI
-generated. The protocol is in [`.claude/CLAUDE.md`](.claude/CLAUDE.md).
+Much of this code was written with an AI coding assistant (Claude Code). Since October 2026 every AI session on this repository is logged in [`research-log/`](research-log/): each request, the AI-refined version of it, what changed, which files and functions the AI generated, and the commit. The protocol is in [`.claude/CLAUDE.md`](.claude/CLAUDE.md).
 
----
+## License and contact
 
-## Repository layout
+MIT License, see [`LICENSE`](LICENSE).
 
-| Path | What's there |
-|---|---|
-| `main.py`, `tasks.py` | Entry point and the Celery task schedule (ingestion, pipeline runs, monitors) |
-| `agents/` | Screener, Analyst, market regime and Markov models, candidate scanner, crew orchestration |
-| `risk_manager.py`, `execution.py`, `ibkr.py` | Position sizing and stops, order execution, broker client |
-| `context_engine.py`, `vector_store.py`, `knowledge_loader.py` | Situation briefs, ChromaDB retrieval, knowledge-base loading |
-| `ingestion/` | One module per data source (EDGAR, options flow, insider, congressional, macro, news, ...) |
-| `catalyst_service/` | Earnings, sector and macro event calendar (SQLite) |
-| `knowledge/` | Watchlist, sector theses and risk rules in markdown, loaded into prompts |
-| `db.py`, `config.py` | Postgres schema and migrations; every tunable limit |
-| `dashboard.py`, `telegram_bot.py`, `chat_assistant.py`, `standby_bot.py` | Streamlit UI, Telegram alerts and chat |
-| `deploy/` | systemd units, watchdog, log rotation for unattended operation |
-| `scripts/` | Manual checks and one-off setup (broker connection, smoke test, schema init) |
-| `tests/` | Unit tests, run in CI on every push to `main` |
-| `research-log/` | AI usage log (see below) |
-
----
-
-## Design principles
-
-1. **Risk rules are code, not vibes.** Sizing, stops, and concentration limits are deterministic and unit-tested; the LLM cannot override them.
-2. **Measure everything.** Every thesis is scored against its 30/60/90-day outcome. The goal is to learn whether the system's conviction means anything, including the possibility that it doesn't.
-3. **Fail toward safety.** Any data source, model, or service going down degrades the system toward *not trading*, never toward trading blind.
-4. **Evaluate forward, never backward.** A backtest of an LLM that may have memorized the period proves nothing. Only decisions made before their outcomes existed count as evidence (see [Evaluation](#evaluation-and-why-there-are-no-backtests)).
-5. **Live size stays small, and both opt-ins stay explicit.** Auto-execution was adopted when there was no capital at risk; extending it to real money required a second, separate flag rather than reusing the first. Size is a risk control, not a limitation to be grown out of on impulse.
+Luke Puzenski, lpuzenski@gmail.com

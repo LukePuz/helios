@@ -3635,7 +3635,7 @@ def alert_catalyst_conflicts(self):
         raise self.retry(exc=e, countdown=300)
 
 
-IMPLAUSIBLE_READS_BEFORE_HWM_RESET = 3
+IMPLAUSIBLE_READS_BEFORE_HALT = 3
 
 
 @app.task(name="tasks.check_portfolio_drawdown", bind=True, max_retries=2)
@@ -3660,6 +3660,7 @@ def check_portfolio_drawdown(self):
         reason_key = f"halt_reason_{TRADING_ENV}"
         breach_key = f"drawdown_breach_count_{TRADING_ENV}"
         implausible_key = f"drawdown_implausible_count_{TRADING_ENV}"
+        rebase_key = f"hwm_rebase_candidate_{TRADING_ENV}"
 
         client = _get_client()
         pv     = float(client.get_account().portfolio_value)
@@ -3677,30 +3678,39 @@ def check_portfolio_drawdown(self):
             log.warning(f"Implausible portfolio value ${pv:,.2f} (HWM ${hwm:,.2f}) — "
                        f"skipping drawdown check, not updating HWM")
             db.set_state(breach_key, "0")
-            # A persistent "implausible" read is a stale baseline, not noise:
-            # the halt fires at MAX_DRAWDOWN_PCT long before a real 50% loss.
-            # From 2026-10-11 the live HWM was the paper default ($1M), so this
-            # branch skipped every check and the circuit breaker was off
-            # (limitations audit 2026-10-28). After 3 consecutive reads (90
-            # min), reset the HWM to the current value and say so.
+            # A persistent "implausible" read is either a stale baseline (from
+            # 2026-10-11 the live HWM was the $1M paper default and the breaker
+            # was off) or a real collapse. It used to rebase the HWM to the
+            # current value after 3 reads, so a real collapse would have
+            # re-armed the breaker below it instead of halting (audit
+            # A1031-0853-4). Now it fails closed: halt buys, alert, and keep
+            # the value as a candidate that /rebase applies after a human
+            # looks.
             implausible = int(db.get_state(implausible_key, "0") or 0) + 1 if pv > 0 else 0
             db.set_state(implausible_key, str(implausible))
-            if implausible >= IMPLAUSIBLE_READS_BEFORE_HWM_RESET:
-                db.set_state(hwm_key, str(pv))
-                db.set_state(implausible_key, "0")
-                log.critical(f"HWM {hwm_key} reset from ${hwm:,.2f} to ${pv:,.2f} after "
-                             f"{implausible} consecutive implausible reads")
-                try:
-                    alerts._send(
-                        f"⚠️ Drawdown baseline reset ({TRADING_ENV})\n"
-                        f"The high-water mark was more than twice the account value on "
-                        f"{implausible} checks in a row, so the drawdown halt was being skipped. "
-                        f"Baseline reset to the current value; the halt is active again."
-                    )
-                except Exception:
-                    pass
+            if implausible >= IMPLAUSIBLE_READS_BEFORE_HALT:
+                db.set_state(rebase_key, str(pv))
+                if db.get_state(halted_key, "false") != "true":
+                    db.set_state(halted_key, "true")
+                    db.set_state(reason_key, f"Auto: account value under half the HWM on "
+                                             f"{implausible} checks; /rebase after checking")
+                    log.critical(f"Drawdown check: {implausible} consecutive implausible reads "
+                                 f"(value under half of {hwm_key}) — trading HALTED")
+                    try:
+                        alerts._send(
+                            f"🛑 Trading HALTED ({TRADING_ENV}): account value read under half the "
+                            f"high-water mark on {implausible} checks in a row.\n"
+                            f"Either the baseline is stale or the account really fell. Check TWS. "
+                            f"If the value is right and the baseline is stale, send /rebase to "
+                            f"make it the new high-water mark and resume; /resume lifts the halt "
+                            f"without touching the baseline."
+                        )
+                    except Exception:
+                        pass
             return
         db.set_state(implausible_key, "0")
+        if db.get_state(rebase_key, ""):
+            db.set_state(rebase_key, "")   # a plausible read: no reset pending
 
         if pv > hwm:
             db.set_state(hwm_key, str(pv))

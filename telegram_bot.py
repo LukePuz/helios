@@ -411,6 +411,26 @@ def _handle_mention(update: dict, is_urgent: bool) -> None:
         except Exception as e:
             _reply(chat_id, f"⚠️ Could not set halt flag: {e}", msg_id)
         return
+    if cmd == "/rebase":
+        # Applies the value the drawdown check saw on its implausible reads
+        # as the new high-water mark, then lifts the halt (audit A1031-0853-4).
+        try:
+            import db
+            from config import TRADING_ENV
+            cand = db.get_state(f"hwm_rebase_candidate_{TRADING_ENV}", "")
+            if not cand:
+                _reply(chat_id, "No baseline reset is pending.", msg_id)
+                return
+            db.set_state(f"high_water_mark_{TRADING_ENV}", cand)
+            db.set_state(f"hwm_rebase_candidate_{TRADING_ENV}", "")
+            db.set_state(f"drawdown_implausible_count_{TRADING_ENV}", "0")
+            db.set_state(f"trading_halted_{TRADING_ENV}", "false")
+            db.set_state(f"halt_reason_{TRADING_ENV}", "")
+            _reply(chat_id, f"🟢 <b>Baseline reset</b> ({TRADING_ENV}) to the last read account value; "
+                            f"trading RESUMED.", msg_id)
+        except Exception as e:
+            _reply(chat_id, f"⚠️ Could not reset the baseline: {e}", msg_id)
+        return
     if cmd in ("/resume", "resume trading"):
         try:
             import db

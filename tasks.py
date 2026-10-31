@@ -1138,9 +1138,16 @@ _DONE_UNFILLED = {"Cancelled", "ApiCancelled", "Inactive"}
 def _backfill_perm_ids(pending: list[dict]) -> None:
     """A row logged before TWS assigned its permId has none (professor M127).
     Fill it from the open orders while the order still works, only when
-    exactly one open order has that orderId, symbol and side (orderId alone
-    is per client, m102). Never raises."""
-    missing = [o for o in pending if not o.get("perm_id")]
+    exactly one open market order has that orderId, symbol, side and
+    quantity, and only for today's rows: our market orders are DAY orders,
+    and orderId alone is per client, so an old row could match another
+    client's stop (m102, review of 0a80ce7). Never raises."""
+    from zoneinfo import ZoneInfo
+    from datetime import datetime
+    et = ZoneInfo("America/New_York")
+    today = datetime.now(et).date()
+    missing = [o for o in pending if not o.get("perm_id") and o.get("created_at") is not None
+               and o["created_at"].astimezone(et).date() == today]
     if not missing:
         return
     import db
@@ -1153,7 +1160,8 @@ def _backfill_perm_ids(pending: list[dict]) -> None:
     for order in missing:
         hits = [o for o in open_orders if o.get("order_id") == order["broker_order_id"]
                 and o.get("ticker") == order["ticker"] and (o.get("action") or "").upper() == order["side"]
-                and o.get("perm_id")]
+                and o.get("order_type") == "MKT" and order.get("qty") is not None
+                and abs(float(o.get("qty") or 0) - float(order["qty"])) < 1e-6 and o.get("perm_id")]
         if len(hits) == 1:
             try:
                 if db.set_order_perm_id(order["id"], hits[0]["perm_id"]):
@@ -1213,21 +1221,10 @@ def _resolve_if_cancelled(order: dict, completed: dict) -> None:
     log.warning(f"[{ticker}] reconcile: order {order['broker_order_id']} ({order['side']} "
                 f"{order.get('intent')}) is {hit['status']} at the broker with {recorded:g} filled; "
                 f"marked cancelled, the rest never sold")
-    intent = (order.get("intent") or "").upper()
-    if order["side"] == "SELL" and recorded > 0 and intent in ("EXIT", "BACKSTOP") and order.get("fill_price"):
-        # Flat with no other unrecorded sell today: its part fill was the
-        # whole exit, so close from it as the late-fill path does (professor
-        # M127 point 4). Another sale in the mix leaves it open: the exit
-        # price of a mixed close is Luke's open question.
-        try:
-            pos = next((p for p in ibkr.get_client().get_all_positions() if p.symbol == ticker), None)
-            if pos is None and not db.get_position_stop(ticker):
-                recorded_ids = db.recorded_sell_order_ids(ticker)
-                if recorded_ids is not None and not ibkr.get_recent_sell_fill(ticker, recorded_ids):
-                    db.close_trade_outcome(ticker, exit_price=order["fill_price"],
-                                           exit_source=f"late_{intent.lower()}", exit_price_source="fill")
-        except Exception as e:
-            log.warning(f"[{ticker}] reconcile: close after a cancelled part-filled {intent} failed: {e}")
+    # A cancelled part-filled exit leaves its outcome to the stale-stop and
+    # sweep paths: a flat position means another sale finished it, and the
+    # exit price of that mixed close is Luke's open question (review of
+    # 0a80ce7).
 
 
 @app.task(name="tasks.reconcile_unconfirmed_orders", bind=True, max_retries=2)

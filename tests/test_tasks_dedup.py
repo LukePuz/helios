@@ -1804,28 +1804,41 @@ class TestCancelledUnconfirmedOrder:
         alert.assert_called_once()
         assert "FILL NOT RECORDED" in alert.call_args.args[0]
 
-    def test_a_cancelled_part_filled_exit_closes_only_when_it_was_the_whole_exit(self):
+    def test_a_cancelled_part_filled_exit_is_marked_but_never_closed_here(self):
+        """Review of 0a80ce7: flat after a part-filled exit is a mixed close."""
         part = {**self.ORDER, "filled_qty": 8.0, "fill_price": 181.0}
-        fill = {"filled_qty": 8.0, "fill_price": 181.0}
-        mark, close, _, _ = self._run(self._done(status="ApiCancelled", filled=8.0), fill=fill, order=part)
+        mark, close, _, _ = self._run(self._done(status="ApiCancelled", filled=8.0),
+                                      fill={"filled_qty": 8.0, "fill_price": 181.0}, order=part)
         mark.assert_called_once_with(44, 8.0)
-        close.assert_called_once_with("CRWD", exit_price=181.0, exit_source="late_exit", exit_price_source="fill")
-        _, close, _, _ = self._run(self._done(status="ApiCancelled", filled=8.0), fill=fill, order=part,
-                                   other_sell={"filled_qty": 12.0, "fill_price": 179.0})
-        close.assert_not_called()   # mixed close: Luke's open question
-        from unittest.mock import MagicMock
-        _, close, _, _ = self._run(self._done(status="ApiCancelled", filled=8.0), fill=fill, order=part,
-                                   positions=[MagicMock(symbol="CRWD", qty=12)])
-        close.assert_not_called()   # rest still held: never sold
+        close.assert_not_called()
+
+    def test_less_filled_at_the_broker_than_recorded_is_left_open(self):
+        part = {**self.ORDER, "filled_qty": 8.0, "fill_price": 181.0}
+        mark, _, alert, _ = self._run(self._done(filled=5.0), fill={"filled_qty": 8.0, "fill_price": 181.0},
+                                      order=part)
+        mark.assert_not_called()
+        alert.assert_not_called()
 
 
 def test_perm_id_backfill_needs_one_unambiguous_open_order():
     from unittest.mock import patch as p
-    rows = [{"id": 1, "ticker": "CRWD", "side": "SELL", "broker_order_id": 900, "perm_id": None},
-            {"id": 2, "ticker": "AMD", "side": "SELL", "broker_order_id": 901, "perm_id": None}]
-    open_orders = [{"order_id": 900, "ticker": "CRWD", "action": "SELL", "perm_id": 7700},
-                   {"order_id": 901, "ticker": "AMD", "action": "SELL", "perm_id": 8800},
-                   {"order_id": 901, "ticker": "AMD", "action": "SELL", "perm_id": 8801}]   # two clients
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    rows = [{"id": 1, "ticker": "CRWD", "side": "SELL", "qty": 20.0, "broker_order_id": 900, "perm_id": None,
+             "created_at": now},
+            {"id": 2, "ticker": "AMD", "side": "SELL", "qty": 5.0, "broker_order_id": 901, "perm_id": None,
+             "created_at": now},
+            {"id": 3, "ticker": "NVDA", "side": "SELL", "qty": 4.0, "broker_order_id": 902, "perm_id": None,
+             "created_at": now},
+            {"id": 4, "ticker": "TSLA", "side": "SELL", "qty": 2.0, "broker_order_id": 903, "perm_id": None,
+             "created_at": now - timedelta(days=3)}]
+    mkt = {"order_type": "MKT", "action": "SELL"}
+    open_orders = [{**mkt, "order_id": 900, "ticker": "CRWD", "qty": 20.0, "perm_id": 7700},
+                   {**mkt, "order_id": 901, "ticker": "AMD", "qty": 5.0, "perm_id": 8800},
+                   {**mkt, "order_id": 901, "ticker": "AMD", "qty": 5.0, "perm_id": 8801},   # two clients
+                   {"order_id": 902, "ticker": "NVDA", "action": "SELL", "order_type": "STP", "qty": 4.0,
+                    "perm_id": 9900},                                                            # a stop
+                   {**mkt, "order_id": 903, "ticker": "TSLA", "qty": 2.0, "perm_id": 9910}]   # old row
     with p("ibkr.get_open_orders", return_value=open_orders), \
          p("db.set_order_perm_id", return_value=True) as setp:
         tasks._backfill_perm_ids(rows)

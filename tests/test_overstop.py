@@ -190,13 +190,17 @@ def test_backstop_does_not_sell_shares_a_working_sell_already_covers():
              patch("ibkr.get_open_orders", return_value=open_orders), \
              patch("ibkr.place_market_order",
                    return_value={"order_id": 78, "filled_qty": 6, "fill_price": 140.0}) as order, \
-             patch("db.log_trade"), patch("db.delete_position_stop"), patch("db.log_order", return_value=5), \
-             patch("db.update_order_fill"), patch("db.close_trade_outcome"), patch("alerts._send"):
+             patch("db.log_trade"), patch("db.delete_position_stop") as delete, \
+             patch("db.log_order", return_value=5), \
+             patch("db.update_order_fill"), patch("db.close_trade_outcome") as close, patch("alerts._send"):
             tasks._execute_backstop_sell("AMD", TestBackstopSellReads._alert)
         if sold is None:
             order.assert_not_called()
         else:
             order.assert_called_once_with("AMD", "SELL", sold)
+            # The working order may still be cancelled: keep the record, and
+            # leave the outcome for the sale that finishes it (professor M128).
+            delete.assert_not_called(); close.assert_not_called()
     # A manual limit sell (e.g. above the market in TWS) is not cover.
     lmt = [{**working[0], "order_type": "LMT", "remaining": 10.0}]
     with patch("ibkr.get_client", return_value=client), \
@@ -208,6 +212,39 @@ def test_backstop_does_not_sell_shares_a_working_sell_already_covers():
          patch("db.update_order_fill"), patch("db.close_trade_outcome"), patch("alerts._send"):
         tasks._execute_backstop_sell("AMD", TestBackstopSellReads._alert)
     order.assert_called_once_with("AMD", "SELL", 10.0)
+
+
+def test_fix_overstop_leaves_out_shares_a_working_market_sell_is_selling():
+    """Professor M129: a stop sized for those shares too would short."""
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="AMD", qty=10)]
+    mkt = {"order_id": 9, "ticker": "AMD", "action": "SELL", "order_type": "MKT", "qty": 10.0,
+           "stop_price": None, "status": "Submitted", "remaining": 4.0}
+    with patch("ibkr.get_client", return_value=client), \
+         patch("ibkr.get_open_orders", return_value=[mkt]), \
+         patch("db.get_position_stop", return_value={"stop_price": 150.0}), \
+         patch("ibkr.get_latest_price", return_value=200.0), \
+         patch("tasks.manage_stop_place", return_value={"order_id": 3}) as place, \
+         patch("db.set_stop_broker_order_id"):
+        tasks._fix_overstop("AMD")
+    place.assert_called_once_with("AMD", 6.0, 150.0)
+
+
+def test_late_sell_reprotect_sizes_the_stop_net_of_the_working_remainder():
+    """Professor M129: 20 left, 15 of them still being sold by our MKT order."""
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="CRWD", qty=20)]
+    mkt = {"order_id": 9, "ticker": "CRWD", "action": "SELL", "order_type": "MKT", "qty": 50.0,
+           "stop_price": None, "status": "Submitted", "remaining": 15.0}
+    with patch("ibkr.get_client", return_value=client), \
+         patch("ibkr.get_open_orders", return_value=[mkt]), \
+         patch("db.get_position_stop", return_value={"stop_price": 150.0}), \
+         patch("execution._stops_still_resting", return_value=0.0), \
+         patch("tasks.manage_cancel_stop_orders_for"), patch("time.sleep"), \
+         patch("tasks.manage_stop_place", return_value={"order_id": 3}) as place, \
+         patch("db.set_stop_broker_order_id"):
+        assert tasks._reprotect_after_late_sell("CRWD", {"intent": "TRIM"}, 175.0) is True
+    place.assert_called_once_with("CRWD", 5.0, 150.0)
 
 
 def test_cancel_failure_in_overcover_returns_a_line_not_a_crash():

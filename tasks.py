@@ -305,6 +305,13 @@ def _resting_sell_stops(ticker: str, types=("STP", "STP LMT", "TRAIL")) -> list[
     return [o for o in _working_sell_stops(ibkr.get_open_orders(), types) if o["ticker"] == ticker]
 
 
+def _working_mkt_sell_qty(open_orders: list[dict], ticker: str) -> float:
+    """Unfilled shares of working market SELLs for ticker. Those shares are
+    already being sold, so a stop sized for them as well would short once
+    both fill (professor M129; same rule as the backstop, 44b889a)."""
+    return sum(float(o["qty"]) for o in _working_sell_stops(open_orders, ("MKT",)) if o["ticker"] == ticker)
+
+
 def _working_sell_stops(open_orders: list[dict], types=("STP", "STP LMT", "TRAIL")) -> list[dict]:
     """The one coverage definition: SELL stops not in a dead state, with
     qty = the unfilled remainder. Shared by _resting_sell_stops and
@@ -1696,6 +1703,20 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
     if not stop_price:
         log.error(f"[{ticker}] reconcile: {remaining} shares left after a late sell, no stop on record")
         return False
+    try:
+        import ibkr
+        selling = _working_mkt_sell_qty(ibkr.get_open_orders(), ticker)
+    except Exception as e:
+        # Unprotected is worse than over-stopped: section 2b fixes the latter.
+        log.warning(f"[{ticker}] reconcile: open-order read failed ({e}); stopping all {remaining} shares")
+        selling = 0.0
+    if selling > 0:
+        # The rest of the sale is still working: protect only what it won't
+        # sell (professor M129).
+        remaining = round(remaining - selling, 4)
+        if remaining <= 0:
+            log.info(f"[{ticker}] reconcile: a working SELL covers the remaining shares; no stop placed")
+            return True
     if order.get("intent") != "PROFIT_TARGET":
         # Already covered (e.g. a stop Luke placed after a "place manually"
         # alert, or an earlier try that did land): cancelling it to re-place
@@ -2137,7 +2158,11 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
                                      "filled" if filled >= owned - 1e-6 else "partial")
         except Exception as e:
             log.warning(f"[{ticker}] Backstop sale order logging failed: {e}")
-        if resting <= 0:  # shares under a stuck stop are still held
+        # Shares under a stuck stop, or under our working SELL, are still
+        # held: keep the record (so a cancelled order's shares can be
+        # backstopped next cycle) and leave the outcome for whichever sale
+        # finishes the position (professor M128).
+        if resting <= 0 and working <= 0:
             db.delete_position_stop(ticker)
             if filled < owned - 1e-6:
                 # Part filled: this part's price isn't the exit (professor
@@ -3145,7 +3170,12 @@ def _fix_overstop(ticker: str) -> str:
         pos = next((p for p in ibkr.get_client().get_all_positions() if p.symbol == ticker), None)
         signed = float(pos.qty) if pos else 0.0
         held = round(abs(signed), 4)
-        resting = sum(float(o["qty"]) for o in _resting_sell_stops(ticker))
+        open_orders = ibkr.get_open_orders()
+        resting = sum(float(o["qty"]) for o in _working_sell_stops(open_orders) if o["ticker"] == ticker)
+        # Shares a working market SELL is already selling need no stop
+        # (professor M129).
+        if signed > 0:
+            held = max(round(held - _working_mkt_sell_qty(open_orders, ticker), 4), 0.0)
     except Exception as e:
         return f"⚠️ {ticker}: stop-coverage re-check failed ({e}); check TWS"
     if signed < 0:
@@ -3512,6 +3542,7 @@ def _reconcile_stop_orders_body(self):
         for ticker, qty in held.items():
             pending_key = f"overstop_pending_{ticker}"
             covered = stop_qty.get(ticker, 0.0)
+            qty = max(round(qty - _working_mkt_sell_qty(open_ords, ticker), 4), 0.0)   # professor M129
             if covered <= 0 or abs(covered - qty) <= 1e-6:
                 db.set_state(pending_key, "")
                 continue

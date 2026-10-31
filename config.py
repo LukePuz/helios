@@ -474,6 +474,8 @@ APPROVAL_EXPIRY_HOURS = 6     # pending approvals auto-expire after 6 hours
 # Portfolio safety
 # ---------------------------------------------------------------------------
 MAX_DRAWDOWN_PCT = 0.15       # alert at 15% drawdown from START_VALUE
+# halt_reason prefix of the implausible-read halt: /rebase lifts only this one (professor M145)
+IMPLAUSIBLE_HALT_REASON_PREFIX = "Auto: account value under half the HWM"
 
 # ---------------------------------------------------------------------------
 # Execution

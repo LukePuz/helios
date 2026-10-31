@@ -61,11 +61,41 @@ def _rebase(state, monkeypatch):
 
 def test_rebase_command_applies_the_candidate_and_resumes(monkeypatch):
     state = {"hwm_rebase_candidate_live": "1900.0", "high_water_mark_live": "1000000",
-             "trading_halted_live": "true", "drawdown_implausible_count_live": "5"}
+             "trading_halted_live": "true", "drawdown_implausible_count_live": "5",
+             "halt_reason_live": "Auto: account value under half the HWM on 3 checks; /rebase after checking"}
     text = _rebase(state, monkeypatch)
     assert state["high_water_mark_live"] == "1900.0" and state["trading_halted_live"] == "false"
     assert state["hwm_rebase_candidate_live"] == "" and state["drawdown_implausible_count_live"] == "0"
-    assert "Baseline reset" in text and "$1,900.00" in text
+    assert "Baseline reset" in text and "$1,900.00" in text and "RESUMED" in text
+
+
+def test_rebase_keeps_a_different_halt(monkeypatch):
+    """Professor M145: /rebase lifts only the implausible-read halt."""
+    state = {"hwm_rebase_candidate_live": "1900.0", "high_water_mark_live": "1000000",
+             "trading_halted_live": "true", "halt_reason_live": "Manual halt by owner"}
+    text = _rebase(state, monkeypatch)
+    assert state["high_water_mark_live"] == "1900.0" and state["trading_halted_live"] == "true"
+    assert state["halt_reason_live"] == "Manual halt by owner" and "stays HALTED" in text
+
+
+def test_rebase_rejects_a_bad_candidate(monkeypatch):
+    state = {"hwm_rebase_candidate_live": "abc", "high_water_mark_live": "2000"}
+    text = _rebase(state, monkeypatch)
+    assert state["high_water_mark_live"] == "2000" and "nothing applied" in text
+
+
+def test_rebase_reports_a_write_that_did_not_land(monkeypatch):
+    import telegram_bot
+    monkeypatch.setattr(telegram_bot, "_ALLOWED_USER_IDS", {99})
+    state = {"hwm_rebase_candidate_live": "1900.0", "high_water_mark_live": "1000000"}
+    update = {"message": {"chat": {"id": 1}, "message_id": 2, "from": {"id": 99}, "text": "/rebase"}}
+    with patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
+         patch("db.set_state"), patch("db.log_halt_event") as ev, \
+         patch("config.TRADING_ENV", "live"), patch.object(telegram_bot, "_reply") as reply, \
+         patch.object(telegram_bot, "_send_chat_action"):
+        telegram_bot._handle_mention(update, is_urgent=False)
+    assert "incomplete" in reply.call_args.args[1]
+    ev.assert_not_called()
 
 
 def test_rebase_without_a_candidate_changes_nothing(monkeypatch):

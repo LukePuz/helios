@@ -370,6 +370,21 @@ def _execute_chat_order(
 # Mention handler (group chat @mentions)
 # ---------------------------------------------------------------------------
 
+def _write_state_checked(writes: list[tuple[str, str]]) -> list[str]:
+    """Write each system_state key and read it back; the keys that didn't
+    land. db.set_state swallows its own errors (professor M145)."""
+    import db
+    failed = []
+    for key, value in writes:
+        db.set_state(key, value)
+        try:
+            if db.get_state_strict(key, "") != value:
+                failed.append(key)
+        except Exception:
+            failed.append(key)
+    return failed
+
+
 def _handle_mention(update: dict, is_urgent: bool) -> None:
     msg      = update.get("message", {})
     chat_id  = msg.get("chat", {}).get("id")
@@ -414,27 +429,50 @@ def _handle_mention(update: dict, is_urgent: bool) -> None:
         return
     if cmd == "/rebase":
         # Applies the value the drawdown check saw on its implausible reads
-        # as the new high-water mark, then lifts the halt (audit A1031-0853-4).
+        # as the new high-water mark (audit A1031-0853-4). Lifts the halt only
+        # when that check set it, and says so if a write didn't land (M145).
         try:
             import db
-            from config import TRADING_ENV
+            from config import TRADING_ENV, IMPLAUSIBLE_HALT_REASON_PREFIX
             cand = db.get_state(f"hwm_rebase_candidate_{TRADING_ENV}", "")
             if not cand:
                 _reply(chat_id, "No baseline reset is pending.", msg_id)
                 return
-            old_hwm = db.get_state(f"high_water_mark_{TRADING_ENV}", "")
-            db.set_state(f"high_water_mark_{TRADING_ENV}", cand)
-            db.set_state(f"hwm_rebase_candidate_{TRADING_ENV}", "")
-            db.set_state(f"drawdown_implausible_count_{TRADING_ENV}", "0")
-            db.set_state(f"trading_halted_{TRADING_ENV}", "false")
-            db.set_state(f"halt_reason_{TRADING_ENV}", "")
             try:
-                ratio = round(float(cand) / float(old_hwm), 4) if old_hwm and float(old_hwm) > 0 else None
+                new_hwm = float(cand)
+            except ValueError:
+                new_hwm = 0.0
+            if not new_hwm > 0:
+                _reply(chat_id, "⚠️ The pending baseline value isn't a positive number; nothing applied.", msg_id)
+                return
+            old_hwm = db.get_state(f"high_water_mark_{TRADING_ENV}", "")
+            halted = db.get_state(f"trading_halted_{TRADING_ENV}", "false") == "true"
+            reason = db.get_state(f"halt_reason_{TRADING_ENV}", "") or ""
+            lift = halted and reason.startswith(IMPLAUSIBLE_HALT_REASON_PREFIX)
+            writes = [(f"high_water_mark_{TRADING_ENV}", cand),
+                      (f"drawdown_implausible_count_{TRADING_ENV}", "0")]
+            if lift:
+                writes += [(f"trading_halted_{TRADING_ENV}", "false"), (f"halt_reason_{TRADING_ENV}", "")]
+            # The candidate goes last, so a partial failure can be retried.
+            writes.append((f"hwm_rebase_candidate_{TRADING_ENV}", ""))
+            failed = _write_state_checked(writes)
+            if failed:
+                _reply(chat_id, f"⚠️ <b>Baseline reset incomplete</b> ({TRADING_ENV}): could not write "
+                                f"{', '.join(failed)}. Check /status and try again.", msg_id)
+                return
+            try:
+                ratio = round(new_hwm / float(old_hwm), 4) if old_hwm and float(old_hwm) > 0 else None
             except ValueError:
                 ratio = None
-            db.log_halt_event("rebase_resume", "telegram", hwm_change_ratio=ratio)
-            _reply(chat_id, f"🟢 <b>Baseline reset</b> ({TRADING_ENV}) to ${float(cand):,.2f}, the last "
-                            f"read account value; trading RESUMED.", msg_id)
+            db.log_halt_event("rebase_resume" if lift else "rebase", "telegram", hwm_change_ratio=ratio)
+            if lift:
+                tail = "trading RESUMED."
+            elif halted:
+                tail = "trading stays HALTED (a different halt is active); /resume lifts it."
+            else:
+                tail = "trading was not halted."
+            _reply(chat_id, f"🟢 <b>Baseline reset</b> ({TRADING_ENV}) to ${new_hwm:,.2f}, the last "
+                            f"read account value; {tail}", msg_id)
         except Exception as e:
             _reply(chat_id, f"⚠️ Could not reset the baseline: {e}", msg_id)
         return

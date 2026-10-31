@@ -3763,7 +3763,8 @@ def check_portfolio_drawdown(self):
                 # Plain read: a failed one returns "false" and sets the halt (fails closed).
                 if db.get_state(halted_key, "false") != "true":
                     db.set_state(halted_key, "true")
-                    db.set_state(reason_key, f"Auto: account value under half the HWM on "
+                    from config import IMPLAUSIBLE_HALT_REASON_PREFIX
+                    db.set_state(reason_key, f"{IMPLAUSIBLE_HALT_REASON_PREFIX} on "
                                              f"{implausible} checks; /rebase after checking")
                     db.log_halt_event("auto_halt", "drawdown_task", "implausible reads",
                                       implausible_reads=implausible)

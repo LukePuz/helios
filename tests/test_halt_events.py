@@ -33,9 +33,14 @@ def _command(text, state, monkeypatch):
 def test_commands_log_events(monkeypatch):
     assert _command("/halt", {}, monkeypatch).call_args.args[:2] == ("manual_halt", "telegram")
     assert _command("/resume", {}, monkeypatch).call_args.args[:2] == ("resume", "telegram")
-    ev = _command("/rebase", {"hwm_rebase_candidate_live": "1900.0", "high_water_mark_live": "1000000"},
+    ev = _command("/rebase", {"hwm_rebase_candidate_live": "1900.0", "high_water_mark_live": "1000000",
+                              "trading_halted_live": "true",
+                              "halt_reason_live": "Auto: account value under half the HWM on 3 checks"},
                   monkeypatch)
     assert ev.call_args.args[0] == "rebase_resume" and ev.call_args.kwargs["hwm_change_ratio"] == 0.0019
+    ev = _command("/rebase", {"hwm_rebase_candidate_live": "1900.0", "high_water_mark_live": "1000000"},
+                  monkeypatch)
+    assert ev.call_args.args[0] == "rebase"                   # not halted: nothing lifted
     _command("/rebase", {}, monkeypatch).assert_not_called()  # nothing pending
 
 

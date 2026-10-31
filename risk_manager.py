@@ -254,8 +254,11 @@ class RiskManager:
                 return True
             hwm_str = db.get_state(f"high_water_mark_{TRADING_ENV}")
         except Exception as e:
-            log.warning(f"Halt state read failed ({e}) — falling back to instance baseline")
-            hwm_str = None
+            # Fail closed (audit A1031-1053-2): an unread flag may be a /halt,
+            # and the fallback baseline is the account value at construction,
+            # so the drawdown would read as ~0. Not latched: this call only.
+            log.warning(f"Halt state read failed ({e}) — treating as halted for this check")
+            return True
 
         current  = self.portfolio_value()
         baseline = float(hwm_str) if hwm_str else self.start_value
@@ -265,15 +268,13 @@ class RiskManager:
         # Plausibility guard: a transient broker read of $0 (clientId
         # collision, cold-morning connection race) would otherwise compute
         # as a 100% drawdown and latch trading_halted until a manual
-        # /resume. Treat an implausible single-step read as "unknown, don't
-        # halt" rather than as a real drawdown — this is checked on every
-        # buy attempt, not on a timer, so failing open here just means one
-        # sizing call proceeds on stale-but-not-dangerous data; failing
-        # closed would mean one bad read stops all trading indefinitely.
+        # /resume. An implausible read blocks this one buy without latching
+        # (A1031-1053-2): sizing on it would be wrong anyway, and a
+        # persistent one halts via check_portfolio_drawdown.
         if current <= 0 or current < 0.5 * baseline:
             log.warning(f"Implausible portfolio value ${current:,.2f} "
-                       f"(baseline ${baseline:,.2f}) — skipping halt check")
-            return False
+                       f"(baseline ${baseline:,.2f}) — blocking this buy, not latching a halt")
+            return True
 
         drawdown = (baseline - current) / baseline
         if drawdown >= DRAWDOWN_HALT_PCT:

@@ -169,6 +169,25 @@ class TestSellClampAndDrift:
         mock_order.assert_not_called()
 
 
+class TestHaltCheckFailsClosed:
+    def test_a_failed_halt_check_blocks_the_buy(self):
+        """Audit A1031-1053-2: an unchecked halt must not let a buy through."""
+        approval = _approval(action="ADD", price_at_sizing=100.0)
+        with patch("ibkr.get_ib"), \
+             patch("ibkr.get_client"), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("ibkr.place_market_order") as mock_order, \
+             patch("ibkr.get_latest_price", return_value=100.0), \
+             patch("market_data.get_priced_quote",
+                   return_value={"price": 100.0, "is_stale": False, "age_minutes": 1, "market_open": True}), \
+             patch("market_data.is_market_hours", return_value=True), \
+             patch("alerts._send"):
+            mock_rm_cls.return_value.is_halted.side_effect = RuntimeError("db down")
+            result = execution.execute_approved(approval)
+        assert result is False
+        mock_order.assert_not_called()
+
+
 class TestPhantomFills:
     def test_zero_fill_records_nothing(self):
         """An order that submits but doesn't confirm a fill within the wait

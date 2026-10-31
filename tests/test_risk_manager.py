@@ -194,6 +194,27 @@ class TestHalt:
             assert rm.is_halted() is False
 
 
+    def test_unreadable_halt_state_fails_closed(self):
+        """Audit A1031-1053-2: an unread flag may be a /halt."""
+        client = _make_client()
+        with patch("risk_manager.TRADING_ENV", "paper"), \
+             patch("db.get_state", side_effect=RuntimeError("dns")), \
+             patch("db.set_state") as set_state:
+            rm = risk_manager.RiskManager(client)
+            assert rm.is_halted() is True
+        set_state.assert_not_called()                       # not latched
+
+    def test_implausible_read_blocks_without_latching(self):
+        client = _make_client(portfolio_value=1_000.0)
+        with patch("risk_manager.TRADING_ENV", "paper"), \
+             patch("db.get_state", side_effect=lambda k, d=None: {"trading_halted_paper": "false",
+                                                                    "high_water_mark_paper": "100000"}.get(k, d)), \
+             patch("db.set_state") as set_state:
+            rm = risk_manager.RiskManager(client)
+            assert rm.is_halted() is True
+        set_state.assert_not_called()
+
+
 class TestConcentrationFailsClosed:
     def test_errored_check_fails_closed(self):
         client = MagicMock()

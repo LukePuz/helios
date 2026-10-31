@@ -642,7 +642,10 @@ def execute_approved(
                     )
                     return _outcome("blocked: drawdown halt active")
             except Exception as halt_err:
-                log.warning(f"[{ticker}] Drawdown halt check failed: {halt_err}")
+                # Fail closed: an unchecked halt must not let a buy through
+                # (A1031-1053-2). The approval can be retried.
+                log.warning(f"[{ticker}] Drawdown halt check failed: {halt_err} — blocking")
+                return _outcome("blocked: halt check failed")
 
         if action in ("OPEN", "ADD"):
             side = "BUY"

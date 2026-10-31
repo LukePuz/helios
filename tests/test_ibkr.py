@@ -554,3 +554,13 @@ class TestFillTime:
             _FakeFillRecord("DDOG", order_id=11, shares=84.0, avg_price=227.8, side="SLD")]
         with patch("ibkr.get_ib", return_value=fake_ib):
             assert "fill_time" not in ibkr.get_recent_sell_fill("DDOG")
+
+    def test_fill_for_order_reports_the_last_execution_time(self):
+        from datetime import datetime, timezone
+        t = datetime(2026, 10, 30, 14, 5)            # naive: read as UTC
+        fake_ib = MagicMock()
+        fake_ib.reqExecutions.return_value = [
+            _FakeFillRecord("CRWD", order_id=764, shares=144.0, avg_price=181.3, side="BOT", time=t)]
+        with patch("ibkr.get_ib", return_value=fake_ib):
+            fill = ibkr.get_fill_for_order(764, ticker="CRWD", side="BUY")
+        assert fill["fill_time"] == t.replace(tzinfo=timezone.utc)

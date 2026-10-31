@@ -105,3 +105,16 @@ class TestRecordedSellOrderIds:
 
     def test_a_query_error_returns_none(self):
         assert self._run(RuntimeError("down")) is None
+
+
+def test_update_order_fill_keeps_an_earlier_fill_time_when_none_is_given():
+    """Professor M110: filled_at=COALESCE(new, old)."""
+    from unittest.mock import MagicMock, patch
+    cur = MagicMock()
+    cur.fetchone.return_value = (None, "SELL")
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
+        db.update_order_fill(44, 171.5, 50.0, "filled", filled_at="T")
+    sql, params = cur.execute.call_args_list[-1][0]
+    assert "filled_at=COALESCE(%s, filled_at)" in sql and params[4] == "T" and params[5] == 44

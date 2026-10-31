@@ -841,6 +841,39 @@ def _r_shadow(result: dict, price: float, stop) -> dict | None:
         return {"error": str(e)[:200]}
 
 
+SWAP_CASH_WAIT_S = 16
+
+
+def _wait_for_swap_cash(rm, cash_before: float | None, sell_result: dict, ticker: str) -> bool:
+    """Poll cash (every 2 s, up to SWAP_CASH_WAIT_S) until at least 90% of the
+    swap sale's proceeds show up. True when they did; False on timeout or
+    when the inputs are unknown (then the re-size runs on whatever cash says)."""
+    import time
+    try:
+        proceeds = float(sell_result.get("filled_qty") or 0) * float(sell_result.get("fill_price") or 0)
+    except (TypeError, ValueError):
+        proceeds = 0.0
+    if cash_before is None or proceeds <= 0:
+        return False
+    target = cash_before + 0.9 * proceeds
+    # ib.sleep runs ib_async's event loop, so the cached account values can
+    # update while waiting; time.sleep would block it (review of d1ab4f2).
+    try:
+        import ibkr
+        pause = ibkr.get_ib().sleep
+    except Exception:
+        pause = time.sleep
+    for _ in range(SWAP_CASH_WAIT_S // 2):
+        try:
+            if rm.cash() >= target:
+                return True
+        except Exception:
+            pass
+        pause(2)
+    log.warning(f"[{ticker}] swap proceeds not in cash after {SWAP_CASH_WAIT_S}s; re-sizing anyway")
+    return False
+
+
 def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
     """
     Run risk sizing on an analyst recommendation and auto-execute it (paper
@@ -1073,6 +1106,10 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
                         f"unrealized P&L ${swap['unrealized_pl']:,.2f}) to fund it"
                     )
                     try:
+                        cash_before = rm.cash()
+                    except Exception:
+                        cash_before = None
+                    try:
                         from execution import execute_manual
                         sell_result = execute_manual(
                             swap["ticker"], "SELL", swap["qty"],
@@ -1100,10 +1137,23 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
                             )
                         except Exception:
                             pass
-                        # Re-size now that the sale has freed up cash.
+                        # Re-size once the sale shows in cash: IBKR updates
+                        # TotalCashValue late, and re-sizing at once could leave
+                        # the holding sold and the buy at 0 (A1031-1253-3).
+                        _wait_for_swap_cash(rm, cash_before, sell_result, ticker)
                         sizing = rm.size_position(ticker, conviction, bucket, regime_str, price)
                         sizing["price_at_sizing"] = price
                         _attach_shadows(sizing, ticker, result, price)
+                        if sizing.get("shares_initial", 0) <= 0:
+                            try:
+                                import alerts as alert_module
+                                alert_module._send(
+                                    f"⚠️ SWAP INCOMPLETE — sold {swap['ticker']} to fund <b>{ticker}</b>, "
+                                    f"but the buy still sizes to 0 shares (flags: "
+                                    f"{', '.join(sizing.get('flags') or []) or 'none'}). The cash is "
+                                    f"free; the next {ticker} analysis can use it.")
+                            except Exception:
+                                pass
                     else:
                         log.warning(f"[{swap['ticker']}] Swap sell did not complete: "
                                     f"{sell_result.get('message')}")

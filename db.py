@@ -4046,7 +4046,8 @@ def flag_orphan_outcomes(held: set[str]) -> tuple[int, int]:
                 "AND ps.trading_env = trade_outcomes.trading_env) AND NOT EXISTS ("
                 "SELECT 1 FROM orders o WHERE UPPER(o.ticker) = UPPER(trade_outcomes.ticker) "
                 "AND o.trading_env = trade_outcomes.trading_env AND o.side = 'SELL' "
-                "AND o.status IN ('unconfirmed', 'partial') AND o.created_at > NOW() - INTERVAL '24 hours')",
+                "AND o.status IN ('unconfirmed', 'partial') AND o.broker_order_id IS NOT NULL "
+                "AND o.created_at > NOW() - INTERVAL '24 hours')",
                 (TRADING_ENV, held_list),
             )
             newly = cur.rowcount

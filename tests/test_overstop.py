@@ -474,3 +474,16 @@ def test_a_queued_profit_target_keeps_a_later_exits_order_for_the_flat_close():
         tasks._reprotect_after_late_sell("CRWD", rec, 171.0, from_queue=True)
     row.assert_called_once_with(5)
     close.assert_called_once_with("CRWD", exit_price=171.5, exit_source="late_exit", exit_price_source="fill")
+
+
+def test_a_restore_replacing_a_queued_exit_keeps_the_exits_order():
+    """Review of 03efab7: the same gap as m111, for a RESTORE/BUY re-queue."""
+    import json
+    state = {tasks._REPROTECT_STATE_KEY: json.dumps(
+        {"CRWD": {"intent": "EXIT", "order_id": 5, "nonce": "a"}})}
+    with patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
+         patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+         patch("stop_lock._redis", side_effect=RuntimeError("no redis")):
+        tasks._queue_reprotect("CRWD", {"intent": "RESTORE"}, None)
+    rec = json.loads(state[tasks._REPROTECT_STATE_KEY])["CRWD"]
+    assert rec["intent"] == "RESTORE" and rec["exit_intent"] == "EXIT" and rec["exit_order_id"] == 5

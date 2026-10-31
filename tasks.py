@@ -1410,6 +1410,14 @@ def _queue_reprotect(ticker: str, order: dict, fill_price: float | None) -> None
                 pending[ticker]["exit_order_id"] = entry["order_id"]
         else:
             pending[ticker] = entry
+            if (entry["intent"] or "").upper() not in ("EXIT", "BACKSTOP"):
+                # A RESTORE/BUY replacing a queued exit keeps that exit's
+                # order for the flat close (review of 03efab7, as m111).
+                if (old.get("intent") or "").upper() in ("EXIT", "BACKSTOP"):
+                    pending[ticker].update(exit_intent=old["intent"], exit_order_id=old.get("order_id"))
+                elif old.get("exit_intent"):
+                    pending[ticker].update(exit_intent=old["exit_intent"],
+                                           exit_order_id=old.get("exit_order_id"))
         return pending
     _reprotect_queue_edit(add)
 

@@ -14,7 +14,8 @@ _PATTERNS = [
     (re.compile(r"\b[UD]U?\d{7,8}\b"), "[ACCOUNT]"),
     # Credentials in a query string: FRED's api_key rode along in every
     # requests error message (audit A1031-0253-5).
-    (re.compile(r"(?i)\b(api_?key|access_token|token)=[^&\s'\"]+"), r"\1=[REDACTED]"),
+    # Stops at "<" too, so a closing HTML tag in a Telegram alert survives.
+    (re.compile(r"(?i)\b(api_?key|access_token|token)=[^&\s'\"<]+"), r"\1=[REDACTED]"),
 ]
 
 

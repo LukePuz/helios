@@ -87,3 +87,7 @@ def test_telegram_alert_text_is_redacted_before_it_is_sent():
     for call in post.call_args_list:
         sent = call.kwargs["json"]["text"]
         assert "abc123" not in sent and "apiKey=[REDACTED]" in sent
+
+
+def test_credential_match_stops_at_a_closing_tag():
+    assert log_redaction.redact("<code>x?token=abc</code> ok") == "<code>x?token=[REDACTED]</code> ok"

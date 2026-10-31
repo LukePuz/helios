@@ -439,16 +439,20 @@ def _brief_exposure(ticker: str, prompt: str) -> dict:
     BRIEF_POSITION_CONTEXT, repeats on held names see their last verdicts and
     aren't independent draws; the section keys on a stop row, not the broker.
     held_broker is None when there is no fresh snapshot (or no positions)."""
-    out = {"position_context_shown": "=== POSITION CONTEXT" in (prompt or ""),
-           "prior_verdicts_shown": []}
+    out = {"position_context_shown": False, "prior_verdicts_shown": []}
+    # Only inside the position section: event text above it is raw news.
+    in_section = False
     for line in (prompt or "").splitlines():
-        if line.startswith("Recent verdicts: "):
+        if line.startswith("=== POSITION CONTEXT"):
+            in_section = out["position_context_shown"] = True
+        elif line.startswith("==="):
+            in_section = False
+        elif in_section and line.startswith("Recent verdicts: "):
             out["prior_verdicts_shown"] = [v.strip() for v in line[len("Recent verdicts: "):].split(";")
                                            if v.strip()]
-            break
     try:
         import db
-        out["has_stop_row"] = db.get_position_stop(ticker) is not None
+        out["has_stop_row"] = db.get_position_stop(ticker, strict=True) is not None
     except Exception:
         out["has_stop_row"] = None
     try:

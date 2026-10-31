@@ -202,10 +202,11 @@ def _route_row_fields(result: dict, kind: str) -> dict:
     and provenance and had to be joined to the preceding verdict). The
     prompt_sha in provenance identifies that verdict's signals row."""
     prov = result.get("provenance") or None
-    if prov and "plan" in prov:
+    if prov and ("plan" in prov or "brief_exposure" in prov):
         # The plan observation belongs to the verdict row only; copied onto
         # routing rows it was counted 2-3 times (pre-pull review 10-29).
-        prov = {k: v for k, v in prov.items() if k != "plan"}
+        # brief_exposure likewise.
+        prov = {k: v for k, v in prov.items() if k not in ("plan", "brief_exposure")}
     return {
         "model": (prov or {}).get("model"),
         "provenance": prov,

@@ -33,3 +33,11 @@ def test_unknown_when_no_fresh_snapshot_or_reads_fail():
     with patch("db.get_position_stop", return_value=None), \
          patch("tasks._fresh_snapshot_positions", return_value={"NVDA": {"qty": 1}}):
         assert analyst._brief_exposure("PLTR", "")["held_broker"] is False
+
+
+def test_a_news_line_outside_the_position_section_is_not_read_as_verdicts():
+    prompt = "=== EVENT ===\nRecent verdicts: analysts upgrade\n=== MEMORY ===\nx"
+    with patch("db.get_position_stop", return_value=None), \
+         patch("tasks._fresh_snapshot_positions", return_value={}):
+        out = analyst._brief_exposure("NVDA", prompt)
+    assert out["position_context_shown"] is False and out["prior_verdicts_shown"] == []

@@ -37,7 +37,7 @@ def _send(text: str, _max_attempts: int = 3) -> int | None:
         return None
     # Alert text often embeds a raw exception, which bypasses log redaction
     # (review of 23673b7).
-    text = log_redaction.redact(text)
+    text = log_redaction.redact(str(text))
     for attempt in range(1, _max_attempts + 1):
         try:
             resp = requests.post(
@@ -65,7 +65,7 @@ def _send_with_buttons(text: str, buttons: list[list[dict]], _max_attempts: int 
     if not _TOKEN or not _CHAT_ID:
         log.debug("Telegram not configured — approval request skipped.")
         return None
-    text = log_redaction.redact(text)
+    text = log_redaction.redact(str(text))
     for attempt in range(1, _max_attempts + 1):
         try:
             resp = requests.post(
@@ -98,7 +98,7 @@ def _edit_message(message_id: int, new_text: str) -> None:
             json={
                 "chat_id":    _CHAT_ID,
                 "message_id": message_id,
-                "text":       new_text,
+                "text":       log_redaction.redact(str(new_text)),
                 "parse_mode": "HTML",
             },
             timeout=10,

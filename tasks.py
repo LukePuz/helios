@@ -1410,9 +1410,11 @@ def _queue_reprotect(ticker: str, order: dict, fill_price: float | None) -> None
                 pending[ticker]["exit_order_id"] = entry["order_id"]
             elif entry["intent"] == "BUY":
                 # New shares: an old exit's fill must never close what reads
-                # flat next (review of 245c9af).
+                # flat next (review of 245c9af). The entry keeps the target's
+                # stop (M80) but gets the BUY's flat-read retry and alert.
                 pending[ticker].pop("exit_intent", None)
                 pending[ticker].pop("exit_order_id", None)
+                pending[ticker]["had_buy"] = True
         else:
             pending[ticker] = entry
             if (entry["intent"] or "").upper() not in ("EXIT", "BACKSTOP", "BUY"):
@@ -1759,7 +1761,7 @@ def _retry_pending_reprotects() -> None:
         # A BUY that still reads flat is retried for 2 runs (~10 min; they
         # are 5 min apart, professor m55/m112), then handed to Luke like a
         # failed retry (professor M60).
-        flat_buy = result is None and rec.get("intent") == "BUY"
+        flat_buy = result is None and (rec.get("intent") == "BUY" or rec.get("had_buy"))
         if flat_buy and tries >= _BUY_FLAT_MAX_TRIES:
             log.error(f"[{ticker}] reconcile: queued BUY stop still reads flat after {tries} tries")
             try:

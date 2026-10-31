@@ -503,3 +503,22 @@ def test_a_buy_never_inherits_a_queued_exits_order():
             tasks._queue_reprotect("CRWD", {"intent": "BUY"}, None)
         rec = json.loads(state[tasks._REPROTECT_STATE_KEY])["CRWD"]
         assert "exit_intent" not in rec and "exit_order_id" not in rec
+    assert rec["had_buy"] is True and rec["intent"] == "PROFIT_TARGET"   # M80 ruling: flat-BUY protection
+
+
+def test_a_buy_merged_into_a_profit_target_gets_the_flat_buy_retry():
+    """Professor ruling on M80: one flat read after the BUY must not drop it."""
+    import json
+    rec = {"intent": "PROFIT_TARGET", "stop_price": 180.0, "had_buy": True, "nonce": "a"}
+    state = {tasks._REPROTECT_STATE_KEY: json.dumps({"CRWD": rec})}
+    with patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
+         patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+         patch("stop_lock._redis", side_effect=RuntimeError("no redis")), \
+         patch("tasks._reprotect_after_late_sell", return_value=None), \
+         patch("alerts._send") as alert, patch("tasks.open_manual_action"):
+        tasks._retry_pending_reprotects()
+        assert json.loads(state[tasks._REPROTECT_STATE_KEY])["CRWD"]["tries"] == 1
+        alert.assert_not_called()
+        tasks._retry_pending_reprotects()
+    alert.assert_called_once()
+    assert "STOP NOT PLACED" in alert.call_args.args[0]

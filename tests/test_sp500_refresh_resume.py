@@ -39,3 +39,17 @@ def test_both_refresh_tasks_share_one_run_lock():
         tasks.refresh_sp500_history.run()
         tasks.refresh_sp500_history_catchup.run()
     assert [c.args[0] for c in single.call_args_list] == ["sp500_history", "sp500_history"]
+
+
+def test_a_no_op_catchup_records_no_heartbeat():
+    import tasks
+    with patch("tasks._run_singleton", side_effect=lambda name, fn, **k: fn()), \
+         patch("ingestion.price_history.refresh_sp500_price_history", return_value=0), \
+         patch("tasks._heartbeat_ok") as ok:
+        tasks.refresh_sp500_history_catchup.run()
+    ok.assert_not_called()
+    with patch("tasks._run_singleton", side_effect=lambda name, fn, **k: fn()), \
+         patch("ingestion.price_history.refresh_sp500_price_history", return_value=12), \
+         patch("tasks._heartbeat_ok") as ok:
+        tasks.refresh_sp500_history_catchup.run()
+    ok.assert_called_once_with("sp500_history", 12)

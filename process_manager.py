@@ -335,7 +335,8 @@ def start(name: str) -> str:
 # Celery stop taking tasks and wait for the running ones; after the grace
 # period the rest is killed. The LLM worker gets the 72B timeout (400 s) plus
 # margin; the others' tasks are short, except the ingestion worker's ~2.5 h
-# S&P refresh, which still gets cut off (it needs to be resumable instead).
+# S&P refresh, which still gets cut off; it resumes on the next run and the
+# weekday catch-up (tasks.refresh_sp500_history_catchup).
 _CELERY_GRACE_S = {"celery_llm_worker": 420}
 _DEFAULT_CELERY_GRACE_S = 60
 _OTHER_GRACE_S = 5

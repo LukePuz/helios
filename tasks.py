@@ -3169,7 +3169,10 @@ def refresh_sp500_history_catchup(self):
         def run():
             count = refresh_sp500_price_history(max_age_days=7)
             log.info(f"S&P 500 price history catch-up: {count} tickers updated")
-            _heartbeat_ok("sp500_history", count)
+            # Only when it did something: a no-op day mustn't keep the
+            # weekly run's health check green if that run stopped happening.
+            if count:
+                _heartbeat_ok("sp500_history", count)
         _run_singleton("sp500_history", run, max_hold_s=_SP500_REFRESH_HOLD_S)
     except Exception as e:
         log.error(f"refresh_sp500_history_catchup failed: {e}")

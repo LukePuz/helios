@@ -630,16 +630,16 @@ app.conf.beat_schedule = {
         "schedule": crontab(hour=16, minute=30, day_of_week="mon-fri"),
         "options":  {"expires": 24 * 3600},
     },
-    # Vector store pruning — Friday 17:45, inside the weekday run window.
-    # It was Sunday 03:00, which only ran as a Monday 05:00 catch-up next to
-    # the pre-market pollers (audit A1031-1253-7). 72h expiry: a Friday the
-    # stack is down still runs at Monday's start.
+    # Vector store pruning — Sunday 3:00 AM. Stack is down all weekend;
+    # actually runs via catch-up Monday 05:00 (~26h later). Kept there:
+    # moving it changes which memories the analyst's brief can retrieve on
+    # Mondays (analyst input; professor m164), so that's not ours to move.
     "prune-vector-store": {
         "task":     "tasks.prune_vector_store",
-        "schedule": crontab(hour=17, minute=45, day_of_week="fri"),
-        "options":  {"expires": 72 * 3600},
+        "schedule": crontab(hour=3, minute=0, day_of_week="sun"),
+        "options":  {"expires": 36 * 3600},
     },
-    # seen_items dedup table — right after vector store pruning.
+    # seen_items dedup table (not analyst input) — Friday evening.
     "prune-seen-items": {
         "task":     "tasks.prune_seen_items",
         "schedule": crontab(hour=17, minute=50, day_of_week="fri"),

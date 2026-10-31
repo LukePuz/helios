@@ -2033,3 +2033,44 @@ def test_has_newer_ticker_activity_checks_approvals_then_verdicts():
     cur.execute.side_effect = RuntimeError("down")
     with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
         assert db.has_newer_ticker_activity("AMD", 81, "T0") is None
+
+
+def test_stuck_processing_rows_are_swept_and_alerted():
+    """Professor M135: a PROCESSING row older than the cap goes FAILED with a note."""
+    with patch("db.expire_stale_approvals", return_value=0), \
+         patch("db.sweep_stuck_processing", return_value=[(81, "AMD", "EXIT")]), \
+         patch("alerts._send") as send:
+        tasks.auto_expire_approvals.run()
+    assert "#81 EXIT AMD" in send.call_args[0][0] and "Check TWS" in send.call_args[0][0]
+
+
+def test_sweep_stuck_processing_sql():
+    from unittest.mock import MagicMock
+    import db
+    cur = MagicMock()
+    cur.fetchall.return_value = [(81, "AMD", "EXIT")]
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
+        assert db.sweep_stuck_processing(60) == [(81, "AMD", "EXIT")]
+    sql, params = cur.execute.call_args[0]
+    assert "status='PROCESSING'" in sql and "SET status='FAILED'" in sql and "decided_at <" in sql
+    assert params[-1] == 60 and "swept" in params[0]
+
+
+def test_held_sell_retry_leaves_a_final_status_when_execution_raises():
+    from unittest.mock import MagicMock
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="AMD", qty=5)]
+    with patch("db.get_approval_by_id", return_value=TestRetryHeldSell.APPROVAL), \
+         patch("market_data.is_market_hours", return_value=True), \
+         patch("ibkr.get_client", return_value=client), \
+         patch("db.has_newer_ticker_activity", return_value=False), \
+         patch("db.claim_failed_sell_for_retry", return_value=TestRetryHeldSell.HELD), \
+         patch("execution.execute_approved", side_effect=RuntimeError("boom")), \
+         patch("db.update_approval_status") as upd:
+        try:
+            tasks.retry_held_sell.run(81)
+        except RuntimeError:
+            pass
+    assert upd.call_args.args[1] == "FAILED" and upd.call_args.kwargs["reason"].endswith("error before an outcome")

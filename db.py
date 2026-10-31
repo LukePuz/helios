@@ -1615,6 +1615,37 @@ def expire_stale_approvals() -> int:
         _put_conn(conn)
 
 
+STUCK_PROCESSING_MINUTES = 60   # an execution holds its ticker lock for at most 15 min
+
+
+def sweep_stuck_processing(minutes: int = STUCK_PROCESSING_MINUTES) -> list[tuple]:
+    """PROCESSING approvals claimed more than `minutes` ago -> FAILED, with
+    a note. A process killed (or a status write lost) between the claim and
+    the final status left them PROCESSING, and has_active_approval then
+    blocked new decisions on the ticker for good (professor M135).
+    Returns (id, ticker, action) for each row swept."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE pending_approvals SET status='FAILED', "
+                "status_reason=COALESCE(status_reason || ' | ', '') || %s "
+                "WHERE status='PROCESSING' AND trading_env=%s "
+                "AND decided_at < NOW() - make_interval(mins => %s) RETURNING id, ticker, action",
+                (f"swept: stuck in PROCESSING over {minutes} min; check the broker for a fill",
+                 TRADING_ENV, minutes),
+            )
+            rows = cur.fetchall()
+        conn.commit()
+        return rows
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"sweep_stuck_processing failed: {e}")
+        return []
+    finally:
+        _put_conn(conn)
+
+
 # ---------------------------------------------------------------------------
 # Position stops
 # ---------------------------------------------------------------------------

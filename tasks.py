@@ -1133,8 +1133,13 @@ def retry_held_sell(self, approval_id: int):
     if not held_reason:
         log.info(f"retry_held_sell: [{ticker}] #{approval_id} already retried or changed; skipping")
         return
-    success = execute_approved(approval, trigger="held_sell_retry")
-    note(held_reason, "executed" if success else last_outcome_reason(), "APPROVED" if success else "FAILED")
+    success, outcome = False, "error before an outcome"
+    try:
+        success = execute_approved(approval, trigger="held_sell_retry")
+        outcome = "executed" if success else last_outcome_reason()
+    finally:
+        # Always leave the claimed row with a final status (professor M135).
+        note(held_reason, outcome, "APPROVED" if success else "FAILED")
     log.info(f"retry_held_sell: [{ticker}] #{approval_id} {'executed' if success else 'still failed'} on retry")
 
 
@@ -3465,6 +3470,14 @@ def auto_expire_approvals(self):
         if count:
             log.info(f"Auto-expired {count} stale approval(s)")
             alerts._send(f"⏰ {count} recommendation(s) expired without a decision.")
+        stuck = db.sweep_stuck_processing()
+        if stuck:
+            # The order may have gone out before the status write was lost.
+            names = ", ".join(f"#{i} {a} {t}" for i, t, a in stuck)
+            log.error(f"Swept {len(stuck)} approval(s) stuck in PROCESSING: {names}")
+            alerts._send(f"⚠️ STUCK APPROVAL(S) CLEARED\n{names} sat in PROCESSING over "
+                         f"{db.STUCK_PROCESSING_MINUTES} min and are now FAILED. Check TWS for a fill "
+                         f"on each: one may have executed.")
     except Exception as e:
         log.error(f"auto_expire_approvals failed: {e}")
         raise self.retry(exc=e, countdown=60)

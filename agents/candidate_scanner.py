@@ -203,17 +203,20 @@ def run_candidate_scan(min_composite_score: int = 40, max_results: int = 25) -> 
 
     log.info(f"Candidate scan complete: {len(results)} candidates above threshold")
 
-    newest_bar, bar_age = _bars_age(bulk_bars)
-    if bar_age is None or bar_age > STALE_BAR_TRADING_DAYS:
-        log.warning(f"Candidate scan scored movement on stale bars (newest {newest_bar}, "
-                    f"{bar_age} trading days old)")
+    newest_bar, median_age, stale_share = _bars_age(bulk_bars)
+    stale = median_age is None or stale_share > 0.5
+    if stale:
+        log.warning(f"Candidate scan scored movement on stale bars (median age {median_age} weekdays, "
+                    f"{stale_share:.0%} of tickers > {STALE_BAR_TRADING_DAYS}; newest {newest_bar})")
 
     return {
         "agent": "candidate_scanner",
         "screened": len(candidate_tickers),
         "candidates": results,
         "newest_bar": newest_bar,
-        "stale_bars": bar_age is None or bar_age > STALE_BAR_TRADING_DAYS,
+        "median_bar_age": median_age,
+        "stale_ticker_share": stale_share,
+        "stale_bars": stale,
         "scan_notes": f"{len(results)} candidates scored >= {min_composite_score}/{MOVEMENT_MAX + THESIS_MAX} "
                       f"out of {len(candidate_tickers)} non-watchlist S&P 500 tickers screened.",
     }
@@ -225,20 +228,27 @@ def run_candidate_scan(min_composite_score: int = 40, max_results: int = 25) -> 
 STALE_BAR_TRADING_DAYS = 3
 
 
-def _bars_age(bulk_bars: dict, today=None) -> tuple[str | None, int | None]:
-    """Newest bar date across the scan and how many weekdays old it is
-    (holidays not excluded). (None, None) when there are no bars."""
+def _bars_age(bulk_bars: dict, today=None) -> tuple[str | None, int | None, float]:
+    """(newest bar date, median per-ticker age in weekdays, share of tickers
+    whose own newest bar is more than STALE_BAR_TRADING_DAYS old). Per
+    ticker, since a refresh can update a few names and leave most stale
+    (SEF 10-31: 423 of 551 at 10-16). Holidays not excluded. With no
+    parseable bars: (None or newest, None, 1.0)."""
     from datetime import date
     import numpy as np
-    dates = [b[-1]["date"] for b in bulk_bars.values() if b]
+    dates = [b[-1]["date"][:10] for b in bulk_bars.values() if b]
     if not dates:
-        return None, None
-    newest = max(dates)[:10]
-    try:
-        age = int(np.busday_count(date.fromisoformat(newest), today or date.today()))
-    except ValueError:
-        return newest, None
-    return newest, max(age, 0)
+        return None, None, 1.0
+    end = today or date.today()
+    ages = []
+    for d in dates:
+        try:
+            ages.append(max(int(np.busday_count(date.fromisoformat(d), end)), 0))
+        except ValueError:
+            continue
+    if not ages:
+        return max(dates), None, 1.0
+    return max(dates), int(np.median(ages)), sum(a > STALE_BAR_TRADING_DAYS for a in ages) / len(ages)
 
 
 if __name__ == "__main__":

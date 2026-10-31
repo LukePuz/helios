@@ -2285,7 +2285,9 @@ def run_candidate_scan(self):
         if top:
             import alerts
             lines = [f"Watchlist candidate scan: {result['scan_notes']}",
-                     f"Price bars as of {result.get('newest_bar') or 'unknown'}"
+                     f"Price bars: median {result.get('median_bar_age')} weekdays old, "
+                     f"{(result.get('stale_ticker_share') or 0):.0%} of tickers stale "
+                     f"(newest {result.get('newest_bar') or 'unknown'})"
                      + (" — STALE, movement scores are old" if result.get("stale_bars") else ""), ""]
             for c in top:
                 lines.append(

@@ -1107,7 +1107,14 @@ def execute_approved(
         # Log trade — reason reflects how this actually fired (see trigger
         # docstring above); it used to always say "approved via Telegram"
         # even for fully autonomous crew.py executions no human ever saw.
-        trigger_label = "auto-executed" if trigger == "auto" else "approved via Telegram"
+        # Every trigger named: the retries used to read "approved via Telegram"
+        # too (professor M134). A deferred retry may come from either path.
+        trigger_label = {
+            "auto": "auto-executed",
+            "telegram": "approved via Telegram",
+            "auto_retry": "executed on a deferred retry",
+            "held_sell_retry": "executed on a held-sell retry (held_sell_retry)",
+        }.get(trigger, f"executed (trigger={trigger})")
         db.log_trade(
             symbol=ticker,
             side=side,

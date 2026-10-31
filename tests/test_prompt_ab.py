@@ -2,7 +2,6 @@
 and its summary applies the rule fixed before the run."""
 import importlib.util
 import os
-import subprocess
 
 _spec = importlib.util.spec_from_file_location(
     "prompt_ab", os.path.join(os.path.dirname(__file__), "..", "scripts", "prompt_ab.py"))
@@ -13,8 +12,9 @@ REPO = os.path.join(os.path.dirname(__file__), "..")
 
 def test_old_and_new_blocks_differ_only_in_order():
     new = ab.schema_block(open(os.path.join(REPO, "agents", "analyst.py")).read())
-    old = ab.schema_block(subprocess.run(["git", "-C", REPO, "show", "31d52f8^:agents/analyst.py"],
-                                         capture_output=True, text=True, check=True).stdout)
+    # The committed copy, not git: commit hashes change if history is rewritten.
+    # test_committed_old_schema_matches_git checks the copy when the hash exists.
+    old = open(ab.OLD_SCHEMA_FILE).read()
     assert new != old
     assert new.index('"action"') > new.index('"reasoning"')
     assert old.index('"action"') < old.index('"reasoning"')

@@ -64,6 +64,22 @@ def test_rotation_and_partial_lines(tmp_path, capsys):
     assert "1 new alert row(s)" in out
 
 
+def test_a_file_recreated_on_the_same_inode_is_read_from_the_start(tmp_path, capsys):
+    # Some filesystems hand a freed inode straight back, so a rotated outbox
+    # can keep the old inode number and be longer than the saved offset.
+    outbox = tmp_path / alert_triage.OUTBOX_NAME
+    _write(tmp_path, "🚨 SHORT POSITION — AAPL")
+    _run(tmp_path, capsys=capsys)
+    ino = outbox.stat().st_ino
+    with open(outbox, "r+") as f:                    # same inode, new content
+        f.truncate(0)
+    _write(tmp_path, "⚠️ <b>Analyst falling back to stub</b> — AAPL, a longer first row than before")
+    _write(tmp_path, "🚨 SHORT POSITION — MSFT")
+    assert outbox.stat().st_ino == ino
+    _, out = _run(tmp_path, capsys=capsys)
+    assert "2 new alert row(s)" in out
+
+
 def test_missing_outbox_and_corrupt_cursor(tmp_path, capsys):
     (tmp_path / alert_triage.CURSOR_NAME).write_text("{bad")
     rc, out = _run(tmp_path, capsys=capsys)

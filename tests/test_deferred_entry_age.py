@@ -56,3 +56,15 @@ def test_fresh_approval_still_executes():
     execute.assert_called_once()
     analyse.assert_not_called()
     status.assert_called_once_with(7, "APPROVED", reason=None)
+
+
+def test_stale_approval_is_only_expired_when_expire_only_is_on():
+    with patch("config.STALE_ENTRY_EXPIRE_ONLY", True), \
+         patch("db.get_approval_by_id", return_value=_approval(3185)), \
+         patch("db.expire_failed_entry", return_value=True) as expire, \
+         patch("execution.execute_approved") as execute, \
+         patch("tasks.deep_analyze_event.apply_async") as analyse:
+        tasks.retry_deferred_entry.run(7)
+    execute.assert_not_called()
+    analyse.assert_not_called()
+    assert expire.call_args.args[0] == 7 and "not re-analysed" in expire.call_args.args[1]

@@ -474,6 +474,12 @@ APPROVAL_EXPIRY_HOURS = 6     # pending approvals auto-expire after 6 hours
 # Portfolio safety
 # ---------------------------------------------------------------------------
 MAX_DRAWDOWN_PCT = 0.15       # alert at 15% drawdown from START_VALUE
+# Daily-loss halt, SHADOW ONLY (audit 2026-11-02 19:27 #10, roadmap 01(c)):
+# check_portfolio_drawdown logs would_halt_daily_loss when equity is down
+# more than this fraction from the day's first snapshot (ET day). It never
+# sets the halt flag. 0.03 is a placeholder, not a chosen value: the
+# threshold is Luke's to set.
+DAILY_LOSS_SHADOW_PCT = 0.03
 # halt_reason prefix of the implausible-read halt: /rebase lifts only this one (professor M145)
 IMPLAUSIBLE_HALT_REASON_PREFIX = "Auto: account value under half the HWM"
 
@@ -525,12 +531,28 @@ ETF_FUNDAMENTALS_CAP_EXEMPT = os.getenv("ETF_FUNDAMENTALS_CAP_EXEMPT", "false").
 # it on: it adds analyst runs and a new trigger (audit A0903-1 step 3).
 PLAN_LEVEL_REVIEW_ENABLED = os.getenv("PLAN_LEVEL_REVIEW_ENABLED", "false").lower() == "true"
 
+# A deferred entry past tasks.DEFERRED_ENTRY_MAX_AGE_HOURS is expired either
+# way; with this on it is only expired, with no fresh analysis queued. Off
+# keeps the 2026-10-27 re-analysis. Off until Luke turns it on: it removes
+# analyst runs.
+STALE_ENTRY_EXPIRE_ONLY = os.getenv("STALE_ENTRY_EXPIRE_ONLY", "false").lower() == "true"
+
 # The rate gate reads a month-only catalyst date ("YYYY-MM") as the 1st of
 # that month, so within the month it floors to 1 day and any expected return
 # clears the 1%/week bar. On, it uses the 15th, as _catalyst_check's
 # provenance already does. Changes which verdicts pass the gate, so it is
 # off until Luke decides (audit A1031-0253-1).
 CATALYST_MONTH_MIDPOINT_ENABLED = os.getenv("CATALYST_MONTH_MIDPOINT_ENABLED", "false").lower() == "true"
+
+# A malformed catalyst in the analyst's reply. On: a catalyst that isn't an
+# object is read as {}, a catalyst.date that isn't a string as its text
+# (int/float) or None, and a dated catalyst with a null expected_return_pct
+# fails the rate gate as "no expected_return_pct". Off keeps the earlier
+# handling: the reply is used as returned, so on the Accelerator/Moonshot
+# rate path these raise and the analysis ends as ANALYST_FAILED. Changes
+# what reaches risk, so it is off until decided.
+ANALYST_TOLERATE_MALFORMED_CATALYST = os.getenv("ANALYST_TOLERATE_MALFORMED_CATALYST",
+                                                "false").lower() == "true"
 
 # Risk-per-trade-of-equity by LIVE setup category (Breakout/Catalyst/
 # Continuation) -- the SETUP_GATES_ENABLED equivalent of RISK_PCT_PER_TRADE

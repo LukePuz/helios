@@ -128,10 +128,26 @@ def insert_row(cur, line: dict) -> int:
     """Insert one replayable line with its original time; returns the new id."""
     kind, rec, at, env = kind_of(line), line.get("record") or {}, line["at"], env_of(line)
     if kind == "trade":
-        cur.execute("INSERT INTO trades (symbol, trading_env, side, quantity, price, reason, "
-                    "price_source, timestamp) VALUES (%s,%s,%s,%s,%s,%s,%s,%s::timestamptz) RETURNING id",
-                    (rec.get("symbol"), env, rec.get("side"), rec.get("quantity"), rec.get("price"),
-                     rec.get("reason"), rec.get("price_source"), at))
+        values = (rec.get("symbol"), env, rec.get("side"), rec.get("quantity"), rec.get("price"),
+                  rec.get("reason"), rec.get("price_source"), at)
+        base = ("INSERT INTO trades (symbol, trading_env, side, quantity, price, reason, "
+                "price_source, timestamp")
+        order_row_id = rec.get("order_row_id")
+        if order_row_id is None:
+            cur.execute(base + ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s::timestamptz) RETURNING id", values)
+        else:
+            # trades.order_row_id is migration 78; before it, replay the row
+            # without the link rather than not at all.
+            cur.execute("SAVEPOINT replay_trade_row")
+            try:
+                cur.execute(base + ", order_row_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s::timestamptz,%s) "
+                            "RETURNING id", values + (order_row_id,))
+            except db.psycopg2.errors.UndefinedColumn:
+                cur.execute("ROLLBACK TO SAVEPOINT replay_trade_row")
+                cur.execute(base + ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s::timestamptz) RETURNING id", values)
+            new_id = cur.fetchone()[0]
+            cur.execute("RELEASE SAVEPOINT replay_trade_row")
+            return new_id
     elif kind == "signal":
         cur.execute("INSERT INTO signals (symbol, signal, confidence, reasoning, trading_env, model, "
                     "provenance, decision, timestamp) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::timestamptz) "

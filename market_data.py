@@ -20,19 +20,12 @@ STALE_AFTER_MINUTES = 20
 
 
 _ET = ZoneInfo("America/New_York")
-_RTH_OPEN = dtime(9, 30)
-_RTH_CLOSE = dtime(16, 0)
-_EARLY_CLOSE = dtime(13, 0)
-# NYSE full-day holidays and 13:00 ET early closes, 2026-2027 (published NYSE
-# calendar). Extend before 2028; is_market_hours logs a warning past the end.
-_NYSE_HOLIDAYS = {date(*d) for d in (
-    (2026, 1, 1), (2026, 1, 19), (2026, 2, 16), (2026, 4, 3), (2026, 5, 25), (2026, 6, 19),
-    (2026, 7, 3), (2026, 9, 7), (2026, 11, 26), (2026, 12, 25),
-    (2027, 1, 1), (2027, 1, 18), (2027, 2, 15), (2027, 3, 26), (2027, 5, 31), (2027, 6, 18),
-    (2027, 7, 5), (2027, 9, 6), (2027, 11, 25), (2027, 12, 24),
-)}
-_NYSE_EARLY_CLOSES = {date(*d) for d in ((2026, 11, 27), (2026, 12, 24), (2027, 11, 26))}
-_CALENDAR_LAST_YEAR = 2027
+# The NYSE calendar lives in market_calendar (no broker imports), so research
+# tooling can use the same holidays and early closes.
+from market_calendar import (RTH_OPEN as _RTH_OPEN, RTH_CLOSE as _RTH_CLOSE,  # noqa: E402
+                             EARLY_CLOSE as _EARLY_CLOSE, NYSE_HOLIDAYS as _NYSE_HOLIDAYS,
+                             NYSE_EARLY_CLOSES as _NYSE_EARLY_CLOSES,
+                             CALENDAR_LAST_YEAR as _CALENDAR_LAST_YEAR)
 
 
 def _session(day: date) -> tuple[dtime, dtime] | None:
@@ -40,7 +33,7 @@ def _session(day: date) -> tuple[dtime, dtime] | None:
     if day.weekday() >= 5 or day in _NYSE_HOLIDAYS:
         return None
     if day.year > _CALENDAR_LAST_YEAR:
-        log.warning(f"NYSE holiday calendar ends {_CALENDAR_LAST_YEAR}; extend market_data._NYSE_HOLIDAYS")
+        log.warning(f"NYSE holiday calendar ends {_CALENDAR_LAST_YEAR}; extend market_calendar.NYSE_HOLIDAYS")
     return (_RTH_OPEN, _EARLY_CLOSE if day in _NYSE_EARLY_CLOSES else _RTH_CLOSE)
 
 

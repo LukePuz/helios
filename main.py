@@ -138,26 +138,42 @@ def _adopt_position(client, rm, symbol, qty, manage_stop_place, resting_sell_sto
         # TWS), so later re-places don't loosen it (audit 04:53, A0453-5).
         stop_price, stop_method = max(resting_px), "resting stop"
     else:
-        stop_price, stop_method = rm.calculate_stop(symbol, entry_price, "Accelerator")
-    db.upsert_position_stop(
-        ticker=symbol, entry_price=entry_price, stop_price=stop_price,
-        stop_method=f"AUTO-ADOPTED ({stop_method}) — verify bucket/stop manually",
-        bucket="Accelerator", conviction=5, trail_distance_pct=None,
-    )
+        stop_price, stop_method = rm.calculate_stop(symbol, entry_price, "Accelerator",
+                                                    log_caller="manual")
+    # A failed record write must not keep the stop off (the next start
+    # adopts the record again from the resting stop); the line says so.
+    try:
+        record_ok = db.upsert_position_stop(
+            ticker=symbol, entry_price=entry_price, stop_price=stop_price,
+            stop_method=f"AUTO-ADOPTED ({stop_method}) — verify bucket/stop manually",
+            bucket="Accelerator", conviction=5, trail_distance_pct=None,
+        ) is not False
+    except Exception as e:
+        logging.error(f"[{symbol}] adopted stop record write failed: {type(e).__name__}: {e}")
+        record_ok = False
+    missing = "" if record_ok else (f"; STOP RECORD MISSING: the DB record for the "
+                                    f"${stop_price:.2f} stop could not be written")
     if need <= 0:
+        if not record_ok:
+            return (f"{symbol} ({qty} shares, existing stops cover {resting:g}{missing}; "
+                    f"the next start retries it)")
         return f"{symbol} ({qty} shares, record only: existing stops cover {resting:g})"
     if not last or stop_price >= last:
         # An underwater adopted position would sell at the open (professor M72).
         return (f"{symbol} ({need:g} shares unprotected: stop ${stop_price:.2f} not below the "
                 f"last price ({'unknown' if not last else f'${last:.2f}'}), nothing placed — "
-                f"set a stop in TWS)")
+                f"set a stop in TWS{missing})")
     try:
         stop_result = manage_stop_place(symbol, need, stop_price, market_price=last)
-        db.set_stop_broker_order_id(symbol, stop_result["order_id"])
-        return f"{symbol} ({need:g} shares, stop placed @ ${stop_price:.2f})"
+        order_id = stop_result["order_id"]
     except Exception as e:
         return (f"{symbol} ({qty} shares, DB stop ${stop_price:.2f} — "
-                f"BROKER STOP PLACEMENT FAILED: {e})")
+                f"BROKER STOP PLACEMENT FAILED: {e}{missing})")
+    try:
+        db.set_stop_broker_order_id(symbol, order_id)
+    except Exception as e:
+        logging.error(f"[{symbol}] adopted stop placed but its order id was not recorded: {e}")
+    return f"{symbol} ({need:g} shares, stop placed @ ${stop_price:.2f}{missing})"
 
 
 def _reconcile_positions() -> None:
@@ -258,7 +274,7 @@ def _reconcile_open_orders() -> None:
 
         cancelled = []
         for o in stale:
-            if manage_cancel_order(o["order_id"]):
+            if manage_cancel_order(o["order_id"], symbol=o["ticker"], perm_id=o.get("perm_id")):
                 cancelled.append(f"{o['ticker']} ({o['qty']} shares, orderId={o['order_id']})")
             else:
                 cancelled.append(f"{o['ticker']} — COULD NOT CANCEL orderId={o['order_id']}, check TWS manually")

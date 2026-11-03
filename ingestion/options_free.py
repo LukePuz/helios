@@ -13,14 +13,20 @@ backend answered — see options_flow.py's fallback dispatch.
 """
 
 import logging
+import math
 import time
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import yfinance as yf
 
 log = logging.getLogger(__name__)
 
 
-def _nearest_chain(ticker: str):
+def _nearest_chain(ticker: str, meta: dict | None = None):
+    """meta, when given, is filled with the expiry used and the chain's
+    underlying quote (part of the same option_chain response, so no extra
+    request)."""
     t = yf.Ticker(ticker)
     expirations = t.options
     if not expirations:
@@ -30,20 +36,103 @@ def _nearest_chain(ticker: str):
     # yfinance load across 75 tickers every 5 minutes. Both come from one
     # call.
     chain = t.option_chain(expirations[0])
+    if meta is not None:
+        meta["expiry"] = expirations[0]
+        meta["underlying"] = getattr(chain, "underlying", None)
     return chain.calls, chain.puts
 
 
-def get_flow_summary(ticker: str) -> dict:
+def _finite_pos(v):
+    """v as a float when it is a finite number above zero, else None."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) and f > 0 else None
+
+
+def _leg_price(row) -> tuple[float | None, str | None]:
+    """(price, source) of one option leg: the bid/ask mid when both sides
+    are quoted and not crossed, else lastPrice, else (None, None)."""
+    bid, ask = _finite_pos(row.get("bid")), _finite_pos(row.get("ask"))
+    if bid is not None and ask is not None and ask >= bid:
+        return (bid + ask) / 2, "mid"
+    last = _finite_pos(row.get("lastPrice"))
+    return (last, "last") if last is not None else (None, None)
+
+
+def _implied_move(calls, puts, underlying_quote, expiry, today) -> dict | None:
+    """Log-only: the nearest-expiry ATM straddle from a chain already
+    downloaded. ATM is the strike quoted on both sides nearest the
+    underlying's regularMarketPrice (ties to the lower strike).
+    implied_move_pct = straddle / underlying * 100. None when the
+    underlying price, a common strike or either leg's price is missing.
+    Never raises."""
+    try:
+        if calls is None or puts is None or calls.empty or puts.empty:
+            return None
+        u = _finite_pos((underlying_quote or {}).get("regularMarketPrice"))
+        if u is None:
+            return None
+        common = set(calls["strike"].dropna()) & set(puts["strike"].dropna())
+        if not common:
+            return None
+        strike = min(common, key=lambda k: (abs(float(k) - u), float(k)))
+        c = calls[calls["strike"] == strike].iloc[0].to_dict()
+        p = puts[puts["strike"] == strike].iloc[0].to_dict()
+        cp, cs = _leg_price(c)
+        pp, ps = _leg_price(p)
+        if cp is None or pp is None:
+            return None
+        straddle = cp + pp
+        exp = date.fromisoformat(str(expiry)[:10]) if expiry else None
+
+        def iv(r):
+            try:
+                f = float(r.get("impliedVolatility"))
+                return round(f, 6) if math.isfinite(f) else None
+            except (TypeError, ValueError):
+                return None
+        return {
+            "implied_move_pct": round(straddle / u * 100, 4),
+            "straddle": round(straddle, 4),
+            "price_source": cs if cs == ps else "mixed",
+            "call_price_source": cs, "put_price_source": ps,
+            "underlying": round(u, 4), "atm_strike": float(strike),
+            "expiry": exp.isoformat() if exp else None,
+            "dte": (exp - today).days if exp else None,
+            "call_iv": iv(c), "put_iv": iv(p),
+        }
+    except Exception as e:
+        log.debug(f"implied move calc failed: {e}")
+        return None
+
+
+def get_flow_summary(ticker: str, implied_sink: dict | None = None) -> dict:
     """
     Free proxy for options_flow.get_flow_summary(). Uses call/put VOLUME
     (not premium — that data isn't reliably available for free) from the
     nearest expiry as a sentiment proxy.
+
+    implied_sink (log-only shadow): when a dict is passed, the ATM straddle
+    implied move from the same chain is stored in it under the ticker. The
+    return value is the same either way.
     """
+    meta = {} if implied_sink is not None else None
     try:
-        calls, puts = _nearest_chain(ticker)
+        calls, puts = _nearest_chain(ticker, meta) if meta is not None else _nearest_chain(ticker)
     except Exception as e:
         log.debug(f"[{ticker}] yfinance option chain fetch failed: {e}")
         calls, puts = None, None
+
+    if meta is not None:
+        try:
+            today = datetime.now(ZoneInfo("America/New_York")).date()
+            mv = _implied_move(calls, puts, meta.get("underlying"), meta.get("expiry"), today)
+            if mv is not None:
+                implied_sink[ticker] = mv
+        except Exception as e:
+            log.debug(f"[{ticker}] implied move shadow failed: {e}")
 
     if calls is None or puts is None or (calls.empty and puts.empty):
         return {"ticker": ticker, "unusual": False,
@@ -85,11 +174,13 @@ def get_flow_summary(ticker: str) -> dict:
     }
 
 
-def get_all_flow_summaries() -> dict[str, dict]:
+def get_all_flow_summaries(implied_sink: dict | None = None) -> dict[str, dict]:
+    """implied_sink: see get_flow_summary (log-only shadow)."""
     from knowledge_loader import get_all_tickers
     summaries = {}
     for ticker in get_all_tickers():
-        summaries[ticker] = get_flow_summary(ticker)
+        summaries[ticker] = (get_flow_summary(ticker, implied_sink) if implied_sink is not None
+                             else get_flow_summary(ticker))
         time.sleep(0.2)
     return summaries
 

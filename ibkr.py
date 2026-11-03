@@ -357,11 +357,19 @@ def get_fresh_stock_positions() -> dict[str, float]:
     return out
 
 
-def place_market_order(ticker: str, side: str, qty: float, fill_timeout: float = 30.0) -> dict:
+def place_market_order(ticker: str, side: str, qty: float, fill_timeout: float = 30.0,
+                       on_submitted=None) -> dict:
     """
     Place a market order and wait for the fill. side = 'BUY' or 'SELL'.
     Returns dict with order_id, status, fill_price (None if unfilled at timeout),
     and filled_qty.
+
+    on_submitted(order_id, perm_id), if given, runs once right after
+    placeOrder and before the fill wait, so the caller can record the order
+    while the wait is still running: a worker killed during the wait (the
+    19:00 stop, an OOM) used to leave a live broker order with no orders row.
+    perm_id is usually None there (TWS assigns it with the first status
+    message). An exception from it is logged and the wait goes on.
 
     Incident 2026-07-26/27: a "DAY" market order submitted while the market
     is closed doesn't get rejected -- IBKR accepts it and queues it for the
@@ -389,6 +397,13 @@ def place_market_order(ticker: str, side: str, qty: float, fill_timeout: float =
     order = ibi.MarketOrder(side.upper(), qty)
     order.tif = "DAY"  # market orders must not persist across sessions
     trade = ib.placeOrder(contract, order)
+    if on_submitted is not None:
+        try:
+            on_submitted(trade.order.orderId,
+                         int(getattr(trade.order, "permId", 0) or 0) or None)
+        except Exception as e:
+            log.error(f"on_submitted failed for {side.upper()} {qty} {ticker} "
+                      f"(orderId={trade.order.orderId}): {e}")
 
     # Wait for the real fill instead of guessing the price afterwards.
     # Incident 2026-07-28: this used to count loop iterations ("waited += 1"
@@ -732,7 +747,8 @@ def place_stop_order(ticker: str, qty: float, stop_price: float,
     return {"order_id": trade.order.orderId, "stop_price": stop_price}
 
 
-def cancel_order(order_id: int, _poll_seconds: int = 5) -> bool:
+def cancel_order(order_id: int, _poll_seconds: int = 5, symbol: str | None = None,
+                 perm_id: int | None = None) -> bool:
     """Cancel an open order by orderId. Returns True only if the broker
     actually confirms the cancel (order status reaches a genuinely
     terminal Cancelled/ApiCancelled state) — a client that doesn't own the
@@ -759,10 +775,22 @@ def cancel_order(order_id: int, _poll_seconds: int = 5) -> bool:
     resting (A0253-1). A real same-clientId cancel usually resolves within a
     second or two. Treat "True" as "very likely", not "certain", for a stop
     this client didn't place.
+
+    symbol / perm_id (optional): the order the caller means. orderIds repeat
+    across clientIds, so a trade with this orderId on another ticker (or
+    with another permId, when both are known) is refused with an error
+    instead of cancelled.
     """
     ib = get_ib()
     for trade in ib.openTrades():
         if trade.order.orderId == order_id:
+            got_perm = int(getattr(trade.order, "permId", 0) or 0)
+            if ((symbol is not None and trade.contract.symbol != symbol)
+                    or (perm_id and got_perm and got_perm != int(perm_id))):
+                log.error(f"cancel_order: orderId={order_id} is {trade.contract.symbol} "
+                          f"permId={got_perm or '?'}, not the {symbol or '?'} "
+                          f"permId={perm_id or '?'} asked for; not cancelled")
+                continue
             ib.cancelOrder(trade.order)
             for _ in range(_poll_seconds):
                 ib.sleep(1)
@@ -864,7 +892,10 @@ def cancel_stop_orders_for(ticker: str) -> int:
     confirmed = 0
     stuck = []
     for order in matches:
-        if cancel_order(order.orderId):
+        # orderIds repeat across clientIds: name the order fully, or
+        # cancel_order could match another ticker's order with this id.
+        if cancel_order(order.orderId, symbol=ticker,
+                        perm_id=int(getattr(order, "permId", 0) or 0) or None):
             confirmed += 1
         else:
             stuck.append(order.orderId)
@@ -1020,8 +1051,29 @@ def get_recent_sell_fill(ticker: str, exclude_order_ids=frozenset(),
     total_qty = sum(float(e.execution.shares) for e in sells)
     if total_qty <= 0:
         return None
-    return _with_fill_time({"filled_qty": total_qty, "fill_price": _weighted_exec_price(sells, total_qty)},
-                           sells)
+    result = _with_fill_time({"filled_qty": total_qty, "fill_price": _weighted_exec_price(sells, total_qty)},
+                             sells)
+    try:   # informational only (the log-only stop_slippage row reads it)
+        result["order_ids"] = sorted({int(e.execution.orderId) for e in sells})
+    except Exception:
+        pass
+    try:   # informational only: each order's own share-weighted fill
+        groups: dict = {}
+        for e in sells:
+            perm = int(getattr(e.execution, "permId", 0) or 0) or None
+            groups.setdefault((int(e.execution.orderId), perm), []).append(e)
+        by_order = []
+        for (oid, perm), execs_ in sorted(groups.items(), key=lambda kv: (kv[0][0], kv[0][1] or 0)):
+            qty = sum(float(e.execution.shares) for e in execs_)
+            if qty <= 0:
+                continue
+            row = {"order_id": oid, "perm_id": perm, "qty": qty,
+                   "price": _weighted_exec_price(execs_, qty)}
+            by_order.append(_with_fill_time(row, execs_))
+        result["by_order"] = by_order
+    except Exception:
+        pass
+    return result
 
 
 # ---------------------------------------------------------------------------

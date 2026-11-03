@@ -1,5 +1,7 @@
 """Resting stops for more shares than held get rebuilt (professor M54)."""
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
+
+import pytest
 
 import tasks
 
@@ -159,6 +161,19 @@ class TestBackstopSellReads:
              patch("ibkr.place_market_order") as order:
             assert tasks._execute_backstop_sell("AMD", self._alert) is False
         delete.assert_called_once_with("AMD"); order.assert_not_called()
+
+    def test_a_retry_with_nothing_held_does_not_claim_the_position_is_unprotected(self, caplog):
+        """11-03 09:30: six stray retries for an unheld AMD each logged
+        "still unprotected", which read like a naked position."""
+        with patch("ibkr.get_client", return_value=self._client(None)), \
+             patch("db.delete_position_stop"), \
+             patch("ibkr.place_market_order") as order, \
+             caplog.at_level("INFO", logger="tasks"):
+            tasks.retry_backstop_sell.run("AMD", self._alert)
+        order.assert_not_called()
+        text = caplog.text
+        assert "no shares held" in text
+        assert "unprotected" not in text
 
     def test_short_is_not_sold(self):
         with patch("ibkr.get_client", return_value=self._client(-10)), \
@@ -858,3 +873,552 @@ def test_backstop_retry_failing_after_the_cancel_sends_the_critical_alert():
         retry.assert_not_called()
         assert cancel.called is (raise_in == "place")
         assert expect in alert.call_args.args[0]
+
+
+def test_2b_marker_needs_the_minimum_cycle_spacing():
+    """A Celery retry (+2 min) must not count as the confirming cycle: the
+    overstop marker uses the same 600 s spacing as the orphan markers."""
+    from datetime import datetime, timedelta, timezone
+    now = datetime(2026, 11, 2, 15, 0, tzinfo=timezone.utc)
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="AMD", qty=5)]
+    for age_s, fixed in ((120, False), (600, True)):
+        armed = (now - timedelta(seconds=age_s)).isoformat()
+        state = {"overstop_pending_AMD": armed}
+        with patch("ibkr.get_client", return_value=client), \
+             patch("ibkr.get_open_orders", return_value=_orders(10)), \
+             patch("db.get_all_position_stops", return_value=[]), \
+             patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
+             patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+             patch("tasks._reconcile_now", return_value=now), \
+             patch("tasks._fix_overstop_safe", return_value="ok") as fix, \
+             patch("alerts._send"):
+            tasks.reconcile_stop_orders.run()
+        assert fix.called is fixed, age_s
+        assert state["overstop_pending_AMD"] == ("" if fixed else armed)
+
+
+# ── Own cancel still pending: never counted as cover ───────────────────
+
+def _cancelling(qty, status="PendingCancel", order_id=0):
+    return {**_orders(qty)[0], "order_id": order_id, "status": status}
+
+
+def _overstop(reads, queue_effect=None):
+    """_fix_overstop on 10 held with stops for 20; reads = the open-orders
+    reads after the first (the post-cancel looks)."""
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="AMD", qty=10)]
+    queue = MagicMock(side_effect=queue_effect)
+    with patch("ibkr.get_client", return_value=client), \
+         patch("ibkr.get_open_orders", side_effect=[_orders(10, 10), *reads]), \
+         patch("db.get_position_stop", return_value={"stop_price": 150.0}), \
+         patch("ibkr.get_latest_price", return_value=200.0), \
+         patch("tasks.manage_cancel_stop_orders_for"), \
+         patch("time.sleep") as sleep, \
+         patch.object(tasks.recheck_stop_coverage, "apply_async", new=queue), \
+         patch("tasks.manage_stop_place", return_value={"order_id": 9}) as place, \
+         patch("db.set_stop_broker_order_id"):
+        msg = tasks._fix_overstop("AMD")
+    return msg, place, sleep, queue
+
+
+def test_own_cancel_still_pending_is_not_cover_and_a_stop_is_placed():
+    # both of our stops still PendingCancel after 3 x 5 s: the old code
+    # counted them as stuck cover (need = 0) and the position went bare
+    # once the cancels landed
+    stuck = [_cancelling(10, order_id=0), _cancelling(10, order_id=1)]
+    msg, place, sleep, queue = _overstop([stuck] * 4)
+    assert sleep.call_count == tasks._CANCEL_SETTLE_LOOKS
+    place.assert_called_once_with("AMD", 10.0, 150.0, market_price=200.0)
+    queue.assert_called_once_with(args=["AMD"], kwargs={"attempt": 1}, countdown=60)
+    assert msg.startswith("🔧") and "still being cancelled" in msg
+
+
+def test_api_pending_cancel_is_waited_for_too():
+    msg, place, sleep, queue = _overstop([[_cancelling(10, "ApiPendingCancel")], []])
+    assert sleep.call_count == 1
+    place.assert_called_once_with("AMD", 10.0, 150.0, market_price=200.0)
+    queue.assert_not_called()
+    assert "still being cancelled" not in msg
+
+
+def test_cancel_that_lands_on_a_later_look_stops_the_waits():
+    pending = [_cancelling(10)]
+    msg, place, sleep, queue = _overstop([pending, pending, []])
+    assert sleep.call_count == 2
+    place.assert_called_once_with("AMD", 10.0, 150.0, market_price=200.0)
+    queue.assert_not_called()
+
+
+def test_working_stop_that_did_not_cancel_covers_with_no_success_line():
+    # a stop for 10 that refused the cancel covers the 10 held; another is
+    # still cancelling: nothing placed, and not reported as a fix
+    msg, place, _, queue = _overstop([[_orders(10)[0], _cancelling(10, order_id=1)]] * 4)
+    place.assert_not_called()
+    assert not msg.startswith("🔧") and "nothing placed" in msg
+    queue.assert_called_once()
+
+
+def test_fix_overstop_survives_a_recheck_queue_failure():
+    stuck = [_cancelling(10)]
+    msg, place, _, _ = _overstop([stuck] * 4, queue_effect=RuntimeError("broker down"))
+    place.assert_called_once()
+    assert msg.startswith("🔧") and "reconcile re-checks" in msg
+
+
+def test_under_cover_does_not_count_a_cancelling_stop():
+    # 4 working + 3 cancelling of 10 held: stop the 6 not working-covered
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="AMD", qty=10)]
+    queue = MagicMock()
+    with patch("ibkr.get_client", return_value=client), \
+         patch("ibkr.get_open_orders", return_value=_orders(4) + [_cancelling(3, order_id=1)]), \
+         patch("db.get_position_stop", return_value={"stop_price": 150.0}), \
+         patch("ibkr.get_latest_price", return_value=200.0), \
+         patch.object(tasks.recheck_stop_coverage, "apply_async", new=queue), \
+         patch("tasks.manage_stop_place", return_value={"order_id": 9}) as place, \
+         patch("db.set_stop_broker_order_id"):
+        msg = tasks._fix_overstop("AMD")
+    place.assert_called_once_with("AMD", 6.0, 150.0, market_price=200.0)
+    queue.assert_called_once()
+
+
+# ── recheck_stop_coverage: one lock around the check and the fix ──────
+
+def test_recheck_precheck_and_fix_run_under_the_ticker_lock():
+    import stop_lock
+    seen = []
+
+    def read(ticker, *a, **k):
+        seen.append(("read", stop_lock._local.held.get(ticker)))
+        return []
+
+    def fix(ticker, **k):
+        seen.append(("fix", stop_lock._local.held.get(ticker)))
+        return "AMD: stop coverage fine on re-check (10 vs 10)"
+    with patch("tasks._resting_sell_stops", side_effect=read), \
+         patch("tasks._fix_overstop_safe", side_effect=fix):
+        tasks.recheck_stop_coverage("AMD")
+    assert seen == [("read", 1), ("fix", 1)]
+    assert not stop_lock._local.held.get("AMD")
+
+
+def test_recheck_lock_nests_with_fix_overstops_own():
+    # the real _fix_overstop (@locked_by_ticker) inside the task's lock
+    import stop_lock
+    depth = []
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="AMD", qty=10)]
+
+    def orders():
+        depth.append(stop_lock._local.held.get("AMD"))
+        return _orders(10)
+    with patch("ibkr.get_client", return_value=client), \
+         patch("ibkr.get_open_orders", side_effect=orders), \
+         patch("alerts._send") as send:
+        tasks.recheck_stop_coverage("AMD")
+    assert depth == [1, 2]   # precheck under the task's lock, then nested
+    send.assert_not_called()
+
+
+def test_recheck_busy_ticker_requeues():
+    import stop_lock
+    from conftest import _FakeLock
+    queue = MagicMock()
+    with patch.object(stop_lock, "DEFAULT_WAIT_S", 0), \
+         patch.object(tasks.recheck_stop_coverage, "apply_async", new=queue), \
+         patch("tasks._fix_overstop_safe") as fix:
+        _FakeLock.held.add("helios:stop_lock:AMD")
+        try:
+            tasks.recheck_stop_coverage("AMD")
+        finally:
+            _FakeLock.held.discard("helios:stop_lock:AMD")
+    fix.assert_not_called()
+    queue.assert_called_once_with(args=["AMD"], kwargs={"attempt": 2}, countdown=60)
+
+
+def test_recheck_requeue_failure_is_caught():
+    queue = MagicMock(side_effect=RuntimeError("broker down"))
+    with patch("tasks._resting_sell_stops", return_value=[_cancelling(10)]), \
+         patch.object(tasks.recheck_stop_coverage, "apply_async", new=queue), \
+         patch("tasks._fix_overstop_safe") as fix:
+        tasks.recheck_stop_coverage("AMD")   # must not raise
+    queue.assert_called_once()
+    fix.assert_not_called()
+
+
+# ── Stops that refuse a cancel are remembered, not cancelled again ─────
+
+class _Broker:
+    """Open orders on a clock. A cross-client stop answers a cancel with
+    PendingCancel for 180 s, then reverts to working (MRVL 08-04,
+    ibkr.cancel_order); ours cancel at once, or after slow_s."""
+
+    def __init__(self, held=100):
+        self.clock, self.held, self.orders, self.next_id = 0.0, held, {}, 100
+        self.cancels = {}      # order id -> cancel requests
+        self.queued = []       # (due time, attempt)
+        self.state = {}        # system_state
+        self.sent = []
+        self.by_id = []        # (order id, symbol, perm_id) per single cancel
+        self.fresh = None      # a fresh reqPositions() qty other than held
+        self.fresh_read = None   # the whole fresh read (or an exception), if set
+        self.revert_s = 180    # how long a cross-client stop shows the cancel
+
+    def add(self, oid, qty, cross=False, slow_s=0, perm=None):
+        self.orders[oid] = {"qty": qty, "status": "Submitted", "cross": cross,
+                            "slow_s": slow_s, "at": None, "perm": perm}
+
+    def _tick(self):
+        for oid, o in list(self.orders.items()):
+            if o["status"] == "PendingCancel" and self.clock >= o["at"]:
+                if o["cross"]:
+                    o["status"], o["at"] = "Submitted", None
+                else:
+                    del self.orders[oid]
+
+    def open_orders(self):
+        self._tick()
+        return [{"order_id": k, "perm_id": v["perm"], "ticker": "AMD", "action": "SELL",
+                 "order_type": "STP", "qty": v["qty"], "stop_price": 150.0,
+                 "status": v["status"]} for k, v in self.orders.items()]
+
+    def cancel(self, oid, symbol=None, perm_id=None):
+        if symbol is not None:   # the per-order path (manage_cancel_order)
+            self.by_id.append((oid, symbol, perm_id))
+        self.cancels[oid] = self.cancels.get(oid, 0) + 1
+        o = self.orders.get(oid)
+        if o is None:
+            return False
+        if o["cross"]:
+            o["status"], o["at"] = "PendingCancel", self.clock + self.revert_s
+        elif o["slow_s"]:
+            o["status"], o["at"] = "PendingCancel", self.clock + o["slow_s"]
+        else:
+            del self.orders[oid]
+        self.clock += 1
+        return not o["cross"] and not o["slow_s"]
+
+    def cancel_all(self, ticker):
+        return sum(self.cancel(oid) for oid in list(self.orders))
+
+    def place(self, ticker, qty, price, market_price=None):
+        self.next_id += 1
+        self.add(self.next_id, qty)
+        return {"order_id": self.next_id}
+
+    def sleep(self, s):
+        self.clock += s
+
+    def queue(self, args=None, kwargs=None, countdown=0):
+        self.queued.append((self.clock + countdown, kwargs["attempt"]))
+
+    def cover(self):
+        self._tick()
+        return sum(v["qty"] for v in self.orders.values())
+
+    def patches(self):
+        client = MagicMock()
+        client.get_all_positions.return_value = [MagicMock(symbol="AMD", qty=self.held)]
+        fresh = self.held if self.fresh is None else self.fresh
+        read = {"AMD": float(fresh)} if self.fresh_read is None else self.fresh_read
+        read_kw = ({"side_effect": read} if isinstance(read, Exception)
+                   else {"return_value": read})
+        return [patch("ibkr.get_client", return_value=client),
+                patch("ibkr.get_fresh_stock_positions", **read_kw),
+                patch("ibkr.get_open_orders", side_effect=self.open_orders),
+                patch("db.get_position_stop", return_value={"stop_price": 150.0}),
+                patch("db.get_state", side_effect=lambda k, d=None: self.state.get(k, d)),
+                patch("db.set_state", side_effect=self.state.__setitem__),
+                patch("ibkr.get_latest_price", return_value=200.0),
+                patch("tasks.manage_cancel_stop_orders_for", side_effect=self.cancel_all),
+                patch("tasks.manage_cancel_order", side_effect=self.cancel),
+                patch("time.sleep", side_effect=self.sleep),
+                patch.object(tasks.recheck_stop_coverage, "apply_async", new=self.queue),
+                patch("tasks.manage_stop_place", side_effect=self.place),
+                patch("db.set_stop_broker_order_id"),
+                patch("alerts._send", side_effect=self.sent.append)]
+
+    def run(self, fn):
+        from contextlib import ExitStack
+        with ExitStack() as stack:
+            for p in self.patches():
+                stack.enter_context(p)
+            return fn()
+
+    def run_rechecks(self):
+        while self.queued:
+            due, attempt = self.queued.pop(0)
+            self.clock = max(self.clock, due)
+            self.run(lambda: tasks.recheck_stop_coverage("AMD", attempt=attempt))
+
+
+def test_cross_client_stop_that_refuses_the_cancel_converges_to_exact_cover():
+    # held 100, our stop 100, a cross-client stop 40 that reverts each cancel
+    b = _Broker()
+    b.add(1, 100)
+    b.add(2, 40, cross=True, perm=7002)
+    msg = b.run(lambda: tasks._fix_overstop("AMD"))
+    assert msg.startswith("🔧") and "still being cancelled" in msg
+    assert "stop_cancel_refused_AMD" in b.state
+    b.run_rechecks()
+    assert b.cover() == 100
+    assert b.orders[2]["status"] == "Submitted" and b.orders[2]["qty"] == 40
+    assert b.cancels[2] == 1           # the refused stop was cancelled once
+    # later reconcile fixes leave it alone: exact cover, nothing cancelled
+    for _ in range(3):
+        b.clock += 1800
+        msg = b.run(lambda: tasks._fix_overstop_safe("AMD"))
+        assert "fine on re-check" in msg
+    assert b.cover() == 100 and b.cancels[2] == 1
+
+
+def test_refused_stop_seen_by_reconcile_only_cancels_our_excess():
+    # the re-check chain gave up while the refused stop still showed the
+    # cancel; the next reconcile sees it working again
+    b = _Broker()
+    b.add(1, 100)
+    b.add(2, 40, cross=True, perm=7002)
+    b.run(lambda: tasks._fix_overstop("AMD"))
+    b.queued.clear()
+    b.clock += 900
+    msg = b.run(lambda: tasks._fix_overstop_safe("AMD"))
+    assert msg.startswith("🔧") and "placed a stop for 60" in msg
+    assert b.cover() == 100 and b.cancels[2] == 1
+
+
+def test_our_slow_cancel_that_lands_gives_exact_cover():
+    b = _Broker()
+    b.add(1, 100, slow_s=20)
+    b.add(2, 100)
+    msg = b.run(lambda: tasks._fix_overstop("AMD"))
+    b.run_rechecks()
+    b.clock += 60
+    assert b.cover() == 100
+    assert sum(1 for o in b.orders.values() if o["status"] == "Submitted") == 1
+    assert "placed a stop for 100" in msg
+
+
+def test_refused_stops_covering_the_position_alone_place_nothing():
+    b = _Broker()
+    b.add(1, 100)
+    b.add(2, 100, cross=True, perm=7002)
+    b.run(lambda: tasks._fix_overstop("AMD"))
+    b.queued.clear()
+    b.clock += 900
+    placed_before = b.next_id
+    msg = b.run(lambda: tasks._fix_overstop("AMD"))
+    assert msg.startswith("🚨") and "won't cancel" in msg
+    assert b.next_id == placed_before     # nothing placed
+    assert b.cover() == 100 and b.cancels[2] == 1
+
+
+_PLACED_PENDING = ("🔧 AMD: stops covered 140 shares but 100 held; placed a stop for 100 @ "
+                   "$150.00; 40 shares of stops still being cancelled, re-check queued")
+_WONT_CANCEL = ("🚨 AMD: stop order(s) 2 for 140 shares won't cancel and exceed the 100 held "
+                "— cancel them in TWS")
+_REFUSED_COVER = ("🚨 AMD: stop order(s) 2 for 100 shares refused a cancel (won't cancel) and "
+                  "cover the 100 held; nothing placed — cancel them in TWS if they aren't wanted")
+_SETTLED = ("AMD: stop coverage settled around stop(s) that refused a cancel (40 working, "
+            "0 still showing the cancel, 60 ours vs 100 held); nothing cancelled")
+_NOTHING_PLACED = ("⚠️ AMD: stops covered 140 shares but 100 held; stop(s) that did not cancel "
+                   "cover the 100 held, nothing placed; 40 shares of stops still being "
+                   "cancelled, re-check queued — check the stops in TWS")
+
+
+def test_a_placed_stop_line_is_never_throttled():
+    with patch("tasks._reconcile_alert_due", return_value=False) as due:
+        assert tasks._stop_fix_alert_due("AMD", _PLACED_PENDING) is True
+        assert tasks._stop_fix_alert_due("AMD", "🔧 AMD: stops covered only 0 of 10 shares; "
+                                                "placed a stop for 10 @ $150.00") is True
+    due.assert_not_called()
+
+
+def test_refused_cancel_alert_has_its_own_throttle_key():
+    with patch("tasks._reconcile_alert_due", return_value=False) as due:
+        assert tasks._stop_fix_alert_due("AMD", _REFUSED_COVER) is False
+    due.assert_called_once_with("stop_cancel_refused_AMD")
+
+
+def test_wont_cancel_and_exceed_is_never_throttled():
+    # stops over the position could open a short: always sent
+    with patch("tasks._reconcile_alert_due", return_value=False) as due:
+        assert tasks._stop_fix_alert_due("AMD", _WONT_CANCEL) is True
+    due.assert_not_called()
+
+
+def test_informational_cancel_lines_share_the_cancelling_key():
+    with patch("tasks._reconcile_alert_due", return_value=False) as due:
+        assert tasks._stop_fix_alert_due("AMD", _SETTLED) is False
+        assert tasks._stop_fix_alert_due("AMD", _NOTHING_PLACED) is False
+    assert due.call_args_list == [call("stop_cancelling_AMD")] * 2
+
+
+def test_other_alerts_are_not_throttled():
+    with patch("tasks._reconcile_alert_due", return_value=False) as due:
+        assert tasks._stop_fix_alert_due("AMD", "🚨 AMD: broker shows a SHORT of -5") is True
+    due.assert_not_called()
+
+
+def test_a_won_t_cancel_alert_is_not_held_back_by_earlier_informational_lines():
+    # real throttle on a state dict: the cancelling lines spend their own
+    # key, never the 🚨's
+    state = {}
+    with patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
+         patch("db.set_state", side_effect=state.__setitem__):
+        assert tasks._stop_fix_alert_due("AMD", _NOTHING_PLACED) is True
+        assert tasks._stop_fix_alert_due("AMD", _SETTLED) is False      # throttled
+        assert tasks._stop_fix_alert_due("AMD", _PLACED_PENDING) is True
+        assert tasks._stop_fix_alert_due("AMD", _REFUSED_COVER) is True   # own key, first
+        assert tasks._stop_fix_alert_due("AMD", _REFUSED_COVER) is False  # then throttled
+        # the refused-cover 🚨 spent its key; the short-risk 🚨 still goes out
+        assert tasks._stop_fix_alert_due("AMD", _WONT_CANCEL) is True
+        assert tasks._stop_fix_alert_due("AMD", _WONT_CANCEL) is True
+    assert set(state) == {"reconcile_alert_stop_cancelling_AMD",
+                          "reconcile_alert_stop_cancel_refused_AMD"}
+
+
+def test_fix_overstop_cancels_one_order_with_its_symbol_and_perm_id():
+    b = _Broker()
+    b.add(1, 100)
+    b.add(2, 40, cross=True, perm=7002)
+    b.run(lambda: tasks._fix_overstop("AMD"))
+    b.queued.clear()
+    b.clock += 900
+    b.by_id = []
+    b.run(lambda: tasks._fix_overstop("AMD"))
+    assert b.by_id == [(101, "AMD", None)]   # ours only, with its ticker
+
+
+def test_refused_record_expires():
+    from datetime import datetime, timedelta, timezone
+    import json
+    old = (datetime.now(timezone.utc) - timedelta(seconds=tasks._CANCEL_REFUSED_TTL_S + 60)).isoformat()
+    rec = json.dumps({"at": old, "stops": [{"kind": "perm", "id": 2}]})
+    with patch("db.get_state", return_value=rec):
+        assert tasks._cancel_refused_ids("AMD") == set()
+    with patch("db.get_state", return_value=json.dumps({**json.loads(rec),
+                                                          "at": datetime.now(timezone.utc).isoformat()})):
+        assert tasks._cancel_refused_ids("AMD") == {("perm", 2)}
+
+
+@pytest.mark.parametrize("revert_s", [200, 250, 290])
+def test_a_late_revert_is_caught_by_the_recheck_chain(revert_s):
+    b = _Broker()
+    b.revert_s = revert_s
+    b.add(1, 100)
+    b.add(2, 40, cross=True, perm=7002)
+    b.run(lambda: tasks._fix_overstop("AMD"))
+    b.run_rechecks()
+    assert b.cover() == 100           # trimmed in the chain, not left to reconcile
+    assert b.orders[2]["status"] == "Submitted" and b.cancels[2] == 1
+
+
+def _refused_over_position(cross=True):
+    """50 held after a partial sale; our stop 50 and a recorded refused
+    stop for 100 (it would short 50 if it filled)."""
+    import json
+    from datetime import datetime, timezone
+    b = _Broker(held=50)
+    b.add(1, 50)
+    b.add(2, 100, cross=cross, perm=7002)
+    b.state["stop_cancel_refused_AMD"] = json.dumps(
+        {"at": datetime.now(timezone.utc).isoformat(), "stops": [{"kind": "perm", "id": 7002}]})
+    return b
+
+
+def test_refused_stop_over_the_position_alerts_unthrottled_and_keeps_our_stop():
+    b = _refused_over_position()
+    msg = b.run(lambda: tasks._fix_overstop("AMD"))
+    assert msg.startswith("🚨") and "won't cancel and exceed the 50 held" in msg
+    assert "refused a cancel" not in msg
+    assert b.cancels == {2: 1}                    # one retry of the refused stop
+    assert 1 in b.orders and b.orders[1]["status"] == "Submitted"   # ours stays
+    with patch("tasks._reconcile_alert_due", return_value=False):
+        assert tasks._stop_fix_alert_due("AMD", msg) is True
+
+
+def test_refused_stop_over_the_position_that_cancels_on_retry_leaves_ours():
+    b = _refused_over_position(cross=False)
+    msg = b.run(lambda: tasks._fix_overstop("AMD"))
+    assert msg.startswith("🔧") and "our stops cover 50" in msg
+    assert b.cover() == 50 and list(b.orders) == [1]
+
+
+def test_refused_stop_equal_to_the_position_keeps_the_cover_path():
+    b = _refused_over_position()
+    b.orders[2]["qty"] = 50
+    msg = b.run(lambda: tasks._fix_overstop("AMD"))
+    assert "refused a cancel" in msg and "cover the 50 held" in msg
+    assert 2 not in b.cancels
+
+
+def test_recheck_with_a_stale_cache_after_an_add_cancels_nothing():
+    # cache 100, fresh 150 (an ADD the cache hasn't caught); stops 100 + a
+    # reverted 40: sized from the cache alone this would cancel and re-place
+    # for 100, leaving the new shares bare
+    b = _Broker(held=100)
+    b.fresh = 150
+    b.add(1, 100)
+    b.add(2, 40)
+    with patch("tasks._fix_overstop_safe", wraps=tasks._fix_overstop_safe) as fix:
+        b.run(lambda: tasks.recheck_stop_coverage("AMD"))
+    assert fix.call_args.kwargs["allow_cancel"] is False
+    assert fix.call_args.kwargs["max_qty"] == 100
+    assert b.cancels == {}
+    assert b.cover() == 140
+
+
+def test_recheck_reads_that_agree_allow_cancels():
+    with patch("ibkr.get_fresh_stock_positions", return_value={"AMD": 100.0}), \
+         patch("ibkr.get_client") as client:
+        client.return_value.get_all_positions.return_value = [MagicMock(symbol="AMD", qty=100)]
+        assert tasks._recheck_position_reads("AMD") == {}
+
+
+@pytest.mark.parametrize("fresh", [TimeoutError("read"), {}, {"NVDA": 5.0}])
+def test_a_fresh_read_failing_or_without_the_ticker_is_no_cross_check(fresh):
+    # an empty or partial fresh read may be a reconnect gap: add-only, no
+    # max_qty (fresh 0 vs cache 50 is not a disagreement)
+    kw = {"side_effect": fresh} if isinstance(fresh, Exception) else {"return_value": fresh}
+    with patch("ibkr.get_fresh_stock_positions", **kw):
+        out = tasks._recheck_position_reads("AMD")
+    assert out["allow_cancel"] is False and "max_qty" not in out and "fresh_qty" not in out
+    assert out["no_cancel_reason"].startswith("the fresh position read")
+
+
+@pytest.mark.parametrize("fresh", [TimeoutError("read"), {}])
+def test_recheck_over_cover_with_no_cross_check_sends_no_alert(fresh):
+    # cache 50, our 50 + a reverted 40: nothing cancelled, no 🚨, and the
+    # line doesn't claim the reads disagree
+    b = _Broker(held=50)
+    b.add(1, 50)
+    b.add(2, 40)
+    b.fresh_read = fresh
+    msgs = []
+    with patch("tasks._fix_overstop_safe",
+               side_effect=lambda *a, **k: msgs.append(tasks._fix_overstop(*a, **k)) or msgs[-1]):
+        b.run(lambda: tasks.recheck_stop_coverage("AMD"))
+    assert b.cancels == {} and b.cover() == 90
+    assert b.sent == []
+    assert "disagree" not in msgs[0] and "reconcile checks it" in msgs[0]
+    assert not msgs[0].startswith(("🚨", "⚠️", "🔧"))
+
+
+def test_under_cover_with_no_cross_check_still_adds():
+    b = _Broker(held=50)
+    b.add(1, 20)
+    with patch("db.set_stop_broker_order_id"):
+        msg = b.run(lambda: tasks._fix_overstop(
+            "AMD", allow_cancel=False, no_cancel_reason="the fresh position read failed"))
+    assert msg.startswith("🔧") and "placed a stop for 30" in msg
+
+
+def test_a_stop_with_no_perm_id_is_not_recorded_as_refused():
+    state = {}
+    with patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
+         patch("db.set_state", side_effect=state.__setitem__):
+        tasks._remember_cancel_refused("AMD", [{"order_id": 2, "perm_id": 0},
+                                               {"order_id": 3, "perm_id": 7003}], [])
+        assert tasks._cancel_refused_ids("AMD") == {("perm", 7003)}

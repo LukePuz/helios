@@ -14,6 +14,18 @@ def test_partial_sale_deferred_outside_rth():
     cancel.assert_not_called(); sell.assert_not_called()
 
 
+
+def _gone_after_cancel(stops):
+    """tasks._resting_sell_stops side effect: the stops on the first read
+    (before the cancel), none after it, as at the broker."""
+    calls = []
+
+    def read(ticker, *a, **k):
+        calls.append(ticker)
+        return list(stops) if len(calls) == 1 else []
+    return read
+
+
 def _failed_conversion(place_side_effect):
     client = MagicMock()
     client.get_all_positions.return_value = [MagicMock(symbol="NVDA", qty=7, current_price=126.0)]
@@ -27,6 +39,8 @@ def _failed_conversion(place_side_effect):
          patch("db.get_position_stop", return_value=rec), \
          patch("risk_manager.SETUP_GATES_ENABLED", False), \
          patch.object(risk_manager.RiskManager, "get_atr", return_value=4.0), \
+         patch("tasks._resting_sell_stops",
+               side_effect=_gone_after_cancel([{"stop_price": 112.0, "qty": 7.0}])), \
          patch("tasks.manage_cancel_stop_orders_for"), \
          patch("tasks.manage_place_trailing_stop", side_effect=RuntimeError("broker")), \
          patch("tasks.manage_stop_place", side_effect=place_side_effect) as place, \
@@ -38,7 +52,7 @@ def _failed_conversion(place_side_effect):
 
 def test_failed_trail_conversion_restores_the_fixed_stop():
     place, alerts = _failed_conversion([{"order_id": 3}])
-    place.assert_called_once_with("NVDA", 7.0, 112.0)
+    place.assert_called_once_with("NVDA", 7.0, 112.0, market_price=126.0)
     assert not [a for a in alerts if a["action"] == "FIX_STOP"]
 
 
@@ -65,6 +79,7 @@ def test_partial_sale_never_places_a_stop_above_the_price(monkeypatch):
     # recorded stop 130 (stale fixed-STP record) is above the 126 trigger price
     with patch("db.get_position_stop", return_value={"stop_price": 130.0}), \
          patch("db.set_stop_broker_order_id"), \
+         patch("execution._stops_still_resting", return_value=0.0), \
          patch("tasks.manage_cancel_stop_orders_for"), \
          patch("ibkr.place_market_order", return_value={"filled_qty": 30, "order_id": 7}), \
          patch("ibkr.get_client", return_value=client), \
@@ -73,7 +88,7 @@ def test_partial_sale_never_places_a_stop_above_the_price(monkeypatch):
          patch("alerts._send"):
         result = object.__new__(risk_manager.RiskManager)._partial_sell_and_resize_stop(
             "NVDA", 100, 30, 100.0, decision_price=126.0)
-    place.assert_called_once_with("NVDA", 70.0, 100.0)
+    place.assert_called_once_with("NVDA", 70.0, 100.0, market_price=126.0)
     assert result["new_stop"] == 100.0
 
 
@@ -91,10 +106,12 @@ def test_failed_cancel_does_not_stack_a_restored_stop():
          patch("db.get_position_stop", return_value=rec), \
          patch("risk_manager.SETUP_GATES_ENABLED", False), \
          patch.object(risk_manager.RiskManager, "get_atr", return_value=4.0), \
-         patch("tasks.manage_cancel_stop_orders_for", side_effect=RuntimeError("cancel timeout")), \
+         patch("tasks._resting_sell_stops", return_value=[{"stop_price": 112.0, "qty": 7.0}]), \
+         patch("tasks.manage_cancel_stop_orders_for", side_effect=RuntimeError("cancel timeout")) as cancel, \
          patch("tasks.manage_place_trailing_stop") as trail, \
          patch("tasks.manage_stop_place") as place:
         rm.check_trailing_stops()
+    cancel.assert_called_once_with("NVDA")
     trail.assert_not_called()
     place.assert_not_called()
 

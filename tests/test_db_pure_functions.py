@@ -124,4 +124,4 @@ def test_update_order_fill_keeps_an_earlier_fill_time_when_none_is_given():
     with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
         db.update_order_fill(44, 171.5, 50.0, "filled", filled_at="T")
     sql, params = cur.execute.call_args_list[-1][0]
-    assert "filled_at=COALESCE(%s, filled_at)" in sql and params[4] == "T" and params[5] == 44
+    assert "filled_at=COALESCE(%s, filled_at)" in sql and params[4] == "T" and params[-1] == 44

@@ -1,0 +1,21 @@
+# Helios 3D forward-return labeling job. NOT INSTALLED: every line below is
+# commented out on purpose. It runs separately from helios-local.service and
+# is not in Celery beat. Before installing, dry-run it by hand:
+#   venv/bin/python -m helios3d.record.labels --dry-run
+# and pair it with a timer (for example 17:30 ET on weekdays, after the
+# close). Installing it is a deliberate step, not part of Wave 0.
+#
+# [Unit]
+# Description=Helios 3D forward-return labels (h3d.verdict_labels)
+# After=network-online.target
+# Wants=network-online.target
+#
+# [Service]
+# Type=oneshot
+# WorkingDirectory=/home/YOUR_USER/Desktop/trading_bot
+# ExecStart=/home/YOUR_USER/Desktop/trading_bot/venv/bin/python -m helios3d.record.labels --apply
+# Nice=10
+# TimeoutStartSec=1800
+#
+# [Install]
+# WantedBy=multi-user.target

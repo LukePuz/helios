@@ -42,7 +42,18 @@ _CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # Services whose absence means the trading pipeline itself is down —
 # catalyst_service is informational, not load-bearing, so it's excluded.
-_CRITICAL_SERVICES = ["celery_worker", "celery_llm_worker", "celery_beat"]
+# The orders worker is the only process that can place, move or cancel a
+# stop (clientId 30), so a dead one means stop changes silently stop
+# happening; screen and ingestion feed the analyst. All are alerted on.
+_CRITICAL_SERVICES = ["celery_worker", "celery_llm_worker", "celery_beat",
+                      "celery_orders_worker", "celery_screen_worker",
+                      "celery_ingestion_worker"]
+
+# --heal restarts the whole unit only when ALL of these are dead (the
+# total-failure rule). One dead worker in an otherwise-up stack is alerted,
+# not healed: process_manager can't respawn a single child, and bouncing
+# helios-local would tear down the live workers mid-task.
+_HEAL_TRIGGER_SERVICES = ["celery_worker", "celery_llm_worker", "celery_beat"]
 
 # take_portfolio_snapshot runs every 5 minutes during market hours; anything
 # much older than that means the ops worker has stopped processing tasks.
@@ -192,17 +203,155 @@ def _clear_alert_state(key: str) -> None:
         _say(f"Could not clear {key}: {e}")
 
 
-def _check_processes() -> list[str]:
+def _check_processes(names: list[str] | None = None) -> list[str]:
     import process_manager as pm
 
     pids = pm._load()
     problems = []
-    for name in _CRITICAL_SERVICES:
+    for name in (_CRITICAL_SERVICES if names is None else names):
         entry = pids.get(name)
         if entry is None or not pm._alive(entry):
             problems.append(f"{pm.SERVICES.get(name, {}).get('label', name)} is not running")
     return problems
 
+
+# A live PID can still be a hung worker (professor m275). The orders worker
+# also has to answer a Celery ping, as main._orders_worker_ready checks at
+# startup. Its prefork parent answers while its one child runs a task, so a
+# miss means the worker process itself is stuck. Two missed checks in a row
+# (~20 min) before alerting, so one slow broker round trip doesn't page;
+# never a self-heal trigger. The count is a file, like the heal history.
+_ORDERS_PING_TIMEOUT_S = 5.0
+_ORDERS_PING_MISSES_TO_ALERT = 2
+_ORDERS_PING_STATE_FILE = _BASE_DIR / "logs" / ".watchdog_orders_ping_misses"
+_ORDERS_PING_GRACE_S = 10.0
+# A count older than this is from an earlier session (last check before the
+# night stop, a manual run hours ago) and doesn't make the next miss "in a row".
+_ORDERS_PING_STALE_S = 30 * 60
+
+
+def _ping_orders_worker(timeout: float = _ORDERS_PING_TIMEOUT_S) -> bool | None:
+    """True when orders@<host> answers a Celery ping, False when it doesn't,
+    None when the ping itself can't be sent (broker down, import error):
+    that says nothing about the worker, and other checks cover the broker."""
+    import threading
+    box: dict = {}
+
+    def _ping() -> None:
+        try:
+            from tasks import app
+            box["ok"] = bool(app.control.ping(destination=[f"orders@{socket.gethostname()}"],
+                                              timeout=timeout))
+        except Exception as e:
+            box["err"] = e
+
+    # A broker that accepts the connection but never replies hangs the ping
+    # with no bound, and the watchdog is a oneshot run, so a hang here would
+    # block every later check. The thread is a daemon and gets abandoned.
+    t = threading.Thread(target=_ping, name="orders-ping", daemon=True)
+    t.start()
+    t.join(timeout + _ORDERS_PING_GRACE_S)
+    if "ok" in box:
+        return box["ok"]
+    if "err" in box:
+        _say(f"orders worker ping could not be sent: {box['err']}")
+    else:
+        _say(f"orders worker ping did not finish within {timeout + _ORDERS_PING_GRACE_S:.0f}s "
+             f"(broker not answering); check skipped")
+    return None
+
+
+def _check_orders_worker_responds(proc_problems: list[str]) -> list[str]:
+    """A problem line once the orders worker, alive by PID, has missed
+    _ORDERS_PING_MISSES_TO_ALERT pings in a row; [] otherwise."""
+    import process_manager as pm
+    label = pm.SERVICES.get("celery_orders_worker", {}).get("label", "celery_orders_worker")
+    if any(p.startswith(label) for p in proc_problems):
+        return []   # already reported as not running
+    ok = _ping_orders_worker()
+    if ok is None:
+        return []
+    try:
+        if ok:
+            misses = 0
+        elif time.time() - _ORDERS_PING_STATE_FILE.stat().st_mtime > _ORDERS_PING_STALE_S:
+            misses = 1
+        else:
+            misses = int(_ORDERS_PING_STATE_FILE.read_text().strip() or 0) + 1
+    except (OSError, ValueError):
+        misses = 0 if ok else 1
+    try:
+        _ORDERS_PING_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _ORDERS_PING_STATE_FILE.write_text(str(misses))
+    except OSError as e:
+        _say(f"Could not save the orders ping count: {e}")
+    if misses >= _ORDERS_PING_MISSES_TO_ALERT:
+        return [f"{label} is running but has not answered a Celery ping on {misses} checks "
+                f"in a row; it may be hung, and stops may not be moving"]
+    return []
+
+
+
+# A live ping only proves the prefork parent is up; the orders worker runs one
+# child (-c 1) and its tasks have no time limit, so a broker call hung in the
+# child passes every ping (professor M219). The parent also reports the
+# child's active task with its start time. Only the _broker_* tasks run on
+# the orders queue, and they finish within a few minutes (a ~1 min reconnect,
+# ~5 s order polls, callers giving up at timeout + 120 s), so one active past
+# this is stuck. Alert only, never a heal trigger.
+_ORDERS_TASK_STUCK_S = 15 * 60
+
+
+def _orders_active_tasks(timeout: float = _ORDERS_PING_TIMEOUT_S) -> list[dict] | None:
+    """The orders worker's active tasks as reported by `inspect active`, or
+    None when the call fails or doesn't finish (bounded like the ping)."""
+    import threading
+    box: dict = {}
+    node = f"orders@{socket.gethostname()}"
+
+    def _inspect() -> None:
+        try:
+            from tasks import app
+            reply = app.control.inspect(destination=[node], timeout=timeout).active()
+            box["tasks"] = (reply or {}).get(node)
+        except Exception as e:
+            box["err"] = e
+
+    t = threading.Thread(target=_inspect, name="orders-inspect", daemon=True)
+    t.start()
+    t.join(timeout + _ORDERS_PING_GRACE_S)
+    if "err" in box:
+        _say(f"orders worker active-task check could not be sent: {box['err']}")
+        return None
+    if "tasks" not in box:
+        _say("orders worker active-task check did not finish; check skipped")
+        return None
+    return box["tasks"] if isinstance(box["tasks"], list) else None
+
+
+def _check_orders_task_not_stuck(proc_problems: list[str]) -> list[str]:
+    """A problem line for each orders task active longer than
+    _ORDERS_TASK_STUCK_S; [] otherwise, or when the worker is already
+    reported dead or the check can't run."""
+    import process_manager as pm
+    label = pm.SERVICES.get("celery_orders_worker", {}).get("label", "celery_orders_worker")
+    if any(p.startswith(label) for p in proc_problems):
+        return []
+    active = _orders_active_tasks()
+    if not active:
+        return []
+    out = []
+    now = time.time()
+    for task in active:
+        try:
+            started = float(task.get("time_start") or 0)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if started and now - started > _ORDERS_TASK_STUCK_S:
+            name = str(task.get("name") or "?").rsplit(".", 1)[-1]
+            out.append(f"{label} has been running {name} for {(now - started) / 60:.0f} min; "
+                       f"it may be hung on a broker call, and stops may not be moving")
+    return out
 
 def _ibkr_port_reachable(host: str | None = None, port: int | None = None,
                          timeout: float = 3.0) -> bool:
@@ -514,13 +663,17 @@ def main() -> None:
     proc_problems = _check_processes()
     problems = ([f"{_HELIOS_SERVICE} is not active"] if service_down else []) \
         + proc_problems + _check_snapshot_freshness()
+    if not service_down:
+        problems += _check_orders_worker_responds(proc_problems)
+        problems += _check_orders_task_not_stuck(proc_problems)
 
     # Restart only on unambiguous total failure -- the unit itself down, or
     # every critical worker gone. A PARTIALLY degraded stack is left alone
     # and merely alerted on: bouncing the whole service to recover one
     # worker would tear down the others mid-task, and a half-up system is
     # the state most likely to have something in flight worth not killing.
-    total_failure = service_down or len(proc_problems) == len(_CRITICAL_SERVICES)
+    total_failure = service_down or (
+        len(_check_processes(_HEAL_TRIGGER_SERVICES)) == len(_HEAL_TRIGGER_SERVICES))
 
     heal_notes: list[str] = []
     if heal and total_failure:

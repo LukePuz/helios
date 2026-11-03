@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import json
 import logging
+import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -52,6 +55,22 @@ def _write_lock():
 _client: chromadb.PersistentClient | None = None
 _embedder: SentenceTransformer | None = None
 _collections: dict[str, chromadb.Collection] = {}
+# Write generation (.write.gen next to .write.lock) that this process's client
+# reflects: set when it reopens or writes under the lock. None means unknown,
+# so the next write reopens.
+_seen_generation: int | None = None
+# Rebuild batch sizes: texts per encode() batch and records per upsert call.
+_EMBED_BATCH = 64
+_UPSERT_BATCH = 256
+
+try:
+    # Raised inside a Celery task at its soft time limit. A rebuild must let
+    # it through: caught as a per-document failure, it would count the rest
+    # of the collection as unrestorable and drop the snapshot.
+    from celery.exceptions import SoftTimeLimitExceeded as _SoftTimeLimit
+except ImportError:  # pragma: no cover - celery is a dependency
+    class _SoftTimeLimit(Exception):
+        pass
 
 COLLECTIONS = {
     "filings":      "SEC filings — 8-K, 10-Q, 10-K",
@@ -68,6 +87,107 @@ COLLECTIONS = {
     # prose rather than a hardcoded keyword list.
     "thesis":       "Investment thesis descriptions per theme",
 }
+
+
+def _reopen_client() -> None:
+    """Drops this process's Chroma client and collection handles, so the next
+    _get_client() loads the store from disk. Writes reach it through
+    _locked_write(), which calls it when another process wrote since this
+    process's last write (see _reopen_if_stale).
+
+    Chroma 1.x keeps a per-process in-memory copy of each collection's HNSW
+    index and writes that copy back to disk. The lock stops two writes from
+    running at once, but a process that wrote earlier still writes from its own
+    old copy, which lacks whatever the other processes wrote since. Three
+    long-lived writers (the screen worker's forks) re-upserting the same news
+    urls leave the on-disk index out of step with the log, and a fresh
+    process's col.count() then fails with "Failed to apply logs to the hnsw
+    segment writer". That is what tasks.check_vector_store_health reported as
+    'news' corrupted. Reproduced with chromadb 1.5.9 on a scratch store: three
+    cached writers under the lock broke it; one writer with two cached readers,
+    or three writers that reopen under the lock, did not. A reopen costs about
+    20 ms. The old system is stopped, which frees its Rust bindings: only
+    dropping it from Chroma's cache leaked about 5 MB per reopen."""
+    global _client
+    from chromadb.api.client import SharedSystemClient
+    for system in list(SharedSystemClient._identifier_to_system.values()):
+        try:
+            system.stop()
+        except Exception as e:
+            log.debug(f"vector_store: stopping the old Chroma system failed: {e}")
+    SharedSystemClient.clear_system_cache()
+    _client = None
+    _collections.clear()
+
+
+def _read_generation() -> int | None:
+    """The store's write generation from .write.gen: 0 when the file is
+    missing, None when it is empty or can't be read (the caller then
+    reopens)."""
+    try:
+        return int((_DB_PATH / ".write.gen").read_text().strip())
+    except FileNotFoundError:
+        return 0
+    except Exception as e:
+        log.debug(f"vector_store: could not read the write generation: {e}")
+        return None
+
+
+def _bump_generation() -> None:
+    """Called under the write lock before a write: other processes see a new
+    generation and reopen before their next write. The file is replaced
+    whole (temp file, rename), so a kill never leaves it empty. When the
+    current value can't be read, the new one is time.time_ns(), which no
+    process can have seen: restarting the count at 1 would match a process
+    whose last seen value was 1, and it would skip a reopen it needs."""
+    global _seen_generation
+    cur = _read_generation()
+    gen = cur + 1 if cur is not None else time.time_ns()
+    path = _DB_PATH / ".write.gen"
+    tmp = path.with_name(".write.gen.tmp")
+    tmp.write_text(str(gen))
+    os.replace(tmp, path)
+    _seen_generation = gen
+
+
+def _reopen_if_stale() -> None:
+    """Called under the write lock before a write. Reopens (_reopen_client)
+    only when another process wrote since this process's last write or reopen,
+    or the generation is unknown. Back-to-back writes from one process keep
+    their client: no 20 ms reopen and no allocator growth from it."""
+    global _seen_generation
+    gen = _read_generation()
+    if _client is None or gen is None or gen != _seen_generation:
+        _reopen_client()
+        _seen_generation = gen
+
+
+def _forget_generation() -> None:
+    """Makes this process's next write reopen. Registered for forks, so a
+    Celery prefork child doesn't trust the client state it inherited, and
+    called when a write raised partway."""
+    global _seen_generation
+    _seen_generation = None
+
+
+os.register_at_fork(after_in_child=_forget_generation)
+
+
+@contextlib.contextmanager
+def _locked_write():
+    """The write lock, a reopen when another process wrote since this one's
+    last write, and a generation bump. The bump comes before the write, so a
+    writer killed partway still makes every other process reopen. A write
+    that raised leaves this process's own generation unknown, so its next
+    write reopens."""
+    with _write_lock():
+        _reopen_if_stale()
+        _bump_generation()
+        try:
+            yield
+        except BaseException:
+            _forget_generation()
+            raise
 
 
 def _get_client() -> chromadb.PersistentClient:
@@ -150,6 +270,15 @@ def embed(text: str) -> list[float]:
     return result.tolist() if hasattr(result, "tolist") else list(result)
 
 
+def embed_many(texts: list[str]) -> list[list[float]]:
+    """embed() for a list of texts, encoded _EMBED_BATCH at a time. Used by
+    rebuild_collection, which re-embeds a whole collection under the lock."""
+    if not texts:
+        return []
+    result = _get_embedder().encode(texts, batch_size=_EMBED_BATCH, show_progress_bar=False)
+    return [r.tolist() if hasattr(r, "tolist") else list(r) for r in result]
+
+
 def store(
     collection: str,
     doc_id: str,
@@ -176,7 +305,7 @@ def store(
     # ChromaDB metadata values must be str/int/float/bool
     meta = {k: str(v) if not isinstance(v, (str, int, float, bool)) else v
             for k, v in meta.items()}
-    with _write_lock():
+    with _locked_write():   # writes from the on-disk state, not this process's old copy
         _with_fresh_retry(collection, lambda col: col.upsert(
             ids=[doc_id],
             embeddings=[embedding],
@@ -315,29 +444,459 @@ def prune_old_documents(collection: str, max_age_days: int = 90) -> int:
     Returns count of documents deleted.
     """
     from datetime import timedelta
-    col = _get_collection(collection)
-    if col.count() == 0:
-        return 0
-
     cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
 
+    # A delete is a write: same lock and reopen rule as store().
+    with _locked_write():
+        if _snapshot_path(collection).exists():
+            # An unfinished rebuild's snapshot would put pruned ids back on
+            # resume. The health check resumes it within the hour; prune then.
+            log.warning(f"prune_old_documents: '{collection}' has an unfinished rebuild; skipped")
+            return 0
+        col = _get_collection(collection)
+        if col.count() == 0:
+            return 0
+        try:
+            # Fetch all document IDs and their timestamps
+            all_docs = col.get(include=["metadatas"])
+            ids_to_delete = []
+            for doc_id, meta in zip(all_docs["ids"], all_docs["metadatas"]):
+                ts = meta.get("timestamp") or meta.get("date") or ""
+                if ts and ts < cutoff:
+                    ids_to_delete.append(doc_id)
+
+            if ids_to_delete:
+                col.delete(ids=ids_to_delete)
+                log.info(f"Pruned {len(ids_to_delete)} docs from '{collection}' (>{max_age_days}d old)")
+
+            return len(ids_to_delete)
+        except Exception as e:
+            log.warning(f"prune_old_documents failed for '{collection}': {e}")
+            return 0
+
+
+def _read_collection_docs(name: str) -> list[tuple[str, str, dict]]:
+    """(id, document, metadata) for every record of a collection, read
+    straight from chroma.sqlite3 over a read-only connection. A broken
+    collection's HNSW index takes down any Chroma call that loads it (count,
+    get), but its documents and metadata live in the sqlite metadata segment,
+    which that breakage leaves intact."""
+    import sqlite3
+    con = sqlite3.connect(f"file:{_DB_PATH / 'chroma.sqlite3'}?mode=ro", uri=True, timeout=30)
     try:
-        # Fetch all document IDs and their timestamps
-        all_docs = col.get(include=["metadatas"])
-        ids_to_delete = []
-        for doc_id, meta in zip(all_docs["ids"], all_docs["metadatas"]):
-            ts = meta.get("timestamp") or meta.get("date") or ""
-            if ts and ts < cutoff:
-                ids_to_delete.append(doc_id)
+        rows = con.execute(
+            "SELECT e.embedding_id, m.key, m.string_value, m.int_value, m.float_value, m.bool_value "
+            "FROM embeddings e JOIN segments s ON s.id = e.segment_id "
+            "JOIN collections c ON c.id = s.collection "
+            "LEFT JOIN embedding_metadata m ON m.id = e.id "
+            "WHERE c.name = ? AND s.scope = 'METADATA'", (name,)).fetchall()
+    finally:
+        con.close()
+    docs: dict[str, dict] = {}
+    for doc_id, key, s, i, f, b in rows:
+        d = docs.setdefault(doc_id, {"document": None, "metadata": {}})
+        if key is None:
+            continue
+        value = (s if s is not None else i if i is not None else f if f is not None
+                 else bool(b) if b is not None else None)
+        if key == "chroma:document":
+            d["document"] = value
+        elif value is not None and not key.startswith("chroma:"):
+            d["metadata"][key] = value
+    without_text = [k for k, v in docs.items() if not v["document"]]
+    if without_text:
+        log.warning(f"vector_store: '{name}' has {len(without_text)} records with no document "
+                    f"text; they can't be re-embedded and are left out: {without_text[:5]}")
+    return [(k, v["document"], v["metadata"]) for k, v in docs.items() if v["document"]]
 
-        if ids_to_delete:
-            col.delete(ids=ids_to_delete)
-            log.info(f"Pruned {len(ids_to_delete)} docs from '{collection}' (>{max_age_days}d old)")
 
-        return len(ids_to_delete)
+def _count_collection_rows(name: str) -> int:
+    """Records in a collection's sqlite metadata segment, read-only, with or
+    without a document. rebuild_collection compares it with what
+    _read_collection_docs returned before it deletes anything."""
+    import sqlite3
+    con = sqlite3.connect(f"file:{_DB_PATH / 'chroma.sqlite3'}?mode=ro", uri=True, timeout=30)
+    try:
+        return con.execute(
+            "SELECT COUNT(*) FROM embeddings e JOIN segments s ON s.id = e.segment_id "
+            "JOIN collections c ON c.id = s.collection "
+            "WHERE c.name = ? AND s.scope = 'METADATA'", (name,)).fetchone()[0]
+    finally:
+        con.close()
+
+
+def _snapshot_path(name: str) -> Path:
+    """A rebuild's snapshot of the collection's records, next to the store."""
+    return _DB_PATH / f".rebuild-{name}.jsonl"
+
+
+def _write_snapshot(name: str, docs: list[tuple[str, str, dict]]) -> None:
+    """Writes the snapshot whole (temp file, fsync, rename), so a kill leaves
+    either the old file or the complete new one."""
+    path = _snapshot_path(name)
+    tmp = path.with_suffix(".jsonl.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        for doc_id, text, meta in docs:
+            f.write(json.dumps({"id": doc_id, "document": text, "metadata": meta}) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _load_snapshot(name: str) -> list[tuple[str, str, dict]] | None:
+    """The records of a rebuild that did not finish, or None if there is no
+    snapshot. Raises if the file can't be read."""
+    path = _snapshot_path(name)
+    if not path.exists():
+        return None
+    docs = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                r = json.loads(line)
+                docs.append((r["id"], r["document"], r["metadata"] or {}))
+    return docs
+
+
+def pending_rebuilds() -> list[str]:
+    """Collections with a snapshot left by a rebuild that did not finish."""
+    if not _DB_PATH.exists():
+        return []
+    return sorted(p.name[len(".rebuild-"):-len(".jsonl")] for p in _DB_PATH.glob(".rebuild-*.jsonl"))
+
+
+# Resumes of one snapshot that may fail in a row before they stop: each one
+# deletes and re-embeds the collection, and the health check runs hourly.
+_MAX_RESUME_FAILURES = 3
+
+
+def _rebuild_state_path(name: str) -> Path:
+    """Sidecar of a pending snapshot: when it was first written, and how many
+    resumes of it failed in a row."""
+    return _DB_PATH / f".rebuild-{name}.state.json"
+
+
+def rebuild_state(name: str) -> dict[str, Any]:
+    """{"created": epoch s, "failures": int, "last_error": str | None} for a
+    pending snapshot; {} when there is no sidecar or it can't be read. A soft
+    time limit landing mid-read is raised, not read as {}: that would reset
+    the failure count and drop created."""
+    try:
+        return json.loads(_rebuild_state_path(name).read_text())
+    except FileNotFoundError:
+        return {}
+    except _SoftTimeLimit:
+        raise
     except Exception as e:
-        log.warning(f"prune_old_documents failed for '{collection}': {e}")
-        return 0
+        log.warning(f"vector_store: '{name}' rebuild state unreadable: {e}")
+        return {}
+
+
+def _save_rebuild_state(name: str, state: dict[str, Any]) -> None:
+    path = _rebuild_state_path(name)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(state))
+    os.replace(tmp, path)
+
+
+def snapshot_age_hours(name: str) -> float | None:
+    """Hours since the pending snapshot of a collection was first written (a
+    resume rewrites the file, so its own mtime is only the fallback); None
+    when there is no snapshot, whatever the sidecar says (an orphan sidecar
+    must not hold up prune)."""
+    path = _snapshot_path(name)
+    if not path.exists():
+        return None
+    try:
+        created = rebuild_state(name).get("created") or path.stat().st_mtime
+    except FileNotFoundError:
+        return None
+    return max(time.time() - float(created), 0.0) / 3600
+
+
+def clear_orphan_rebuild_states() -> list[str]:
+    """Removes, under the write lock, every .rebuild-<name>.state.json whose
+    snapshot is gone (deleted by hand after a gave-up alert, or a kill
+    between the two unlinks). Returns the collections cleared."""
+    if not _DB_PATH.exists():
+        return []
+    cleared = []
+    with _write_lock():
+        for p in _DB_PATH.glob(".rebuild-*.state.json"):
+            name = p.name[len(".rebuild-"):-len(".state.json")]
+            if not _snapshot_path(name).exists():
+                p.unlink(missing_ok=True)
+                cleared.append(name)
+                log.warning(f"vector_store: removed orphan rebuild state for '{name}' "
+                            f"(no snapshot)")
+    return sorted(cleared)
+
+
+@contextlib.contextmanager
+def _resume_attempt(name: str, report: dict[str, Any]):
+    """Wraps one rebuild_collection run under the lock. A run that started
+    with a snapshot on disk (a resume) and ends with it still there, by
+    raising or by returning, counts as a failed resume in the sidecar; the
+    count goes into report["resume_failures"]. A run that ends with no
+    snapshot removes the sidecar. Its own bookkeeping never raises, except
+    that a soft time limit landing during it is re-raised once the
+    bookkeeping has been finished (the new state is computed once, so the
+    second pass doesn't count the failure twice)."""
+    resuming = _snapshot_path(name).exists()
+    error = None
+    planned: dict[str, Any] = {}
+
+    def settle():
+        if not _snapshot_path(name).exists():
+            _rebuild_state_path(name).unlink(missing_ok=True)
+            return
+        if not resuming or report["method"] in ("already_resumed", "resume_gave_up"):
+            return
+        if "state" not in planned:
+            state = rebuild_state(name)
+            state["failures"] = int(state.get("failures") or 0) + 1
+            state["last_error"] = str(error or report.get("error") or report["method"])[:500]
+            state.setdefault("created", _snapshot_path(name).stat().st_mtime)
+            planned["state"] = state
+        _save_rebuild_state(name, planned["state"])
+        report["resume_failures"] = planned["state"]["failures"]
+        log.error(f"rebuild_collection: resume of '{name}' failed "
+                  f"({planned['state']['failures']}/{_MAX_RESUME_FAILURES}): "
+                  f"{planned['state']['last_error']}")
+
+    try:
+        yield resuming
+    except BaseException as e:
+        error = f"{type(e).__name__}: {e}"
+        raise
+    finally:
+        cut_off = None
+        for _ in range(2):   # the soft limit fires once, so a second pass finishes
+            try:
+                settle()
+                break
+            except _SoftTimeLimit as e:
+                cut_off = e
+            except Exception as e:
+                log.error(f"rebuild_collection: could not record the '{name}' resume outcome: {e}")
+                break
+        if cut_off is not None:
+            raise cut_off
+
+
+def _warm_embedder() -> None:
+    """Loads the embedding model before rebuild_collection takes the write
+    lock: on a cold cache _get_embedder() downloads from the Hub, and every
+    writer would wait on that."""
+    _get_embedder()
+
+
+def _resume_todo(col, docs: list[tuple[str, str, dict]]) -> list[tuple[str, str, dict]]:
+    """The records of a resume that the live collection lacks, or holds with
+    a different text or metadata. Raises if the collection can't be read
+    (count() first: that is the call a broken index fails)."""
+    col.count()
+    live: dict[str, tuple[str, dict]] = {}
+    ids = [d[0] for d in docs]
+    for lo in range(0, len(ids), _UPSERT_BATCH):
+        got = col.get(ids=ids[lo:lo + _UPSERT_BATCH], include=["documents", "metadatas"])
+        live.update((i, (d, m or {})) for i, d, m in
+                    zip(got["ids"], got["documents"], got["metadatas"]))
+    return [d for d in docs if live.get(d[0]) != (d[1], d[2] or {})]
+
+
+def rebuild_collection(name: str, resume_only: bool = False) -> dict[str, Any]:
+    """Recreates a broken collection and puts its documents back. Returns a
+    report: collection, method, docs_before (records in sqlite),
+    docs_without_text (records with no document text, which can't be
+    re-embedded), docs_found, restored, docs_after (count() afterwards),
+    error, started_at, finished_at, resume_failures, resume_mode
+    (incremental or full, on a resume), upserted.
+
+    The ids, texts and metadata (timestamp included, so prune ages are kept)
+    are read from sqlite and written to a snapshot file (_snapshot_path)
+    before the collection is deleted. Each text is then re-embedded
+    (embed_many, as store() embeds) and upserted _UPSERT_BATCH at a time. The
+    snapshot is removed only once every id is back in the collection. A
+    rebuild killed partway (the 60 s stop grace at the 19:00 stack-down)
+    leaves the snapshot, and the next call (check_vector_store_health starts
+    with pending_rebuilds()) merges it with whatever sqlite holds now (the
+    newer copy of an id wins) and runs again: method snapshot_resume.
+
+    A resume does not delete the collection when the earlier run had already
+    recreated it (the sidecar's recreated flag): it upserts only the records
+    the live collection lacks or holds with a different text or metadata
+    (resume_mode incremental), so search() keeps what is there and a resume
+    cut off by the soft limit makes progress each run. When the collection
+    was never recreated (the run stopped before its delete, so the broken
+    index may still be there) or can't be read, the resume deletes and
+    rebuilds it in full (resume_mode full).
+
+    Nothing is deleted when sqlite can't be read (skipped_read_failed) or
+    yields no documents while the collection has records there
+    (skipped_zero_docs); both are logged at ERROR and the store is left as it
+    is. Runs under the write lock; nothing else writes until it is done.
+
+    resume_only (the health check's resume of pending_rebuilds(), listed
+    before the lock): when the snapshot is gone by the time the lock is held,
+    another runner already finished it, and nothing is touched
+    (already_resumed).
+
+    A resume that fails (raises, or leaves the snapshot) is counted in the
+    snapshot's sidecar (_resume_attempt). After _MAX_RESUME_FAILURES in a
+    row, calls stop touching the collection (resume_gave_up) and the snapshot
+    is kept; deleting .rebuild-<name>.state.json allows retries again."""
+    report: dict[str, Any] = {
+        "collection": name, "method": "rebuild", "docs_before": None,
+        "docs_without_text": None, "docs_found": 0, "restored": 0, "docs_after": None,
+        "error": None, "started_at": datetime.now(timezone.utc).isoformat(), "finished_at": None,
+        "resume_failures": 0, "resume_mode": None, "upserted": 0,
+    }
+    _warm_embedder()
+    with _write_lock(), _resume_attempt(name, report) as resuming:
+        if resume_only and not resuming:
+            log.info(f"rebuild_collection: '{name}' snapshot already resumed by another run")
+            report.update(method="already_resumed",
+                          finished_at=datetime.now(timezone.utc).isoformat())
+            return report
+        if resuming:
+            state = rebuild_state(name)
+            report["resume_failures"] = int(state.get("failures") or 0)
+            if report["resume_failures"] >= _MAX_RESUME_FAILURES:
+                log.error(f"rebuild_collection: '{name}' resume failed {report['resume_failures']} "
+                          f"times in a row; not retrying, snapshot kept")
+                report.update(method="resume_gave_up", error=state.get("last_error"),
+                              finished_at=datetime.now(timezone.utc).isoformat())
+                return report
+        try:
+            pending = _load_snapshot(name)
+            report["docs_before"] = _count_collection_rows(name)
+            saved = _read_collection_docs(name)
+            report["docs_without_text"] = max(report["docs_before"] - len(saved), 0)
+        except Exception as e:
+            log.error(f"rebuild_collection: could not read '{name}' records; nothing deleted: {e}")
+            report.update(method="skipped_read_failed", error=str(e),
+                          finished_at=datetime.now(timezone.utc).isoformat())
+            return report
+        if report["docs_before"] and not saved:
+            log.error(f"rebuild_collection: '{name}' has {report['docs_before']} records in sqlite "
+                      f"but none with a document were read; nothing deleted")
+            report.update(method="skipped_zero_docs",
+                          error=f"0 documents read from {report['docs_before']} sqlite records",
+                          finished_at=datetime.now(timezone.utc).isoformat())
+            return report
+        merged: dict[str, tuple[str, dict]] = {}
+        if pending is not None:
+            report["method"] = "snapshot_resume"
+            merged.update((doc_id, (text, meta)) for doc_id, text, meta in pending)
+        merged.update((doc_id, (text, meta)) for doc_id, text, meta in saved)
+        docs = [(doc_id, text, meta) for doc_id, (text, meta) in merged.items()]
+        report["docs_found"] = len(docs)
+        if docs:
+            _write_snapshot(name, docs)
+            if not resuming:
+                _save_rebuild_state(name, {"created": time.time(), "failures": 0,
+                                           "last_error": None})
+
+        failed: set[str] = set()
+        _reopen_client()
+        _bump_generation()   # before the delete: a kill from here on still makes others reopen
+        try:
+            col = None
+            todo = docs
+            prior = rebuild_state(name) if pending is not None else {}
+            if prior.get("recreated"):
+                # count()/get() on the live collection is the call a broken
+                # index fails, possibly by killing the process. Count this
+                # attempt first, so three such deaths still reach
+                # resume_gave_up and the alert; the count goes back once the
+                # call returns (settle() counts a failed resume as usual).
+                _save_rebuild_state(name, {
+                    **prior, "failures": int(prior.get("failures") or 0) + 1,
+                    "last_error": "process died reading the live collection (count/get)"})
+                try:
+                    col = _get_collection(name)
+                    todo = _resume_todo(col, docs)
+                    report["resume_mode"] = "incremental"
+                except _SoftTimeLimit:
+                    _save_rebuild_state(name, prior)
+                    raise
+                except Exception as e:
+                    _save_rebuild_state(name, prior)
+                    log.warning(f"rebuild_collection: '{name}' can't be read for an incremental "
+                                f"resume ({e}); rebuilding it in full")
+                    col, todo = None, docs
+                    _collections.pop(name, None)
+                else:
+                    _save_rebuild_state(name, prior)
+            if col is None:
+                if pending is not None:
+                    report["resume_mode"] = "full"
+                client = _get_client()
+                try:
+                    old_id = client.get_collection(name).id
+                except Exception:
+                    old_id = None
+                deleted = True
+                try:
+                    client.delete_collection(name)
+                except Exception as e:
+                    deleted = False   # may already be gone/unreadable; get_or_create below still works
+                    log.warning(f"rebuild_collection: deleting '{name}' failed: {e}")
+                _collections.pop(name, None)
+                col = _get_collection(name)
+                if _snapshot_path(name).exists() and deleted and col.id != old_id:
+                    # A new collection: from here a resume can fill it in place.
+                    # Not set when the delete raised, which may leave the old
+                    # index in use; the next resume then rebuilds in full again.
+                    _save_rebuild_state(name, {**rebuild_state(name), "recreated": True})
+            report["upserted"] = len(todo)
+            for lo in range(0, len(todo), _UPSERT_BATCH):
+                chunk = todo[lo:lo + _UPSERT_BATCH]
+                try:
+                    col.upsert(ids=[d[0] for d in chunk],
+                               embeddings=embed_many([d[1][:8192] for d in chunk]),
+                               documents=[d[1] for d in chunk],
+                               metadatas=[d[2] or None for d in chunk])
+                    continue
+                except _SoftTimeLimit:
+                    raise   # cut off: keep the snapshot, the next run resumes
+                except Exception as e:
+                    log.warning(f"rebuild_collection: '{name}' batch at {lo} failed ({e}); "
+                                f"upserting its documents one by one")
+                for doc_id, text, meta in chunk:
+                    try:
+                        col.upsert(ids=[doc_id], embeddings=embed_many([text[:8192]]),
+                                   documents=[text], metadatas=[meta] if meta else None)
+                    except _SoftTimeLimit:
+                        raise
+                    except Exception as e:
+                        failed.add(doc_id)
+                        log.warning(f"rebuild_collection: '{name}' doc {doc_id!r} not restored: {e}")
+            present: set[str] = set()
+            ids = [d[0] for d in docs]
+            for lo in range(0, len(ids), _UPSERT_BATCH):
+                present.update(col.get(ids=ids[lo:lo + _UPSERT_BATCH], include=[])["ids"])
+            report["restored"] = len(present)
+            report["docs_after"] = col.count()
+        except BaseException:
+            _forget_generation()
+            raise
+        # Any missing id keeps the snapshot, including ids whose upsert raised:
+        # a disk-full store fails every upsert, and dropping the snapshot then
+        # would lose the collection. _resume_attempt bounds the retries.
+        missing = set(ids) - present
+        if missing:
+            report["error"] = (f"{len(missing)} documents missing after the rebuild "
+                               f"({len(missing & failed)} failed to upsert)")
+            log.error(f"rebuild_collection: '{name}' {report['error']}: {sorted(missing)[:5]}; "
+                      f"keeping {_snapshot_path(name).name} for the next run")
+        else:
+            _snapshot_path(name).unlink(missing_ok=True)
+    report["finished_at"] = datetime.now(timezone.utc).isoformat()
+    log.info(f"rebuild_collection: '{name}' rebuilt ({report['method']}), "
+             f"{report['restored']}/{report['docs_found']} documents restored")
+    return report
 
 
 def collection_stats() -> dict[str, int]:

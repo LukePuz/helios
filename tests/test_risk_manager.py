@@ -506,6 +506,7 @@ def stop_resize_mocks():
     (test_profit_target_stop_resize.py covers that part)."""
     with patch("db.get_position_stop", return_value={"stop_price": 90.0}), \
          patch("db.set_stop_broker_order_id"), \
+         patch("execution._stops_still_resting", return_value=0.0), \
          patch("tasks.manage_cancel_stop_orders_for"), \
          patch("tasks.manage_stop_place", return_value={"order_id": 2}), \
          patch("ibkr.get_client"), \
@@ -905,7 +906,7 @@ class TestSwapPreCheck:
         rm = self._rm(cash=0.0)
         seen = {}
 
-        def fake_size(self_, *a):
+        def fake_size(self_, *a, **k):
             seen["cash"] = self_.cash()
             seen["positions"] = [p.symbol for p in self_._client.get_all_positions()]
             return {"shares_initial": 3}

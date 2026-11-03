@@ -7,6 +7,14 @@ import risk_manager
 import tasks
 
 
+@pytest.fixture(autouse=True)
+def _cancel_confirmed():
+    """The profit-target sale re-reads the stops after its cancel and holds
+    if one still works; these tests are about a confirmed cancel."""
+    with patch("execution._stops_still_resting", return_value=0.0):
+        yield
+
+
 
 @pytest.fixture(autouse=True)
 def _in_market_hours(monkeypatch):
@@ -53,7 +61,7 @@ def test_logging_failure_does_not_block_stop_replacement():
          patch("db.log_trade", side_effect=RuntimeError("db down")):
         result = _rm()._partial_sell_and_resize_stop("NVDA", 100, 30, 100.0)
     assert result is not None
-    stop.assert_called_once_with("NVDA", 70.0, 100.0)
+    stop.assert_called_once_with("NVDA", 70.0, 100.0, market_price=None)
 
 
 def _run_task(results):

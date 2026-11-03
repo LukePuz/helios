@@ -55,3 +55,20 @@ def test_retry_failure_records_why():
 def test_retry_resize_is_recorded_on_success():
     status = _retry(lambda *a, **k: True, shares_now=2)
     status.assert_called_once_with(7, "APPROVED", reason="reduced 4 -> 2 shares at execution")
+
+
+def test_retry_left_to_reconcile_is_recorded_approved():
+    """A fill left to reconcile filled: APPROVED with that reason, not FAILED."""
+    status = _retry(lambda *a, **k: execution._outcome(
+        f"{execution._LEFT_TO_RECONCILE} (trade row recovered)"))
+    status.assert_called_once_with(7, "APPROVED",
+                                   reason="skipped: fill left to reconcile (trade row recovered)")
+
+
+def test_auto_execution_left_to_reconcile_is_recorded_approved():
+    import inspect
+    import agents.crew as crew
+    src = inspect.getsource(crew)
+    assert "status, reason = approval_outcome(success)" in src
+    assert "db.update_approval_status(approval_id, status, reason=reason)" in src
+    assert 'if not success and status == "FAILED"' in src

@@ -121,7 +121,8 @@ def test_failed_rows_are_not_verdicts_for_readers():
         db.recent_event_verdicts("NVDA", 15)
     (recent_sql, recent_params), (event_sql, _) = [c.args for c in cur.execute.call_args_list]
     assert "signal NOT IN %s" in recent_sql
-    assert set(recent_params[0]) == {"ANALYST_FAILED", "NO_VERDICT", "ROUTE_NO_BROKER"}
+    assert set(recent_params[0]) == {"ANALYST_FAILED", "NO_VERDICT", "ROUTE_NO_BROKER",
+                                     "ROUTE_RISK_INIT_FAILED"}
     assert recent_params[1] == 10
     assert "signal <> 'ANALYST_FAILED'" in event_sql
 

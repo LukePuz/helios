@@ -312,6 +312,146 @@ def _held_negative_override(result: dict, ticker: str, source: str, title: str, 
     log.info(f"[{ticker}] Screener override: held position, {source}, tone={tone}")
 
 
+_RATING_DOWN = re.compile(r"\bdown\s+[A-Z][A-Z0-9.\-]*:")          # "<Firm> down NVDA: ..."
+_PT_LOWERED = re.compile(r"price target (?:lowers|lowered|cuts?)\b", re.I)
+
+
+def _would_pass_held_negative(result: dict, event: dict, source: str, title: str,
+                              held: bool) -> dict | None:
+    """Log-only (audit 2026-11-02 19:27 #4, roadmap 01(c)): a held name's
+    event that is still screened out (after _held_negative_override) and
+    reads negative on the fields the screener already has: the title tone,
+    a rating "down" action or a lowered price target in an analyst_ratings
+    title, or a BEARISH sentiment/direction field (options flow). Records
+    that a held-aware screener would pass it. None unless held and screened
+    out. The screener's decision never reads it. Never raises."""
+    try:
+        if not held or result.get("relevant"):
+            return None
+        hits = []
+        tone = title_tone(title)
+        if tone in ("neg", "mixed"):
+            hits.append(f"tone_{tone}")
+        if source == "analyst_ratings" and _RATING_DOWN.search(title or ""):
+            hits.append("rating_down")
+        if source == "analyst_ratings" and _PT_LOWERED.search(title or ""):
+            hits.append("pt_lowered")
+        for f in ("sentiment", "direction"):
+            if str((event or {}).get(f) or "").upper() == "BEARISH":
+                hits.append(f"{f}_bearish")
+        return {"would_pass": bool(hits), "negative_signals": hits, "source": source,
+                "override_skipped": result.get("override_skipped")}
+    except Exception as e:
+        return {"error": str(e)[:120]}
+
+
+_EARNINGS_TITLE = re.compile(
+    r"\b(earnings|results|Q[1-4]|guidance|outlook|beats?|miss(?:es)?|EPS|revenues?)\b", re.I)
+_ITEM_202 = re.compile(r"Item\s+2\.02|8-K items:[^\n]*\b2\.02\b", re.I)
+_POST_PRINT_KEY = "would_bypass_post_print_{env}"
+_POST_PRINT_KEEP_DAYS = 14
+
+
+def _earnings_like(event: dict, source: str, title: str) -> str | None:
+    """'8k_item_2_02' for an 8-K carrying Item 2.02 (results of operations),
+    'title' for a title that reads like a print, else None."""
+    form = str((event or {}).get("form") or (event or {}).get("type") or "").upper()
+    if source == "sec_filing" and form.startswith("8-K") and _ITEM_202.search(
+            str((event or {}).get("text") or "")):
+        return "8k_item_2_02"
+    return "title" if _EARNINGS_TITLE.search(title or "") else None
+
+
+def _next_trading_day(day):
+    """The first NYSE session after `day` (weekends and holidays skipped)."""
+    from datetime import timedelta
+    from market_calendar import NYSE_HOLIDAYS
+    d = day + timedelta(days=1)
+    while d.weekday() >= 5 or d in NYSE_HOLIDAYS:
+        d += timedelta(days=1)
+    return d
+
+
+def _log_would_bypass_post_print(result: dict, event: dict, ticker: str, source: str,
+                                 title: str, held: bool, now=None) -> None:
+    """Log-only: a held name's earnings item that the screener drops in the
+    post-print window: from 16:00 ET on the report day until 09:30 ET on the
+    next trading day, weekends and holidays included. A held name's earnings
+    items can all be screened out; _held_negative_override covers only
+    negative tone and ratings. The earnings calendar has no before/after-open
+    timing, so a before-open report's own morning is not covered. One activity_feed row (stage screener_shadow) for the first
+    such item per (ticker, earnings date); later ones only raise the count
+    kept in system_state. The screener's decision never reads it. DB reads
+    only inside the window, on a held, dropped, earnings-like item. Never
+    raises."""
+    try:
+        if not held or result.get("relevant"):
+            return
+        kind = _earnings_like(event, source, title)
+        if kind is None:
+            return
+        from datetime import date, datetime, time as dtime, timedelta, timezone
+        from zoneinfo import ZoneInfo
+        et_now = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo("America/New_York"))
+        today = et_now.date()
+        from market_calendar import NYSE_HOLIDAYS
+        in_session_day = today.weekday() < 5 and today not in NYSE_HOLIDAYS
+        if in_session_day and dtime(9, 30) <= et_now.time() < dtime(16, 0):
+            return
+        import db
+        ed = db.get_earnings_around([ticker], days_ahead=1, days_back=5).get(ticker)
+        if ed is None:
+            return
+        ed = ed if isinstance(ed, date) else date.fromisoformat(str(ed)[:10])
+        nxt = _next_trading_day(ed)
+        if ed == today and et_now.time() >= dtime(16, 0):
+            window = "after_close"
+        elif ed < today < nxt or (today == nxt and et_now.time() < dtime(9, 30)):
+            window = "pre_open"
+        else:
+            return
+        import json as _json
+        from config import TRADING_ENV
+        from agents.analyst import shadow_versions
+        key = _POST_PRINT_KEY.format(env=TRADING_ENV)
+        try:
+            book = _json.loads(db.get_state_strict(key, "") or "{}")
+        except ValueError:
+            log.warning(f"{key} is not valid JSON; starting a new post-print book")
+            book = {}
+        if not isinstance(book, dict):
+            book = {}
+        keep_from = (today - timedelta(days=_POST_PRINT_KEEP_DAYS)).isoformat()
+        book = {k: v for k, v in book.items()
+                if isinstance(v, dict) and str(v.get("earnings_date") or "") >= keep_from}
+        sk = f"{ticker}:{ed.isoformat()}"
+        entry = book.get(sk) or {"earnings_date": ed.isoformat(), "count": 0, "logged": False}
+        entry["count"] = int(entry.get("count") or 0) + 1
+        entry["last_at"] = et_now.isoformat()
+        if not entry.get("logged"):
+            item_id = event.get("_seen_key") or event.get("url") or event.get("id")
+            entry["logged"] = bool(db.log_activity(
+                "screener_shadow", ticker,
+                f"would bypass (post-print): held {ticker} reported {ed}, screener dropped "
+                f"{source} item: {str(title)[:80]}", "neutral",
+                {"would_bypass_post_print": True, "shadow_key": sk,
+                 "item_id": str(item_id)[:300] if item_id else None,
+                 "title": str(title)[:200], "source": source,
+                 "form": event.get("form") or event.get("type"),
+                 "earnings_like": kind, "earnings_date": ed.isoformat(), "window": window,
+                 "screener_reason": str(result.get("reason") or "")[:200],
+                 "screener_model": result.get("model_used"),
+                 "override_skipped": result.get("override_skipped"),
+                 "count_at_log": entry["count"], "count_state_key": key,
+                 "et_date": today.isoformat(), **shadow_versions()}))
+            if entry["logged"]:
+                entry["first_item_id"] = str(item_id)[:300] if item_id else None
+        book[sk] = entry
+        db.set_state(key, _json.dumps(book, default=str))
+    except Exception as e:
+        log.debug(f"[{ticker}] would_bypass_post_print log failed: {e}")
+
+
 def screen(event: dict) -> dict:
     """
     Main entry point. Returns screening result dict.
@@ -358,6 +498,8 @@ def screen(event: dict) -> dict:
             result = _keyword_fallback(event, tier=tier)
 
     _held_negative_override(result, ticker, source, title, held)
+    held_negative_shadow = _would_pass_held_negative(result, event, source, title, held)
+    _log_would_bypass_post_print(result, event, ticker, source, title, held)   # log-only
 
     # Provenance for the SCREENED_OUT signal row (SEF run 7, 2026-10-28):
     # those rows had no model or code version, so screener rejections couldn't
@@ -378,6 +520,7 @@ def screen(event: dict) -> dict:
             "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:12],
             "title_tone": title_tone(title),
             "override": result.get("override"),
+            "would_pass_held_negative": held_negative_shadow,
         }
     except Exception as e:
         log.warning(f"screener provenance failed: {e}")

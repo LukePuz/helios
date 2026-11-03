@@ -307,6 +307,13 @@ def start(name: str) -> str:
             # manage_stop_* functions).
             extra["IB_CLIENT_ID"] = "30"
             extra["DB_MAXCONN"] = "2"
+        # glibc gives each thread that allocates its own malloc arena (up to
+        # 8 per core). A vector-store write that reopens the Chroma client
+        # starts new Rust threads, and each writer process grew by about
+        # 550 MB of arenas that were never handed back. Two arenas cap that.
+        # A value already set in the environment wins.
+        if _is_celery_worker(name) and "MALLOC_ARENA_MAX" not in __import__("os").environ:
+            extra["MALLOC_ARENA_MAX"] = "2"
         env      = {**__import__("os").environ, **extra}
         _rotate_log_if_large(svc["log"])
         log_file = open(svc["log"], "a", encoding="utf-8")

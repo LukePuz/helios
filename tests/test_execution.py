@@ -348,7 +348,7 @@ class TestMarketHoursGate:
              patch("db.log_order"), patch("alerts._send"):
             mock_client.return_value.get_open_position.return_value = MagicMock(qty=100)
             assert execution.execute_approved(approval) is False
-        restore.assert_called_once_with(approval["ticker"])
+        restore.assert_called_once_with(approval["ticker"], floor=None)
         assert "stop restored" in execution.last_outcome_reason()
 
 
@@ -895,7 +895,8 @@ def test_exit_not_sent_when_resting_stops_cannot_be_read():
          patch("execution._restore_stop_after_failed_sell") as restore, \
          patch("ibkr.get_latest_price", return_value=100.0), \
          patch("market_data.get_priced_quote", return_value=None), \
-         patch("alerts._send") as send:
+         patch("alerts._send") as send, \
+         patch("tasks.retry_held_sell.apply_async") as sched:
         client.return_value.get_open_position.return_value = MagicMock(qty=100)
         assert execution.execute_approved(approval) is False
     order.assert_not_called()
@@ -903,6 +904,7 @@ def test_exit_not_sent_when_resting_stops_cannot_be_read():
     assert read.call_count == 3                       # pre-read, then the post-cancel read and its retry
     assert execution.last_outcome_reason() == "skipped: resting stops unreadable, sell not sent"
     assert "could not be read" in send.call_args_list[0][0][0]
+    sched.assert_called_once()
 
 
 def test_resting_stop_read_is_retried_once():
@@ -966,7 +968,7 @@ def test_manual_sell_not_sent_when_resting_stops_cannot_be_read_after_the_cancel
     """Review of 73494d1: same hold as the EXIT path."""
     r, cancel, restore = _manual_sell([0.0, None])
     assert r["success"] is False and "could not be read" in r["message"]
-    cancel.assert_called_once(); restore.assert_called_once_with("NVDA")
+    cancel.assert_called_once(); restore.assert_called_once_with("NVDA", floor=None)
 
 
 def test_exit_unreadable_before_the_cancel_leaves_the_stop_in_place():
@@ -979,12 +981,14 @@ def test_exit_unreadable_before_the_cancel_leaves_the_stop_in_place():
          patch("execution._restore_stop_after_failed_sell") as restore, \
          patch("ibkr.get_latest_price", return_value=100.0), \
          patch("market_data.get_priced_quote", return_value=None), \
-         patch("alerts._send") as send:
+         patch("alerts._send") as send, \
+         patch("tasks.retry_held_sell.apply_async") as sched:
         client.return_value.get_open_position.return_value = MagicMock(qty=100)
         assert execution.execute_approved(approval) is False
     order.assert_not_called(); cancel.assert_not_called(); restore.assert_not_called()
     assert "left in place" in send.call_args[0][0]
     assert "stop left in place" in execution.last_outcome_reason()
+    sched.assert_called_once()
 
 
 def test_a_held_sell_schedules_one_retry_but_the_retry_does_not():

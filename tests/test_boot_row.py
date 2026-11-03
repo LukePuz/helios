@@ -15,6 +15,15 @@ def test_boot_record_fields(tmp_path, monkeypatch):
     assert "sp500_cache_sha" in rec
 
 
+def test_boot_record_says_whether_the_spill_path_is_the_repo_default(monkeypatch, tmp_path):
+    from pathlib import Path
+    monkeypatch.setattr(db, "_SPILL_PATH", tmp_path / "spill.jsonl")   # an override
+    assert analyst.boot_record("x")["spill_path_default"] is False
+    monkeypatch.setattr(db, "_SPILL_PATH",
+                        Path(db.__file__).parent / "logs" / "db_write_spill.jsonl")
+    assert analyst.boot_record("x")["spill_path_default"] is True
+
+
 def test_dirty_and_cache_hash(monkeypatch, tmp_path):
     monkeypatch.setattr(analyst, "_CODE_SHA", {"code_sha": "abc-dirty", "head_sha": "abc-dirty"})
     assert analyst.boot_record("x")["dirty"] is True

@@ -187,14 +187,20 @@ def deep_analyze(event: dict, screening: dict | None = None) -> dict:
 # worked correctly; this closes the actual gap upstream of it.
 # ---------------------------------------------------------------------------
 
-def _log_route_exit(ticker: str, kind: str, result: dict, reason: str) -> None:
+def _log_route_exit(ticker: str, kind: str, result: dict, reason: str,
+                    decision_extra: dict | None = None) -> None:
     """A passed verdict that dies in routing gets a signals row, like
     EARNINGS_BLOCKED already did (professor M30, 2026-10-28): these exits were
-    log.info only, so the final disposition of a pass wasn't observable."""
+    log.info only, so the final disposition of a pass wasn't observable.
+    decision_extra adds kind-specific keys to the row's decision."""
     try:
         import db
+        fields = _route_row_fields(result, kind)
+        if decision_extra:
+            fields["decision"].update({k: v for k, v in decision_extra.items()
+                                       if k not in fields["decision"]})
         db.log_signal(ticker, kind, (result.get("conviction") or 0) / 10.0, reason[:500],
-                      **_route_row_fields(result, kind))
+                      **fields)
     except Exception as e:
         log.warning(f"[{ticker}] route-exit signal log failed: {e}")
 
@@ -902,6 +908,124 @@ def _wait_for_swap_cash(rm, cash_before: float | None, sell_result: dict, ticker
     return False
 
 
+# RiskManager(trading_client) raising (e.g. TWS unreachable) used to end
+# routing with a log line only: no row, no alert (10-19: 10 OPEN c7 verdicts
+# lost). Now a ROUTE_RISK_INIT_FAILED row per verdict and at most one alert
+# per process per window; hits inside the window go into the next alert.
+_RISK_INIT_ALERT_WINDOW_S = 30 * 60
+_RISK_INIT_ALERT = {"sent_at": None, "held": []}
+_RISK_INIT_ALERT_MAX_LISTED = 20
+
+
+def _risk_init_would_retry(action) -> bool:
+    """Shadow only: whether retry_deferred_entry's rules would take this
+    verdict. It retries new entries (OPEN/ADD) under
+    tasks.DEFERRED_ENTRY_MAX_AGE_HOURS that no newer approval or non-buy
+    verdict supersedes; at routing time the verdict is the newest one, its
+    age is ~0, and an active approval already ended routing earlier
+    (ROUTE_APPROVAL_PENDING). Nothing is scheduled."""
+    return action in ("OPEN", "ADD")
+
+
+def _arm_risk_init_timer(now: float, last: float) -> None:
+    """Start the daemon timer that runs _flush_risk_init_held when the
+    current alert window ends. Caller holds the lock. Never raises."""
+    try:
+        import threading
+        t = threading.Timer(max(1.0, _RISK_INIT_ALERT_WINDOW_S - (now - last)),
+                            _flush_risk_init_held)
+        t.daemon = True
+        t.start()
+        _RISK_INIT_ALERT["timer"] = t
+    except Exception as e:
+        log.warning(f"risk-init held-alert timer not started: {e}")
+
+
+def _flush_risk_init_held(now: float | None = None) -> bool:
+    """Timer body (professor m302): send the hits held since the last alert
+    once its window is over, so they reach Telegram even when no further
+    failure comes. Counts as that window's alert. True when it sent one.
+    Never raises."""
+    try:
+        import threading
+        import time
+        lock = _RISK_INIT_ALERT.setdefault("lock", threading.Lock())
+        now = time.monotonic() if now is None else now
+        with lock:
+            _RISK_INIT_ALERT["timer"] = None
+            held = _RISK_INIT_ALERT["held"]
+            if not held:
+                return False
+            last = _RISK_INIT_ALERT["sent_at"]
+            if last is not None and now - last < _RISK_INIT_ALERT_WINDOW_S - 1:
+                # A failure's own alert went out since this timer was set and
+                # these were held after it: wait out that window too.
+                _arm_risk_init_timer(now, last)
+                return False
+            _RISK_INIT_ALERT["held"] = []
+            _RISK_INIT_ALERT["sent_at"] = now
+        listed = ", ".join(held[:_RISK_INIT_ALERT_MAX_LISTED])
+        more = len(held) - _RISK_INIT_ALERT_MAX_LISTED
+        import alerts
+        alerts._send(f"Routing blocked: RiskManager init failed when sizing {len(held)} more "
+                     f"verdict(s) since the last alert; not executed: {listed}"
+                     + (f" and {more} more" if more > 0 else ""))
+        return True
+    except Exception as e:
+        log.warning(f"risk-init held-alert flush failed: {e}")
+        return False
+
+
+def _alert_risk_init_failed(item: str, now: float | None = None) -> bool:
+    """One Telegram per process per _RISK_INIT_ALERT_WINDOW_S. A hit inside
+    the window is held and listed in the next alert; the first held hit
+    starts a timer that sends them when the window ends if no later failure
+    has (professor m302). True when it sent one. Never raises."""
+    try:
+        import threading
+        import time
+        lock = _RISK_INIT_ALERT.setdefault("lock", threading.Lock())
+        now = time.monotonic() if now is None else now
+        with lock:
+            last = _RISK_INIT_ALERT["sent_at"]
+            if last is not None and now - last < _RISK_INIT_ALERT_WINDOW_S:
+                _RISK_INIT_ALERT["held"].append(item)
+                if _RISK_INIT_ALERT.get("timer") is None:
+                    _arm_risk_init_timer(now, last)
+                return False
+            held, _RISK_INIT_ALERT["held"] = _RISK_INIT_ALERT["held"], []
+            _RISK_INIT_ALERT["sent_at"] = now
+        text = f"Routing blocked: RiskManager init failed when sizing {item}; verdict not executed"
+        if held:
+            listed = ", ".join(held[:_RISK_INIT_ALERT_MAX_LISTED])
+            more = len(held) - _RISK_INIT_ALERT_MAX_LISTED
+            text += (f"\nAlso blocked since the last alert ({len(held)}): {listed}"
+                     + (f" and {more} more" if more > 0 else ""))
+        import alerts
+        alerts._send(text)
+        return True
+    except Exception as e:
+        log.warning(f"risk-init alert failed: {e}")
+        return False
+
+
+def _record_risk_init_failed(ticker: str, result: dict, exc: Exception) -> None:
+    """ROUTE_RISK_INIT_FAILED row plus the throttled alert. The row carries
+    the exception class only: the message can include account details.
+    Never raises."""
+    try:
+        action = result.get("action")
+        conviction = result.get("conviction")
+        error_class = type(exc).__name__
+        _log_route_exit(ticker, "ROUTE_RISK_INIT_FAILED", result,
+                        f"RiskManager init failed ({error_class}); not sized, not executed",
+                        decision_extra={"error_class": error_class,
+                                        "would_retry": _risk_init_would_retry(action)})
+        _alert_risk_init_failed(f"{ticker} {action} c{conviction} ({error_class})")
+    except Exception as e:
+        log.warning(f"[{ticker}] risk-init failure record failed: {e}")
+
+
 def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
     """
     Run risk sizing on an analyst recommendation and auto-execute it (paper
@@ -1073,6 +1197,7 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
             rm = RiskManager(trading_client)
         except Exception as e:
             log.error(f"[{ticker}] RiskManager init failed: {e}")
+            _record_risk_init_failed(ticker, result, e)
             return
 
         # Get current price
@@ -1311,7 +1436,7 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
     # control (drawdown halt, concentration caps, price-drift abort, ATR
     # stop placement) still applies unchanged, only the human-in-the-loop
     # tap is removed.
-    from execution import execute_approved, last_outcome_reason
+    from execution import execute_approved, approval_outcome
 
     if not db.claim_approval_for_execution(approval_id):
         log.error(f"[{ticker}] Could not claim approval #{approval_id} for auto-execution")
@@ -1319,8 +1444,9 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
 
     approval = db.get_approval_by_id(approval_id)
     success = execute_approved(approval, trigger="auto")
-    db.update_approval_status(approval_id, "APPROVED" if success else "FAILED",
-                              reason=None if success else last_outcome_reason())
+    # A fill left to reconcile filled: APPROVED with that reason, not FAILED.
+    status, reason = approval_outcome(success)
+    db.update_approval_status(approval_id, status, reason=reason)
     log.info(f"[{ticker}] Approval #{approval_id} auto-{'executed' if success else 'execution FAILED'}")
 
     if _feed_emit:
@@ -1346,7 +1472,7 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
     # _execute_approved_order already sends a Telegram trade alert on success;
     # only notify separately here on failure, so a broken execution doesn't
     # fail silently.
-    if not success:
+    if not success and status == "FAILED":   # left to reconcile has its own alert
         try:
             alert_module._send(
                 f"⚠️ AUTO-EXECUTION FAILED\n"

@@ -103,9 +103,9 @@ process_manager does not respawn dead children by itself. Recovery comes from th
 `deploy/watchdog.py` is standalone and posts directly to the Telegram API (`deploy/watchdog.py:84-95`).
 
 - `--gateway-only`: if a gateway unit is active but the IBKR port does not accept a TCP connection, it alerts that login is probably stuck on 2FA (`:202-232`).
-- Full check (`:430-464`): skipped while helios-local is in a transitional state or while `logs/.planned_restart` is under 600 s old (`:180-199`). It checks that helios-local is active, that `celery_worker`, `celery_llm_worker` and `celery_beat` are alive (`:45`, `:125-134`), and that the newest `portfolio_snapshots` row is under 15 minutes old (`:49`, `:235-270`). The orders, screen and ingestion workers are not in the critical list.
+- Full check (`:430-464`): skipped while helios-local is in a transitional state or while `logs/.planned_restart` is under 600 s old (`:180-199`). It checks that helios-local is active, that `celery_worker`, `celery_llm_worker`, `celery_beat`, `celery_orders_worker`, `celery_screen_worker` and `celery_ingestion_worker` are alive (`_CRITICAL_SERVICES`, `_check_processes`), and that the newest `portfolio_snapshots` row is under 15 minutes old (`_check_snapshot_freshness`). Any dead one is alerted.
 - Alerts are throttled to one per 30 minutes per key, stored in `system_state` (`:98-122`).
-- `--heal` restarts helios-local (`sudo -n systemctl reset-failed` then `start`) only on total failure: unit inactive or all three critical processes dead (`:342-396`). Limits: 15-minute cooldown and at most 4 restarts per rolling 24 h, recorded in `logs/.watchdog_heal_history.json` (`:62-81`, `:273-320`).
+- `--heal` restarts helios-local (`sudo -n systemctl reset-failed` then `start`) only on total failure: unit inactive or the ops, LLM and beat processes all dead (`_HEAL_TRIGGER_SERVICES`); a single dead worker in an otherwise-up stack is alerted, not healed (`:342-396`). Limits: 15-minute cooldown and at most 4 restarts per rolling 24 h, recorded in `logs/.watchdog_heal_history.json` (`:62-81`, `:273-320`).
 
 ---
 

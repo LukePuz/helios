@@ -242,14 +242,16 @@ def _handle_callback(update: dict) -> None:
             _answer_callback(cq_id, "Processing order...")
 
             success = _execute_approved_order(approval)
-            status  = "APPROVED" if success else "FAILED"
-            from execution import last_outcome_reason
-            db.update_approval_status(approval_id, status,
-                                      reason=None if success else last_outcome_reason())
+            from execution import approval_outcome
+            status, reason = approval_outcome(success)   # a fill left to reconcile: APPROVED
+            db.update_approval_status(approval_id, status, reason=reason)
             try:
                 from feed import emit as _fe
                 if success:
                     _fe("execution", ticker, f"Order executed: {action} {ticker} — filled", "bullish")
+                elif status == "APPROVED":   # filled; reconcile records it
+                    _fe("execution", ticker, f"Order filled: {action} {ticker} — recorded by "
+                                             f"reconcile", "alert")
                 else:
                     _fe("execution", ticker, f"Order FAILED: {action} {ticker} — check logs", "alert")
             except Exception:
@@ -257,7 +259,9 @@ def _handle_callback(update: dict) -> None:
 
             now = datetime.now(timezone.utc)
             if msg_id:
-                icon = "✅ APPROVED" if success else "⚠️ APPROVAL FAILED"
+                icon = ("✅ APPROVED" if success else
+                        "✅ APPROVED (filled; recorded by reconcile)" if status == "APPROVED" else
+                        "⚠️ APPROVAL FAILED")
                 _edit_message(
                     msg_id,
                     f"{icon}\n<b>{action} {ticker}</b>\n"

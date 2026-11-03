@@ -157,3 +157,54 @@ def test_non_transient_errors_spill_without_retry():
 ])
 def test_transient_classifier(msg, transient):
     assert db._is_transient_connect_error(Exception(msg)) is transient
+
+
+class _GuardCur:
+    """Records every statement; the order_row_id INSERT raises UndefinedColumn
+    when `missing_column` is set (migration 78 not applied)."""
+    def __init__(self, missing_column=False):
+        self.missing_column = missing_column
+        self.sql: list[str] = []
+        self.params: list = []
+
+    def execute(self, sql, params=None):
+        self.sql.append(sql)
+        self.params.append(params)
+        if self.missing_column and "order_row_id" in sql:
+            raise psycopg2.errors.UndefinedColumn("column order_row_id does not exist")
+
+    def fetchone(self):
+        return (7,)
+
+
+def _trade_line(**extra):
+    rec = {"symbol": "NVDA", "side": "BUY", "quantity": 1, "price": 200.0,
+           "reason": "r", "price_source": "fill", **extra}
+    return {"kind": "trade", "writer": "log_trade", "record": rec, "at": "2026-11-03T15:00:00+00:00",
+            "env": "live"}
+
+
+def test_replayed_trade_without_order_row_id_uses_the_old_insert():
+    cur = _GuardCur()
+    assert replay_spill.insert_row(cur, _trade_line()) == 7
+    assert cur.sql == ["INSERT INTO trades (symbol, trading_env, side, quantity, price, reason, "
+                       "price_source, timestamp) VALUES (%s,%s,%s,%s,%s,%s,%s,%s::timestamptz) RETURNING id"]
+    assert cur.params[0] == ("NVDA", "live", "BUY", 1, 200.0, "r", "fill", "2026-11-03T15:00:00+00:00")
+
+
+def test_replayed_trade_carries_order_row_id():
+    cur = _GuardCur()
+    assert replay_spill.insert_row(cur, _trade_line(order_row_id=42)) == 7
+    assert cur.sql[0] == "SAVEPOINT replay_trade_row"
+    assert "order_row_id" in cur.sql[1] and cur.params[1][-1] == 42
+    assert cur.sql[-1] == "RELEASE SAVEPOINT replay_trade_row"
+
+
+def test_replayed_trade_without_the_column_still_writes_the_row():
+    cur = _GuardCur(missing_column=True)
+    assert replay_spill.insert_row(cur, _trade_line(order_row_id=42)) == 7
+    assert "ROLLBACK TO SAVEPOINT replay_trade_row" in cur.sql
+    i = cur.sql.index("ROLLBACK TO SAVEPOINT replay_trade_row") + 1
+    assert cur.sql[i].startswith("INSERT INTO trades") and "order_row_id" not in cur.sql[i]
+    assert cur.params[i] == ("NVDA", "live", "BUY", 1, 200.0, "r", "fill", "2026-11-03T15:00:00+00:00")
+    assert cur.sql[-1] == "RELEASE SAVEPOINT replay_trade_row"

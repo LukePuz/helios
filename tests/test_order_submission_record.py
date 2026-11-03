@@ -52,7 +52,9 @@ def test_reconcile_note_touches_only_its_column():
     with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
         assert db.set_order_reconcile_note(5, "fill_write_failed") is True
     sql = cur.execute.call_args.args[0]
-    assert sql.startswith("UPDATE orders SET reconcile_note=%s WHERE id=%s AND reconcile_note IS NULL")
+    assert sql.startswith("UPDATE orders SET reconcile_note=%s WHERE id=%s AND "
+                          "(reconcile_note IS NULL OR reconcile_note=%s)")
+    assert cur.execute.call_args.args[1] == ("fill_write_failed", 5, db.AWAITING_FILL_NOTE)
     assert db.set_order_reconcile_note(-1, "x") is False
 
 
@@ -98,7 +100,7 @@ def _manual(result, fill_ok=True):
 
 def test_manual_orders_carry_submission_time_and_quote():
     place, log_order, note = _manual({"order_id": 78, "fill_price": 100.0, "filled_qty": 3})
-    place.assert_called_once_with("ZZZ", "BUY", 3)                # order unchanged
+    assert place.call_args.args == ("ZZZ", "BUY", 3)               # order unchanged
     kw = log_order.call_args.kwargs
     assert isinstance(kw["submitted_at"], datetime) and kw["submitted_at"].tzinfo is not None
     assert kw["submit_price"] == 100.0 and kw["status"] == "submitted"

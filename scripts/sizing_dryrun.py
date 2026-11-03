@@ -89,7 +89,7 @@ def _reason_category(shares: int, why: str) -> str:
 
 def size_like_crew(rm, ticker, conviction, bucket, regime, price):
     """Mirror of the sizing steps in crew._route_to_approval for an OPEN."""
-    sizing = rm.size_position(ticker, conviction, bucket, regime, price)
+    sizing = rm.size_position(ticker, conviction, bucket, regime, price, log_fallback=False)
     if sizing.get("shares_initial", 0) <= 0:
         return 0, "size_position: " + "; ".join(sizing.get("flags", []))[:160]
     # Mirrors crew._route_to_approval: check the larger of target and order weight.

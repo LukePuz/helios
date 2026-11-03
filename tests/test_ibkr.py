@@ -198,6 +198,54 @@ class TestCancelOrderPollsForTerminalStatus:
 
         assert result is False
 
+    def _cancellable(self, order_id=5, symbol="NVDA", perm_id=0):
+        trade = self._trade(order_id=order_id, symbol=symbol)
+        trade.order.permId = perm_id
+        fake_ib = MagicMock()
+        fake_ib.openTrades.return_value = [trade]
+        fake_ib.sleep.side_effect = lambda _: setattr(trade.orderStatus, "status", "Cancelled")
+        return fake_ib
+
+    def test_an_order_id_on_another_ticker_is_not_cancelled(self):
+        # orderIds repeat across clientIds: 5 here is NVDA, the caller means AMD
+        fake_ib = self._cancellable(symbol="NVDA")
+        with patch("ibkr.get_ib", return_value=fake_ib):
+            assert ibkr.cancel_order(5, symbol="AMD") is False
+        fake_ib.cancelOrder.assert_not_called()
+
+    def test_an_order_with_another_perm_id_is_not_cancelled(self):
+        fake_ib = self._cancellable(symbol="AMD", perm_id=900)
+        with patch("ibkr.get_ib", return_value=fake_ib):
+            assert ibkr.cancel_order(5, symbol="AMD", perm_id=901) is False
+        fake_ib.cancelOrder.assert_not_called()
+
+    def test_a_matching_symbol_and_perm_id_cancels(self):
+        for perm in (900, None):          # perm_id unknown: symbol alone
+            fake_ib = self._cancellable(symbol="AMD", perm_id=900)
+            with patch("ibkr.get_ib", return_value=fake_ib):
+                assert ibkr.cancel_order(5, symbol="AMD", perm_id=perm) is True
+            fake_ib.cancelOrder.assert_called_once()
+
+    def test_cancel_all_skips_another_tickers_order_with_the_same_id(self):
+        # NVDA's order 5 (another client) is listed before AMD's order 5:
+        # the cancel-all for AMD must cancel AMD's, not NVDA's
+        nvda = self._trade(order_id=5, symbol="NVDA")
+        amd = self._trade(order_id=5, symbol="AMD")
+        amd.order.permId = 777
+        fake_ib = MagicMock()
+        fake_ib.openTrades.return_value = [nvda, amd]
+        fake_ib.sleep.side_effect = lambda _: setattr(amd.orderStatus, "status", "Cancelled")
+        with patch("ibkr.get_ib", return_value=fake_ib), \
+             patch("ibkr.cancel_order", wraps=ibkr.cancel_order) as spy:
+            assert ibkr.cancel_stop_orders_for("AMD") == 1
+        fake_ib.cancelOrder.assert_called_once_with(amd.order)
+        spy.assert_called_once_with(5, symbol="AMD", perm_id=777)
+
+    def test_without_a_symbol_any_ticker_cancels_as_before(self):
+        fake_ib = self._cancellable(symbol="NVDA")
+        with patch("ibkr.get_ib", return_value=fake_ib):
+            assert ibkr.cancel_order(5) is True
+
 
 class _FakeExecution:
     def __init__(self, order_id, shares, avg_price, side, time=None, price=None, perm_id=0):
@@ -276,7 +324,8 @@ class TestGetRecentSellFill:
         ]
         with patch("ibkr.get_ib", return_value=fake_ib):
             result = ibkr.get_recent_sell_fill("DDOG", {40})
-        assert result == {"filled_qty": 64.0, "fill_price": 227.80}
+        assert result == {"filled_qty": 64.0, "fill_price": 227.80, "order_ids": [11],
+                          "by_order": [{"order_id": 11, "perm_id": None, "qty": 64.0, "price": 227.80}]}
 
     def test_a_recorded_perm_id_is_left_out_but_its_orderid_on_another_client_is_not(self):
         """Professor m102: orderIds collide across clientIds. The logged TRIM
@@ -289,7 +338,8 @@ class TestGetRecentSellFill:
         ]
         with patch("ibkr.get_ib", return_value=fake_ib):
             result = ibkr.get_recent_sell_fill("DDOG", set(), {5001})
-        assert result == {"filled_qty": 64.0, "fill_price": 227.80}
+        assert result == {"filled_qty": 64.0, "fill_price": 227.80, "order_ids": [40],
+                          "by_order": [{"order_id": 40, "perm_id": 6002, "qty": 64.0, "price": 227.80}]}
 
     def test_no_sell_execution_today_returns_none(self):
         fake_ib = MagicMock()

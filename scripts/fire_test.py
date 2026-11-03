@@ -159,6 +159,7 @@ def main():
         result["thesis_bucket"],
         regime.get("regime", "Neutral"),
         price,
+        log_fallback=False,
     )
 
     print(f"  shares    : {sizing.get('shares_initial')}")

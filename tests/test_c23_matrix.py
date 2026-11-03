@@ -11,6 +11,17 @@ import stop_lock
 import tasks
 
 
+def _gone_after_cancel(stops):
+    """tasks._resting_sell_stops side effect: the stops on the first read
+    (before the cancel), none after it, as at the broker."""
+    calls = []
+
+    def read(ticker, *a, **k):
+        calls.append(ticker)
+        return list(stops) if len(calls) == 1 else []
+    return read
+
+
 def _errors():
     import ibkr
     return [tasks.OrdersCallUnknown("x"), tasks.OrdersCallExpired("x"),
@@ -45,6 +56,7 @@ def _trail_conversion(trail_effect, place_effect=({"order_id": 3},)):
          patch("db.get_position_stop", return_value=rec), \
          patch("risk_manager.SETUP_GATES_ENABLED", False), \
          patch.object(risk_manager.RiskManager, "get_atr", return_value=4.0), \
+         patch("tasks._resting_sell_stops", side_effect=_gone_after_cancel([{"stop_price": 112.0, "qty": 7.0}])), \
          patch("tasks.manage_cancel_stop_orders_for"), \
          patch("tasks.manage_place_trailing_stop", side_effect=trail_effect), \
          patch("tasks.manage_stop_place", side_effect=place_effect) as place, \
@@ -65,7 +77,7 @@ def test_trail_unknown_places_no_fixed_stop_and_alerts():
 @pytest.mark.parametrize("err", _errors()[1:], ids=lambda e: type(e).__name__)
 def test_trail_failure_restores_the_fixed_stop(err):
     place, queued, _, _ = _trail_conversion(err)
-    place.assert_called_once_with("NVDA", 7.0, 112.0)
+    place.assert_called_once_with("NVDA", 7.0, 112.0, market_price=126.0)
     queued.assert_not_called()
 
 

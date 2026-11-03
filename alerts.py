@@ -385,6 +385,7 @@ def send_daily_digest(
     pending_count: int,
     halted: bool,
     ingestion_issues: list[str],
+    atr_fallback_tickers: list[str] | None = None,
 ) -> None:
     """
     Richer post-close digest — day P&L vs SPY, open positions with stop
@@ -421,6 +422,11 @@ def send_daily_digest(
     if ingestion_issues:
         lines.append("\n⚠️ <b>Ingestion Health:</b>")
         lines.extend(f"  {i}" for i in ingestion_issues[:8])
+
+    if atr_fallback_tickers:
+        n = len(atr_fallback_tickers)
+        lines.append(f"\nATR fallback (sizing or stop) today: {n} ticker{'s' if n != 1 else ''} "
+                     f"({', '.join(atr_fallback_tickers)})")
 
     _send("\n".join(lines))
 

@@ -13,8 +13,8 @@ def test_calendar_has_at_least_a_year_left():
     left = (end - date.today()).days
     assert left >= 365, (
         f"NYSE holiday calendar ends {end} ({left} days from today, under a year). "
-        f"Add the next year's holidays and early closes to market_data._NYSE_HOLIDAYS / "
-        f"_NYSE_EARLY_CLOSES and raise _CALENDAR_LAST_YEAR.")
+        f"Add the next year's holidays and early closes to market_calendar.NYSE_HOLIDAYS / "
+        f"NYSE_EARLY_CLOSES and raise CALENDAR_LAST_YEAR.")
 
 
 def test_last_year_constant_matches_the_data():

@@ -1,0 +1,41 @@
+# Helios 3D shadow analyst panel (helios3d.panel). NOT INSTALLED: every line
+# below is commented out on purpose. It is a separate unit from
+# helios-local.service, so a live restart never drops it, and it is not in
+# Celery beat. Nothing schedules it; pair it with a timer only by decision.
+#
+# Before installing:
+#   1. Dry-run by hand (reads only, calls no model, writes nothing):
+#        venv/bin/python -m helios3d.panel run --limit 5
+#   2. Check that the live-lane gate can read the live broker (read only):
+#        venv/bin/python -m helios3d.panel gate
+#   3. Choose the compute budget and set it in the
+#      EnvironmentFile: HELIOS3D_PANEL_BUDGET=full or shortlist (plus the
+#      shortlist rule), HELIOS3D_PANEL_MODEL (and any per-role
+#      HELIOS3D_PANEL_MODEL_<ROLE>), HELIOS3D_OLLAMA_URL. Every setting is
+#      listed in helios3d/panel/config.py.
+#   4. Stop it at any time without systemctl: touch logs/.h3d_off (the kill
+#      file is checked before every model call). Remove the file to resume.
+#
+# Model co-residency: if HELIOS3D_OLLAMA_URL is the live server, a panel
+# model other than the one loaded there makes Ollama swap models and starves
+# the live 72B (2026-10-25), and a different num_ctx makes Ollama reload the
+# same model. Set HELIOS3D_LIVE_OLLAMA_URL (required) and, when sharing,
+# HELIOS3D_LIVE_MODEL: the runner then refuses to call unless every role's
+# model is the live model and HELIOS3D_PANEL_NUM_CTX=32768 (live's num_ctx,
+# agents/analyst.py). Any other model belongs on a separate Ollama instance.
+#
+# [Unit]
+# Description=Helios 3D shadow analyst panel (h3d.panel_output, h3d.pm_verdict)
+# After=network-online.target redis.service
+# Wants=network-online.target
+#
+# [Service]
+# Type=oneshot
+# WorkingDirectory=/home/YOUR_USER/Desktop/trading_bot
+# EnvironmentFile=/home/YOUR_USER/.config/helios3d/panel.env
+# ExecStart=/home/YOUR_USER/Desktop/trading_bot/venv/bin/python -m helios3d.panel run --apply --limit 20
+# Nice=10
+# TimeoutStartSec=6h
+#
+# [Install]
+# WantedBy=multi-user.target

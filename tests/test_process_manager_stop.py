@@ -101,3 +101,30 @@ def test_rotation_archives_the_previous_backup(tmp_path, monkeypatch):
     assert (tmp_path / "celery_llm_worker.log.1").read_text() == "x" * 50
     [archived] = list((tmp_path / "archive").iterdir())
     assert archived.read_text() == "old verdicts" and archived.name.startswith("celery_llm_worker.")
+
+
+def _start_env(monkeypatch, tmp_path, name):
+    """The environment pm.start(name) hands the new process (nothing is run)."""
+    started = {}
+    monkeypatch.setattr(pm, "_load", lambda: {})
+    monkeypatch.setattr(pm, "_save", lambda pids: None)
+    monkeypatch.setattr(pm, "_rotate_log_if_large", lambda path: None)
+    monkeypatch.setitem(pm.SERVICES, name, {**pm.SERVICES[name], "log": tmp_path / "w.log"})
+    monkeypatch.setattr(pm.subprocess, "Popen",
+                        lambda cmd, **k: started.update(k) or MagicMock(pid=4242))
+    monkeypatch.setattr(psutil, "Process", lambda pid: MagicMock())
+    assert pm.start(name) == "ok"
+    return started["env"]
+
+
+@pytest.mark.parametrize("name,expected", [("celery_screen_worker", "2"),
+                                           ("celery_ingestion_worker", "2"),
+                                           ("celery_beat", None)])
+def test_celery_workers_start_with_two_malloc_arenas(monkeypatch, tmp_path, name, expected):
+    monkeypatch.delenv("MALLOC_ARENA_MAX", raising=False)
+    assert _start_env(monkeypatch, tmp_path, name).get("MALLOC_ARENA_MAX") == expected
+
+
+def test_a_malloc_arena_max_already_set_is_kept(monkeypatch, tmp_path):
+    monkeypatch.setenv("MALLOC_ARENA_MAX", "4")
+    assert _start_env(monkeypatch, tmp_path, "celery_worker")["MALLOC_ARENA_MAX"] == "4"

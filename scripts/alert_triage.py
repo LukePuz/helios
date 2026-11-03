@@ -16,6 +16,7 @@ Exit status is 0, or 2 when a new critical type appeared, so a cron wrapper
 can escalate on it.
 """
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -55,17 +56,36 @@ def save_cursor(path: Path, cursor: dict) -> None:
     os.replace(tmp, path)
 
 
+def _head(path: Path) -> str | None:
+    """Fingerprint of the file's first complete line, or None if it has none
+    yet. Tells a recreated file from the old one when the filesystem hands
+    the freed inode straight back."""
+    try:
+        with open(path, "rb") as f:
+            first = f.readline(4096)
+    except OSError:
+        return None
+    if not first.endswith(b"\n"):
+        return None
+    return hashlib.sha1(first).hexdigest()
+
+
 def read_new_rows(outbox: Path, cursor: dict, from_start: bool = False) -> tuple[list[dict], int, int | None]:
     """(rows, new_offset, inode). Starts over when the file was rotated
-    (other inode) or truncated (shorter than the saved offset). Stops at the
-    last complete line so a row being written is read next time."""
+    (other inode, or the same inode with a different first line) or truncated
+    (shorter than the saved offset). Stops at the last complete line so a row
+    being written is read next time."""
     try:
         st = outbox.stat()
     except FileNotFoundError:
         return [], 0, None
     offset = 0 if from_start else int(cursor.get("offset") or 0)
     rows: list[dict] = []
-    if cursor.get("inode") not in (None, st.st_ino):
+    saved_head = cursor.get("head")
+    head = _head(outbox)
+    if saved_head and head and head != saved_head and cursor.get("inode") == st.st_ino:
+        offset = 0                                   # recreated on a reused inode
+    elif cursor.get("inode") not in (None, st.st_ino):
         # Rotated (alert_policy keeps one old file as .1): finish the old
         # file from the saved offset, then read the new one from the start.
         old = outbox.with_name(outbox.name + ".1")
@@ -164,6 +184,7 @@ def main(argv: list[str] | None = None) -> int:
             cursor["known"].setdefault(k, groups[k]["first"] or "")
         cursor["offset"] = offset
         cursor["inode"] = inode
+        cursor["head"] = _head(outbox)
         try:
             save_cursor(cursor_path, cursor)
         except OSError as e:

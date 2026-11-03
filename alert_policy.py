@@ -64,6 +64,7 @@ LOW_TYPES = [
     ("vector_store_recovered", re.compile(r"Vector store auto-recovery")),
     ("ipo_watch", re.compile(r"IPO watch")),
     ("monitor_recovered", re.compile(r"monitor recovered after \d+ failed checks")),
+    ("edgar_recovered", re.compile(r"EDGAR recovered after \d+ failed polls")),
     # Success text only; main.py sends a failure under a FAILED header.
     ("startup_info", re.compile(r"^ℹ️ <b>Startup reconciliation</b> finished after \d+s\.$")),
     ("catalyst_conflict", re.compile(r"^<b>CATALYST CONFLICT")),

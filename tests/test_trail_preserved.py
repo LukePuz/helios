@@ -8,6 +8,14 @@ import risk_manager
 import tasks
 
 
+@pytest.fixture(autouse=True)
+def _cancel_confirmed():
+    """The profit-target sale re-reads the stops after its cancel and holds
+    if one still works; these tests are about a confirmed cancel."""
+    with patch("execution._stops_still_resting", return_value=0.0):
+        yield
+
+
 
 @pytest.fixture(autouse=True)
 def _in_market_hours(monkeypatch):
@@ -43,7 +51,7 @@ def test_partial_sale_keeps_a_trail_raised_stop():
          patch("alerts._send"):
         result = object.__new__(risk_manager.RiskManager)._partial_sell_and_resize_stop(
             "NVDA", 100, 30, 100.0)
-    place.assert_called_once_with("NVDA", 70.0, 112.0)  # not breakeven 100
+    place.assert_called_once_with("NVDA", 70.0, 112.0, market_price=None)  # not breakeven 100
     assert result["new_stop"] == 112.0
 
 
@@ -66,6 +74,7 @@ def _trail_check(stop_price, atr):
          patch("db.get_position_stop", return_value=rec), \
          patch("risk_manager.SETUP_GATES_ENABLED", False), \
          patch.object(risk_manager.RiskManager, "get_atr", return_value=atr), \
+         patch("tasks._resting_sell_stops", return_value=[{"stop_price": 112.0, "qty": 7.0}]), \
          patch("tasks.manage_cancel_stop_orders_for") as cancel, \
          patch("tasks.manage_place_trailing_stop", return_value={"order_id": 9}) as trail, \
          patch("db.set_stop_broker_order_id"), patch("db.update_trailing_stop"), \

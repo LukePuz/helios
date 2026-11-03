@@ -7,6 +7,14 @@ from unittest.mock import MagicMock, patch
 import risk_manager
 
 
+@pytest.fixture(autouse=True)
+def _cancel_confirmed():
+    """The profit-target sale re-reads the stops after its cancel and holds
+    if one still works; these tests are about a confirmed cancel."""
+    with patch("execution._stops_still_resting", return_value=0.0):
+        yield
+
+
 
 @pytest.fixture(autouse=True)
 def _in_market_hours(monkeypatch):
@@ -35,7 +43,7 @@ def test_stop_is_cancelled_then_replaced_for_remaining_shares_at_breakeven():
                side_effect=lambda *a: calls.append("sell") or {"filled_qty": 30, "order_id": 7}), \
          patch("ibkr.get_client", return_value=_client(70)), \
          patch("tasks.manage_stop_place",
-               side_effect=lambda *a: calls.append(("stop",) + a) or {"order_id": 8}), \
+               side_effect=lambda *a, **k: calls.append(("stop",) + a) or {"order_id": 8}), \
          patch("alerts._send") as send:
         result = _rm()._partial_sell_and_resize_stop("NVDA", 100, 30, 100.0)
 
@@ -47,6 +55,7 @@ def test_stop_is_cancelled_then_replaced_for_remaining_shares_at_breakeven():
 
 def test_failed_sale_restores_the_original_stop_for_the_full_position():
     with patch("db.get_position_stop", return_value={"stop_price": 90.0}), \
+         patch("tasks._resting_sell_stops", return_value=[]), \
          patch("db.set_stop_broker_order_id"), \
          patch("tasks.manage_cancel_stop_orders_for"), \
          patch("ibkr.place_market_order", side_effect=RuntimeError("rejected")), \
@@ -55,7 +64,7 @@ def test_failed_sale_restores_the_original_stop_for_the_full_position():
         result = _rm()._partial_sell_and_resize_stop("NVDA", 100, 30, 100.0)
 
     assert result is None
-    place.assert_called_once_with("NVDA", 100, 90.0)
+    place.assert_called_once_with("NVDA", 100, 90.0, market_price=None)
     send.assert_not_called()
 
 
@@ -102,7 +111,7 @@ def test_small_position_moves_stop_to_breakeven_without_selling():
          patch("db.set_stop_broker_order_id"), \
          patch("db.mark_profit_target_taken") as taken, \
          patch("tasks.manage_cancel_stop_orders_for", side_effect=lambda t: calls.append("cancel")), \
-         patch("tasks.manage_stop_place", side_effect=lambda *a: calls.append(("stop",) + a) or {"order_id": 5}), \
+         patch("tasks.manage_stop_place", side_effect=lambda *a, **k: calls.append(("stop",) + a) or {"order_id": 5}), \
          patch("ibkr.place_market_order") as sell:
         assert _rm()._breakeven_without_sale("NVDA", 1, 100.0) is True
     sell.assert_not_called()
@@ -121,6 +130,7 @@ def test_breakeven_move_skipped_when_stop_already_higher():
 
 def test_failed_breakeven_stop_restores_old_stop_and_keeps_target_open():
     with patch("db.get_position_stop", return_value={"stop_price": 90.0}), \
+         patch("tasks._resting_sell_stops", return_value=[]), \
          patch("db.set_stop_broker_order_id"), \
          patch("db.mark_profit_target_taken") as taken, \
          patch("tasks.manage_cancel_stop_orders_for"), \
@@ -167,7 +177,7 @@ def test_breakeven_stop_from_a_raw_fill_price_goes_on_the_tick():
          patch("tasks.manage_stop_place", return_value={"order_id": 8}) as place, \
          patch("alerts._send"):
         result = _rm()._partial_sell_and_resize_stop("NVDA", 100, 30, 100.1278, decision_price=120.0)
-    place.assert_called_once_with("NVDA", 70.0, 100.13)
+    place.assert_called_once_with("NVDA", 70.0, 100.13, market_price=120.0)
     assert result["new_stop"] == 100.13
 
     for current, expected in ((120.0, 100.13), (100.13, 100.12), (None, 100.13)):
@@ -177,5 +187,5 @@ def test_breakeven_stop_from_a_raw_fill_price_goes_on_the_tick():
              patch("tasks.manage_cancel_stop_orders_for"), \
              patch("tasks.manage_stop_place", return_value={"order_id": 9}) as place:
             assert _rm()._breakeven_without_sale("NVDA", 2, 100.1278, current_price=current) is True
-        place.assert_called_once_with("NVDA", 2, expected)
+        place.assert_called_once_with("NVDA", 2, expected, market_price=current)
         taken.assert_called_once_with("NVDA", expected)

@@ -1,4 +1,135 @@
+import os
+
+# Point Celery and every other Redis user at a dead port before any project
+# module is imported, so no test can reach the live broker even if a publish
+# path gets past the send_task trap below. load_dotenv never overrides a set
+# variable, so .env can't undo this.
+os.environ["REDIS_URL"] = "redis://127.0.0.1:1/0"
+# No test may reach the real Telegram bot: with these blank, alerts.py,
+# telegram_bot.py, deploy/watchdog.py and deploy/notify_failure.py all skip
+# sending. Tests of the send path patch the module token and requests.post.
+os.environ["TELEGRAM_BOT_TOKEN"] = ""
+os.environ["TELEGRAM_CHAT_ID"] = ""
+# The Ollama servers on this box are the live model servers (one GPU slot).
+os.environ["OLLAMA_HOST"] = "http://127.0.0.1:1"
+os.environ["OLLAMA_CPU_HOST"] = "http://127.0.0.1:1"
+# ingestion.edgar builds its ticker -> CIK map from SEC at import time.
+os.environ["HELIOS_EDGAR_OFFLINE"] = "1"
+
+import tempfile
+from pathlib import Path
+
+# Same idea for the db write spill: db._SPILL_PATH defaults to the repo's
+# logs/db_write_spill.jsonl, and a per-test monkeypatch only covers the test
+# body. A feed-emit thread still running while that patch is undone (the undo
+# is last-in-first-out, so _SPILL_PATH comes back before the db guard does)
+# appended real lines to the live spill. With this set before db is imported,
+# every undo lands on a session temp file instead.
+_SESSION_SPILL_DIR = tempfile.mkdtemp(prefix="helios-test-spill-")
+os.environ["HELIOS_DB_SPILL_PATH"] = os.path.join(_SESSION_SPILL_DIR, "db_write_spill.jsonl")
+_REPO_SPILL = Path(__file__).resolve().parent.parent / "logs" / "db_write_spill.jsonl"
+
 import pytest
+
+
+def _spill_size():
+    try:
+        return _REPO_SPILL.stat().st_size
+    except OSError:
+        return None
+
+
+def pytest_sessionstart(session):
+    session.config._repo_spill_size_at_start = _spill_size()
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Fail the run if the repo's logs/db_write_spill.jsonl grew: no test may
+    write there. Only the file size is checked, never its contents."""
+    import threading
+    for t in threading.enumerate():
+        if t.name == "feed-emit":
+            t.join(timeout=5)
+    before = getattr(session.config, "_repo_spill_size_at_start", None)
+    after = _spill_size()
+    if after is not None and after != (before or 0):
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+        msg = (f"tests wrote to {_REPO_SPILL} (size {before} -> {after} bytes); "
+               f"a db write escaped the spill redirect")
+        reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+        if reporter is not None:
+            reporter.ensure_newline()
+            reporter.write_line(msg, red=True)
+        else:
+            print(msg)
+
+
+class _SyncThread:
+    """feed.emit's daemon thread, run inline: the db write then happens
+    inside the test, under its patches, and can't outlive them."""
+
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None, name=None):
+        self._target, self._args, self._kwargs = target, args, kwargs or {}
+        self.name, self.daemon = name, daemon
+
+    def start(self):
+        if self._target is not None:
+            self._target(*self._args, **self._kwargs)
+
+    def join(self, timeout=None):
+        pass
+
+    def is_alive(self):
+        return False
+
+
+@pytest.fixture(autouse=True)
+def _feed_emit_inline(monkeypatch):
+    """feed.emit looks up threading.Thread at call time, so this also covers
+    modules holding a reference to emit itself."""
+    import threading
+    import types
+    import feed
+    monkeypatch.setattr(feed, "threading", types.SimpleNamespace(Thread=_SyncThread))
+    yield
+    for t in threading.enumerate():
+        if t.name == "feed-emit":
+            t.join(timeout=5)
+
+
+_BLOCKED_HTTP = []
+_LIVE_HTTP = ("api.telegram.org", "localhost:11434", "127.0.0.1:11434", "localhost:11435", "127.0.0.1:11435")
+
+
+@pytest.fixture(autouse=True)
+def _no_real_telegram(monkeypatch):
+    """Backstop for the blank token and Ollama hosts: an unmocked HTTP request
+    to Telegram or a live Ollama server is refused and fails the test, even
+    when the code under test swallows the exception."""
+    import requests.sessions
+    real = requests.sessions.Session.request
+    blocked = _BLOCKED_HTTP
+    blocked.clear()
+
+    def guarded(self, method, url, *a, **k):
+        if any(h in str(url) for h in _LIVE_HTTP):
+            blocked.append(str(url).split("/bot")[0])
+            raise RuntimeError("test tried to call the real Telegram API or a live Ollama server")
+        return real(self, method, url, *a, **k)
+    monkeypatch.setattr(requests.sessions.Session, "request", guarded)
+    yield
+    assert not blocked, f"unmocked request to a live service: {blocked}"
+
+
+@pytest.fixture(autouse=True)
+def _no_kombu_publish(monkeypatch):
+    """Backstop for the send_task trap: any message published through kombu
+    (control broadcasts, a second app, a raw Producer) fails the test."""
+    import kombu.messaging
+
+    def _blocked(*a, **k):
+        raise RuntimeError("test tried to publish a message through kombu")
+    monkeypatch.setattr(kombu.messaging.Producer, "publish", _blocked)
 
 
 @pytest.fixture(autouse=True)
@@ -175,6 +306,27 @@ def _no_live_ibkr(monkeypatch):
     def _blocked(*a, **k):
         raise RuntimeError("tests must not connect to IBKR; mock the ibkr.* call")
     monkeypatch.setattr(ibkr, "get_ib", _blocked)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_celery_publish(monkeypatch):
+    """An unpatched apply_async publishes to the live Redis broker, and the
+    running ops worker then executes it against the live database: two
+    held-sell tests queued tasks.retry_held_sell(1) on every run, and the
+    worker ran retry tasks for live approval #1 (IONQ, 3185 h old) and
+    re-analysed it. The publish raises, and the test fails at teardown even
+    when the code under test swallows the error."""
+    import tasks
+    hits = []
+
+    def _blocked(name, *a, **k):
+        hits.append(name)
+        raise RuntimeError(f"tests must not publish {name} to the live broker; "
+                           f"patch its apply_async")
+    monkeypatch.setattr(tasks.app, "send_task", _blocked)
+    yield hits
+    if hits:
+        pytest.fail(f"test published Celery task(s) to the live broker: {hits}")
 
 
 @pytest.fixture(autouse=True)

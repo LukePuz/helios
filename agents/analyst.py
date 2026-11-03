@@ -206,7 +206,8 @@ def _venv_record() -> dict:
 def boot_record(service: str) -> dict:
     """What a process started with (M181): commit, dirty flag, service, pid,
     process start time, plus hashes of inputs code_sha can't see (m248): the
-    S&P 500 universe cache (gitignored) and the installed packages."""
+    S&P 500 universe cache (gitignored) and the installed packages, and
+    spill_path_default (the db-write spill is at the repo default path)."""
     import platform
     import sys
     started = None
@@ -218,7 +219,17 @@ def boot_record(service: str) -> dict:
         pass
     code = _CODE_SHA.get("code_sha")
     repo = Path(__file__).resolve().parent.parent
+    # True when the db-write spill goes to the repo default, i.e.
+    # HELIOS_DB_SPILL_PATH (a test-suite override) is not in effect.
+    spill_default = None
+    try:
+        import db
+        spill_default = (Path(db._SPILL_PATH).resolve()
+                         == (Path(db.__file__).parent / "logs" / "db_write_spill.jsonl").resolve())
+    except Exception:
+        pass
     return {"service": service, "pid": os.getpid(), "process_started_at": started,
+            "spill_path_default": spill_default,
             "code_read_at": _BOOT["code_read_at"], "code_read_pid": _BOOT["pid"],
             "code_sha": code, "head_sha": _CODE_SHA.get("head_sha"),
             "dirty": code.endswith("-dirty") if code else None,
@@ -330,6 +341,40 @@ def _trim_shadow(ticker: str, action: str, parsed: dict, brief: str) -> dict | N
         return {"error": str(e)[:120]}
 
 
+_ENTRY_UDR_FLOOR = 2.0   # keep equal to the OPEN/ADD UDR gate in analyze_candidate
+
+
+def _hold_fails_entry_rule(action: str, udr, parsed: dict, candidate: dict,
+                           conviction=None) -> dict | None:
+    """Log-only (audit 2026-11-02 19:27 #4, roadmap 01(c)): a HOLD on a held
+    name faces no "would I buy it today" check, so a holding whose UDR has
+    fallen under the OPEN/ADD floor is kept anyway. Records whether this
+    HOLD would fail the entry rule (a would-trim). `udr` is the value the
+    entry gate reads (a missing UDR reads as 0 there too). Final HOLD
+    verdicts only: a HOLD on an unheld name is already a WATCH. Nothing
+    routes on it. Never raises.
+
+    Scope (professor m270): `fails` tests only the entry rule's UDR clause
+    (UDR under _ENTRY_UDR_FLOOR). The full OPEN/ADD rule also needs
+    conviction >= 5 and corroboration, which this does not test; `checks`
+    names the clause tested, and `conviction` is recorded so the conviction
+    clause can be applied later."""
+    if action != "HOLD":
+        return None
+    try:
+        import math
+        u = float(udr)
+        raw = (parsed or {}).get("upside_downside_ratio")
+        fails = (u < _ENTRY_UDR_FLOOR) if math.isfinite(u) else None
+        return {"fails": fails, "would_trim": fails, "udr": u if math.isfinite(u) else None,
+                "udr_floor": _ENTRY_UDR_FLOOR, "checks": "udr_floor_only",
+                "conviction": conviction,
+                "udr_stated": isinstance(raw, (int, float)) and not isinstance(raw, bool),
+                "held_at_gate": (candidate or {}).get("held")}
+    except Exception as e:
+        return {"error": str(e)[:120]}
+
+
 def _udr_check(parsed: dict, brief: str) -> dict:
     """Log-only (audit A0700-5): the gate uses the UDR the model writes,
     which swings 1.1-2.9 on one name within minutes. Recompute it from the
@@ -365,6 +410,225 @@ def _udr_check(parsed: dict, brief: str) -> dict:
                 "price_for_2r_pct": round((p2 / price - 1) * 100, 2) if p2 and price else None}
     except Exception as e:
         return {"error": str(e)[:120]}
+
+
+def _udr_structural(ticker: str, parsed: dict, udr, brief: str) -> dict:
+    """Log-only: the reward-to-risk from compile_plan's structural levels,
+    (t1 - price) / (price - structural_stop) and the same with t2, next to
+    the model's own upside_downside_ratio (`udr`, the value the gate reads).
+    A ratio is None unless stop < price < target. One DB read (the trade
+    ladder). Nothing routes on it. Never raises."""
+    import math
+
+    def num(v):
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return None
+        return v if math.isfinite(v) else None
+
+    out = {"udr_structural": None, "udr_structural_t2": None}
+    try:
+        raw = (parsed or {}).get("upside_downside_ratio")
+        out.update(model_udr=num(udr),
+                   model_udr_stated=isinstance(raw, (int, float)) and not isinstance(raw, bool))
+        import db
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from agents.plans import brief_price, compile_plan
+        price = num(brief_price(brief))
+        if not price or price <= 0:
+            out["why_null"] = "no price in the brief"
+            return out
+        compiled = compile_plan(parsed, price, db.get_trade_ladder(ticker), None,
+                                datetime.now(ZoneInfo("America/New_York")).date())
+        stop, t1, t2 = (num(compiled.get(k)) for k in ("structural_stop", "t1", "t2"))
+        out.update(price=price, structural_stop=stop, t1=t1, t2=t2,
+                   plan_source=compiled.get("source"),
+                   stop_from_support=compiled.get("support_types") is not None)
+        if stop is not None and t1 is not None and stop < price < t1:
+            out["udr_structural"] = round((t1 - price) / (price - stop), 2)
+        if stop is not None and t2 is not None and stop < price < t2:
+            out["udr_structural_t2"] = round((t2 - price) / (price - stop), 2)
+        if out["udr_structural"] is None:
+            out["why_null"] = ("no structural stop" if stop is None else "no t1" if t1 is None
+                               else "levels not stop < price < t1")
+        return out
+    except Exception as e:
+        out["error"] = str(e)[:120]
+        return out
+
+
+_PENDING_ENTRY_MIN_CONVICTION = 6
+_PENDING_ENTRIES_KEY = "pending_entries_shadow_{env}"
+_PENDING_ENTRIES_MAX = 200
+_PENDING_PRUNE_GRACE_DAYS = 14   # the checker logs an expired row before the entry is pruned
+
+
+def _level_in_zone(lv: dict, price) -> bool | None:
+    """Whether price already meets a pending-entry level (at or under an
+    at_or_below level, at or over an at_or_above one); None without a
+    price."""
+    try:
+        price, level = float(price), float(lv["level"])
+    except (TypeError, ValueError, KeyError):
+        return None
+    return price <= level if lv.get("side") == "at_or_below" else price >= level
+
+
+def _pending_entry_shadow(ticker: str, action: str, conviction: int, model_action: str,
+                          parsed: dict, brief: str) -> dict | None:
+    """Log-only (audit 2026-11-02 19:27 #2, roadmap 01(c)): a c>=6 WATCH, or
+    an OPEN/ADD the gates turned into a WATCH, leaves no pending entry, so
+    whether its level was ever reached is never known. This records the
+    entry levels the plans already carry:
+      plan_entry    the active plan row's entry, as plans.plan_says reads it
+                    (a buy at or under entry x 1.05)
+      price_for_2r  the price where the model's own target and floor give
+                    2:1 (_udr_check, audit A2059-2), a buy at or under
+      add_trigger   compile_plan's breakout level, a close at or over
+    and the expiry (compile_plan's time_stop: catalyst + grace, or the
+    bucket horizon). Each level carries the bar field the checker tests
+    (price_field: low / high, close for add_trigger) and
+    in_zone_at_verdict, whether the verdict price already met it. tasks._check_pending_entries logs would_fill against
+    daily bars later. None when the verdict doesn't qualify. Nothing
+    routes on it. Never raises."""
+    gated = model_action in ("OPEN", "ADD") and action == "WATCH"
+    if not (gated or (action == "WATCH" and conviction >= _PENDING_ENTRY_MIN_CONVICTION)):
+        return None
+    out = {"recorded": False, "trigger": "gated_down" if gated else "watch_c6",
+           "model_action": model_action, "conviction": conviction}
+    try:
+        import db
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from agents.plans import brief_price, compile_plan
+        price = brief_price(brief)
+        if not price:
+            out["why_not"] = "no price in the brief"
+            return out
+        today = datetime.now(ZoneInfo("America/New_York")).date()
+        compiled = compile_plan(parsed, price, db.get_trade_ladder(ticker), None, today)
+        plan = db.get_active_plan(ticker)
+        levels = {}
+        if plan and plan.get("entry_price"):
+            levels["plan_entry"] = {"side": "at_or_below",
+                                    "level": round(float(plan["entry_price"]) * 1.05, 2),
+                                    "plan_id": plan.get("id")}
+        p2 = _udr_check(parsed, brief).get("price_for_2r")
+        if p2:
+            levels["price_for_2r"] = {"side": "at_or_below", "level": float(p2)}
+        if compiled.get("add_trigger"):
+            # compile_plan defines it as a close above t1's band
+            levels["add_trigger"] = {"side": "at_or_above", "level": float(compiled["add_trigger"]),
+                                     "price_field": "close"}
+        for lv in levels.values():
+            lv.setdefault("price_field", "low" if lv["side"] == "at_or_below" else "high")
+            # already met at the verdict price, so it can "fill" by
+            # construction on the next bar (professor M208)
+            lv["in_zone_at_verdict"] = _level_in_zone(lv, price)
+        out.update(price=price, et_date=today.isoformat(), expires=compiled.get("time_stop"),
+                   levels=levels, structural_stop=compiled.get("structural_stop"),
+                   invalidation_analyst=compiled.get("invalidation_analyst"))
+        if out["expires"] in (None, "", "None"):
+            out["expires"] = None
+            out["why_not"] = "no_expiry"
+            return out
+        if not levels:
+            out["why_not"] = "no entry level in the plans"
+            return out
+        out["recorded"] = True
+        return out
+    except Exception as e:
+        out["error"] = str(e)[:120]
+        return out
+
+
+_PENDING_LATER_MAX = 20   # later verdicts kept per pending entry
+
+
+def _note_later_verdict(ticker: str, signal_id, action: str | None) -> None:
+    """A verdict that records no pending entry leaves the ticker's old one
+    in place (professor m269). Append it to that entry's later_verdicts
+    (signal_id, ET date, final action), so a would_fill after, say, a real
+    OPEN can be told apart later. Log-only. Never raises."""
+    try:
+        import db
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from config import TRADING_ENV
+        key = _PENDING_ENTRIES_KEY.format(env=TRADING_ENV)
+        book = json.loads(db.get_state_strict(key, "") or "{}")
+        e = book.get(ticker) if isinstance(book, dict) else None
+        if not isinstance(e, dict):
+            return
+        sid = signal_id if isinstance(signal_id, int) and not isinstance(signal_id, bool) else None
+        later = [v for v in (e.get("later_verdicts") or []) if isinstance(v, dict)]
+        later.append({"signal_id": sid, "action": action,
+                      "et_date": datetime.now(ZoneInfo("America/New_York")).date().isoformat()})
+        e["later_verdicts"] = later[-_PENDING_LATER_MAX:]
+        db.set_state(key, json.dumps(book, default=str))
+    except Exception as ex:
+        log.debug(f"[{ticker}] pending entry later-verdict note failed: {ex}")
+
+
+def _store_pending_entry(ticker: str, rec: dict | None, signal_id,
+                         action: str | None = None) -> None:
+    """Keep a recorded pending entry in system_state (one per ticker), for
+    tasks._check_pending_entries. A verdict that records none is noted on
+    the ticker's existing entry instead (_note_later_verdict). Only the analyst writes the key (the LLM
+    worker runs one task at a time); the checker only reads it, so there is
+    no write race. Entries are pruned _PENDING_PRUNE_GRACE_DAYS after their
+    expiry, so the checker has logged their expired row first. A newer
+    verdict that replaces a ticker's entry, or the size cap evicting one,
+    writes an entry_shadow row (superseded / evicted) so that outcome is
+    censored, not lost. Log-only. Never raises."""
+    try:
+        if not rec or not rec.get("recorded"):
+            _note_later_verdict(ticker, signal_id, action)
+            return
+        import db
+        from datetime import date, datetime, timedelta, timezone
+        from config import TRADING_ENV
+        key = _PENDING_ENTRIES_KEY.format(env=TRADING_ENV)
+        try:
+            book = json.loads(db.get_state_strict(key, "") or "{}")
+        except (TypeError, ValueError):
+            book = {}
+        if not isinstance(book, dict):
+            book = {}
+        today = rec["et_date"]
+        keep_from = (date.fromisoformat(today) - timedelta(days=_PENDING_PRUNE_GRACE_DAYS)).isoformat()
+        book = {t: e for t, e in book.items()
+                if isinstance(e, dict) and str(e.get("expires") or "9999") >= keep_from}
+        sid = signal_id if isinstance(signal_id, int) and not isinstance(signal_id, bool) else None
+        dropped = []
+        if ticker in book:
+            dropped.append((ticker, book[ticker], "superseded"))
+        book[ticker] = {**{k: rec.get(k) for k in ("trigger", "model_action", "conviction", "price",
+                                                   "et_date", "expires", "levels")},
+                        "signal_id": sid, "at": datetime.now(timezone.utc).isoformat()}
+        if len(book) > _PENDING_ENTRIES_MAX:
+            ordered = [kv for kv in sorted(book.items(), key=lambda kv: kv[1].get("at") or "")
+                       if kv[0] != ticker]
+            cut = len(book) - _PENDING_ENTRIES_MAX
+            dropped += [(t, e, "evicted") for t, e in ordered[:cut]]
+            book = {**dict(ordered[cut:]), ticker: book[ticker]}
+        db.set_state(key, json.dumps(book, default=str))
+        for t, e, why in dropped:
+            try:
+                levels = e.get("levels") if isinstance(e.get("levels"), dict) else {}
+                db.log_activity(
+                    "entry_shadow", t, f"pending entry {why} (verdict {e.get('et_date')})", "neutral",
+                    {"would_fill": None, why: True, "verdict_signal_id": e.get("signal_id"),
+                     "verdict_et_date": e.get("et_date"), "expires": e.get("expires"),
+                     "trigger": e.get("trigger"), "kinds": sorted(levels),
+                     "censored_et_date": today, "replaced_by_signal_id": sid,
+                     **shadow_versions()})
+            except Exception as ex:
+                log.debug(f"[{t}] pending entry {why} row failed: {ex}")
+    except Exception as e:
+        log.debug(f"[{ticker}] pending entry store failed: {e}")
 
 
 _DEBOUNCE_SHADOW_MIN = 15
@@ -541,6 +805,17 @@ def _config_env_record() -> dict:
     return _CONFIG_ENV_CACHE
 
 
+def shadow_versions() -> dict:
+    """code_sha and env_sha for a log-only shadow row's extras, so the row
+    names the code and config it came from without relying on boot rows
+    (professor m268). Never raises."""
+    try:
+        return {"code_sha": _CODE_SHA.get("code_sha"),
+                "env_sha": _config_env_record().get("env_sha")}
+    except Exception:
+        return {"code_sha": None, "env_sha": None}
+
+
 def _treatment_config() -> dict:
     import config
     return {k: getattr(config, k, None) for k in (
@@ -552,7 +827,9 @@ def _treatment_config() -> dict:
         "TIER_MAX_CONCURRENT_POSITIONS", "MAX_TRADE_PCT_OF_CASH_RESERVE",
         "ETF_FUNDAMENTALS_CAP_EXEMPT", "PLAN_LEVEL_REVIEW_ENABLED",
         # Added 10-31 (A1031-0253-1): the month-only catalyst reading.
-        "CATALYST_MONTH_MIDPOINT_ENABLED")}
+        "CATALYST_MONTH_MIDPOINT_ENABLED",
+        # Added 11-03: the malformed-catalyst reading.
+        "ANALYST_TOLERATE_MALFORMED_CATALYST")}
 
 
 _OLLAMA_ID_TTL_S = 600
@@ -1270,6 +1547,16 @@ def expected_return_per_week(expected_return_pct: float | None, weeks_to_catalys
     return expected_return_pct / weeks_to_catalyst
 
 
+def _null_return_not_tolerated(ticker: str) -> None:
+    """ANALYST_TOLERATE_MALFORMED_CATALYST off: a dated catalyst with a null
+    expected_return_pct raises the TypeError the rate gate's reason text
+    raised before it was tolerated (it formatted the None rate with :.2f),
+    so analyze() ends as ANALYST_FAILED as it did then."""
+    log.warning(f"[{ticker}] Malformed expected_return_pct: null on a dated catalyst; "
+                f"not tolerated (ANALYST_TOLERATE_MALFORMED_CATALYST off)")
+    raise TypeError("unsupported format string passed to NoneType.__format__")
+
+
 # ---------------------------------------------------------------------------
 # JSON extraction (robust to 3B model quirks)
 # ---------------------------------------------------------------------------
@@ -1679,6 +1966,32 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
     model_pass = bool(parsed.get("pass_to_risk", False))
     model_action, model_conviction = action, conviction
     gates: list[str] = []
+    # The schema's catalyst is an object. A string or list from the model is
+    # read as no catalyst (no date), so the gates below take their None path
+    # instead of raising on .get(); model_output above keeps the raw value.
+    # ANALYST_TOLERATE_MALFORMED_CATALYST off (the default) leaves the reply
+    # as returned, so the rate gate raises on it as before (ANALYST_FAILED).
+    from config import ANALYST_TOLERATE_MALFORMED_CATALYST as tolerate_catalyst
+    if not isinstance(parsed.get("catalyst", {}), (dict, type(None))):
+        if tolerate_catalyst:
+            log.warning(f"[{ticker}] Non-object catalyst {type(parsed['catalyst']).__name__}; read as no catalyst")
+            parsed["catalyst"] = {}
+        else:
+            log.warning(f"[{ticker}] Malformed catalyst: {type(parsed['catalyst']).__name__}, not an object; "
+                        f"not tolerated (ANALYST_TOLERATE_MALFORMED_CATALYST off)")
+    # Same for catalyst.date: a number is read as its text (20261201 ->
+    # "20261201"), anything else that isn't a string as no date, so
+    # compute_weeks_to_catalyst never calls .strip() on a non-string.
+    _cat = parsed.get("catalyst")
+    if isinstance(_cat, dict) and _cat.get("date") is not None and not isinstance(_cat["date"], str):
+        _raw_date = _cat["date"]
+        if tolerate_catalyst:
+            _cat["date"] = (str(_raw_date) if isinstance(_raw_date, (int, float))
+                            and not isinstance(_raw_date, bool) else None)
+            log.warning(f"[{ticker}] Non-string catalyst date {type(_raw_date).__name__}; read as {_cat['date']!r}")
+        else:
+            log.warning(f"[{ticker}] Malformed catalyst.date: {type(_raw_date).__name__}, not a string; "
+                        f"not tolerated (ANALYST_TOLERATE_MALFORMED_CATALYST off)")
 
     # The model doesn't reliably know what's held (ADD/HOLD on unheld MSFT
     # and AMZN, 10-15 and 10-26). An ADD on nothing is an OPEN and must pass
@@ -1849,7 +2162,10 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
         weeks_to_catalyst = compute_weeks_to_catalyst(catalyst_date)
         per_week = expected_return_per_week(_optional_float("expected_return_pct"), weeks_to_catalyst)
         if per_week is None or per_week < MIN_EXPECTED_RETURN_PCT_PER_WEEK:
+            if per_week is None and weeks_to_catalyst is not None and not tolerate_catalyst:
+                _null_return_not_tolerated(ticker)
             reason = ("no computable catalyst timeframe" if weeks_to_catalyst is None
+                      else "no expected_return_pct" if per_week is None
                       else f"{per_week:.2f}%/week < {MIN_EXPECTED_RETURN_PCT_PER_WEEK}%/week minimum")
             log.info(f"[{ticker}] Expected-return rate check failed ({reason}) — downgrading to WATCH")
             gates.append(f"return rate ({reason}): {action} -> WATCH")
@@ -1874,8 +2190,11 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
         weeks_to_catalyst = compute_weeks_to_catalyst(catalyst_date)
         per_week = expected_return_per_week(_optional_float("expected_return_pct"), weeks_to_catalyst)
         if per_week is None or per_week < MIN_EXPECTED_RETURN_PCT_PER_WEEK:
+            if per_week is None and weeks_to_catalyst is not None and not tolerate_catalyst:
+                _null_return_not_tolerated(ticker)
             catalyst_stale = True
             reason = ("no computable catalyst timeframe" if weeks_to_catalyst is None
+                      else "no expected_return_pct" if per_week is None
                       else f"{per_week:.2f}%/week < {MIN_EXPECTED_RETURN_PCT_PER_WEEK}%/week minimum")
             log.info(f"[{ticker}] HOLD carries a stale catalyst ({reason}) — flagged, not auto-downgraded")
             parsed["reasoning"] = parsed.get("reasoning", "") + f" [STALE CATALYST ON HOLD: {reason}]"
@@ -2052,6 +2371,8 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
         provenance["plan"] = _plan_observe(ticker, parsed, action, conviction, situation_brief)
     except Exception as e:
         log.warning(f"[{ticker}] plan shadow unavailable: {e}")
+    pending_entry = _pending_entry_shadow(ticker, action, conviction, model_action, parsed,
+                                          situation_brief)
     try:
         import db
         signal_id = db.log_signal(
@@ -2071,7 +2392,11 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
                 "prior_verdicts_72h": _prior_verdicts(ticker) if action in ("OPEN", "ADD") else None,
                 "rule_shadows": _rule_shadows(ticker, action, situation_brief),
                 "trim_shadow": _trim_shadow(ticker, action, parsed, situation_brief),
+                "hold_fails_entry_rule": _hold_fails_entry_rule(action, udr, parsed, candidate,
+                                                                conviction=conviction),
+                "pending_entry": pending_entry,
                 "udr_check": _udr_check(parsed, situation_brief),
+                "udr_structural": _udr_structural(ticker, parsed, udr, situation_brief),
                 "event_burst": _event_burst(ticker, trigger, gates),
             },
             prompt=redact_account_figures(prompt),
@@ -2085,6 +2410,8 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
                                    and not isinstance(signal_id, bool) else None)
     except Exception as e:
         log.warning(f"[{ticker}] Signal log failed: {e}")
+        signal_id = None
+    _store_pending_entry(ticker, pending_entry, signal_id, action=action)   # log-only shadow
 
     result = {
         "ticker":    ticker,

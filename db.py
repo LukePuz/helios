@@ -831,6 +831,12 @@ _MIGRATIONS: list[tuple[int, str]] = [
     # the "[TEST RUN]" reasoning prefix).
     (77, "ALTER TABLE pending_approvals ADD COLUMN IF NOT EXISTS signal_id INTEGER, "
          "ADD COLUMN IF NOT EXISTS is_test BOOLEAN;"),
+    # The orders row a trade row was booked from (orders.id), so the two join
+    # by id instead of a time-window match. Written where the caller has the
+    # orders row id when it writes the trade; NULL before 11-03 and for
+    # trade rows written before (or without) their orders row. No FOREIGN
+    # KEY: a constraint failure must never lose a trade row.
+    (78, "ALTER TABLE trades ADD COLUMN IF NOT EXISTS order_row_id INTEGER;"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -878,7 +884,10 @@ def init_db() -> None:
 # full record goes to a local JSONL spill (never the rendered prompt: it holds
 # portfolio values) and an alert goes out at most once an hour per writer.
 DEGRADED_SIGNAL_PREFIX = "[degraded-log] "
-_SPILL_PATH = Path(__file__).parent / "logs" / "db_write_spill.jsonl"
+# HELIOS_DB_SPILL_PATH overrides it; the test suite sets it so no test can
+# append to the repo's logs/.
+_SPILL_PATH = Path(os.getenv("HELIOS_DB_SPILL_PATH")
+                   or Path(__file__).parent / "logs" / "db_write_spill.jsonl")
 _LAST_WRITE_ALERT: dict[str, float] = {}
 # The kind of record each writer spills, so scripts/replay_spill.py knows
 # which table a line belongs to without parsing the writer name.
@@ -943,6 +952,22 @@ def _is_transient_connect_error(exc: Exception) -> bool:
     return any(m in msg for m in _TRANSIENT_CONNECT_MARKERS)
 
 
+def _connect_with_retry(writer: str):
+    """A pooled connection, retrying a transient connect error with the same
+    short backoff as _writer_conn; raises the last error (no spill)."""
+    delays = list(_CONNECT_RETRY_DELAYS)
+    while True:
+        try:
+            return _get_conn()
+        except Exception as e:
+            if delays and _is_transient_connect_error(e):
+                delay = delays.pop(0)
+                logging.warning(f"{writer}: transient connect error, retrying in {delay}s: {e}")
+                _time.sleep(delay)
+                continue
+            raise
+
+
 def _writer_conn(writer: str, record: dict):
     """A pooled connection for a writer, or None after spilling the record.
     Getting the connection used to sit outside the writers' try, so a DNS or
@@ -962,11 +987,41 @@ def _writer_conn(writer: str, record: dict):
             return None
 
 
+def _insert_trade_row(cur, writer: str, symbol: str, side: str, quantity, price,
+                      reason: str, price_source, order_row_id: int | None) -> None:
+    """INSERT one trades row on cur. With order_row_id None the statement and
+    values are the ones used before migration 78. With an id, it is written
+    to trades.order_row_id; if that column doesn't exist yet (migration 78
+    pending), rolls back to a savepoint (keeping anything the caller did
+    earlier in the transaction) and inserts the row without it, so a
+    missing column never loses the trade row. The caller commits. Raises
+    on any other error."""
+    base_sql = ("INSERT INTO trades (symbol, trading_env, side, quantity, price, reason, "
+                "price_source")
+    base_vals = (symbol, TRADING_ENV, side, quantity, price, reason, price_source)
+    if order_row_id is None:
+        cur.execute(base_sql + ") VALUES (%s,%s,%s,%s,%s,%s,%s)", base_vals)
+        return
+    cur.execute("SAVEPOINT trade_order_row_id")
+    try:
+        cur.execute(base_sql + ", order_row_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                    base_vals + (order_row_id,))
+    except psycopg2.errors.UndefinedColumn:
+        # Migration 78 not applied yet (it runs in init_db at stack start).
+        cur.execute("ROLLBACK TO SAVEPOINT trade_order_row_id")
+        logging.warning(f"{writer}: {symbol} trade stored without order_row_id {order_row_id} "
+                        f"(migration 78 pending)")
+        cur.execute(base_sql + ") VALUES (%s,%s,%s,%s,%s,%s,%s)", base_vals)
+    cur.execute("RELEASE SAVEPOINT trade_order_row_id")
+
+
 def log_trade(symbol: str, side: str, quantity: int, price: float, reason: str,
-              price_source: str | None = None) -> None:
+              price_source: str | None = None, order_row_id: int | None = None) -> bool:
     """price_source: 'fill', 'quote', 'decision' or None (unknown). A
     missing, zero or non-finite price is stored NULL with source 'none',
-    not 0.0 (professor M109)."""
+    not 0.0 (professor M109). order_row_id: the orders.id this trade was
+    booked from, where the caller has it (else NULL). Returns True if the
+    row was committed, False if the write failed (and was spilled)."""
     import math
     try:
         ok = float(price) > 0 and math.isfinite(float(price))
@@ -976,20 +1031,21 @@ def log_trade(symbol: str, side: str, quantity: int, price: float, reason: str,
         price, price_source = None, "none"
     rec = {"symbol": symbol, "side": side, "quantity": quantity, "price": price, "reason": reason,
            "price_source": price_source}
+    if order_row_id is not None:
+        rec["order_row_id"] = order_row_id
     conn = _writer_conn("log_trade", rec)
     if conn is None:
-        return
+        return False
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO trades (symbol, trading_env, side, quantity, price, reason, price_source) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s)",
-                (symbol, TRADING_ENV, side, quantity, price, reason, price_source),
-            )
+            _insert_trade_row(cur, "log_trade", symbol, side, quantity, price, reason,
+                              price_source, order_row_id)
         conn.commit()
+        return True
     except Exception as e:
         _rollback_quietly(conn)
         _record_write_failure("log_trade", e, rec)
+        return False
     finally:
         _put_conn(conn)
 
@@ -1189,7 +1245,9 @@ _NON_ANALYST_SIGNALS = ("SCREENED_OUT", "CATALYST_BLOCKED", "COOLDOWN_SKIPPED", 
                         # A sell skipped because the market was closed (A0903-4).
                         "SELL_SKIPPED_CLOSED",
                         # An analysis that produced no verdict (log-only, M166).
-                        "ANALYST_FAILED")
+                        "ANALYST_FAILED",
+                        # A pass not sized because RiskManager could not start.
+                        "ROUTE_RISK_INIT_FAILED")
 
 
 def get_latest_signal_for(ticker: str) -> dict | None:
@@ -1232,8 +1290,10 @@ def get_latest_signal_for(ticker: str) -> dict | None:
 
 # Signal kinds written only for the record (from 11-02): an analysis with no
 # verdict (ANALYST_FAILED from the analyst, NO_VERDICT from the scan guard)
-# and a scan pass not routed for want of a broker (ROUTE_NO_BROKER).
-_RECORD_ONLY_SIGNALS = ("ANALYST_FAILED", "NO_VERDICT", "ROUTE_NO_BROKER")
+# and a scan pass not routed for want of a broker (ROUTE_NO_BROKER); from
+# 11-03 also a pass not sized because RiskManager could not start
+# (ROUTE_RISK_INIT_FAILED).
+_RECORD_ONLY_SIGNALS = ("ANALYST_FAILED", "NO_VERDICT", "ROUTE_NO_BROKER", "ROUTE_RISK_INIT_FAILED")
 
 
 def get_recent_signals(limit: int = 50) -> list[dict]:
@@ -1279,6 +1339,38 @@ def get_portfolio_history(limit: int = 288) -> list[dict]:
     except Exception as e:
         logging.error(f"get_portfolio_history failed: {e}")
         return []
+    finally:
+        _put_conn(conn)
+
+
+def get_first_snapshot_since(since: datetime) -> dict | None:
+    """The earliest portfolio snapshot at or after `since` for this
+    TRADING_ENV with a positive total_value: {"timestamp", "total_value",
+    "skipped_nonpositive"} (how many earlier snapshots since `since` read
+    $0 or less, e.g. a cold-start read before the broker connected), or None
+    (none yet, or a failed read). Read-only; used by the daily-loss shadow."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = 5000")
+            cur.execute(
+                "SELECT timestamp, total_value, "
+                "(SELECT COUNT(*) FROM portfolio_snapshots z WHERE z.trading_env=%s "
+                " AND z.timestamp >= %s AND z.timestamp < s.timestamp "
+                " AND (z.total_value IS NULL OR z.total_value <= 0)) "
+                "FROM portfolio_snapshots s "
+                "WHERE trading_env=%s AND timestamp >= %s AND total_value > 0 "
+                "ORDER BY timestamp ASC LIMIT 1",
+                (TRADING_ENV, since, TRADING_ENV, since),
+            )
+            row = cur.fetchone()
+        if not row or row[1] is None:
+            return None
+        return {"timestamp": row[0], "total_value": float(row[1]),
+                "skipped_nonpositive": int(row[2] or 0) if len(row) > 2 else 0}
+    except Exception as e:
+        logging.error(f"get_first_snapshot_since failed: {e}")
+        return None
     finally:
         _put_conn(conn)
 
@@ -1685,6 +1777,66 @@ def log_boot_activity(message: str, extra: dict) -> bool:
                 pass
 
 
+def log_activity_direct(stage: str, ticker: str, message: str, sentiment: str = "neutral",
+                        extra: dict | None = None) -> bool:
+    """log_activity on its own short-lived connection, never the shared pool,
+    for log-only rows written from side threads (a full pool must not be made
+    fuller by them). Bounded like log_boot_activity. A failure is spilled as
+    a log_activity row and logged as a warning, with no Telegram alert.
+    Never raises; returns whether the row was written."""
+    rec = {"stage": stage, "ticker": ticker, "message": message, "sentiment": sentiment,
+           "extra": extra}
+    conn = None
+    try:
+        conn = psycopg2.connect(
+            host=os.getenv("SUPABASE_HOST"), port=int(os.getenv("SUPABASE_PORT", "5432")),
+            dbname=os.getenv("SUPABASE_DB", "postgres"), user=os.getenv("SUPABASE_USER", "postgres"),
+            password=os.getenv("SUPABASE_PASSWORD"), sslmode="require", connect_timeout=5,
+            keepalives=1, tcp_user_timeout=10000)
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = 5000")
+            cur.execute(
+                "INSERT INTO activity_feed (stage, ticker, message, sentiment, extra_json) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (stage, ticker or "", message, sentiment,
+                 json.dumps(extra, default=str) if extra else None))
+        conn.commit()
+        return True
+    except Exception as e:
+        logging.warning(f"log_activity_direct({stage}) failed: {e}")
+        _spill("log_activity", rec, str(e))
+        return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def get_activity_shadow_keys(stage: str) -> set[str] | None:
+    """Every extra_json shadow_key already written for an activity_feed
+    stage: the durable dedup record for log-only shadows whose Redis
+    markers a flush would lose (professor m267). None on a failed read."""
+    conn = None
+    try:
+        conn = _get_conn()
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = 5000")
+            cur.execute(
+                "SELECT extra_json->>'shadow_key' FROM activity_feed "
+                "WHERE stage=%s AND extra_json ? 'shadow_key'",
+                (stage,),
+            )
+            return {r[0] for r in cur.fetchall() if r[0]}
+    except Exception as e:
+        logging.error(f"get_activity_shadow_keys failed: {e}")
+        return None
+    finally:
+        if conn is not None:
+            _put_conn(conn)
+
+
 def get_activity_feed(limit: int = 120) -> list[dict]:
     """Return the most recent activity feed rows, newest first."""
     conn = _get_conn()
@@ -1965,7 +2117,9 @@ def upsert_position_stop(
     bucket: str,
     conviction: int,
     trail_distance_pct: float | None = None,
-) -> None:
+) -> bool:
+    """True once the row is committed, False when the write failed (logged).
+    Getting a connection can still raise (pool exhausted, DB down)."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
@@ -1996,9 +2150,11 @@ def upsert_position_stop(
                 (ticker, TRADING_ENV, entry_price, stop_price, stop_method, bucket, conviction, trail_distance_pct),
             )
         conn.commit()
+        return True
     except Exception as e:
         conn.rollback()
         logging.error(f"upsert_position_stop failed: {e}")
+        return False
     finally:
         _put_conn(conn)
 
@@ -2235,6 +2391,51 @@ def get_recent_verdicts(ticker: str, hours: int = 72, limit: int = 20,
         return []
     finally:
         _put_conn(conn)
+
+
+def get_latest_verdicts(days: int | None = None, tickers: list[str] | None = None) -> dict | None:
+    """The most recent analyst verdict per ticker (this env; legacy NULL-env
+    rows count, degraded ones don't, as in get_recent_verdicts), limited to
+    the last `days` days and/or to `tickers`: {ticker: {signal_id,
+    timestamp, signal, conviction, model_action, udr_structural,
+    pending_entry, model_output, plan}}. The last four are the stored JSON
+    from signals.decision / provenance (None when absent). Read-only, for
+    the plan_cross_section log. None on a failed read."""
+    if tickers is not None and not tickers:
+        return {}
+    conn = None
+    try:
+        conn = _get_conn()
+        where, args = ["signal NOT IN %s",
+                       "(trading_env=%s OR (trading_env IS NULL AND COALESCE(reasoning, '') NOT LIKE %s))"], \
+            [_NON_ANALYST_SIGNALS, TRADING_ENV, DEGRADED_SIGNAL_PREFIX + '%']
+        if days is not None:
+            where.append("timestamp > NOW() - make_interval(days => %s)")
+            args.append(int(days))
+        if tickers is not None:
+            where.append("symbol = ANY(%s)")
+            args.append(list(tickers))
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = 10000")
+            cur.execute(
+                "SELECT DISTINCT ON (symbol) symbol, id, timestamp, signal, confidence, "
+                "decision->>'model_action', decision->'udr_structural', decision->'pending_entry', "
+                "decision->'model_output', provenance->'plan' FROM signals "
+                "WHERE " + " AND ".join(where) + " ORDER BY symbol, timestamp DESC, id DESC",
+                tuple(args),
+            )
+            rows = cur.fetchall()
+        return {r[0]: {"signal_id": r[1], "timestamp": r[2], "signal": r[3],
+                       "conviction": round(float(r[4] or 0) * 10) if r[4] is not None else None,
+                       "model_action": r[5], "udr_structural": r[6], "pending_entry": r[7],
+                       "model_output": r[8], "plan": r[9]}
+                for r in rows if r[0]}
+    except Exception as e:
+        logging.error(f"get_latest_verdicts failed: {e}")
+        return None
+    finally:
+        if conn is not None:
+            _put_conn(conn)
 
 
 def get_position_context(ticker: str) -> dict:
@@ -3339,51 +3540,80 @@ def log_order(
     perm_id: int | None = None,
     submitted_at=None,
     submit_price: float | None = None,
+    reconcile_note: str | None = None,
 ) -> int:
     """Logs a newly-placed order. Returns the local orders.id (-1 on failure).
     submitted_at: when the order was sent (default: now, the logging time);
-    submit_price: the quote at submission, where the caller has one."""
+    submit_price: the quote at submission, where the caller has one;
+    reconcile_note: written with the row when given (AWAITING_FILL_NOTE for a
+    row written before the fill wait). The missing-column fallback below
+    drops it along with submitted_at and submit_price."""
     rec = {"ticker": ticker, "side": side, "order_type": order_type, "qty": qty,
            "broker_order_id": broker_order_id, "stop_price": stop_price,
            "decision_price": decision_price, "approval_id": approval_id, "status": status,
            "intent": intent, "perm_id": perm_id, "submitted_at": submitted_at,
            "submit_price": submit_price}
+    if reconcile_note is not None:
+        rec["reconcile_note"] = reconcile_note
     conn = _writer_conn("log_order", rec)
     if conn is None:
         return -1
     base = (broker_order_id, TRADING_ENV, ticker, side, order_type, qty, limit_price,
             stop_price, decision_price, approval_id, parent_order_id, status, intent,
             perm_id or None)
+    note_col, note_val, note_args = ((", reconcile_note", ",%s", (reconcile_note[:40],))
+                                     if reconcile_note is not None else ("", "", ()))
     try:
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
+                    f"""
                     INSERT INTO orders
                         (broker_order_id, trading_env, ticker, side, order_type, qty, limit_price,
                          stop_price, decision_price, approval_id, parent_order_id, status, intent,
-                         perm_id, submitted_at, submit_price)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,COALESCE(%s, NOW()),%s)
+                         perm_id, submitted_at, submit_price{note_col})
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,COALESCE(%s, NOW()),%s{note_val})
                     RETURNING id
                     """,
-                    base + (submitted_at, submit_price),
+                    base + (submitted_at, submit_price) + note_args,
                 )
                 order_id = cur.fetchone()[0]
         except psycopg2.errors.UndefinedColumn:
-            # Migration 75 not applied yet: keep the order row without them.
+            # Migration 75 not applied yet: keep the order row without them,
+            # but with its reconcile_note (migration 76) where that column
+            # exists: without awaiting_fill an early row is never adopted.
             conn.rollback()
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO orders
-                        (broker_order_id, trading_env, ticker, side, order_type, qty, limit_price,
-                         stop_price, decision_price, approval_id, parent_order_id, status, intent, perm_id)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    RETURNING id
-                    """,
-                    base,
-                )
-                order_id = cur.fetchone()[0]
+            order_id = None
+            if note_col:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            INSERT INTO orders
+                                (broker_order_id, trading_env, ticker, side, order_type, qty,
+                                 limit_price, stop_price, decision_price, approval_id,
+                                 parent_order_id, status, intent, perm_id, reconcile_note)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            RETURNING id
+                            """,
+                            base + note_args,
+                        )
+                        order_id = cur.fetchone()[0]
+                except psycopg2.errors.UndefinedColumn:
+                    conn.rollback()
+            if order_id is None:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO orders
+                            (broker_order_id, trading_env, ticker, side, order_type, qty, limit_price,
+                             stop_price, decision_price, approval_id, parent_order_id, status, intent, perm_id)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        RETURNING id
+                        """,
+                        base,
+                    )
+                    order_id = cur.fetchone()[0]
             logging.warning(f"log_order: {ticker} stored without submitted_at/submit_price "
                             f"(migration 75 pending)")
         conn.commit()
@@ -3415,16 +3645,36 @@ def compute_slippage_pct(decision_price: float | None, fill_price: float | None,
     return raw if side == "BUY" else -raw
 
 
+# The note on an orders row written before place_market_order's fill wait.
+# Every outcome of the wait replaces or clears it (update_order_fill,
+# finish_submitted_order, set_order_reconcile_note), so a row still
+# 'submitted' with it well after the wait belongs to a worker that died
+# during the wait: adopt_orphaned_submitted_orders hands it to reconcile.
+AWAITING_FILL_NOTE = "awaiting_fill"
+ORPHANED_FILL_WAIT_NOTE = "orphaned_in_fill_wait"
+# Set with the fill mark after the wait, cleared once the trade row is
+# written: a filled row that keeps it belongs to a worker that stopped in
+# between, and reconcile books (or finds) its trade row.
+TRADE_PENDING_NOTE = "trade_pending"
+TRADE_BOOKED_BY_RECONCILE_NOTE = "trade_booked_by_reconcile"
+# trade_pending, but the execution path's trade-row transaction failed and it
+# then finished its stop and outcome work: reconcile books only the trade row.
+TRADE_PENDING_STOP_DONE_NOTE = "trade_pending_stop_done"
+TRADE_PENDING_NOTES = (TRADE_PENDING_NOTE, TRADE_PENDING_STOP_DONE_NOTE)
+
+
 def set_order_reconcile_note(order_id: int, note: str) -> bool:
-    """Sets orders.reconcile_note on one row if it has none. A record-keeping
-    note only: status and fill columns are left alone. True if set."""
+    """Sets orders.reconcile_note on one row if it has none (or only the
+    AWAITING_FILL_NOTE placeholder). A record-keeping note only: status and
+    fill columns are left alone. True if set."""
     if not order_id or order_id < 0:
         return False
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("UPDATE orders SET reconcile_note=%s WHERE id=%s AND reconcile_note IS NULL",
-                        (note[:40], order_id))
+            cur.execute("UPDATE orders SET reconcile_note=%s WHERE id=%s AND "
+                        "(reconcile_note IS NULL OR reconcile_note=%s)",
+                        (note[:40], order_id, AWAITING_FILL_NOTE))
             n = cur.rowcount
         conn.commit()
         return n > 0
@@ -3432,6 +3682,369 @@ def set_order_reconcile_note(order_id: int, note: str) -> bool:
         _rollback_quietly(conn)
         logging.error(f"set_order_reconcile_note failed: {e}")
         return False
+    finally:
+        _put_conn(conn)
+
+
+def finish_submitted_order(order_id: int, status: str, perm_id: int | None = None) -> bool:
+    """Moves a row written before the fill wait from 'submitted' to status
+    ('unconfirmed', or 'cancelled' for an order the broker reported dead
+    with no fill), clears AWAITING_FILL_NOTE and fills a NULL perm_id. Only
+    while the row is still 'submitted'. True if it changed; False if not or
+    on error (the note then stays, so reconcile adopts the row later)."""
+    if not order_id or order_id < 0:
+        return False
+    conn = None
+    try:
+        conn = _get_conn()   # inside the try: a pool error is a False, never a raise
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE orders SET status=%s, perm_id=COALESCE(perm_id, %s), "
+                "reconcile_note=NULLIF(reconcile_note, %s), updated_at=NOW() "
+                "WHERE id=%s AND status='submitted'",
+                (status, perm_id or None, AWAITING_FILL_NOTE, order_id),
+            )
+            n = cur.rowcount
+        conn.commit()
+        return n > 0
+    except Exception as e:
+        if conn is not None:
+            _rollback_quietly(conn)
+        logging.error(f"finish_submitted_order failed: {e}")
+        return False
+    finally:
+        if conn is not None:
+            _put_conn(conn)
+
+
+def adopt_orphaned_submitted_orders(min_age_minutes: int = 10) -> list[dict] | None:
+    """Rows still 'submitted' with AWAITING_FILL_NOTE min_age_minutes after
+    they were written: the worker died during the fill wait (or every
+    outcome write failed), so nothing recorded a fill or 'unconfirmed'. Sets
+    them 'unconfirmed' with ORPHANED_FILL_WAIT_NOTE in this env, so the same
+    reconcile run finds a late fill (or a cancel) the usual way. The update
+    is guarded on the note, so a row is adopted once. Returns the adopted
+    rows (id, ticker, side, broker_order_id), or None on error."""
+    conn = None
+    try:
+        conn = _get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE orders SET status='unconfirmed', reconcile_note=%s, updated_at=NOW() "
+                "WHERE status='submitted' AND reconcile_note=%s AND trading_env=%s "
+                "AND created_at < NOW() - make_interval(mins => %s) "
+                "RETURNING id, ticker, side, broker_order_id",
+                (ORPHANED_FILL_WAIT_NOTE, AWAITING_FILL_NOTE, TRADING_ENV, min_age_minutes),
+            )
+            rows = cur.fetchall()
+        conn.commit()
+        return [{"id": r[0], "ticker": r[1], "side": r[2], "broker_order_id": r[3]} for r in rows]
+    except Exception as e:
+        if conn is not None:
+            _rollback_quietly(conn)
+        logging.error(f"adopt_orphaned_submitted_orders failed: {e}")
+        return None
+    finally:
+        if conn is not None:
+            _put_conn(conn)
+
+
+# Reasons of trades rows that are never the execution path's own row for an
+# order: backstop, profit-target and stale-stop sells, and reconcile's own
+# late-fill bookings.
+_NOT_EXECUTION_TRADE_REASONS = ("Backstop%", "Profit target%", "Reconciled exit%",
+                                "%Late-fill reconciled%")
+
+
+# trade_logged_near's window: from TRADE_MATCH_BEFORE_S before the order row
+# up to the next same-ticker/side order row, capped at TRADE_MATCH_CAP_MINUTES.
+# The cap must stay above the adoption and trade_pending recovery ages (both
+# 10 min), so any trade row the execution path could still write before
+# reconcile acts is inside it.
+TRADE_MATCH_BEFORE_S = 5
+TRADE_MATCH_CAP_MINUTES = 20
+
+
+def trade_logged_near(ticker: str, side: str, around, intent: str | None = None,
+                      order_id: int | None = None) -> float:
+    """The summed quantity of the trades rows the execution path could have
+    written for one market order: same ticker, side and env, with that path's
+    reason (0.0 if none). Used before booking a fill on an order row whose
+    trade row may already exist (adopted from its fill wait, or left
+    trade_pending). Raises on error, so the caller waits rather than books
+    twice.
+
+    Window: timestamp >= around - TRADE_MATCH_BEFORE_S and < the earlier of
+    around + TRADE_MATCH_CAP_MINUTES and the created_at of the next orders
+    row (higher id) for the same ticker, side and env (order_id is this
+    order's row). The execution path's trade row has no fixed bound after the
+    order row (a fill with no price waits on ibkr.get_latest_price, which can
+    take minutes on a reconnect, and the DB calls have no timeouts), but it
+    can't come after the next same-side order, and reconcile only acts after
+    10 min, inside the cap. around is the order row's created_at; both share
+    the DB clock, so TRADE_MATCH_BEFORE_S only absorbs rounding.
+
+    Reason: execute_approved writes "<intent> <trigger label> (conviction=N/10)"
+    (intent is the approval action), so an approval order matches that prefix
+    only. A manual order's reason is the caller's text, so it matches any
+    reason except an approval-style one and _NOT_EXECUTION_TRADE_REASONS."""
+    cap = "%s + make_interval(mins => %s)"
+    sql = ("SELECT COALESCE(SUM(quantity), 0) FROM trades WHERE symbol=%s AND side=%s "
+           "AND trading_env=%s AND timestamp >= %s - make_interval(secs => %s) ")
+    params = [ticker, side, TRADING_ENV, around, TRADE_MATCH_BEFORE_S]
+    if order_id is not None:
+        sql += (f"AND timestamp < LEAST(COALESCE((SELECT MIN(o.created_at) FROM orders o "
+                f"WHERE o.ticker=%s AND o.side=%s AND o.trading_env=%s AND o.id > %s), {cap}), "
+                f"{cap}) ")
+        params += [ticker, side, TRADING_ENV, order_id, around, TRADE_MATCH_CAP_MINUTES,
+                   around, TRADE_MATCH_CAP_MINUTES]
+    else:
+        sql += f"AND timestamp < {cap} "
+        params += [around, TRADE_MATCH_CAP_MINUTES]
+    for pattern in _NOT_EXECUTION_TRADE_REASONS:
+        sql += "AND COALESCE(reason, '') NOT LIKE %s "
+        params.append(pattern)
+    if intent and not intent.upper().startswith("MANUAL"):
+        sql += "AND COALESCE(reason, '') LIKE %s"
+        params.append(intent.replace("%", r"\%").replace("_", r"\_") + " % (conviction=%")
+    else:
+        sql += "AND COALESCE(reason, '') NOT LIKE %s"
+        params.append("%(conviction=%/10)%")
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, tuple(params))
+            r = cur.fetchone()
+            return float(r[0]) if r and r[0] is not None else 0.0
+    except Exception as e:
+        _rollback_quietly(conn)
+        logging.error(f"trade_logged_near({ticker}) failed: {e}")
+        raise
+    finally:
+        _put_conn(conn)
+
+
+def claim_trade_pending(order_id: int, note: str | None,
+                        expect_note: str = TRADE_PENDING_NOTE) -> int | None:
+    """Replace TRADE_PENDING_NOTE on one row with note (None clears it),
+    only while the row still has it. Returns the rows changed (1: this
+    caller owns what comes next; 0: someone else got there first) or None on
+    error. Never raises."""
+    conn = None
+    try:
+        conn = _get_conn()
+        with conn.cursor() as cur:
+            cur.execute("UPDATE orders SET reconcile_note=%s, updated_at=NOW() "
+                        "WHERE id=%s AND reconcile_note=%s",
+                        (note, order_id, expect_note))
+            n = cur.rowcount
+        conn.commit()
+        return n
+    except Exception as e:
+        if conn is not None:
+            _rollback_quietly(conn)
+        logging.error(f"claim_trade_pending({order_id}) failed: {e}")
+        return None
+    finally:
+        if conn is not None:
+            _put_conn(conn)
+
+
+def claim_and_log_trade(order_id: int, note: str | None, symbol: str, side: str,
+                        quantity: float, price: float, reason: str,
+                        price_source: str | None = None,
+                        expect_note: str = TRADE_PENDING_NOTE,
+                        order_row_id: int | None = None) -> bool | None:
+    """Claim a trade_pending order row and write its trades row in ONE
+    transaction on one connection: replace TRADE_PENDING_NOTE with note
+    (None clears it) only while the row has it, then insert the trade row
+    (the same columns, price rule and order_row_id handling as log_trade),
+    then commit. order_row_id: written to trades.order_row_id when given
+    (callers pass order_id); a missing column (migration 78 pending) keeps
+    the claim and writes the row without it.
+    - True: both written.
+    - False: the row no longer had the note (someone else claimed it);
+      rolled back, nothing written.
+    - None: an error; rolled back, nothing written and NOT spilled, so the
+      note stays and reconcile books the trade later.
+    The UPDATE's row lock makes a concurrent claim wait for this commit and
+    then match no row, so the trade row is written once. Never raises."""
+    import math
+    try:
+        ok = float(price) > 0 and math.isfinite(float(price))
+    except (TypeError, ValueError):
+        ok = False
+    if not ok:
+        price, price_source = None, "none"
+    conn = None
+    try:
+        conn = _connect_with_retry("claim_and_log_trade")
+        with conn.cursor() as cur:
+            cur.execute("UPDATE orders SET reconcile_note=%s, updated_at=NOW() "
+                        "WHERE id=%s AND reconcile_note=%s",
+                        (note, order_id, expect_note))
+            if cur.rowcount != 1:
+                conn.rollback()
+                return False
+            _insert_trade_row(cur, "claim_and_log_trade", symbol, side, quantity, price,
+                              reason, price_source, order_row_id)
+        conn.commit()
+        return True
+    except Exception as e:
+        if conn is not None:
+            _rollback_quietly(conn)
+        logging.error(f"claim_and_log_trade({order_id}, {symbol}) failed, rolled back: {e}")
+        return None
+    finally:
+        if conn is not None:
+            _put_conn(conn)
+
+
+def order_reconcile_note(order_id: int) -> str | None:
+    """One orders row's reconcile_note (None if none or no row). Raises on error."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT reconcile_note FROM orders WHERE id=%s", (order_id,))
+            r = cur.fetchone()
+        return r[0] if r else None
+    except Exception as e:
+        _rollback_quietly(conn)
+        logging.error(f"order_reconcile_note({order_id}) failed: {e}")
+        raise
+    finally:
+        _put_conn(conn)
+
+
+def position_stop_written(ticker: str) -> dict | None:
+    """The write-once fields of the ticker's stop record in this env
+    (updated_at, entry_price, stop_method, thesis_bucket, conviction), or
+    None when there is no record. Raises on error."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT updated_at, entry_price, stop_method, thesis_bucket, conviction "
+                        "FROM position_stops WHERE ticker=%s AND trading_env=%s",
+                        (ticker, TRADING_ENV))
+            r = cur.fetchone()
+        if not r:
+            return None
+        return {"updated_at": r[0], "entry_price": float(r[1]) if r[1] is not None else None,
+                "stop_method": r[2], "thesis_bucket": r[3], "conviction": r[4]}
+    except Exception as e:
+        _rollback_quietly(conn)
+        logging.error(f"position_stop_written({ticker}) failed: {e}")
+        raise
+    finally:
+        _put_conn(conn)
+
+
+def get_stale_trade_pending_orders(min_age_minutes: int = 10) -> list[dict]:
+    """filled/partial rows in this env still carrying TRADE_PENDING_NOTE or
+    TRADE_PENDING_STOP_DONE_NOTE min_age_minutes after they were written.
+    Raises on error."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, ticker, side, qty, broker_order_id, decision_price, approval_id, "
+                "intent, stop_price, created_at, filled_qty, fill_price, perm_id, filled_at, status, "
+                "reconcile_note "
+                "FROM orders WHERE status IN ('filled', 'partial') AND reconcile_note IN (%s, %s) "
+                "AND trading_env=%s AND created_at < NOW() - make_interval(mins => %s) "
+                "ORDER BY created_at",
+                (TRADE_PENDING_NOTE, TRADE_PENDING_STOP_DONE_NOTE, TRADING_ENV, min_age_minutes),
+            )
+            rows = cur.fetchall()
+        keys = ("id", "ticker", "side", "qty", "broker_order_id", "decision_price", "approval_id",
+                "intent", "stop_price", "created_at", "filled_qty", "fill_price", "perm_id",
+                "filled_at", "status", "reconcile_note")
+        out = []
+        for r in rows:
+            d = dict(zip(keys, r))
+            for k in ("qty", "decision_price", "stop_price", "filled_qty", "fill_price"):
+                d[k] = float(d[k]) if d[k] is not None else None
+            out.append(d)
+        return out
+    except Exception as e:
+        _rollback_quietly(conn)
+        logging.error(f"get_stale_trade_pending_orders failed: {e}")
+        raise
+    finally:
+        _put_conn(conn)
+
+
+def find_awaiting_order_row(ticker: str, side: str, broker_order_id: int) -> int | None:
+    """The id of an orders row in this env still 'submitted' with
+    AWAITING_FILL_NOTE for this ticker, side and broker order id, written in
+    the last 10 minutes, or None. Checked before the after-the-wait fallback insert:
+    the early INSERT can commit while the client sees an error, and a second
+    row for the same order would be booked twice. broker_order_id alone is
+    not unique (IB order ids are per-client sequences and repeat across
+    accounts and sessions), so env, ticker, side, the awaiting state and the
+    10-minute window (the fallback runs within ~3 min of the write) all have
+    to match: an older or unrelated row is never reused. Raises on error."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM orders WHERE trading_env=%s AND ticker=%s AND side=%s "
+                "AND broker_order_id=%s AND status='submitted' AND reconcile_note=%s "
+                "AND created_at > NOW() - INTERVAL '10 minutes' ORDER BY id DESC LIMIT 1",
+                (TRADING_ENV, ticker, side, broker_order_id, AWAITING_FILL_NOTE),
+            )
+            r = cur.fetchone()
+            return int(r[0]) if r else None
+    except Exception as e:
+        _rollback_quietly(conn)
+        logging.error(f"find_awaiting_order_row({ticker}) failed: {e}")
+        raise
+    finally:
+        _put_conn(conn)
+
+
+def awaiting_fill_sell_tickers() -> set[str]:
+    """Tickers with a SELL row in this env still 'submitted' with
+    AWAITING_FILL_NOTE: in its fill wait, or orphaned and not adopted yet.
+    Only the last day: adoption clears these within minutes, so an older one
+    means adoption isn't running, and it must not hold stale-stop cleanup
+    back forever; it is logged instead. Raises on error (unknown is not "none")."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT ticker, created_at > NOW() - interval '1 day' FROM orders "
+                        "WHERE side='SELL' AND status='submitted' "
+                        "AND reconcile_note=%s AND trading_env=%s",
+                        (AWAITING_FILL_NOTE, TRADING_ENV))
+            rows = cur.fetchall()
+        old = sorted({r[0] for r in rows if not r[1]})
+        if old:
+            logging.warning(f"awaiting_fill SELL rows older than a day, not adopted: {old}")
+        return {r[0] for r in rows if r[1]}
+    except Exception as e:
+        _rollback_quietly(conn)
+        logging.error(f"awaiting_fill_sell_tickers failed: {e}")
+        raise
+    finally:
+        _put_conn(conn)
+
+
+def trade_pending_sell_tickers() -> set[str]:
+    """Tickers with a filled/partial SELL row in this env from the last day
+    whose trade row is not confirmed yet (TRADE_PENDING_NOTES): reconcile's
+    recovery books it, so stale-stop cleanup must wait. Raises on error."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT ticker FROM orders WHERE side='SELL' "
+                        "AND status IN ('filled', 'partial') AND reconcile_note IN (%s, %s) "
+                        "AND trading_env=%s AND created_at > NOW() - interval '1 day'",
+                        (*TRADE_PENDING_NOTES, TRADING_ENV))
+            return {r[0] for r in cur.fetchall()}
+    except Exception as e:
+        _rollback_quietly(conn)
+        logging.error(f"trade_pending_sell_tickers failed: {e}")
+        raise
     finally:
         _put_conn(conn)
 
@@ -3511,8 +4124,32 @@ def update_order_fill(order_id: int, fill_price: float, filled_qty: float, statu
     With expect_filled_qty, the update applies only while the row is still
     unconfirmed/partial with that filled_qty, and returns False if another
     run got there first (audit 22:53, A2253-5)."""
-    conn = _get_conn()
+    n = _write_order_fill(order_id, fill_price, filled_qty, status,
+                          expect_filled_qty=expect_filled_qty, filled_at=filled_at)
+    if n is None:
+        return False
+    return expect_filled_qty is None or n > 0
+
+
+def mark_submitted_order_fill(order_id: int, fill_price: float, filled_qty: float, status: str,
+                              filled_at=None) -> int | None:
+    """update_order_fill for a row written before the fill wait, applied only
+    while it is still 'submitted'. Returns the rows updated: 0 means the row
+    has moved on (reconcile adopted it from its fill wait and may have booked
+    the fill), None means the write failed."""
+    return _write_order_fill(order_id, fill_price, filled_qty, status,
+                             filled_at=filled_at, only_if_submitted=True,
+                             note=TRADE_PENDING_NOTE)
+
+
+def _write_order_fill(order_id: int, fill_price: float, filled_qty: float, status: str,
+                      expect_filled_qty: float | None = None, filled_at=None,
+                      only_if_submitted: bool = False, note: str | None = None) -> int | None:
+    """The fill UPDATE behind update_order_fill and mark_submitted_order_fill.
+    Rows updated, or None on error. Never raises."""
+    conn = None
     try:
+        conn = _get_conn()   # inside the try: a pool error is a False, never a raise
         with conn.cursor() as cur:
             cur.execute("SELECT decision_price, side FROM orders WHERE id=%s", (order_id,))
             row = cur.fetchone()
@@ -3521,23 +4158,34 @@ def update_order_fill(order_id: int, fill_price: float, filled_qty: float, statu
                 decision_price = float(row[0]) if row[0] else None
                 slippage_pct = compute_slippage_pct(decision_price, fill_price, row[1])
 
+            # Clears AWAITING_FILL_NOTE with the fill, so a filled row is
+            # never adopted as orphaned (adopt_orphaned_submitted_orders).
+            if note is None:
+                note_sql, note_arg = "reconcile_note=NULLIF(reconcile_note, %s)", AWAITING_FILL_NOTE
+            else:   # replaces the note in the same write (TRADE_PENDING_NOTE at the mark)
+                note_sql, note_arg = "reconcile_note=%s", note
             sql = ("UPDATE orders SET fill_price=%s, filled_qty=%s, status=%s, slippage_pct=%s, "
-                   "filled_at=COALESCE(%s, filled_at), updated_at=NOW() WHERE id=%s")
-            params = [fill_price, filled_qty, status, slippage_pct, filled_at, order_id]
+                   f"filled_at=COALESCE(%s, filled_at), {note_sql}, "
+                   "updated_at=NOW() WHERE id=%s")
+            params = [fill_price, filled_qty, status, slippage_pct, filled_at, note_arg, order_id]
             if expect_filled_qty is not None:
                 sql += (" AND status IN ('unconfirmed', 'partial') "
                         "AND ABS(COALESCE(filled_qty, 0) - %s) < 0.0001")
                 params.append(expect_filled_qty)
+            if only_if_submitted:
+                sql += " AND status='submitted'"
             cur.execute(sql, params)
             updated = cur.rowcount
         conn.commit()
-        return expect_filled_qty is None or updated > 0
+        return updated
     except Exception as e:
-        conn.rollback()
+        if conn is not None:
+            _rollback_quietly(conn)
         logging.error(f"update_order_fill failed: {e}")
-        return False
+        return None
     finally:
-        _put_conn(conn)
+        if conn is not None:
+            _put_conn(conn)
 
 
 def recorded_sell_order_ids(ticker: str, max_age_hours: int = 24) -> tuple[set[int], set[int]] | None:
@@ -3593,7 +4241,7 @@ def get_unconfirmed_orders(max_age_hours: int = 24) -> list[dict]:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT id, ticker, side, qty, broker_order_id, decision_price, approval_id, "
-                "intent, stop_price, created_at, filled_qty, fill_price, perm_id "
+                "intent, stop_price, created_at, filled_qty, fill_price, perm_id, reconcile_note "
                 "FROM orders WHERE status IN ('unconfirmed', 'partial') AND broker_order_id IS NOT NULL "
                 "AND trading_env=%s "
                 "AND created_at > NOW() - INTERVAL '%s hours' ORDER BY created_at",
@@ -3611,6 +4259,7 @@ def get_unconfirmed_orders(max_age_hours: int = 24) -> list[dict]:
                 "filled_qty": float(r[10]) if r[10] is not None else 0.0,
                 "fill_price": float(r[11]) if r[11] is not None else None,
                 "perm_id": r[12],
+                "reconcile_note": r[13] if len(r) > 13 else None,
             }
             for r in rows
         ]

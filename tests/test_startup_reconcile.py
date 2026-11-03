@@ -24,6 +24,20 @@ def test_reconcile_skipped_with_alert_when_worker_never_answers():
     assert "skipped" in send.call_args[0][0]
 
 
+def test_stale_market_buy_cancel_names_the_order_fully():
+    # orderIds repeat across clientIds: the cancel carries ticker and permId
+    orders = [{"order_id": 5, "perm_id": 777, "ticker": "AMD", "action": "BUY",
+               "order_type": "MKT", "qty": 10},
+              {"order_id": 6, "ticker": "NVDA", "action": "BUY", "order_type": "MKT", "qty": 3},
+              {"order_id": 7, "ticker": "AMD", "action": "SELL", "order_type": "STP", "qty": 10}]
+    with patch("ibkr.get_client"), patch("ibkr.get_open_orders", return_value=orders), \
+         patch("tasks.manage_cancel_order", return_value=True) as cancel, \
+         patch("alerts._send"):
+        main._reconcile_open_orders()
+    assert [c.args + tuple(sorted(c.kwargs.items())) for c in cancel.call_args_list] == [
+        (5, ("perm_id", 777), ("symbol", "AMD")), (6, ("perm_id", None), ("symbol", "NVDA"))]
+
+
 def test_ready_polls_until_a_ping_answers():
     replies = iter([[], [{"orders@h": {"ok": "pong"}}]])
     with patch("tasks.app.control.ping", side_effect=lambda **k: next(replies)), \

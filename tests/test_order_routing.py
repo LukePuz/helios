@@ -19,7 +19,7 @@ functions decide whether the CURRENT process already IS that one process
 work (dispatch a task to the "orders" queue and wait for the result).
 """
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import tasks
 
@@ -126,6 +126,28 @@ class TestManageCancelOrder:
 
         _assert_dispatched(mock_dispatch, [11])
         assert result is False
+
+    def test_symbol_and_perm_id_reach_the_broker_call(self, monkeypatch):
+        monkeypatch.setenv("IB_CLIENT_ID", "30")
+        with patch("ibkr.cancel_order", return_value=True) as mock_cancel:
+            tasks.manage_cancel_order(11, symbol="AMD", perm_id=900)
+        mock_cancel.assert_called_once_with(11, symbol="AMD", perm_id=900)
+
+    def test_symbol_and_perm_id_are_dispatched_as_keywords(self, monkeypatch):
+        monkeypatch.setenv("IB_CLIENT_ID", "1")
+        fake_result = MagicMock()
+        fake_result.get.return_value = True
+        with patch.object(tasks._broker_cancel_order, "apply_async",
+                          return_value=fake_result) as mock_dispatch:
+            tasks.manage_cancel_order(11, symbol="AMD", perm_id=None)
+        _assert_dispatched(mock_dispatch, [11], {"symbol": "AMD"})
+
+    def test_the_worker_task_accepts_old_and_new_messages(self):
+        with patch("tasks._mark_started", return_value=True), \
+             patch("ibkr.cancel_order", return_value=True) as mock_cancel:
+            tasks._broker_cancel_order.run(11, deadline=None)
+            tasks._broker_cancel_order.run(11, deadline=None, symbol="AMD", perm_id=900)
+        assert mock_cancel.call_args_list == [call(11), call(11, symbol="AMD", perm_id=900)]
 
 
 class TestManagePlaceTrailingStop:

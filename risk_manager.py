@@ -11,6 +11,7 @@ Maintains backward-compatible interface for any modules still calling
 shares_affordable() and check_sell_allowed().
 """
 import logging
+import threading
 
 from stop_lock import TickerBusy, locked_by_ticker, ticker_lock
 import os
@@ -109,6 +110,11 @@ except ImportError:
 # Helpers: Alpaca bar fetch for ATR
 # ---------------------------------------------------------------------------
 
+# Why the last get_atr() on this thread had no ATR: {"ticker", "n_bars",
+# "error"}. Read only by the log-only stop_atr_fallback row.
+_ATR_DIAG = threading.local()
+
+
 def _fetch_bars_for_atr(ticker: str, days: int = 20) -> list[dict]:
     try:
         from ibkr import get_historical_bars
@@ -116,6 +122,10 @@ def _fetch_bars_for_atr(ticker: str, days: int = 20) -> list[dict]:
         return [{"h": b["high"], "l": b["low"], "c": b["close"]} for b in bars]
     except Exception as e:
         log.debug(f"ATR bar fetch failed for {ticker}: {e}")
+        try:
+            _ATR_DIAG.error = type(e).__name__
+        except Exception:
+            pass
         return []
 
 
@@ -129,6 +139,226 @@ def _compute_atr(bars: list[dict]) -> float | None:
         tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
         trs.append(tr)
     return sum(trs) / len(trs)
+
+
+_ATR_FALLBACK_MARKER = "helios:stop_atr_fallback:{env}:{day}:{caller}:{ticker}"
+_ATR_FALLBACK_TICKERS = "helios:stop_atr_fallback_tickers:{env}:{day}"
+_ATR_FALLBACK_TICKERS_TTL_S = 3 * 86400
+_ATR_FALLBACK_REDIS: dict = {}
+# At most one fallback logger thread at a time; a fallback while one runs
+# is dropped (log.debug), so these threads can never pile up.
+_ATR_FALLBACK_SEM = threading.BoundedSemaphore(1)
+_ATR_FALLBACK_CALLERS = ("size_position", "post_fill", "manual", "other")
+# Fallbacks that arrive while the logger thread runs wait here, and that
+# thread logs them in turn (professor m308: they used to be dropped). Past
+# _ATR_FALLBACK_PENDING_MAX they are dropped and counted; the next written
+# row carries the count (dropped_before).
+_ATR_FALLBACK_PENDING: list = []
+_ATR_FALLBACK_PENDING_MAX = 50
+_ATR_FALLBACK_PENDING_LOCK = threading.Lock()
+_ATR_FALLBACK_DROPPED = {"n": 0}
+
+
+def _atr_fallback_redis():
+    """The fallback logger's own Redis client, with short socket timeouts so
+    a slow Redis can't hold its thread for long. Cached per process."""
+    client = _ATR_FALLBACK_REDIS.get("client")
+    if client is None:
+        import redis
+        client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+                                      socket_timeout=0.5, socket_connect_timeout=0.5)
+        _ATR_FALLBACK_REDIS["client"] = client
+    return client
+
+
+def _spawn(target, name: str, args: tuple = ()) -> None:
+    """Run target on a daemon thread. Tests replace this to run it inline."""
+    threading.Thread(target=target, args=args, name=name, daemon=True).start()
+
+
+def _atr_fallback_reason(ticker: str, atr) -> tuple[str, dict]:
+    """Why get_atr() gave no ATR, from the thread's _ATR_DIAG: exception,
+    no_bars, too_few_bars, or other (a zero ATR, or no diagnostics for this
+    ticker, e.g. get_atr replaced in a test)."""
+    diag = getattr(_ATR_DIAG, "last", None) or {}
+    if diag.get("ticker") != ticker:
+        return "other", {"n_bars": None, "error": None}
+    n_bars, error = diag.get("n_bars"), diag.get("error")
+    if error:
+        reason = "exception"
+    elif n_bars == 0:
+        reason = "no_bars"
+    elif n_bars is not None and n_bars < 2:
+        reason = "too_few_bars"
+    else:
+        reason = "other"
+    return reason, {"n_bars": n_bars, "error": error}
+
+
+def _log_atr_fallback(ticker: str, entry_price, bucket, stop, fallback_pct, atr,
+                      reason: str, diag: dict, caller: str = "other", queued: bool = False) -> None:
+    """Log-only, run on its own thread for calculate_stop: one activity_feed
+    row (stage stop_atr_fallback) per ticker per caller per ET day when the
+    flat-percent fallback stop was used. The row goes through
+    db.log_activity_direct (its own connection, never the shared pool). Dedup is a Redis SET NX marker that expires an
+    hour after ET midnight; if that call fails the row is written anyway and
+    no other Redis call is made. After a written row the ticker is added to
+    the day's Redis set for the daily digest; after a failed write the marker
+    is deleted so a later fallback that day retries. No DB read. Never
+    raises, and nothing here touches the stop."""
+    try:
+        import sys
+        from zoneinfo import ZoneInfo
+        et_now = datetime.now(ZoneInfo("America/New_York"))
+        day = et_now.date().isoformat()
+        env = TRADING_ENV
+        marker = _ATR_FALLBACK_MARKER.format(env=env, day=day, caller=caller, ticker=ticker)
+        r, dedup = None, "unavailable"
+        try:
+            client = _atr_fallback_redis()
+            midnight = (et_now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            ttl = max(60, int((midnight - et_now).total_seconds()) + 3600)
+            if not client.set(marker, "1", nx=True, ex=ttl):
+                return      # already logged for this ticker and caller today
+            r, dedup = client, "ok"
+        except Exception as e:
+            log.debug(f"[{ticker}] ATR fallback dedup unavailable ({e}); logging anyway")
+        versions = {"code_sha": None, "env_sha": None}
+        analyst = sys.modules.get("agents.analyst")
+        if analyst is not None:
+            try:
+                versions = analyst.shadow_versions()
+            except Exception:
+                pass
+        import db
+        with _ATR_FALLBACK_PENDING_LOCK:
+            dropped, _ATR_FALLBACK_DROPPED["n"] = _ATR_FALLBACK_DROPPED["n"], 0
+        written = db.log_activity_direct(
+            "stop_atr_fallback", ticker,
+            f"ATR unavailable ({reason}): flat {fallback_pct:.0%} fallback stop ${stop:.2f}",
+            "neutral",
+            {"ticker": ticker, "caller": caller, "reason": reason, "n_bars": diag.get("n_bars"),
+             "error": diag.get("error"), "atr": atr, "stop_basis": "flat_pct_fallback",
+             "fallback_pct": fallback_pct, "stop_price": stop, "price": entry_price,
+             "bucket": bucket, "env": env, "et_date": day, "dedup": dedup,
+             "queued_behind_logger": bool(queued), "dropped_before": dropped,
+             "code_sha": versions.get("code_sha"), "env_sha": versions.get("env_sha")})
+        if not written and dropped:
+            with _ATR_FALLBACK_PENDING_LOCK:
+                _ATR_FALLBACK_DROPPED["n"] += dropped
+        if r is None:
+            return
+        try:
+            if written:
+                tkey = _ATR_FALLBACK_TICKERS.format(env=env, day=day)
+                r.pipeline(transaction=False).sadd(tkey, ticker).expire(
+                    tkey, _ATR_FALLBACK_TICKERS_TTL_S).execute()
+            else:
+                r.delete(marker)
+        except Exception as e:
+            log.debug(f"[{ticker}] ATR fallback marker/set update failed: {e}")
+    except Exception as e:
+        log.debug(f"[{ticker}] stop_atr_fallback log failed: {e}")
+
+
+def _run_atr_fallback_log(*args) -> None:
+    """Thread body: the logger, then the fallbacks queued while it ran, then
+    release the slot taken by _queue_atr_fallback_log. A fallback queued
+    just after the last check is picked up by retaking the slot; if another
+    logger already holds it, that one drains it."""
+    try:
+        _log_atr_fallback(*args)
+    finally:
+        _drain_atr_fallback_and_release()
+
+
+def _drain_atr_fallback_and_release() -> None:
+    """Thread body for a holder of the logger slot: log the queued
+    fallbacks, release the slot, and retake it if more were queued in the
+    meantime (if another thread took it, that one drains them)."""
+    while True:
+        try:
+            _drain_atr_fallback_pending()
+        finally:
+            _ATR_FALLBACK_SEM.release()
+        with _ATR_FALLBACK_PENDING_LOCK:
+            if not _ATR_FALLBACK_PENDING:
+                return
+        if not _ATR_FALLBACK_SEM.acquire(blocking=False):
+            return
+
+
+def _drain_atr_fallback_pending() -> None:
+    """Log each queued fallback in turn, on the logger thread. Never raises."""
+    while True:
+        with _ATR_FALLBACK_PENDING_LOCK:
+            if not _ATR_FALLBACK_PENDING:
+                return
+            args = _ATR_FALLBACK_PENDING.pop(0)
+        try:
+            _log_atr_fallback(*args, queued=True)
+        except Exception as e:
+            log.debug(f"stop_atr_fallback queued log failed: {e}")
+
+
+def _queue_atr_fallback_log(ticker: str, entry_price, bucket, stop, fallback_pct, atr,
+                            caller: str = "other") -> None:
+    """calculate_stop's side: read the thread-local diagnostics, then hand
+    every Redis and DB call to a daemon thread. Only one logger thread runs
+    at a time; a fallback while one runs is queued for that thread (up to
+    _ATR_FALLBACK_PENDING_MAX, then dropped and counted). Never raises."""
+    try:
+        if not _ATR_FALLBACK_SEM.acquire(blocking=False):
+            caller = caller if caller in _ATR_FALLBACK_CALLERS else "other"
+            reason, diag = _atr_fallback_reason(ticker, atr)
+            with _ATR_FALLBACK_PENDING_LOCK:
+                queued = len(_ATR_FALLBACK_PENDING) < _ATR_FALLBACK_PENDING_MAX
+                if queued:
+                    _ATR_FALLBACK_PENDING.append(
+                        (ticker, entry_price, bucket, stop, fallback_pct, atr, reason, diag, caller))
+                else:
+                    _ATR_FALLBACK_DROPPED["n"] += 1
+            if not queued:
+                log.debug(f"[{ticker}] stop_atr_fallback log dropped: the logger queue is full")
+            # The running logger may have finished its last queue check
+            # between our failed acquire and the append: if the slot is free
+            # now, drain here, or the item waits for the next fallback.
+            if _ATR_FALLBACK_SEM.acquire(blocking=False):
+                try:
+                    _spawn(_drain_atr_fallback_and_release, f"atr-fallback-log-{ticker}")
+                except Exception as e:
+                    log.debug(f"[{ticker}] stop_atr_fallback drain not started: {e}")
+                    _ATR_FALLBACK_SEM.release()
+            return
+    except Exception as e:
+        log.debug(f"[{ticker}] stop_atr_fallback log not started: {e}")
+        return
+    try:
+        caller = caller if caller in _ATR_FALLBACK_CALLERS else "other"
+        reason, diag = _atr_fallback_reason(ticker, atr)
+        _spawn(_run_atr_fallback_log, f"atr-fallback-log-{ticker}",
+               (ticker, entry_price, bucket, stop, fallback_pct, atr, reason, diag, caller))
+    except Exception as e:
+        log.debug(f"[{ticker}] stop_atr_fallback log not started: {e}")
+        try:
+            _ATR_FALLBACK_SEM.release()
+        except Exception:
+            pass
+
+
+def atr_fallback_tickers_today(now=None) -> list[str] | None:
+    """Sorted tickers that had a logged ATR fallback stop on today's ET date,
+    from the Redis set _log_atr_fallback keeps; None if Redis can't be read.
+    For the daily digest only."""
+    try:
+        from zoneinfo import ZoneInfo
+        now = now or datetime.now(timezone.utc)
+        day = now.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+        raw = _atr_fallback_redis().smembers(_ATR_FALLBACK_TICKERS.format(env=TRADING_ENV, day=day))
+        return sorted(k.decode() if isinstance(k, bytes) else str(k) for k in raw)
+    except Exception as e:
+        log.debug(f"atr_fallback_tickers_today unavailable: {e}")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +406,334 @@ def _conviction_band(conviction: int) -> int:
         return 5
     else:
         return 3
+
+
+def _read_resting_stop_floor(ticker: str, new_level: float, what: str,
+                             floor_only: bool = False) -> tuple[bool, float | None]:
+    """Body of RiskManager._resting_stop_floor (see there), module level so
+    execution.py's ADD path can use it without a RiskManager.
+
+    floor_only=True is for the paths that must replace the stop anyway (ADD,
+    breakeven, profit-target partial): the caller raises its level to the
+    highest resting stop instead of skipping. Then ok is False only when the
+    read failed or a price was unreadable, and the alert says the change went
+    ahead without the floor. A lower level is not alerted: with a native
+    TRAIL the record is expected to lag the broker's trigger."""
+    import tasks
+
+    def alert(kind: str, body: str) -> None:
+        # Throttled per ticker and kind, so a ticker skipped run after
+        # run is never skipped in silence, nor alerted every run.
+        try:
+            if tasks._reconcile_alert_due(f"stop_no_loosen_{kind}_{ticker}"):
+                import alerts
+                head = "STOP FLOOR UNREAD" if floor_only else "STOP CHANGE SKIPPED"
+                alerts._send(f"⚠️ {head} — <b>{ticker}</b>\n{body}")
+        except Exception as e:
+            log.warning(f"[{ticker}] no-loosen alert failed: {e}")
+
+    try:
+        resting = tasks._resting_sell_stops(ticker)
+    except Exception as e:
+        if floor_only:
+            at = f" at ${float(new_level):.2f}" if new_level else ""
+            log.warning(f"[{ticker}] {what}: could not read the resting stops ({e}); going ahead"
+                        f"{at} without the no-loosen floor")
+            alert("floor_read", f"{what} went ahead{at}: the broker's resting stops could not "
+                                f"be read, so its stop may sit below a resting TRAIL it "
+                                f"replaced. Check the stop in TWS.")
+            return False, None
+        log.warning(f"[{ticker}] {what} skipped: could not read the resting stops ({e}); "
+                    f"nothing cancelled")
+        alert("read", f"{what} to ${float(new_level):.2f} was skipped: the broker's resting "
+                      f"stops could not be read, so nothing was cancelled. It retries next run.")
+        return False, None
+    prices = [o.get("stop_price") for o in resting]
+    if any(p is None for p in prices):
+        if floor_only:
+            at = f" at ${float(new_level):.2f}" if new_level else ""
+            log.warning(f"[{ticker}] {what}: a resting stop has no readable price; going ahead"
+                        f"{at} without the no-loosen floor")
+            alert("floor_price", f"{what} went ahead{at}: a resting stop has no readable price, "
+                                 f"so its stop may sit below a resting TRAIL it replaced. Check "
+                                 f"the stop in TWS.")
+            return False, None
+        log.warning(f"[{ticker}] {what} skipped: a resting stop has no readable price; "
+                    f"nothing cancelled")
+        alert("price", f"{what} to ${float(new_level):.2f} was skipped: a resting stop has no "
+                       f"readable price, so nothing was cancelled. Check the stops in TWS.")
+        return False, None
+    highest = max((float(p) for p in prices), default=None)
+    if floor_only:
+        return True, highest
+    # Compared on the tick the broker would place it at (rounded up), so a
+    # same-cent level isn't read as lower. The placed value is unchanged.
+    try:
+        import ibkr
+        on_tick = float(ibkr.round_sell_stop_up_to_tick(new_level))
+    except Exception:
+        on_tick = float(new_level)
+    if highest is not None and on_tick < highest - 1e-6:
+        log.warning(f"[{ticker}] {what} skipped: ${float(new_level):.2f} would replace a "
+                    f"resting stop at ${highest:.2f} (the record is lower than the broker); "
+                    f"resting stops kept")
+        alert("lower", f"{what} to ${float(new_level):.2f} would have replaced a resting stop at "
+                       f"${highest:.2f}, so nothing was changed. The recorded stop is lower "
+                       f"than the broker's; check the stops in TWS.")
+        return False, highest
+    return True, highest
+
+
+def _floor_at_resting_stop(ticker: str, level: float, what: str,
+                           market_price: float | None = None) -> tuple[float, float | None]:
+    """For a cancel-all-and-replace that must go ahead (ADD, breakeven,
+    profit-target partial): read the working SELL stops BEFORE the cancel
+    and raise the replacement to the highest of them, so a native TRAIL whose
+    trigger sits above the DB record is never loosened.
+
+    Returns (level to place, floor), floor being the highest resting stop
+    when it is usable (None otherwise), for the caller's restore paths. A
+    failed read returns the level unchanged (logged and alerted by
+    _read_resting_stop_floor): protection is never blocked by it. A resting
+    price at or above market_price is not used, since a SELL stop there
+    fills at once."""
+    level = float(level)
+    try:
+        _, highest = _read_resting_stop_floor(ticker, level, what, floor_only=True)
+    except Exception as e:   # never block the replacement on the floor read
+        log.warning(f"[{ticker}] {what}: no-loosen floor read crashed ({e}); placing at ${level:.2f}")
+        return level, None
+    if highest is None:
+        return level, None
+    mp = _plausible_price(market_price)
+    if mp is not None and highest >= mp:
+        log.warning(f"[{ticker}] {what}: resting stop ${highest:.2f} is at/above the price "
+                    f"${mp:.2f}; not used as the floor")
+        return level, None
+    return _floored_level(ticker, level, highest, None, what), highest
+
+
+def _plausible_price(price) -> float | None:
+    """A market price usable for the floor check, or None: missing, NaN,
+    non-positive and absurd (> 1e9) values count as no price."""
+    try:
+        mp = float(price) if price is not None else None
+    except (TypeError, ValueError):
+        return None
+    if mp is None or not 0 < mp <= 1e9:   # NaN fails both comparisons
+        return None
+    return mp
+
+
+def _floored_level(ticker: str, level: float, floor: float | None,
+                   market_price: float | None, what: str) -> float:
+    """level raised to floor (a resting stop read before the cancel), unless
+    the floor is missing, not higher, or at/above a plausible market price
+    (a SELL stop there fills at once)."""
+    level = float(level)
+    if floor is None or float(floor) <= level + 1e-9:
+        return level
+    mp = _plausible_price(market_price)
+    if mp is not None and float(floor) >= mp:
+        log.warning(f"[{ticker}] {what}: resting stop ${float(floor):.2f} is at/above the price "
+                    f"${mp:.2f}; placing at ${level:.2f}")
+        return level
+    log.info(f"[{ticker}] {what}: ${level:.2f} raised to the resting stop ${float(floor):.2f} "
+             f"(the record is below the broker's)")
+    return float(floor)
+
+
+# Profit targets this process sold but could not mark taken (the mark's pool
+# checkout raised): ticker -> {"opened_at", "new_stop", "held_after",
+# "entry_price"}. check_profit_targets skips them, so a DB failure can't lead
+# to a second partial sale in this process, and retries the mark each run.
+# In memory only: a restart or another worker process doesn't see it.
+_PT_TAKEN_UNRECORDED: dict[str, dict] = {}
+
+
+def _mark_profit_target_taken_guarded(ticker: str, new_stop: float, opened_at,
+                                      held_after: float | None = None,
+                                      entry_price: float | None = None,
+                                      held_before: float | None = None) -> bool:
+    """db.mark_profit_target_taken after a partial sale went through. Never
+    raises: a failure is logged, alerted and kept in _PT_TAKEN_UNRECORDED
+    with the shares held after the sale and the entry price, so an ADD
+    before the mark lands re-arms the target instead of being marked taken
+    (_profit_target_unrecorded). True when the mark was written."""
+    import db
+    try:
+        db.mark_profit_target_taken(ticker, new_stop)
+    except Exception as e:
+        first = ticker not in _PT_TAKEN_UNRECORDED
+        _PT_TAKEN_UNRECORDED[ticker] = {"opened_at": opened_at, "new_stop": new_stop,
+                                        "held_after": held_after, "entry_price": entry_price,
+                                        "held_before": held_before}
+        log.error(f"[{ticker}] profit target sold but not marked taken ({type(e).__name__}: {e}); "
+                  f"held in memory so this process doesn't sell it again, retried each run")
+        if first:
+            try:
+                import alerts
+                alerts._send(
+                    f"⚠️ PROFIT TARGET NOT RECORDED — {ticker}\n"
+                    f"The partial sale went through, but the DB could not mark the target taken "
+                    f"({type(e).__name__}). This process won't sell it again and retries the "
+                    f"mark each run; a restart before the mark lands could sell it again. "
+                    f"Check position_stops.profit_target_taken if this repeats."
+                )
+            except Exception:
+                pass
+        return False
+    _PT_TAKEN_UNRECORDED.pop(ticker, None)
+    return True
+
+
+def _held_after_sale(qty: float, order_result: dict, sell_qty: float) -> float:
+    """Shares held right after a profit-target sale, for the marker."""
+    try:
+        sold = float(order_result.get("filled_qty") or sell_qty)
+    except (TypeError, ValueError):
+        sold = float(sell_qty)
+    return round(max(float(qty) - sold, 0.0), 4)
+
+
+def _profit_target_unrecorded(ticker: str, stop_record: dict, pos=None) -> bool:
+    """True when this process already sold this position's target but the
+    mark is missing: the caller skips the ticker. The mark is retried here.
+
+    The entry is dropped (and the target evaluated as usual) for a different
+    position (another opened_at), or when the position changed since the
+    sale: more shares held than right after it, or another entry price. An
+    ADD in between re-arms the target rather than having the retry mark the
+    new shares' target taken."""
+    pending = _PT_TAKEN_UNRECORDED.get(ticker)
+    if pending is None:
+        return False
+    changed = pending.get("opened_at") != stop_record.get("opened_at")
+    held_after, entry = pending.get("held_after"), pending.get("entry_price")
+    held_before = pending.get("held_before")
+    try:
+        if not changed and held_after is not None and pos is not None:
+            held = abs(float(pos.qty))
+            # Exactly the pre-sale quantity reads as a position cache that
+            # hasn't caught up with the sale (it lags fills), not an ADD:
+            # re-selling would be the double sale this marker prevents.
+            lagging = held_before is not None and abs(held - float(held_before)) <= 1e-6
+            changed = held > float(held_after) + 1e-6 and not lagging
+        rec_entry = stop_record.get("entry_price")
+        if not changed and entry is not None and rec_entry is not None:
+            changed = abs(float(rec_entry) - float(entry)) > 1e-6
+    except (TypeError, ValueError):
+        changed = True   # can't tell: evaluate the target as usual
+    if changed:
+        log.warning(f"[{ticker}] position changed since the unrecorded profit-target sale; "
+                    f"dropping the in-memory marker, target re-armed")
+        _PT_TAKEN_UNRECORDED.pop(ticker, None)
+        return False
+    if stop_record.get("profit_target_taken"):
+        _PT_TAKEN_UNRECORDED.pop(ticker, None)
+        return True
+    _mark_profit_target_taken_guarded(ticker, pending["new_stop"], pending["opened_at"],
+                                      held_after, entry, held_before)
+    return True
+
+
+# Profit-target sales held because a stop the cancel didn't take was still
+# working: ticker -> identities of those stops (not PendingCancel), see
+# _stop_identity. While any
+# of them still works the sale is skipped, so the restored stop isn't
+# cancelled and put back every run. In memory: a restart clears it, and the
+# next run then holds once more and records them again.
+_PT_HELD_BY_WORKING_STOP: dict[str, set] = {}
+
+
+def _working_non_cancelling_stops(ticker: str) -> list[dict] | None:
+    """Working SELL stops for ticker other than ones being cancelled, or
+    None if the read fails."""
+    import execution
+    import tasks
+    try:
+        stops = tasks._resting_sell_stops(ticker)
+    except Exception as e:
+        log.warning(f"[{ticker}] could not read the working stops: {e}")
+        return None
+    return [o for o in stops if o.get("status") not in execution._CANCELLING_STATUSES]
+
+
+def _stop_identity(order: dict) -> tuple:
+    """A stop's identity across clients: its permId, or its orderId when the
+    permId is missing or 0. orderIds repeat across clientIds, and a manual
+    TWS order can show orderId 0, so the orderId is only the fallback."""
+    perm = order.get("perm_id")
+    try:
+        perm = int(perm) if perm is not None else 0
+    except (TypeError, ValueError):
+        perm = 0
+    if perm:
+        return ("perm", perm)
+    return ("order", order.get("order_id"))
+
+
+def _identity_text(ids) -> str:
+    return ", ".join(sorted(f"{kind} {val}" for kind, val in ids))
+
+
+def _pt_skip_reminder(ticker: str, detail: str) -> None:
+    """Throttled reminder (about every RECONCILE_ALERT_THROTTLE_HOURS) that a
+    profit target is still being skipped. If the throttle can't be read, no
+    reminder: a DB outage must not send one every run."""
+    try:
+        import tasks
+        if not tasks._reconcile_alert_due(f"pt_sale_skipped_{ticker}"):
+            return
+    except Exception as e:
+        log.warning(f"[{ticker}] profit-target skip reminder throttle unreadable: {e}")
+        return
+    try:
+        import alerts
+        alerts._send(
+            f"⏸️ PROFIT TARGET STILL SKIPPED — {ticker}\n"
+            f"The partial sale stays held: {detail}. Selling on top of it could short the "
+            f"account. The target re-arms on its own once that stop is gone; cancel it in TWS "
+            f"if it shouldn't be there.")
+    except Exception as e:
+        log.warning(f"[{ticker}] profit-target skip reminder failed: {e}")
+
+
+def _note_pt_hold_working_stops(ticker: str) -> None:
+    """Remember the non-cancelling stops a held profit-target sale found."""
+    stops = _working_non_cancelling_stops(ticker)
+    ids = {_stop_identity(o) for o in (stops or [])}
+    if ids:
+        _PT_HELD_BY_WORKING_STOP[ticker] = ids
+        log.warning(f"[{ticker}] profit-target sale skipped while stop(s) {_identity_text(ids)} "
+                    f"still work")
+
+
+def _pt_hold_still_blocked(ticker: str) -> bool:
+    """True while a stop that held this ticker's last profit-target sale
+    still works: the caller skips the sale. Cleared once none of them works
+    (the sale then runs and re-checks after its own cancel). An unreadable
+    read keeps the skip: no sale is the safe side."""
+    ids = _PT_HELD_BY_WORKING_STOP.get(ticker)
+    if not ids:
+        return False
+    stops = _working_non_cancelling_stops(ticker)
+    if stops is None:
+        log.info(f"[{ticker}] Profit-target sale skipped: stops unreadable, an earlier hold "
+                 f"found a working stop")
+        _pt_skip_reminder(ticker, "the broker's stops could not be read, and an earlier hold "
+                                  "found a stop the cancel couldn't take")
+        return True
+    still = ids & {_stop_identity(o) for o in stops}
+    if still:
+        log.info(f"[{ticker}] Profit-target sale skipped: stop(s) {_identity_text(still)} "
+                 f"that held it still work")
+        _pt_skip_reminder(ticker, f"stop(s) {_identity_text(still)} that the cancel couldn't "
+                                  f"take still work")
+        return True
+    _PT_HELD_BY_WORKING_STOP.pop(ticker, None)
+    log.info(f"[{ticker}] the stop that held the profit-target sale is gone; target re-armed")
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -324,9 +882,11 @@ class RiskManager:
         bucket: str,
         regime: str,
         price: float,
+        log_fallback: bool = True,
     ) -> dict:
         """
         Calculate full sizing parameters for a new position.
+        log_fallback is passed to calculate_stop (False for simulations).
 
         Returns a dict with:
             position_size_pct    — target allocation as % of portfolio
@@ -538,7 +1098,9 @@ class RiskManager:
                               f"of {ticker} at ${price:,.2f} — skipping"]}
 
         # Stop loss
-        stop_price, stop_method = self.calculate_stop(ticker, price, bucket)
+        stop_price, stop_method = self.calculate_stop(ticker, price, bucket,
+                                                      log_fallback=log_fallback,
+                                                      log_caller="size_position")
 
         # Fixed dollar-risk sizing cap (2026-09-11, user request, Minervini
         # SEPA methodology): shares_initial above came purely from the
@@ -798,14 +1360,27 @@ class RiskManager:
     # ------------------------------------------------------------------
 
     def get_atr(self, ticker: str, days: int = 14) -> float | None:
+        try:
+            _ATR_DIAG.error = None
+        except Exception:
+            pass
         bars = _fetch_bars_for_atr(ticker, days=days)
+        try:
+            _ATR_DIAG.last = {"ticker": ticker, "n_bars": len(bars),
+                              "error": getattr(_ATR_DIAG, "error", None)}
+        except Exception:
+            pass
         return _compute_atr(bars)
 
     def calculate_stop(
-        self, ticker: str, entry_price: float, bucket: str
+        self, ticker: str, entry_price: float, bucket: str, log_fallback: bool = True,
+        log_caller: str = "other",
     ) -> tuple[float | None, str]:
         """
-        Returns (stop_price, method_description).
+        Returns (stop_price, method_description). log_fallback=False skips the
+        log-only stop_atr_fallback row (simulations and dry runs); log_caller
+        (size_position, post_fill, manual, other) is recorded on that row.
+        The stop is the same either way.
         """
         # Swing-trading cutover, Phase 4/5 (2026-10-11): when SETUP_GATES_
         # ENABLED and a live gate classification with a real stop_price
@@ -829,10 +1404,20 @@ class RiskManager:
             stop = round(entry_price * (1 - MOONSHOT_MAX_LOSS_PCT), 2)
             return stop, f"Moonshot hard stop: {MOONSHOT_MAX_LOSS_PCT:.0%} max loss from entry"
 
+        try:
+            _ATR_DIAG.last = None
+        except Exception:
+            pass
         atr = self.get_atr(ticker)
         if atr is None or atr == 0:
             fallback_pct = 0.08 if bucket == "Compounder" else 0.05
             stop = round(entry_price * (1 - fallback_pct), 2)
+            if log_fallback:
+                try:
+                    _queue_atr_fallback_log(ticker, entry_price, bucket, stop, fallback_pct, atr,
+                                            log_caller)
+                except Exception:
+                    pass
             log.warning(
                 f"[{ticker}] ATR unavailable — using flat {fallback_pct:.0%} fallback stop ${stop:.2f}. "
                 "Stop accuracy may be poor; verify manually."
@@ -1218,7 +1803,8 @@ class RiskManager:
 
         try:
             sim = RiskManager(_View(), start_value=self.start_value)
-            sizing = sim.size_position(ticker, conviction, bucket, regime, price)
+            sizing = sim.size_position(ticker, conviction, bucket, regime, price,
+                                       log_fallback=False)
             # Same concentration cap crew applies after sizing (professor M36):
             # a swap whose buy the caps cut to 0 must not sell the holding.
             return sim.shares_after_concentration(ticker, sizing, bucket)
@@ -1285,6 +1871,19 @@ class RiskManager:
             if abs(live - float(qty)) > 1e-6:
                 return f"position changed {qty} -> {live}"
         return None
+
+    def _resting_stop_floor(self, ticker: str, new_level: float,
+                            what: str) -> tuple[bool, float | None]:
+        """Read the working SELL stops for ticker BEFORE a cancel-all and
+        replace. Returns (ok, highest resting stop price or None).
+
+        ok is False when the replacement at new_level would sit below the
+        highest resting stop (the record can be lower than what rests: a
+        manual TWS change, an unrecorded older tranche, adoption), when the
+        read fails, or when a resting stop's price can't be read. The caller
+        then changes nothing, so the resting stops stay. A TRAIL counts at
+        its current trigger price (ibkr.get_open_orders' trailStopPrice)."""
+        return _read_resting_stop_floor(ticker, new_level, what)
 
     def check_trailing_stops(self) -> list[dict]:
         """
@@ -1397,12 +1996,27 @@ class RiskManager:
                         with ticker_lock(ticker):
                           changed = self._changed_while_waiting(
                               ticker, qty=round(abs(float(pos.qty)), 4), stop_px=stop_px)
+                          # Never cancel a higher resting stop for a lower
+                          # trail start; read before the cancel (no-loosen).
+                          floor_ok, resting_high = (False, None) if changed else \
+                              self._resting_stop_floor(ticker, new_stop, "TRAIL conversion")
                           if changed:
                             log.info(f"[{ticker}] TRAIL conversion skipped this run: {changed}")
+                          elif not floor_ok:
+                            pass   # logged (and alerted) by _resting_stop_floor
                           else:
+                            # The fallback restore never goes below what was
+                            # cancelled. Equal to the record when consistent.
+                            restore_px = float(stop_px) if resting_high is None or \
+                                resting_high <= float(stop_px) else resting_high
                             cancelled = False
+                            # Set once the broker accepts the TRAIL: from then
+                            # on no fallback below may place another stop, or
+                            # two full-size stops rest (professor M227).
+                            placed = False
                             try:
                                 import tasks
+                                import execution
                                 qty = round(abs(float(pos.qty)), 4)
                                 tasks.manage_cancel_stop_orders_for(ticker)
                                 cancelled = True
@@ -1410,12 +2024,21 @@ class RiskManager:
                                     result = tasks.manage_place_trailing_stop(ticker, qty, trail_amount=trail_amount)
                                 else:
                                     result = tasks.manage_place_trailing_stop(ticker, qty, trail_percent=trail_pct)
-                                db.set_stop_broker_order_id(ticker, result["order_id"])
-                                db.update_trailing_stop(ticker, new_stop, current)
-                                db.set_trail_params(ticker, trail_amount, trail_pct)
+                                placed = True
+                                execution._record_placed_stop(ticker, "TRAIL conversion", result.get("order_id"), [
+                                    ("order id", lambda: db.set_stop_broker_order_id(ticker, result["order_id"])),
+                                    ("trailing stop", lambda: db.update_trailing_stop(ticker, new_stop, current)),
+                                    ("trail params", lambda: db.set_trail_params(ticker, trail_amount, trail_pct)),
+                                ])
                                 log.info(f"[{ticker}] Converted to native TRAIL stop ({method_label}), "
-                                        f"orderId={result['order_id']}")
+                                        f"orderId={result.get('order_id')}")
                             except Exception as e:
+                                if placed:
+                                    # Unreachable unless the log line itself
+                                    # raised: the TRAIL rests, so no fallback.
+                                    log.error(f"[{ticker}] Error after the TRAIL was placed ({e}); "
+                                              f"no fallback stop placed")
+                                    continue
                                 log.error(f"[{ticker}] Native TRAIL conversion failed — falling back to "
                                          f"one-shot cancel/replace: {e}")
                                 prev_high = stop_record.get("trailing_high") or entry
@@ -1444,11 +2067,41 @@ class RiskManager:
                                     # (professor C16, 2026-10-28).
                                     try:
                                         import tasks
+                                        import execution
                                         qty = round(abs(float(pos.qty)), 4)
-                                        result = tasks.manage_stop_place(ticker, qty, float(stop_px))
-                                        db.set_stop_broker_order_id(ticker, result["order_id"])
-                                        log.info(f"[{ticker}] Fixed stop restored @ ${float(stop_px):.2f} "
-                                                 f"after the failed TRAIL conversion")
+                                        # Sized to what no working stop covers:
+                                        # the failed call may have placed the
+                                        # TRAIL anyway (M227 follow-up).
+                                        outcome, result = execution._restore_sized_stop(
+                                            ticker, qty, restore_px, "TRAIL conversion",
+                                            market_price=current)
+                                        if outcome == "placed":
+                                            # The restore rests: a write failure
+                                            # must not reach the queue below (M227).
+                                            execution._record_placed_stop(
+                                                ticker, "Stop restore after a failed TRAIL",
+                                                result.get("order_id"),
+                                                [("order id", lambda: db.set_stop_broker_order_id(
+                                                    ticker, result["order_id"]))])
+                                            log.info(f"[{ticker}] Fixed stop restored @ ${restore_px:.2f} "
+                                                     f"after the failed TRAIL conversion")
+                                        if outcome == "placed" and restore_px > float(stop_px):
+                                            # Restored at a higher cancelled
+                                            # stop: raise the record to match
+                                            # so the next run works from it.
+                                            # The write logs its own SQL errors,
+                                            # but its pool checkout (_get_conn)
+                                            # sits outside that try: a raise here
+                                            # must not reach the restore-failed
+                                            # path below while the stop rests.
+                                            try:
+                                                db.update_trailing_stop(
+                                                    ticker, restore_px,
+                                                    stop_record.get("trailing_high"),
+                                                    native_trail=False)
+                                            except Exception as e4:
+                                                log.warning(f"[{ticker}] Stop restored @ ${restore_px:.2f} "
+                                                            f"but the record update failed: {e4}")
                                     except Exception as e2:
                                         log.error(f"[{ticker}] Stop restore after TRAIL failure failed: {e2}")
                                         try:
@@ -1461,21 +2114,28 @@ class RiskManager:
                                             "ticker":        ticker,
                                             "action":        "FIX_STOP",
                                             "current_price": current,
-                                            "stop_price":    stop_px,
-                                            "reason":        f"TRAIL conversion failed and the ${float(stop_px):.2f} "
+                                            "stop_price":    stop_px if restore_px == float(stop_px) else restore_px,
+                                            "reason":        f"TRAIL conversion failed and the ${restore_px:.2f} "
                                                              f"stop could not be restored — place it manually in TWS",
                                         })
                                         tasks.open_manual_action(
-                                            ticker, f"restore the stop @ ${float(stop_px):.2f} after a "
+                                            ticker, f"restore the stop @ ${restore_px:.2f} after a "
                                                     f"failed TRAIL conversion")
                                 elif current > prev_high and new_stop > stop_px:
                                     try:
                                         import tasks
+                                        import execution
                                         tasks.manage_cancel_stop_orders_for(ticker)
                                         qty = round(abs(float(pos.qty)), 4)
-                                        result = tasks.manage_stop_place(ticker, qty, new_stop)
-                                        db.set_stop_broker_order_id(ticker, result["order_id"])
-                                        db.update_trailing_stop(ticker, new_stop, current, native_trail=False)
+                                        result = tasks.manage_stop_place(ticker, qty, new_stop,
+                                                                         market_price=current)
+                                        execution._record_placed_stop(
+                                            ticker, "Fallback stop move", result.get("order_id"), [
+                                                ("order id", lambda: db.set_stop_broker_order_id(
+                                                    ticker, result["order_id"])),
+                                                ("trailing stop", lambda: db.update_trailing_stop(
+                                                    ticker, new_stop, current, native_trail=False)),
+                                            ])
                                         log.info(f"[{ticker}] Broker stop moved to ${new_stop:.2f} (fallback path)")
                                     except Exception as e2:
                                         log.error(f"[{ticker}] Fallback stop move also failed: {e2}")
@@ -1514,6 +2174,44 @@ class RiskManager:
 
         return alerts
 
+    def _restore_after_failed_ratchet(self, ticker: str, qty: float, stop_px: float,
+                                      resting_high: float | None, current: float,
+                                      err: Exception) -> None:
+        """The ratchet's cancel went through and its placement failed: put
+        the previous stop back (never below what was cancelled), sized to the
+        shares no working stop covers, or queue it for the reconcile retry.
+        A placement with no reply may be resting: no restore then."""
+        import execution
+        import db
+        import tasks
+        if isinstance(err, tasks.OrdersCallUnknown):
+            execution._alert_stop_unknown(ticker, qty, float(stop_px))
+            return
+        restore_px = float(stop_px) if resting_high is None or resting_high <= float(stop_px) \
+            else float(resting_high)
+        try:
+            outcome, result = execution._restore_sized_stop(
+                ticker, qty, restore_px, "Ladder ratchet", market_price=current)
+        except Exception as e2:
+            log.error(f"[{ticker}] Stop restore after the failed ratchet failed: {e2}")
+            try:
+                tasks._queue_reprotect(ticker, {"intent": "RESTORE"}, None)
+            except Exception as e3:
+                log.error(f"[{ticker}] Could not queue the stop restore: {e3}")
+            try:
+                tasks.open_manual_action(
+                    ticker, f"restore the stop @ ${restore_px:.2f} after a failed ladder ratchet")
+            except Exception as e4:
+                log.error(f"[{ticker}] could not open the manual action: {e4}")
+            return
+        if outcome == "placed":
+            writes = [("order id", lambda: db.set_stop_broker_order_id(ticker, result["order_id"]))]
+            if restore_px > float(stop_px):
+                writes.append(("record stop", lambda: db.update_trailing_stop(
+                    ticker, restore_px, current, native_trail=False)))
+            execution._record_placed_stop(ticker, "Stop restore after a failed ladder ratchet",
+                                          result.get("order_id"), writes)
+
     @locked_by_ticker(lambda self, ticker, *a, **k: ticker)
     def _ratchet_ladder_stop(self, ticker: str, pos: object, current: float,
                               stop_px: float, alerts: list[dict]) -> None:
@@ -1545,15 +2243,20 @@ class RiskManager:
         new_stop = max(candidates)
         if new_stop <= stop_px:
             return  # not an improvement -- never move down
+        # Nor below a higher stop resting at the broker; read before the
+        # cancel, and a failed read changes nothing (no-loosen).
+        floor_ok, resting_high = self._resting_stop_floor(ticker, new_stop, "Ladder ratchet")
+        if not floor_ok:
+            return
 
+        import tasks
+        import execution
+        qty = round(abs(float(pos.qty)), 4)
+        cancelled = False
         try:
-            import tasks
-            qty = round(abs(float(pos.qty)), 4)
             tasks.manage_cancel_stop_orders_for(ticker)
-            result = tasks.manage_stop_place(ticker, qty, new_stop)
-            db.set_stop_broker_order_id(ticker, result["order_id"])
-            db.update_trailing_stop(ticker, new_stop, current, native_trail=False)
-            log.info(f"[{ticker}] Ladder trailing stop ratcheted ${stop_px:.2f} -> ${new_stop:.2f}")
+            cancelled = True
+            result = tasks.manage_stop_place(ticker, qty, new_stop, market_price=current)
         except Exception as e:
             log.error(f"[{ticker}] Ladder trailing stop ratchet FAILED: {e}")
             alerts.append({
@@ -1564,6 +2267,49 @@ class RiskManager:
                 "reason":        f"Ladder trailing stop should be ${new_stop:.2f} but broker "
                                  f"order update FAILED — fix manually in TWS",
             })
+            if cancelled:
+                self._restore_after_failed_ratchet(ticker, qty, stop_px, resting_high, current, e)
+            return
+        # Placed: a record write failure is logged and alerted, not read as
+        # a failed ratchet (professor M227).
+        execution._record_placed_stop(
+            ticker, "Ladder ratchet", result.get("order_id"), [
+                ("order id", lambda: db.set_stop_broker_order_id(ticker, result["order_id"])),
+                ("trailing stop", lambda: db.update_trailing_stop(
+                    ticker, new_stop, current, native_trail=False)),
+            ])
+        log.info(f"[{ticker}] Ladder trailing stop ratcheted ${stop_px:.2f} -> ${new_stop:.2f}")
+
+    def _restore_previous_stop(self, ticker: str, held: float, old_stop: float,
+                               floor: float | None, market_price: float | None, what: str,
+                               trailing_high) -> str:
+        """After a failed breakeven move or profit-target sale (stops already
+        cancelled): put the old stop back at max(record, resting floor), sized
+        to the shares no working stop covers. A restore above the record
+        raises the record to match. Returns the outcome: "placed", "covered"
+        (nothing uncovered), "unread" (coverage unreadable: nothing placed,
+        queued with an alert by _restore_sized_stop) or "failed" (the
+        placement raised, for the caller's alert)."""
+        import db
+        import execution
+        restore_px = max(float(old_stop), float(floor)) if floor is not None else float(old_stop)
+        try:
+            outcome, result = execution._restore_sized_stop(
+                ticker, round(held, 4), restore_px, f"Stop restore after a failed {what}",
+                market_price=market_price)
+        except Exception as e:
+            log.error(f"[{ticker}] Could not restore stop after a failed {what}: {e}")
+            return "failed"
+        if outcome == "placed":
+            writes = [("order id", lambda: db.set_stop_broker_order_id(ticker, result["order_id"]))]
+            if restore_px > float(old_stop):
+                # Restored above the record (a resting TRAIL): the next run
+                # works from what rests.
+                writes.append(("record stop", lambda: db.update_trailing_stop(
+                    ticker, restore_px, trailing_high, native_trail=False)))
+            execution._record_placed_stop(ticker, f"Stop restore after a failed {what}",
+                                          result.get("order_id"), writes)
+        return outcome
 
     @locked_by_ticker(lambda self, ticker, *a, **k: ticker, on_busy=False)
     def _breakeven_without_sale(self, ticker: str, qty: float, new_stop: float,
@@ -1578,6 +2324,7 @@ class RiskManager:
         goes back on. Returns True when the target is marked taken."""
         import alerts
         import db
+        import execution
         import tasks
 
         changed = self._changed_while_waiting(ticker, qty=qty)
@@ -1590,15 +2337,25 @@ class RiskManager:
         stop_rec = db.get_position_stop(ticker) or {}
         old_stop = stop_rec.get("stop_price")
         if old_stop is not None and float(old_stop) >= new_stop:
-            db.mark_profit_target_taken(ticker, float(old_stop))
+            try:
+                db.mark_profit_target_taken(ticker, float(old_stop))
+            except Exception as e:
+                # Nothing was sold or moved: the next run tries again.
+                log.error(f"[{ticker}] Breakeven: could not mark the target taken: {e}")
+                return False
             return True
+        # A native TRAIL's trigger can sit above the record: never replace it
+        # lower. Read before the cancel; a failed read keeps new_stop (M228).
+        new_stop, floor = _floor_at_resting_stop(ticker, new_stop, "Breakeven move",
+                                                 market_price=current_price)
         try:
             tasks.manage_cancel_stop_orders_for(ticker)
         except Exception as e:
             log.error(f"[{ticker}] Breakeven move: could not cancel broker stop: {e}")
             return False
         try:
-            result = tasks.manage_stop_place(ticker, round(qty, 4), new_stop)
+            result = tasks.manage_stop_place(ticker, round(qty, 4), new_stop,
+                                              market_price=current_price)
         except Exception as e:
             log.error(f"[{ticker}] Breakeven stop placement failed: {e}")
             restored = False
@@ -1610,12 +2367,11 @@ class RiskManager:
                              f"within ~30 min.")
                 return False
             if old_stop:
-                try:
-                    result = tasks.manage_stop_place(ticker, round(qty, 4), float(old_stop))
-                    db.set_stop_broker_order_id(ticker, result["order_id"])
-                    restored = True
-                except Exception as e2:
-                    log.error(f"[{ticker}] Could not restore stop: {e2}")
+                # Back at the highest cancelled stop, sized to what no working
+                # stop covers (the failed call may have placed its stop).
+                restored = self._restore_previous_stop(
+                    ticker, qty, float(old_stop), floor, current_price, "breakeven move",
+                    stop_rec.get("trailing_high")) != "failed"
             if not restored:
                 alerts._send(
                     f"🚨 UNPROTECTED POSITION — {ticker}\n"
@@ -1623,11 +2379,89 @@ class RiskManager:
                     f"Place a stop for {round(qty, 4)} shares manually."
                 )
             return False
-        db.set_stop_broker_order_id(ticker, result["order_id"])
-        db.mark_profit_target_taken(ticker, new_stop)
+        # Placed: a record write failure must not propagate (professor M227).
+        # If the target can't be marked taken, the next run moves the stop
+        # again (cancel, then place), so no second stop rests.
+        execution._record_placed_stop(ticker, "Breakeven move", result.get("order_id"), [
+            ("order id", lambda: db.set_stop_broker_order_id(ticker, result["order_id"])),
+            ("profit target taken", lambda: db.mark_profit_target_taken(ticker, new_stop)),
+        ])
         log.info(f"[{ticker}] Profit target hit on {qty:g} shares (too few to sell part): "
                  f"stop moved to breakeven ${new_stop:.2f}, no sale")
         return True
+
+    def _hold_profit_target_sale(self, ticker: str, qty: float, old_stop, floor: float | None,
+                                 decision_price: float | None, trailing_high,
+                                 resting: float | None) -> None:
+        """The profit-target sale is held because a stop still works (or the
+        stops can't be read) after the cancel. Nothing is sold and the target
+        is not marked taken, so the next run tries again. Protection: the old
+        stop goes back for the shares no non-cancelling stop covers
+        (_restore_previous_stop), the restore is queued for reconcile, and
+        one alert is sent."""
+        import alerts
+        import tasks
+        why = ("the resting stops could not be read" if resting is None
+               else f"stop(s) for {resting:g} shares were still working after the cancel")
+        log.error(f"[{ticker}] Profit-target sale held: {why}; nothing sold")
+        # Stops still working that aren't being cancelled (another client's,
+        # or a cancel the broker refused): read before our restore, so it
+        # isn't among them. While any of them works, the target is skipped
+        # rather than cancelling the restored stop every run.
+        if resting:
+            _note_pt_hold_working_stops(ticker)
+        outcome = "no_record"   # no previous stop to put back
+        if old_stop:
+            outcome = self._restore_previous_stop(
+                ticker, qty, float(old_stop), floor, decision_price,
+                "profit-target sale hold", trailing_high)
+        queued = False
+        try:
+            tasks._queue_reprotect(ticker, {"intent": "RESTORE"}, None)
+            queued = True
+        except Exception as e:
+            log.error(f"[{ticker}] Could not queue the stop restore: {e}")
+        try:
+            if outcome != "failed":
+                # Throttled: a stop the cancel can't take holds the sale run
+                # after run (the skip above stops most of those runs).
+                try:
+                    due = tasks._reconcile_alert_due(f"pt_sale_held_{ticker}")
+                except Exception as e:
+                    log.warning(f"[{ticker}] held-sale alert throttle unreadable ({e}); sending")
+                    due = True
+                if due:
+                    if outcome == "unread":
+                        protection = ("Protection not restored yet; queued for the reconcile "
+                                      "retry, which places it once the stops can be read")
+                    elif outcome == "no_record":
+                        protection = ("No previous stop was recorded, so none was put back"
+                                      + ("; the restore is queued for the reconcile check"
+                                         if queued else "") + ". Check the stop in TWS")
+                    elif outcome == "covered":
+                        protection = ("No stop was placed: working stops already cover the "
+                                      "position"
+                                      + (", and the restore is queued for the reconcile check"
+                                         if queued else ""))
+                    else:
+                        protection = ("Protection was put back"
+                                      + (" and the restore is queued for the reconcile check"
+                                         if queued else ""))
+                    alerts._send(
+                        f"⚠️ PROFIT-TARGET SALE HELD — {ticker}\n"
+                        f"Nothing was sold: {why}, and selling on top of a working stop could "
+                        f"short the account. {protection}. The target is retried once the "
+                        f"other stop is gone; check the stops in TWS if this repeats.")
+            else:
+                alerts._send(
+                    f"🚨 UNPROTECTED POSITION — {ticker}\n"
+                    f"The profit-target sale was held ({why}) and the stop could not be "
+                    f"restored. "
+                    + ("It is queued and retried every reconcile cycle; " if queued else "")
+                    + f"place a stop for {round(qty, 4)} shares manually if it isn't back "
+                    f"within ~15 min.")
+        except Exception:
+            pass
 
     @locked_by_ticker(lambda self, ticker, *a, **k: ticker)
     def _partial_sell_and_resize_stop(self, ticker: str, qty: float, sell_qty: float,
@@ -1644,6 +2478,7 @@ class RiskManager:
         Returns the order result, or None if the sale failed."""
         import alerts
         import db
+        import execution
         import ibkr
         import tasks
 
@@ -1659,6 +2494,8 @@ class RiskManager:
         if changed:
             log.info(f"[{ticker}] Profit-target sale skipped this run: {changed}")
             return None
+        if _pt_hold_still_blocked(ticker):
+            return None   # logged there; nothing cancelled
 
         stop_rec = db.get_position_stop(ticker) or {}
         old_stop = stop_rec.get("stop_price")
@@ -1678,10 +2515,25 @@ class RiskManager:
         # up (never wider) unless that reaches the price, so the broker
         # can't reject it (audit 2026-11-02 #9).
         new_stop = ibkr.round_sell_stop_up_to_tick(new_stop, decision_price)
+        # A native TRAIL's trigger can sit above the record: the stop for
+        # the rest never goes below it, nor does a restore. Read before the
+        # cancel; a failed read keeps new_stop (professor M228).
+        new_stop, floor = _floor_at_resting_stop(ticker, new_stop, "Profit-target stop",
+                                                 market_price=decision_price)
         try:
             tasks.manage_cancel_stop_orders_for(ticker)
         except Exception as e:
             log.error(f"[{ticker}] Profit-target: could not cancel broker stop, not selling: {e}")
+            return None
+        # The cancel can return with a stop still working (PendingCancel
+        # after its poll, or a stop another client placed). Selling on top
+        # of it, then re-placing the remainder's stop, leaves two stops that
+        # could both fill into a short: hold the sale, put protection back
+        # and queue the reprotect, as execute_approved does (A2253-1).
+        resting = execution._stops_still_resting(ticker)
+        if resting or resting is None:
+            self._hold_profit_target_sale(ticker, qty, old_stop, floor, decision_price,
+                                          stop_rec.get("trailing_high"), resting)
             return None
 
         try:
@@ -1691,15 +2543,14 @@ class RiskManager:
         except Exception as e:
             log.error(f"[{ticker}] Profit-target partial sell FAILED: {e}")
             if old_stop:
-                try:
-                    result = tasks.manage_stop_place(ticker, round(qty, 4), float(old_stop))
-                    db.set_stop_broker_order_id(ticker, result["order_id"])
-                except Exception as e2:
-                    log.error(f"[{ticker}] Could not restore stop after failed sale: {e2}")
+                restore_px = max(float(old_stop), floor) if floor is not None else float(old_stop)
+                if self._restore_previous_stop(
+                        ticker, qty, float(old_stop), floor, decision_price,
+                        "profit-target sale", stop_rec.get("trailing_high")) == "failed":
                     alerts._send(
                         f"🚨 UNPROTECTED POSITION — {ticker}\n"
                         f"Profit-target sale failed and the stop could not be restored. "
-                        f"Place stop @ ${float(old_stop):.2f} for {round(qty, 4)} shares manually."
+                        f"Place stop @ ${restore_px:.2f} for {round(qty, 4)} shares manually."
                     )
             return None
 
@@ -1756,9 +2607,8 @@ class RiskManager:
             remaining = round(qty - float(order_result.get("filled_qty") or sell_qty), 4)
         if remaining > 0:
             try:
-                result = tasks.manage_stop_place(ticker, remaining, new_stop)
-                db.set_stop_broker_order_id(ticker, result["order_id"])
-                log.info(f"[{ticker}] Stop re-placed @ ${new_stop:.2f} for remaining {remaining} shares")
+                result = tasks.manage_stop_place(ticker, remaining, new_stop,
+                                                market_price=order_result.get("fill_price") or decision_price)
             except Exception as e:
                 log.error(f"[{ticker}] Failed to re-place stop after profit-target sale: {e}")
                 alerts._send(
@@ -1766,6 +2616,12 @@ class RiskManager:
                     f"Profit-target sale filled but stop re-placement failed. "
                     f"Place stop @ ${new_stop:.2f} for {remaining} shares manually."
                 )
+            else:
+                # Placed: a record write failure is not "unprotected" (M227).
+                execution._record_placed_stop(
+                    ticker, "Stop re-place after a profit-target sale", result.get("order_id"),
+                    [("order id", lambda: db.set_stop_broker_order_id(ticker, result["order_id"]))])
+                log.info(f"[{ticker}] Stop re-placed @ ${new_stop:.2f} for remaining {remaining} shares")
         # The stop actually used (may be above breakeven).
         return {**order_result, "new_stop": new_stop}
 
@@ -1846,6 +2702,8 @@ class RiskManager:
             bucket = stop_record.get("thesis_bucket")
             if stop_record.get("profit_target_taken"):
                 continue
+            if _profit_target_unrecorded(ticker, stop_record, positions.get(ticker)):
+                continue   # sold this run or earlier, mark not written yet
 
             # Moved up from below the old bucket-table lookup (unchanged
             # computation, just earlier) so the SETUP_GATES_ENABLED branch
@@ -1868,7 +2726,8 @@ class RiskManager:
                 trade_style = _trade_style_for(ticker)
                 partial_pct = PARTIAL_SELL_PCT_BY_STYLE[trade_style]
                 self._check_profit_target_setup_gates(
-                    ticker, bucket, entry, current, gain_pct, partial_pct, trade_style, results
+                    ticker, bucket, entry, current, gain_pct, partial_pct, trade_style, results,
+                    opened_at=stop_record.get("opened_at"),
                 )
                 continue
 
@@ -1898,7 +2757,11 @@ class RiskManager:
             if order_result is None:
                 continue
             new_stop = order_result.get("new_stop", new_stop)
-            db.mark_profit_target_taken(ticker, new_stop)
+            # A failed mark must not abort the loop or allow a second sale.
+            _mark_profit_target_taken_guarded(
+                ticker, new_stop, stop_record.get("opened_at"),
+                held_after=_held_after_sale(qty, order_result, sell_qty), entry_price=entry,
+                held_before=qty)
             log.info(f"[{ticker}] Profit target hit ({gain_pct:.1%} >= {target:.1%}, "
                      f"style={trade_style}): sold {sell_qty} shares, "
                      f"remainder stop -> breakeven ${new_stop:.2f}")
@@ -1913,6 +2776,7 @@ class RiskManager:
     def _check_profit_target_setup_gates(
         self, ticker: str, bucket: str, entry: float, current: float, gain_pct: float,
         partial_pct: float, trade_style: str, results: list[dict],
+        opened_at=None,
     ) -> bool:
         """
         SETUP_GATES_ENABLED profit-taking path (2026-10-11): the scale-out
@@ -1987,7 +2851,10 @@ class RiskManager:
         if order_result is None:
             return False
         new_stop = order_result.get("new_stop", new_stop)
-        db.mark_profit_target_taken(ticker, new_stop)
+        # A failed mark must not abort the caller's loop or allow a second sale.
+        _mark_profit_target_taken_guarded(ticker, new_stop, opened_at,
+                                          held_after=_held_after_sale(qty, order_result, sell_qty),
+                                          entry_price=entry, held_before=qty)
         if overextended and target_hit:
             reason = f"ladder target ${nearest_target:.2f} hit + Overextended valuation"
         elif overextended:

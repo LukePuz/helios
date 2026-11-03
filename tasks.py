@@ -138,19 +138,41 @@ LLM_EVENT_EXPIRES_SECONDS = 4 * 3600
 # sets for it) — if so, call the broker directly; if not, dispatch a task to
 # the "orders" queue and wait for the result. The direct-call branch also
 # means celery_orders_worker's own tasks never call back into themselves.
-from celery.signals import worker_init
+from celery.signals import beat_init, worker_init
+
+
+def _boot_service_name(sender) -> str:
+    """'celery:<node name before @>' for a worker (ops, llm, orders...), so
+    the host name isn't recorded."""
+    hostname = getattr(sender, "hostname", None) or ""
+    return f"celery:{hostname.split('@')[0] or 'worker'}"
 
 
 @worker_init.connect
-def _pin_code_stamp(**_):
+def _pin_code_stamp(sender=None, **_):
     """Import the analyst (which reads the commit stamp) in the worker's
     parent at boot, before the pool forks, so the stamp and the analyst code
     come from the files present at start, not whatever is on disk at the
-    first analysis (professor M75 a)."""
+    first analysis (professor M75 a). Then write the boot row (M181)."""
     try:
         import agents.analyst  # noqa: F401
     except Exception as e:
         log.warning(f"could not pre-import agents.analyst at worker start: {e}")
+        return
+    try:
+        agents.analyst.record_boot(_boot_service_name(sender))
+    except Exception as e:
+        log.warning(f"boot row not written: {e}")
+
+
+@beat_init.connect
+def _record_beat_boot(**_):
+    """The beat scheduler's boot row (M181)."""
+    try:
+        import agents.analyst
+        agents.analyst.record_boot("celery:beat")
+    except Exception as e:
+        log.warning(f"beat boot row not written: {e}")
 
 
 ORDERS_QUEUE = "orders"
@@ -214,11 +236,14 @@ def _was_started(task_id: str) -> bool | None:
 
 @app.task(name="tasks._broker_place_stop_order", bind=True, max_retries=1)
 def _broker_place_stop_order(self, ticker: str, qty: float, stop_price: float,
-                             deadline: float | None = None) -> dict:
+                             deadline: float | None = None,
+                             market_price: float | None = None) -> dict:
     if not _mark_started(self) or _past(deadline):
         return _EXPIRED
     import ibkr
-    return ibkr.place_stop_order(ticker, qty, stop_price)
+    if market_price is None:
+        return ibkr.place_stop_order(ticker, qty, stop_price)
+    return ibkr.place_stop_order(ticker, qty, stop_price, market_price=market_price)
 
 
 @app.task(name="tasks._broker_cancel_stop_orders_for", bind=True, max_retries=1)
@@ -326,7 +351,8 @@ def _working_sell_stops(open_orders: list[dict], types=("STP", "STP LMT", "TRAIL
     return out
 
 
-def manage_stop_place(ticker: str, qty: float, stop_price: float, timeout: int = 30) -> dict:
+def manage_stop_place(ticker: str, qty: float, stop_price: float, timeout: int = 30,
+                      market_price: float | None = None) -> dict:
     """Place a protective stop — see the module-level comment above for why
     this exists instead of calling ibkr.place_stop_order directly. Every
     caller anywhere in the codebase should go through this, including code
@@ -340,13 +366,16 @@ def manage_stop_place(ticker: str, qty: float, stop_price: float, timeout: int =
     re-arms the trail on its next run if the gain still qualifies. Before
     2026-10-28 a partial sale, TRIM or failed-sell restore left the flag TRUE
     and the trail never came back (limitations audit 12:53, finding 3).
-    Callers that convert to a trail set it again via update_trailing_stop."""
+    Callers that convert to a trail set it again via update_trailing_stop.
+    market_price: the last price where the caller has it, so the tick
+    round-up in ibkr.place_stop_order can't reach the market."""
     stop_lock.assert_held(ticker)  # professor M69
+    mp = {"market_price": market_price} if market_price else {}
     if _is_orders_worker():
         import ibkr
-        result = ibkr.place_stop_order(ticker, qty, stop_price)
+        result = ibkr.place_stop_order(ticker, qty, stop_price, **mp)
     else:
-        result = _orders_call(_broker_place_stop_order, [ticker, qty, stop_price],
+        result = _orders_call(_broker_place_stop_order, [ticker, qty, stop_price], mp or None,
                               timeout=timeout)
     try:
         import db
@@ -715,6 +744,14 @@ app.conf.beat_schedule = {
         "schedule": 3600,
         "options":  {"expires": 3600},
     },
+    # Low-severity alert repeats held back by alert_policy, sent as one
+    # message — hourly at :50 while the machine is awake. Critical alerts
+    # never wait for this.
+    "flush-alert-digest": {
+        "task":     "tasks.flush_alert_digest",
+        "schedule": crontab(minute=50, hour="6-18"),
+        "options":  {"expires": 1800},
+    },
     # Daily digest — weekdays 4:15 PM ET (after market close). A digest
     # delivered the next morning is noise — short expiry.
     "daily-digest": {
@@ -1004,7 +1041,8 @@ def analyze_candidates(self, candidates: list, max_per_run: int = 5):
 
 
 @app.task(name="tasks.retry_deferred_entry", bind=True, max_retries=0)
-def retry_deferred_entry(self, approval_id: int, gap_retry_attempt: int = 1, price_retry_attempt: int = 1):
+def retry_deferred_entry(self, approval_id: int, gap_retry_attempt: int = 1, price_retry_attempt: int = 1,
+                         recheck_attempt: int = 1):
     """
     Retry for a new-entry (OPEN/ADD) approval that execution.execute_approved
     deferred, for any of three reasons: the market was closed at analysis
@@ -1018,7 +1056,8 @@ def retry_deferred_entry(self, approval_id: int, gap_retry_attempt: int = 1, pri
     gap_retry_attempt and price_retry_attempt thread through the latter two
     cases independently, each counting against its own config.*_MAX_RETRIES
     so every retry chain is bounded to a fixed window after the open rather
-    than deferring indefinitely.
+    than deferring indefinitely. recheck_attempt counts the re-size retries
+    (an unreadable re-size check) against DEFERRED_RECHECK_MAX_ATTEMPTS.
 
     Approvals older than DEFERRED_ENTRY_MAX_AGE_HOURS are expired and sent
     back through a fresh 72B analysis instead (2026-10-27). Younger ones do
@@ -1057,9 +1096,14 @@ def retry_deferred_entry(self, approval_id: int, gap_retry_attempt: int = 1, pri
     # Monday's open on 60-hour-old reasoning, guarded only by price drift.
     age_h = _approval_age_hours(approval)
     if age_h is not None and age_h > DEFERRED_ENTRY_MAX_AGE_HOURS:
-        db.update_approval_status(approval_id, "EXPIRED",
-                                  reason=f"deferred entry {age_h:.0f}h old "
-                                         f"(> {DEFERRED_ENTRY_MAX_AGE_HOURS}h), re-analysed")
+        # Conditional: of several duplicate deliveries only the one that
+        # moves the row FAILED -> EXPIRED queues the re-analysis.
+        if not db.expire_failed_entry(approval_id,
+                                      f"deferred entry {age_h:.0f}h old "
+                                      f"(> {DEFERRED_ENTRY_MAX_AGE_HOURS}h), re-analysed"):
+            log.info(f"retry_deferred_entry: [{ticker}] approval #{approval_id} already expired "
+                     f"or claimed — no re-analysis")
+            return
         log.info(f"retry_deferred_entry: [{ticker}] approval #{approval_id} is {age_h:.0f}h old "
                  f"(> {DEFERRED_ENTRY_MAX_AGE_HOURS}h) — expired, queued a fresh analysis")
         deep_analyze_event.apply_async(args=[{
@@ -1082,6 +1126,34 @@ def retry_deferred_entry(self, approval_id: int, gap_retry_attempt: int = 1, pri
     # have changed since approval (audit 10-28 10:53 #2 residual).
     shares_now = _deferred_buy_shares_now(approval)
     resized = None
+    if shares_now == _RESIZE_UNREADABLE:
+        # The concentration check failed closed (0 room) because positions
+        # couldn't be read: not a real 0, so the approval stays FAILED and is
+        # retried, not expired. Not executed either. The age cap above bounds
+        # the retries, and so does recheck_attempt: an approval whose age
+        # can't be read, or that ran out of attempts, is expired instead.
+        why = ("its age can't be read" if age_h is None
+               else f"{recheck_attempt} re-size attempts" if recheck_attempt >= DEFERRED_RECHECK_MAX_ATTEMPTS
+               else None)
+        if why:
+            if db.expire_failed_entry(approval_id, f"re-size check unreadable and {why}; expired, "
+                                                   f"not executed"):
+                log.warning(f"retry_deferred_entry: [{ticker}] approval #{approval_id} re-size check "
+                            f"unreadable and {why}; expired")
+            else:
+                log.info(f"retry_deferred_entry: [{ticker}] approval #{approval_id} already expired "
+                         f"or claimed")
+            return
+        log.warning(f"retry_deferred_entry: [{ticker}] approval #{approval_id} re-size check "
+                    f"unreadable; not executed, retrying in {DEFERRED_RECHECK_RETRY_MINUTES} min "
+                    f"(attempt {recheck_attempt}/{DEFERRED_RECHECK_MAX_ATTEMPTS})")
+        try:
+            retry_deferred_entry.apply_async(args=[approval_id, gap_retry_attempt, price_retry_attempt,
+                                                   recheck_attempt + 1],
+                                             countdown=DEFERRED_RECHECK_RETRY_MINUTES * 60, queue="ops")
+        except Exception as e:
+            log.error(f"retry_deferred_entry: [{ticker}] could not schedule the re-check retry: {e}")
+        return
     if shares_now is not None:
         approved = int((approval.get("risk_json") or {}).get("shares_initial") or 0)
         if shares_now <= 0:
@@ -1193,12 +1265,20 @@ def retry_held_sell(self, approval_id: int):
 
 
 DEFERRED_ENTRY_MAX_AGE_HOURS = 16
+# _deferred_buy_shares_now's answer when the re-size couldn't be done (positions
+# or the halt check unreadable, or the re-size raised): the buy is neither sized
+# nor expired, and is not executed at the approved size; it waits for a retry.
+_RESIZE_UNREADABLE = "concentration_unreadable"
+DEFERRED_RECHECK_RETRY_MINUTES = 5
+DEFERRED_RECHECK_MAX_ATTEMPTS = 200   # about 16 h at 5 min
 
 
 def _deferred_buy_shares_now(approval: dict) -> int | None:
     """Shares a deferred OPEN/ADD would get if sized now (sizing + concentration
     caps on the live account, at the price it was approved at). None when it
-    isn't a buy or the re-check itself fails (then the approved size stands)."""
+    isn't a buy or has no sizing price (then the approved size stands);
+    _RESIZE_UNREADABLE when the re-check itself fails, so the buy waits for a
+    retry instead of going at the approved size (roadmap 00 b)."""
     if approval.get("action") not in ("OPEN", "ADD"):
         return None
     risk_json = approval.get("risk_json") or {}
@@ -1215,16 +1295,19 @@ def _deferred_buy_shares_now(approval: dict) -> int | None:
         sizing = rm.size_position(approval["ticker"], int(approval.get("conviction") or 5),
                                   bucket, regime, float(price))
         if sizing.get("halt_unknown") is True:
-            # One unreadable check mustn't expire the buy for good; execution
-            # re-checks the halt and leaves it FAILED if it still can't.
+            # One unreadable check mustn't expire the buy for good, nor let
+            # it go at the approved size: keep it for a retry.
             log.warning(f"retry_deferred_entry: [{approval.get('ticker')}] halt check "
-                        f"unreadable, keeping the approved size")
-            return None
-        return rm.shares_after_concentration(approval["ticker"], sizing, bucket)
+                        f"unreadable; not executed, kept for a retry")
+            return _RESIZE_UNREADABLE
+        shares = rm.shares_after_concentration(approval["ticker"], sizing, bucket)
+        if getattr(rm, "last_concentration_errored", False) is True:
+            return _RESIZE_UNREADABLE
+        return shares
     except Exception as e:
-        log.warning(f"retry_deferred_entry: [{approval.get('ticker')}] re-size failed, "
-                    f"keeping the approved size: {e}")
-        return None
+        log.warning(f"retry_deferred_entry: [{approval.get('ticker')}] re-size failed; "
+                    f"not executed, kept for a retry: {e}")
+        return _RESIZE_UNREADABLE
 
 
 def _deferred_buy_superseded(approval: dict) -> str | None:
@@ -1351,6 +1434,22 @@ def _resolve_if_cancelled(order: dict, completed: dict) -> None:
     log.warning(f"[{ticker}] reconcile: order {order['broker_order_id']} ({order['side']} "
                 f"{order.get('intent')}) is {hit['status']} at the broker with {recorded:g} filled; "
                 f"marked cancelled, the rest never sold")
+    if order.get("side") == "SELL":
+        # The stops were cancelled before this sell, and its unsold shares
+        # (all of them if nothing filled) had no stop coming back: the queued
+        # re-protect places the recorded stop on what is still held and drops
+        # out if the position is flat (audit 2026-11-02 #2).
+        try:
+            _queue_reprotect(ticker, {"intent": "RESTORE"}, None)
+        except Exception as e:
+            log.error(f"[{ticker}] reconcile: could not queue the stop after a cancelled sell: {e}")
+            try:
+                import alerts
+                alerts._send(f"🚨 CHECK STOPS — <b>{ticker}</b>\nA SELL was cancelled at the broker "
+                             f"and the stop retry could not be queued. Check TWS and protect the "
+                             f"unsold shares.")
+            except Exception:
+                pass
     # A cancelled part-filled exit leaves its outcome to the stale-stop and
     # sweep paths: a flat position means another sale finished it, and the
     # exit price of that mixed close is Luke's open question (review of
@@ -1404,6 +1503,112 @@ def reconcile_unconfirmed_orders(self):
                    lambda: _reconcile_unconfirmed_orders_locked(self))
 
 
+_UNTRACKED_STATE_KEY = "untracked_orders"
+_UNTRACKED_REDIS_PREFIX = "helios:untracked_order:"
+
+
+def _untracked_key(row: dict) -> str:
+    return f"{row.get('ticker')}:{row.get('side')}:{row.get('perm_id') or ''}:{row.get('broker_order_id')}"
+
+
+def _save_untracked_order(row: dict) -> bool:
+    """Keep an 'unconfirmed' orders row that could not be written, so the
+    next reconcile run can write it and then find a late fill (audit
+    2026-11-02 #7). Stored in Redis and in system_state: a DB outage that
+    lost the row can lose the state write too. True if either store took it."""
+    import db
+    rec = {k: row.get(k) for k in ("ticker", "side", "order_type", "qty", "broker_order_id",
+                                   "perm_id", "decision_price", "approval_id", "status",
+                                   "intent", "stop_price", "submitted_at", "submit_price")}
+    rec = json.loads(json.dumps(rec, default=str))   # submitted_at is a datetime: ISO text
+    key = _untracked_key(rec)
+    saved = False
+    try:
+        stop_lock._redis().set(_UNTRACKED_REDIS_PREFIX + key, json.dumps(rec, default=str),
+                               ex=30 * 86400)
+        saved = True
+    except Exception as e:
+        log.error(f"[{rec['ticker']}] untracked order not saved to Redis: {e}")
+    try:
+        def add(pending):
+            pending[key] = rec
+            return pending
+        _reprotect_queue_edit(add, key=_UNTRACKED_STATE_KEY)
+        saved = saved or key in json.loads(db.get_state(_UNTRACKED_STATE_KEY) or "{}")
+    except Exception as e:
+        log.error(f"[{rec['ticker']}] untracked order not saved to system_state: {e}")
+    return saved
+
+
+def _retry_untracked_orders() -> None:
+    """Write each saved untracked order's row (once: an existing row for that
+    broker order counts as written), then drop it from both stores. Runs at
+    the start of every reconcile_unconfirmed_orders, so the row is in the
+    order list the same run reads."""
+    import db
+    found: dict[str, dict] = {}
+    r = None
+    try:
+        r = stop_lock._redis()
+        for k in r.scan_iter(_UNTRACKED_REDIS_PREFIX + "*"):
+            k = k.decode() if isinstance(k, bytes) else k
+            v = r.get(k)
+            if v:
+                found[k[len(_UNTRACKED_REDIS_PREFIX):]] = json.loads(v)
+    except Exception as e:
+        log.warning(f"reconcile: untracked-order read from Redis failed: {e}")
+    try:
+        found.update(json.loads(db.get_state(_UNTRACKED_STATE_KEY) or "{}"))
+    except Exception as e:
+        log.warning(f"reconcile: untracked-order read from system_state failed: {e}")
+    done = []
+    for key, rec in found.items():
+        if not rec.get("perm_id") and rec.get("broker_order_id") is None:
+            # Nothing to match a broker order or a late fill on, and no way to
+            # tell a written row apart: writing it would add one every cycle.
+            # Alert once and drop it.
+            log.error(f"[{rec.get('ticker')}] reconcile: untracked order has no perm id or order id; "
+                      f"dropped, needs a manual check")
+            try:
+                import alerts
+                alerts._send(f"🚨 ORDER UNTRACKED — <b>{rec.get('ticker')}</b>\nA {rec.get('side')} "
+                             f"{rec.get('qty')} order with no order id or perm id could not be logged, "
+                             f"so reconcile cannot follow it. Check TWS for a fill and protect any "
+                             f"shares by hand.")
+            except Exception as e:
+                log.error(f"reconcile: untracked-order alert failed: {e}")
+            done.append(key)
+            continue
+        try:
+            exists = db.order_row_exists(rec["ticker"], rec["side"], rec.get("broker_order_id"),
+                                         rec.get("perm_id"))
+            if not exists and (db.log_order(**rec) or -1) <= 0:
+                log.error(f"[{rec['ticker']}] reconcile: untracked order row still not written")
+                continue
+        except Exception as e:
+            log.error(f"[{rec.get('ticker')}] reconcile: untracked order row retry failed: {e}")
+            continue
+        log.warning(f"[{rec['ticker']}] reconcile: untracked order {rec.get('broker_order_id')} "
+                    f"now has its orders row")
+        done.append(key)
+    if not done:
+        return
+    for key in done:
+        try:
+            if r is not None:
+                r.delete(_UNTRACKED_REDIS_PREFIX + key)
+        except Exception as e:
+            log.warning(f"reconcile: could not drop untracked order {key} from Redis: {e}")
+    try:
+        def drop(pending):
+            for key in done:
+                pending.pop(key, None)
+            return pending
+        _reprotect_queue_edit(drop, key=_UNTRACKED_STATE_KEY)
+    except Exception as e:
+        log.warning(f"reconcile: could not drop untracked orders from system_state: {e}")
+
+
 def _reconcile_unconfirmed_orders_locked(task):
     import db
     import ibkr
@@ -1412,6 +1617,7 @@ def _reconcile_unconfirmed_orders_locked(task):
 
     # Queued retries first: they don't need the order list, and a failed
     # load must not hold back a stop (review of 1492b13).
+    _retry_untracked_orders()
     _retry_pending_reprotects()
     _retry_pending_buy_outcomes()
 
@@ -2586,6 +2792,39 @@ def _split_ratio(ticker: str, pos) -> float | None:
     return None
 
 
+_BACKSTOP_RETRY_GUARD = "helios:backstop_retry_sent:{ticker}:{day}"
+
+
+def _claim_backstop_retry_send(ticker: str) -> bool:
+    """Once per ticker per trading session, a backstop RETRY may go on to
+    cancel stops and sell: several retry_backstop_sell tasks can be queued
+    for the same open (one per after-hours check), and each used to sell
+    (review of 5f13c44). Redis SET NX, expiring at the 16:00 ET close.
+    False if already claimed or Redis can't be reached (unsure: skip)."""
+    from datetime import datetime, time as dtime
+    from zoneinfo import ZoneInfo
+    et = ZoneInfo("America/New_York")
+    now = datetime.now(et)
+    close = datetime.combine(now.date(), dtime(16, 0), tzinfo=et)
+    ttl = max(60, int((close - now).total_seconds()))
+    key = _BACKSTOP_RETRY_GUARD.format(ticker=ticker, day=now.date().isoformat())
+    try:
+        return bool(stop_lock._redis().set(key, now.isoformat(), ex=ttl, nx=True))
+    except Exception as e:
+        log.error(f"[{ticker}] backstop retry guard unavailable ({e}); not selling")
+        return False
+
+
+def _backstop_retry_skipped(ticker: str, why: str) -> None:
+    log.error(f"[{ticker}] Backstop retry skipped: {why}")
+    try:
+        import alerts
+        alerts._send(f"⚠️ BACKSTOP RETRY SKIPPED — <b>{ticker}</b>\n{why}. Nothing was cancelled or "
+                     f"sold. Check the position and its stop in TWS.")
+    except Exception:
+        pass
+
+
 @locked_by_ticker(lambda ticker, *a, **k: ticker, on_busy=False)
 def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) -> bool:
     """Market-sell the full position when its stop level is breached and no
@@ -2601,6 +2840,7 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
     day. A zero-fill result now schedules retry_backstop_sell instead of
     dropping the problem.
     """
+    stops_cancelled = False
     try:
         import ibkr
         import db
@@ -2614,6 +2854,8 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
             log.error(f"[{ticker}] Backstop sell: position read failed ({e}); retrying later")
             if not _is_retry:
                 _schedule_backstop_retry(ticker, alert)
+            else:
+                _backstop_retry_skipped(ticker, f"the position could not be read ({e})")
             return False
         pos = next((p for p in positions if p.symbol == ticker), None)
         qty = float(pos.qty) if pos else 0.0
@@ -2658,6 +2900,45 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
                 pass
             return False
 
+        # Everything that can abort the sale is checked before any stop is
+        # cancelled (audit 2026-11-02 #11). Outside regular hours the market
+        # SELL is cancelled after its fill wait (ibkr.place_market_order), so
+        # cancelling first left the position with no stop overnight.
+        from market_data import is_market_hours
+        if not is_market_hours():
+            log.warning(f"[{ticker}] Backstop: outside regular hours; stops left in place, "
+                        f"sale retried at the open")
+            _schedule_backstop_retry(ticker, alert)
+            return False
+        # A SELL of ours still working that covers every share: nothing to
+        # sell, so nothing to cancel.
+        working = sum(float(o["qty"]) for o in _resting_sell_stops(ticker, types=("MKT",)))
+        if owned - working <= 1e-6:
+            log.warning(f"[{ticker}] Backstop: a working SELL for {working:g} shares covers all "
+                        f"{owned:g}; nothing cancelled or sold")
+            return False
+        if _is_retry:
+            # A retry runs later than the breach that queued it: re-check
+            # that the shares are still unprotected, and sell at most once
+            # per session (review of 5f13c44).
+            if working > 0:
+                _backstop_retry_skipped(ticker, f"a SELL for {working:g} shares is still working")
+                return False
+            try:
+                covered = sum(float(o["qty"]) for o in _resting_sell_stops(ticker))
+            except Exception as e:
+                _backstop_retry_skipped(ticker, f"the resting stops could not be read ({e})")
+                return False
+            if covered > 0 and covered >= owned - max(0.01, owned * 0.02):
+                log.info(f"[{ticker}] Backstop retry: a stop now covers {covered:g} of {owned:g} "
+                         f"shares; not selling")
+                return False
+            if not _claim_backstop_retry_send(ticker):
+                _backstop_retry_skipped(ticker, "a backstop retry already ran this session "
+                                                "(or its guard could not be checked)")
+                return False
+
+        stops_cancelled = True  # set before the call: a raise inside it may follow a cancel
         manage_cancel_stop_orders_for(ticker)  # belt-and-braces before selling
         # A stop that wouldn't cancel still protects its shares, and selling
         # those too would short once both fill (same rule as
@@ -2680,8 +2961,8 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
         # remainder) will sell its shares; selling them again would short
         # once both fill (review of 16009ad). Same remainder rule as stops.
         # Market orders only: the bot places no limit sells, and a manual limit
-        # above the market (TWS) would not sell into a stop breach.
-        working = sum(float(o["qty"]) for o in _resting_sell_stops(ticker, types=("MKT",)))
+        # above the market (TWS) would not sell into a stop breach. (Read
+        # before the cancel above.)
         if working > 0:
             log.warning(f"[{ticker}] Backstop: a SELL for {working:g} shares is still working; "
                         f"selling only what it doesn't cover")
@@ -2754,6 +3035,19 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
         log.error(f"[{ticker}] Backstop sell FAILED: {e}")
         if not _is_retry:
             _schedule_backstop_retry(ticker, alert)
+        elif stops_cancelled:
+            # No further retry follows, and the stops may already be gone.
+            log.critical(f"[{ticker}] Backstop retry FAILED after its stops were cancelled ({e}); "
+                         f"the position may have no stop")
+            try:
+                import alerts
+                alerts._send(f"🚨 BACKSTOP RETRY FAILED — <b>{ticker}</b>\nThe retry failed ({e}) "
+                             f"after its stops were cancelled, so the position may have no stop "
+                             f"and was not sold. Check the position and its stop in TWS now.")
+            except Exception as e2:
+                log.error(f"[{ticker}] could not send the backstop retry alert: {e2}")
+        else:
+            _backstop_retry_skipped(ticker, f"the retry failed before any stop was cancelled ({e})")
         return False
 
 
@@ -2761,10 +3055,10 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
 def retry_backstop_sell(self, ticker: str, alert: dict):
     """Retry for a backstop stop-breach sell that _execute_backstop_sell
     couldn't complete on the first attempt -- see that function's docstring
-    for the AMD incident this closes the loop on. Deliberately does not
-    re-check whether the stop condition still holds: if this fired, the
-    position already has zero broker-side protection, and the only open
-    question is whether the sell can go through now."""
+    for the AMD incident this closes the loop on. It does not re-check the
+    price against the stop, but _execute_backstop_sell re-checks that the
+    shares are still held, uncovered by a stop and not already being sold,
+    and lets only one retry per ticker per session sell (review of 5f13c44)."""
     success = _execute_backstop_sell(ticker, alert, _is_retry=True)
     if success:
         log.info(f"[{ticker}] Backstop sell succeeded on retry")
@@ -3030,13 +3324,16 @@ def _log_would_reassess(live_vix: float) -> None:
         key = f"would_reassess_logged_{TRADING_ENV}"
         if db.get_state(key, "") == row_at:
             return
-        db.set_state(key, row_at)
-        db.log_activity("regime_shadow", "", f"would reassess: live VIX {live_vix:.1f} vs "
-                        f"{float(stored):.1f} at the last regime row", "alert",
-                        {"would_reassess": True, "live_vix": round(live_vix, 2),
-                         "stored_vix": round(float(stored), 2),
-                         "delta": round(live_vix - float(stored), 2),
-                         "regime": row.get("regime"), "regime_row_at": row_at})
+        written = db.log_activity("regime_shadow", "", f"would reassess: live VIX {live_vix:.1f} vs "
+                                  f"{float(stored):.1f} at the last regime row", "alert",
+                                  {"would_reassess": True, "live_vix": round(live_vix, 2),
+                                   "stored_vix": round(float(stored), 2),
+                                   "delta": round(live_vix - float(stored), 2),
+                                   "regime": row.get("regime"), "regime_row_at": row_at})
+        # The key only after the row is written: set first, a failed write
+        # (log_activity swallows errors) marked the row logged and lost it.
+        if written:
+            db.set_state(key, row_at)
     except Exception as e:
         log.debug(f"would_reassess log failed: {e}")
 
@@ -3372,7 +3669,9 @@ def _get_stale_ingestion_sources() -> list[str]:
         "edgar": 20, "options_flow": 15, "macro": 90, "arxiv": 1560,
         "congressional": 400, "insider": 60, "news": 30, "fundamentals": 1560,
         "price_history": 1560, "sp500_history": 11520, "analyst_ratings": 60,
-        "candidate_scan": 10080,
+        # Weekly at Mon 09:00, the same minute as an hourly check: a week
+        # plus a day, like sp500_history, so a run still in progress isn't stale.
+        "candidate_scan": 11520,
     }
 
     # Calendar awareness (audit 06:53, A0653-6): options_flow only polls in
@@ -3445,6 +3744,17 @@ def check_ingestion_health(self):
         raise self.retry(exc=e, countdown=300)
 
 
+@app.task(name="tasks.flush_alert_digest")
+def flush_alert_digest():
+    """One Telegram message listing the low-severity alerts that
+    alert_policy held back as repeats since the last flush."""
+    try:
+        import alerts
+        alerts.flush_digest()
+    except Exception as e:
+        log.error(f"flush_alert_digest failed: {e}")
+
+
 @app.task(name="tasks.send_daily_digest", bind=True, max_retries=2)
 def send_daily_digest(self):
     """
@@ -3462,10 +3772,16 @@ def send_daily_digest(self):
         account = client.get_account()
         pv      = float(account.portfolio_value)
 
-        # Day P&L: compare against the first snapshot recorded today
+        # Day P&L: compare against the first snapshot recorded today. Both
+        # sides are ET calendar dates (the snapshot's own date was UTC, so
+        # a 19:00-24:00 EST snapshot counted as the next day's first).
+        from zoneinfo import ZoneInfo
+        _et = ZoneInfo("America/New_York")
         history = db.get_portfolio_history(limit=500)
-        today_str = date.today().isoformat()
-        todays = [h for h in history if h["timestamp"].date().isoformat() == today_str]
+        today_et = datetime.now(timezone.utc).astimezone(_et).date()
+        todays = [h for h in history
+                  if (h["timestamp"] if h["timestamp"].tzinfo else h["timestamp"].replace(tzinfo=timezone.utc))
+                  .astimezone(_et).date() == today_et]
         start_of_day_value = todays[0]["total_value"] if todays else pv
         day_pl = pv - start_of_day_value
         day_pl_pct = day_pl / start_of_day_value if start_of_day_value else 0.0
@@ -3530,7 +3846,7 @@ def send_daily_digest(self):
         catalysts_text = []
         try:
             from catalyst_service.client import query_events
-            tomorrow = (date.today() + timedelta(days=1)).isoformat()
+            tomorrow = (today_et + timedelta(days=1)).isoformat()
             events = query_events(start=tomorrow, end=tomorrow)
             catalysts_text = [f"{e.get('ticker')}: {e.get('event_type')}" for e in events]
         except Exception as e:
@@ -3906,21 +4222,29 @@ def check_portfolio_drawdown(self):
             _monitor_health("portfolio_drawdown", failed)
 
 
-@locked_by_ticker(lambda ticker: ticker,
+@locked_by_ticker(lambda ticker, *a, **k: ticker,
                   on_busy=lambda: "over-stop fix skipped: ticker busy (next cycle)")
-def _fix_overstop(ticker: str) -> str:
+def _fix_overstop(ticker: str, fresh_qty: float | None = None, allow_cancel: bool = True) -> str:
     """Re-read under the lock and make resting SELL stops cover exactly the
     position at the recorded stop. Over-covered: cancel, re-read what is
     still resting (a cross-client stop may refuse to cancel, A2253-6) and
     place stops only for what is left uncovered. Under-covered (A2253-4),
     including no stop at all (A0053-2): add a stop for the uncovered shares.
     Never places a stop at or above the last price, which would sell at
-    once. Returns a line for log/alert."""
+    once. Returns a line for log/alert.
+
+    fresh_qty: the signed quantity a fresh positions read showed for a ticker
+    the portfolio cache reads flat (reconcile's `disagree`). It stands in for
+    the position only while the cache still shows none, and then this never
+    cancels: it only adds a stop for uncovered shares. allow_cancel=False
+    (reconcile while the position reads disagree) likewise never cancels or
+    shrinks: an over-cover is only reported."""
     import db
     import ibkr
     try:
         pos = next((p for p in ibkr.get_client().get_all_positions() if p.symbol == ticker), None)
-        signed = float(pos.qty) if pos else 0.0
+        from_fresh = pos is None and fresh_qty is not None
+        signed = float(pos.qty) if pos else (float(fresh_qty) if from_fresh else 0.0)
         held = round(abs(signed), 4)
         open_orders = ibkr.get_open_orders()
         resting = sum(float(o["qty"]) for o in _working_sell_stops(open_orders) if o["ticker"] == ticker)
@@ -3950,6 +4274,9 @@ def _fix_overstop(ticker: str) -> str:
                 f"set the stop in TWS")
     label = (f"stops covered {resting:g} shares but {held:g} held" if resting > held
              else f"stops covered only {resting:g} of {held:g} shares")
+    if (from_fresh or not allow_cancel) and resting > held:
+        return (f"🚨 {ticker}: {label} while the position reads disagree; "
+                f"nothing cancelled — check the stops in TWS")
     try:
         if resting > held:
             manage_cancel_stop_orders_for(ticker)
@@ -3969,18 +4296,18 @@ def _fix_overstop(ticker: str) -> str:
         else:
             need = round(held - resting, 4)
         if need > 0:
-            result = manage_stop_place(ticker, need, float(stop_price))
+            result = manage_stop_place(ticker, need, float(stop_price), market_price=last)
             db.set_stop_broker_order_id(ticker, result["order_id"])
     except Exception as e:
         return f"🚨 {ticker}: {label}; fix failed ({e}) — check TWS now"
     return f"🔧 {ticker}: {label}; placed a stop for {need:g} @ ${float(stop_price):.2f}"
 
 
-def _fix_overstop_safe(ticker: str) -> str:
+def _fix_overstop_safe(ticker: str, **kwargs) -> str:
     """_fix_overstop for the reconcile loops: one ticker's failure must not
     skip the remaining tickers and section 3 (audit 02:53, A0253-7)."""
     try:
-        return _fix_overstop(ticker)
+        return _fix_overstop(ticker, **kwargs)
     except Exception as e:
         log.error(f"[{ticker}] stop coverage fix crashed: {e}")
         return f"🚨 {ticker}: stop coverage fix failed ({e}) — check TWS"
@@ -4007,6 +4334,132 @@ def _reconcile_alert_due(issue_key: str) -> bool:
             pass
     db.set_state(state_key, now.isoformat())
     return True
+
+
+# Reconcile's multi-cycle confirmations (the orphan and stale-record markers,
+# the empty-read counter) count a cycle only this long after the last one, so
+# the task's own Celery retries (+2/+4 min) can't stand in for later cycles.
+_RECONCILE_MIN_CYCLE_S = 600
+
+
+def _reconcile_now():
+    """The clock reconcile's cycle markers use (a seam for tests)."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc)
+
+
+def _pending_marker_ready(key: str) -> bool:
+    """Two-cycle marker: True once the marker was armed at least
+    _RECONCILE_MIN_CYCLE_S ago. Otherwise arms it (when missing or
+    unreadable; a young marker keeps its time) and returns False."""
+    import db
+    from datetime import datetime
+    now = _reconcile_now()
+    raw = db.get_state(key)
+    if raw:
+        try:
+            return (now - datetime.fromisoformat(raw)).total_seconds() >= _RECONCILE_MIN_CYCLE_S
+        except (TypeError, ValueError):
+            pass
+    db.set_state(key, now.isoformat())
+    return False
+
+
+# An empty fresh positions read while stop records exist confirms a ticker
+# flat only on this many consecutive reconcile cycles with the cache empty too.
+_EMPTY_READ_CONFIRM_CYCLES = 3
+_EMPTY_READ_KEY = "flat_empty_reads_{ticker}"   # "<count>|<iso time of the last count>"
+_EMPTY_READ_GAP_S = 2400                         # a longer gap restarts the count
+_empty_read_store_alert_at = 0.0                 # in-process: the store itself may be down
+
+
+def _count_empty_flat_reads(tickers) -> tuple[set[str], list[str], list[str]] | None:
+    """Count one more cycle with both position reads empty for each ticker.
+    Returns (tickers still waiting, tickers confirmed flat this cycle, tickers
+    seen for the first time), or None when the counter store can't be read
+    or written; then nothing is confirmed, with an alert at most hourly."""
+    import db
+    import time as _time
+    from datetime import datetime
+    global _empty_read_store_alert_at
+    now = _reconcile_now()
+    waiting: set[str] = set()
+    confirmed: list[str] = []
+    first: list[str] = []
+    try:
+        for ticker in sorted(tickers):
+            key = _EMPTY_READ_KEY.format(ticker=ticker)
+            raw = db.get_state_strict(key, "") or ""
+            n, age = 0, None
+            if raw:
+                count, _, at = raw.partition("|")
+                try:
+                    age = (now - datetime.fromisoformat(at)).total_seconds()
+                    if age <= _EMPTY_READ_GAP_S:
+                        n = int(count)
+                except (TypeError, ValueError):
+                    n, age = 0, None
+            if n and age is not None and age < _RECONCILE_MIN_CYCLE_S:
+                counted = False   # too soon after the last count (a retry): row left as is
+            else:
+                n += 1
+                counted = True
+                if db.set_state_verified([(key, f"{n}|{now.isoformat()}")]):
+                    raise RuntimeError(f"{key} did not save")
+            if counted and n == 1:
+                first.append(ticker)
+            if n < _EMPTY_READ_CONFIRM_CYCLES:
+                waiting.add(ticker)
+            elif counted and n == _EMPTY_READ_CONFIRM_CYCLES:
+                confirmed.append(ticker)
+    except Exception as e:
+        log.error(f"reconcile_stop_orders: empty-read counter unavailable ({e}); nothing is "
+                  f"confirmed flat this cycle")
+        if _time.monotonic() - _empty_read_store_alert_at >= 3600 or not _empty_read_store_alert_at:
+            _empty_read_store_alert_at = _time.monotonic()
+            try:
+                import alerts
+                alerts._send(f"⚠️ STOP CHECK: the broker shows no positions but stop records exist "
+                             f"for {', '.join(sorted(tickers))}, and the confirmation counter can't "
+                             f"be read or saved ({e}). Nothing is cancelled or deleted until it can.")
+            except Exception as e2:
+                log.error(f"reconcile_stop_orders: could not send the counter alert: {e2}")
+        return None
+    return waiting, confirmed, first
+
+
+def _clear_empty_flat_reads(tickers) -> None:
+    import db
+    for ticker in tickers:
+        try:
+            db.set_state(_EMPTY_READ_KEY.format(ticker=ticker), "")
+        except Exception as e:
+            log.warning(f"[{ticker}] could not reset the empty-read counter: {e}")
+
+
+_ACCOUNT_FLAT_HEALTHY_S = 1800        # no connectivity error or reconnect for this long
+_empty_read_gate_alert_at = 0.0       # in-process hourly throttle for the gate alert
+
+
+def _account_flat_gate() -> tuple[bool, str]:
+    """The server's account-level view must agree before an empty-read flat
+    is confirmed: stock value 0 (GrossPositionValue, else StockMarketValue)
+    and a connection with no 1100/1101/2110 error or reconnect in the last
+    30 min. (False, why) when either disagrees or can't be checked."""
+    import ibkr
+    try:
+        value = float(ibkr.get_account_stock_value())
+    except Exception as e:
+        return False, f"the account-level position value could not be read ({e})"
+    if abs(value) > 0.005:
+        return False, f"the account-level view shows ${value:,.2f} in stock"
+    try:
+        healthy = ibkr.connectivity_error_free_for(_ACCOUNT_FLAT_HEALTHY_S) is True
+    except Exception as e:
+        return False, f"the connection health could not be checked ({e})"
+    if not healthy:
+        return False, "the broker connection had a connectivity error or reconnect in the last 30 min"
+    return True, ""
 
 
 @app.task(name="tasks.reconcile_stop_orders", bind=True, max_retries=2)
@@ -4102,26 +4555,130 @@ def _reconcile_stop_orders_body(self):
         all_actions: list[str] = []   # every cycle, for the debug log
         new_actions: list[str] = []   # unthrottled — logged as warning + alerted
 
+        # Sections 1 and 2 cancel stops and delete records for tickers this
+        # read doesn't show. The portfolio cache can read empty or short
+        # after a reconnect, and two such cycles in a row used to cancel
+        # every stop and delete every record (audit 2026-11-02 #6). Before
+        # either acts, a fresh reqPositions() read must agree those tickers
+        # are gone. It fails: sections 1 and 2 wait this cycle. It shows a
+        # ticker held: that ticker is left out of sections 1 and 2 and an
+        # alert goes out. Sections 2b and 3 always run for every held ticker:
+        # skipping them left naked positions unfixed and unalerted.
+        records = db.get_all_position_stops()
+        looks_flat = ({o["ticker"] for o in stops} | {r["ticker"] for r in records}) - set(held)
+        flat_confirmed = True
+        disagree: list[str] = []
+        wait_flat: set[str] = set()   # empty-read flat not yet confirmed: markers arm, nothing acts
+        fresh = None
+        if looks_flat:
+            try:
+                fresh = ibkr.get_fresh_stock_positions()
+            except Exception as e:
+                log.warning(f"reconcile_stop_orders: confirming position read failed ({e}); "
+                            f"orphan/stale-record checks wait a cycle for {sorted(looks_flat)}")
+                fresh = None
+                flat_confirmed = False
+            if fresh is not None and not fresh and records:
+                # An empty fresh read while stop records exist looks like the
+                # same reconnect gap as the cache, not a confirmed flat. Only
+                # 3 consecutive cycles with both reads empty confirm it, so a
+                # truly flat account's orphan stops (which could open a short)
+                # still get cleaned up.
+                if held:
+                    log.warning(f"reconcile_stop_orders: confirming position read is empty while "
+                                f"stop records exist; orphan/stale-record checks wait a cycle for "
+                                f"{sorted(looks_flat)}")
+                    flat_confirmed = False
+                else:
+                    counted = _count_empty_flat_reads(looks_flat)
+                    if counted is None:
+                        flat_confirmed = False
+                    else:
+                        wait_flat, _, first_seen = counted
+                        ready = sorted(set(looks_flat) - wait_flat)
+                        confirmed_now: list[str] = []
+                        if ready:
+                            # Both reads come from the same session; the
+                            # server's account-level view must agree too.
+                            gate_ok, why = _account_flat_gate()
+                            if gate_ok:
+                                confirmed_now = [t for t in ready
+                                                 if _reconcile_alert_due(f"empty_read_flat_{t}")]
+                            else:
+                                wait_flat |= set(ready)
+                                log.error(f"reconcile_stop_orders: {ready} empty on 3+ cycles of both "
+                                          f"reads, but {why}; still waiting")
+                                import time as _time
+                                global _empty_read_gate_alert_at
+                                if (not _empty_read_gate_alert_at
+                                        or _time.monotonic() - _empty_read_gate_alert_at >= 3600):
+                                    _empty_read_gate_alert_at = _time.monotonic()
+                                    try:
+                                        import alerts
+                                        alerts._send(f"⚠️ STOP CHECK: no position in {', '.join(ready)} "
+                                                     f"on 3+ cycles of both position reads, but {why}. "
+                                                     f"Nothing cancelled or deleted; still waiting.")
+                                    except Exception as e:
+                                        log.error(f"reconcile_stop_orders: could not send the "
+                                                  f"account-check alert: {e}")
+                        log.warning(f"reconcile_stop_orders: both position reads empty while stop "
+                                    f"records exist; waiting: {sorted(wait_flat)}, confirmed flat: "
+                                    f"{sorted(set(looks_flat) - wait_flat)}")
+                        for tickers_, text in (
+                                (first_seen, "broker shows no position but stop records exist for "
+                                             "{t}; confirming over 3 cycles before any stop is "
+                                             "cancelled or record deleted"),
+                                (confirmed_now, "no position in {t} on 3 consecutive cycles of both "
+                                                "position reads, and the account-level view agrees; "
+                                                "treating as flat, cleaning up its orphan stops and "
+                                                "stop records now")):
+                            if not tickers_:
+                                continue
+                            try:
+                                import alerts
+                                alerts._send(f"🚨 STOP CHECK: " + text.format(t=", ".join(tickers_)))
+                            except Exception as e:
+                                log.error(f"reconcile_stop_orders: could not send the empty-read "
+                                          f"alert: {e}")
+            elif fresh:
+                _clear_empty_flat_reads(looks_flat)   # a non-empty read resets the count
+            disagree = sorted(t for t in looks_flat if fresh and t in fresh)
+            if disagree:
+                msg = (f"position reads disagree: the portfolio cache shows no position in "
+                       f"{', '.join(disagree)} but a fresh positions read does; their stops and "
+                       f"records are left alone this cycle")
+                log.error(f"reconcile_stop_orders: {msg}")
+                if _reconcile_alert_due("position_reads_disagree"):
+                    try:
+                        import alerts
+                        alerts._send(f"⚠️ STOP CHECK PAUSED\nBroker {msg}. If it persists, check "
+                                     f"the IB gateway connection.")
+                    except Exception as e:
+                        log.error(f"reconcile_stop_orders: could not send the disagreement alert: {e}")
+        skip_flat = set(disagree)   # held per the fresh read: never cancelled or deleted
+
         # Clear any pending-orphan/pending-stale-stop marker for tickers
         # confirmed held this cycle -- a marker set during a transient
         # cache lag shouldn't linger and cause an action on some unrelated
         # future cycle.
-        for ticker in held:
+        for ticker in set(held) | skip_flat:
             db.set_state(f"orphan_pending_{ticker}", "")
             db.set_state(f"stale_stop_pending_{ticker}", "")
+        _clear_empty_flat_reads(set(held) | skip_flat)
 
         # 1. Orphaned broker stops — stop order with no position on TWO
         # consecutive cycles → cancel. A single missing-this-cycle reading
         # just arms the marker and waits.
         for o in stops:
-            if o["ticker"] not in held:
+            if o["ticker"] not in held and flat_confirmed and o["ticker"] not in skip_flat:
                 pending_key = f"orphan_pending_{o['ticker']}"
-                if not db.get_state(pending_key):
-                    db.set_state(pending_key, datetime.now(timezone.utc).isoformat())
+                if not _pending_marker_ready(pending_key):
                     log.info(f"[{o['ticker']}] Stop order {o['order_id']} looks orphaned "
                              f"(no position in this cycle's snapshot) — waiting for the next "
                              f"cycle to confirm before cancelling")
                     continue
+                if o["ticker"] in wait_flat:
+                    continue   # empty reads not yet confirmed over 3 cycles
                 if manage_cancel_order(o["order_id"]):
                     msg = (f"Cancelled ORPHANED stop: SELL {o['qty']} {o['ticker']} "
                            f"@ ${o['stop_price'] or 0:.2f} (no position held on 2 consecutive "
@@ -4203,15 +4760,25 @@ def _reconcile_stop_orders_body(self):
             # Unknown is not "none pending": skip stale records this cycle (M126).
             log.warning(f"reconcile_stop_orders: unconfirmed-SELL check failed; stale records wait a cycle: {e}")
             pending_sell_tickers = None
-        for rec in db.get_all_position_stops():
-            if rec["ticker"] not in held:
+        stop_tickers = {o["ticker"] for o in stops}
+        for rec in records:
+            if rec["ticker"] not in held and flat_confirmed and rec["ticker"] not in skip_flat:
                 ticker = rec["ticker"]
                 pending_key = f"stale_stop_pending_{ticker}"
-                if not db.get_state(pending_key):
-                    db.set_state(pending_key, datetime.now(timezone.utc).isoformat())
+                if not _pending_marker_ready(pending_key):
                     log.info(f"[{ticker}] Position stop record looks stale (no matching "
                              f"position in this cycle's snapshot) — waiting for the next "
                              f"cycle to confirm before reconciling")
+                    continue
+                if ticker in wait_flat:
+                    continue   # empty reads not yet confirmed over 3 cycles
+                if ticker in stop_tickers:
+                    # Its stop was at the broker this cycle (orphan-cancelled
+                    # above, or still resting): the record goes a cycle later,
+                    # so it is still there to rebuild from if the position
+                    # reappears.
+                    log.info(f"[{ticker}] Stale stop record kept: a stop order was at the broker "
+                             f"this cycle; deleting no sooner than next cycle")
                     continue
                 if pending_sell_tickers is None or ticker in pending_sell_tickers:
                     # Leaving that order's fills out below would orphan the
@@ -4297,13 +4864,36 @@ def _reconcile_stop_orders_body(self):
         # A partly covered position (some stop, but for fewer shares than
         # held) is fixed the same way (audit 22:53, A2253-4); no stop at all
         # is section 3's alert.
-        for ticker, qty in held.items():
+        # Tickers the reads disagree on (the cache reads them flat, a fresh
+        # read shows them held) are checked at the fresh-read quantity.
+        overstop_check = dict(held)
+        for ticker in disagree:
+            overstop_check.setdefault(ticker, round(abs(float(fresh[ticker])), 4))
+        for ticker, qty in overstop_check.items():
             pending_key = f"overstop_pending_{ticker}"
             covered = stop_qty.get(ticker, 0.0)
-            if ticker in longs:   # a short's SELL adds to it; _fix_overstop alerts on that
+            in_disagree = ticker in disagree and ticker not in held
+            if (ticker in longs) or (in_disagree and float(fresh[ticker]) > 0):
+                # a short's SELL adds to it; _fix_overstop alerts on that
                 qty = max(round(qty - _working_mkt_sell_qty(open_ords, ticker), 4), 0.0)   # professor M129
             if covered <= 0 or abs(covered - qty) <= 1e-6:
                 db.set_state(pending_key, "")
+                continue
+            if in_disagree and covered > qty:
+                # The reads disagree on this ticker, so neither quantity is
+                # sure: no over-cover cancel or shrink (roadmap 00 e).
+                db.set_state(pending_key, "")
+                log.error(f"[{ticker}] resting stops cover {covered:g} vs {qty:g} per the fresh "
+                          f"read, but the position reads disagree; over-cover fix skipped")
+                if _reconcile_alert_due(f"overstop_disagree_{ticker}"):
+                    try:
+                        import alerts
+                        alerts._send(f"🚨 STOP CHECK — <b>{ticker}</b>\nResting stops cover "
+                                     f"{covered:g} shares vs {qty:g} held per a fresh read, but the "
+                                     f"position reads disagree, so nothing was cancelled. Check the "
+                                     f"position and its stops in TWS.")
+                    except Exception as e:
+                        log.error(f"[{ticker}] could not send the over-cover alert: {e}")
                 continue
             if not db.get_state(pending_key):
                 db.set_state(pending_key, datetime.now(timezone.utc).isoformat())
@@ -4311,7 +4901,8 @@ def _reconcile_stop_orders_body(self):
                             f"confirming next cycle")
                 continue
             db.set_state(pending_key, "")
-            msg = _fix_overstop_safe(ticker)
+            msg = (_fix_overstop_safe(ticker, fresh_qty=float(fresh[ticker]), allow_cancel=False)
+                   if in_disagree else _fix_overstop_safe(ticker))
             all_actions.append(msg)
             new_actions.append(msg)
             try:
@@ -4341,7 +4932,13 @@ def _reconcile_stop_orders_body(self):
         stopped_tickers = {o["ticker"] for o in working}
         for ticker in stopped_tickers:
             db.set_state(f"no_stop_since_{ticker}", "")  # has a stop again -- reset
-        for ticker, qty in held.items():
+        # A ticker the cache reads flat but a fresh read shows held (disagree)
+        # is checked too, at the fresh-read quantity: a naked one gets the
+        # alert and the auto-stop like any other (roadmap 00 d).
+        naked_check = dict(held)
+        for ticker in disagree:
+            naked_check.setdefault(ticker, round(abs(float(fresh[ticker])), 4))
+        for ticker, qty in naked_check.items():
             if ticker not in stopped_tickers:
                 msg = f"⚠️ {ticker} ({qty} shares) has NO protective stop at the broker"
                 all_actions.append(msg)
@@ -4369,7 +4966,13 @@ def _reconcile_stop_orders_body(self):
                 else:
                     # Naked on two consecutive cycles: put a stop on at the
                     # recorded level instead of only alerting (A0053-2).
-                    fix = _fix_overstop_safe(ticker)
+                    if ticker in disagree and ticker not in held:
+                        fix = _fix_overstop_safe(ticker, fresh_qty=float(fresh[ticker]),
+                                                 allow_cancel=False)
+                    elif disagree:
+                        fix = _fix_overstop_safe(ticker, allow_cancel=False)
+                    else:
+                        fix = _fix_overstop_safe(ticker)
                     all_actions.append(fix)
                     new_actions.append(fix)
                     if fix.startswith("🔧"):
@@ -4584,6 +5187,25 @@ def check_vector_store_health(self):
         log.error(f"check_vector_store_health failed: {e}")
 
 
+def _log_outcome_checkpoint(o: dict, days: int, days_held: int, price: float) -> None:
+    """One activity_feed row per checkpoint written, so when and from what
+    each 30/60/90-day price was taken can be read back (trade_outcomes keeps
+    only the price). Never raises."""
+    try:
+        import db
+        from datetime import datetime, timezone
+        db.log_activity("outcome_checkpoint", o.get("ticker") or "",
+                        f"{days}d checkpoint written (held {days_held}d)", "neutral",
+                        {"outcome_id": o.get("id"), "approval_id": o.get("approval_id"),
+                         "env": o.get("trading_env"), "checkpoint_days": days,
+                         "days_held": days_held, "price": round(float(price), 4),
+                         "source": "yfinance fast_info.last_price",
+                         "entry_date": str(o.get("entry_date")),
+                         "written_at": datetime.now(timezone.utc).isoformat()})
+    except Exception as e:
+        log.warning(f"[{o.get('ticker')}] checkpoint activity row failed: {e}")
+
+
 @app.task(name="tasks.review_trade_outcomes", bind=True, max_retries=2)
 def review_trade_outcomes(self):
     """
@@ -4592,13 +5214,24 @@ def review_trade_outcomes(self):
     downtime, a holiday, the box being off — doesn't permanently skip a
     checkpoint; each checkpoint is only ever written once (guarded by the
     review_Xd_price column already being NULL).
+
+    Covers the open rows of both envs (paper rows went unreviewed after the
+    switch to live). Price checkpoints only: the price is market data
+    (yfinance), the write goes to that row by id, and nothing here reads the
+    account or the broker or touches stops or positions.
+
+    Then notes orders still 'submitted' hours after they were sent
+    (db.mark_stale_submitted_orders: reconcile_note only, never status).
     """
     try:
         import db
         import yfinance as yf
         from datetime import date
 
-        outcomes = db.get_open_outcomes()
+        # days_held keeps its original basis (local date minus entry_date's
+        # UTC date): the checkpoint day is part of how outcomes are measured.
+        outcomes = db.get_open_outcomes(all_envs=True)
+        prices: dict[str, float | None] = {}   # one fetch per ticker per run
         for o in outcomes:
             if not o.get("entry_date"):
                 continue
@@ -4615,17 +5248,36 @@ def review_trade_outcomes(self):
             if not pending_checkpoints:
                 continue
 
-            try:
-                price = yf.Ticker(o["ticker"]).fast_info.last_price
-            except Exception as e:
-                log.warning(f"[{o['ticker']}] price fetch failed: {e}")
-                continue
+            if o["ticker"] not in prices:
+                try:
+                    prices[o["ticker"]] = yf.Ticker(o["ticker"]).fast_info.last_price
+                except Exception as e:
+                    log.warning(f"[{o['ticker']}] price fetch failed: {e}")
+                    prices[o["ticker"]] = None
+            price = prices[o["ticker"]]
             if not price:
                 continue
 
             for days in pending_checkpoints:
-                db.update_outcome_price(o["approval_id"], days, price)
+                written = db.update_outcome_price(o["approval_id"], days, price,
+                                                  outcome_id=o.get("id"))
+                if not written:
+                    log.warning(f"[{o['ticker']}] {days}d checkpoint not written "
+                                f"(outcome {o.get('id')}, approval {o['approval_id']}): "
+                                f"{'write failed' if written is None else 'no open row with it unset'}")
+                    continue
                 log.info(f"[{o['ticker']}] {days}d checkpoint (held {days_held}d): ${price:.2f}")
+                _log_outcome_checkpoint(o, days, days_held, price)
+
+        # Record-keeping: note orders still 'submitted' hours after they were
+        # sent (reconcile_note only; status and the broker are not touched).
+        try:
+            noted = db.mark_stale_submitted_orders()
+            if noted:
+                log.warning(f"review_trade_outcomes: {noted} order row(s) still 'submitted' "
+                            f"noted as {db.STALE_SUBMITTED_NOTE}")
+        except Exception as e:
+            log.warning(f"review_trade_outcomes: stale submitted-order note failed: {e}")
     except Exception as e:
         log.error(f"review_trade_outcomes failed: {e}")
         raise self.retry(exc=e, countdown=120)

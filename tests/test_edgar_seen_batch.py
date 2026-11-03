@@ -1,5 +1,6 @@
 """One seen-ids query per EDGAR pass instead of one per feed entry (a pass
 took 11-18 minutes at ~230 ms per DB round trip)."""
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 from ingestion import edgar
@@ -36,8 +37,10 @@ def test_poll_falls_back_to_per_item_checks_when_the_batch_fails():
 def test_filing_in_two_feeds_is_dispatched_once_per_pass():
     """A filing dispatched (and marked seen by the dispatch) earlier in the
     pass must not dispatch again from another company's feed."""
+    # Dated from now: the feed skips entries past its age limit, so a fixed date stops dispatching.
+    updated = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
     atom = ('<feed xmlns="http://www.w3.org/2005/Atom"><entry><id>new-1</id><title>4 - insider</title>'
-            '<updated>2026-10-30T09:00:00Z</updated></entry></feed>')
+            f'<updated>{updated}</updated></entry></feed>')
     sent = []
 
     def dispatch(filing):

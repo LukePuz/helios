@@ -731,17 +731,45 @@ def process_candidates(candidates: list[dict], max_per_run: int = 5) -> list[dic
 
     # Built BEFORE analyze_batch (not after, as before) so each candidate's
     # situation brief can include live portfolio/account context.
+    # broker_error: the client or its position read failed, so the book the
+    # analysis sees is falsely empty. The verdicts are still logged, but no
+    # pass is routed: each gets a ROUTE_NO_BROKER row, plus one alert a day.
+    broker_error = None
     try:
         from ibkr import IBKRClient
         client = IBKRClient()
-        positions = _get_positions(client)
+        positions = _get_positions(client, strict=True)
+        if positions is None:
+            broker_error = "broker positions unreadable"
+            positions = {}
     except Exception as e:
         log.warning(f"Could not init IBKR client for brief/routing: {e}")
+        broker_error = f"{type(e).__name__}: {e}"
         client = None
         positions = {}
 
-    results = analyze_batch(to_analyze, regime_packet=regime,
-                            positions=positions, trading_client=client)
+    # Lost analyses get a NO_VERDICT row each, so a dead scan is visible.
+    from agents.scan_guard import log_lost_candidates
+    try:
+        results = analyze_batch(to_analyze, regime_packet=regime,
+                                positions=positions, trading_client=client)
+    except Exception as e:
+        # A logging failure must not replace the batch's own exception.
+        try:
+            log_lost_candidates(to_analyze, None, batch_error=f"{type(e).__name__}: {e}")
+        except Exception as log_error:
+            log.warning(f"NO_VERDICT logging failed after analyze_batch raised: {log_error}")
+        raise
+    try:
+        log_lost_candidates(to_analyze, results)
+    except Exception as e:
+        log.warning(f"NO_VERDICT logging failed: {e}")
+
+    if broker_error is not None:
+        from agents.scan_guard import alert_scan_without_broker, log_no_broker_passes
+        log.warning(f"Scan ran without a broker ({broker_error}); verdicts logged, none routed")
+        alert_scan_without_broker(broker_error, log_no_broker_passes(results, broker_error))
+        return results
 
     for result in results:
         if result.get("pass_to_risk") and client:

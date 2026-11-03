@@ -22,6 +22,12 @@ import threading
 log = logging.getLogger(__name__)
 
 
+def _now_utc():
+    """Timezone-aware now, for the orders.submitted_at record."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc)
+
+
 def _capture_original_thesis_if_new(ticker: str, approval: dict) -> None:
     """Writes original_thesis once, at genuine first entry -- never
     overwritten by a later ADD to the same position (db.get_thesis
@@ -101,6 +107,67 @@ def _remaining_after_sell(ticker: str, owned: float, filled_qty: float) -> float
             return None
         return 0.0
     return min(round(abs(float(held.qty)), 4), expected)
+
+
+def _log_unconfirmed_order(**row) -> bool:
+    """Write the 'unconfirmed' orders row that reconcile_unconfirmed_orders
+    uses to find a late fill. db.log_order returns -1 on failure without
+    raising, and that used to be ignored: a late fill then left a live
+    position with no stop and no trade row, invisible to reconcile (audit
+    2026-11-02 #7). On a failed write the row goes into the untracked-order
+    store (Redis and system_state), which reconcile re-writes from every
+    cycle (that is the retry), and one ORDER UNTRACKED alert goes out.
+    Ownership: db.log_order spills every failed write itself, so this only
+    spills when log_order raised instead of returning -1. This alert is the
+    one alert for the event: db's generic hourly "DB WRITE FAILED" for
+    log_order is held off for this call. Returns True if the row was written."""
+    import time
+    import db
+    import tasks
+    import alerts as alert_module
+    ticker = row.get("ticker")
+    throttle = getattr(db, "_LAST_WRITE_ALERT", None)
+    prev = throttle.get("log_order") if isinstance(throttle, dict) else None
+    if isinstance(throttle, dict):
+        throttle["log_order"] = time.time()   # this call's alert is ORDER UNTRACKED below
+    try:
+        if (db.log_order(**row) or -1) > 0:
+            if isinstance(throttle, dict):
+                if prev is None:
+                    throttle.pop("log_order", None)
+                else:
+                    throttle["log_order"] = prev
+            return True
+        log.error(f"[{ticker}] unconfirmed order row not written (log_order returned -1; spilled by db)")
+    except Exception as e:
+        log.error(f"[{ticker}] unconfirmed order row not written: {e}")
+        try:
+            db._spill("log_order", row, str(e))
+        except Exception as e2:
+            log.error(f"[{ticker}] unconfirmed order spill failed: {e2}")
+    try:
+        saved = tasks._save_untracked_order(row)
+    except Exception as e:
+        log.error(f"[{ticker}] could not save the untracked order for reconcile: {e}")
+        saved = False
+    try:
+        alert_module._send(
+            f"🚨 ORDER UNTRACKED — {ticker}\n"
+            f"{row.get('side')} {row.get('qty')} (order id {row.get('broker_order_id')}, "
+            f"perm id {row.get('perm_id')}) has no fill confirmed and its order row could not "
+            f"be written. "
+            + ("Reconcile retries the row every cycle; " if saved else
+               "It could NOT be queued for reconcile either; ")
+            + "check TWS for a late fill and protect any shares by hand."
+        )
+    except Exception:
+        pass
+    try:
+        tasks.open_manual_action(ticker, f"check order {row.get('broker_order_id')} for a late "
+                                         f"fill (order row not written)")
+    except Exception as e:
+        log.error(f"[{ticker}] could not open the manual action for the untracked order: {e}")
+    return False
 
 
 def _schedule_held_sell_retry(approval: dict, trigger: str) -> None:
@@ -322,7 +389,9 @@ def log_buy_outcome(approval: dict, ticker: str, action: str, entry_price: float
     try:
         planned_rps, fill_rps = _risk_per_share(approval, entry_price)
     except Exception as e:                 # log-only: never block the outcome row
-        log.debug(f"[{ticker}] risk-per-share record failed: {e}")
+        # warning, not debug: a silent failure leaves both columns NULL
+        # with nothing in the log to say why.
+        log.warning(f"[{ticker}] risk-per-share record failed: {e}")
         planned_rps, fill_rps = None, None
     return db.log_trade_outcome(
         approval_id=approval["id"],
@@ -1076,6 +1145,7 @@ def execute_approved(
             USE_BRACKET_ORDERS = False
 
         bracket_used = False
+        submitted_at = _now_utc()   # record-keeping only (orders.submitted_at)
         if side == "BUY" and USE_BRACKET_ORDERS and stop_price_for_entry:
             # Native bracket: entry + stop linked by parentId — TWS enforces
             # the pairing atomically, so this can't produce an orphaned stop.
@@ -1132,16 +1202,14 @@ def execute_approved(
                 # the broker.
                 log.error(f"[{ticker}] No fill confirmed within wait window "
                           f"(id={order_result.get('order_id')}) — nothing recorded")
-                try:
-                    db.log_order(
-                        ticker=ticker, side=side, order_type="MARKET",
-                        qty=shares, broker_order_id=order_result.get("order_id"),
-                        perm_id=order_result.get("perm_id"),
-                        decision_price=price_at_sizing, approval_id=approval["id"],
-                        status="unconfirmed", intent=action,
-                    )
-                except Exception:
-                    pass
+                _log_unconfirmed_order(
+                    ticker=ticker, side=side, order_type="MARKET",
+                    qty=shares, broker_order_id=order_result.get("order_id"),
+                    perm_id=order_result.get("perm_id"),
+                    decision_price=price_at_sizing, approval_id=approval["id"],
+                    status="unconfirmed", intent=action,
+                    submitted_at=submitted_at, submit_price=current_price_pre,
+                )
                 try:
                     stop_note = ""
                     if side == "SELL":
@@ -1183,6 +1251,7 @@ def execute_approved(
         )
 
         # Order-lifecycle + slippage logging (decision price = price used at sizing time)
+        local_order_id = None
         try:
             local_order_id = db.log_order(
                 ticker=ticker, side=side,
@@ -1191,6 +1260,7 @@ def execute_approved(
                 perm_id=order_result.get("perm_id"),
                 decision_price=price_at_sizing, approval_id=approval["id"],
                 status="submitted", intent=action,
+                submitted_at=submitted_at, submit_price=current_price_pre,
             )
             if local_order_id > 0 and (order_result.get("fill_price")
                                        or (filled_qty > 0 and not bracket_used)):   # bracket qty is assumed
@@ -1200,9 +1270,14 @@ def execute_approved(
                 # without a price is still a fill: record it with no price
                 # rather than leaving the row 'submitted' (professor run 17).
                 partial = not bracket_used and filled_qty < float(shares) - 1e-6
-                db.update_order_fill(local_order_id, order_result.get("fill_price"),
-                                     filled_qty, "partial" if partial else "filled",
-                                     filled_at=order_result.get("fill_time"))
+                if not db.update_order_fill(local_order_id, order_result.get("fill_price"),
+                                            filled_qty, "partial" if partial else "filled",
+                                            filled_at=order_result.get("fill_time")):
+                    # The row stays 'submitted'; say why (a note, not a status).
+                    log.warning(f"[{ticker}] fill write failed for order row {local_order_id}")
+                    db.set_order_reconcile_note(local_order_id, "fill_write_failed")
+            elif local_order_id > 0 and bracket_used:
+                db.set_order_reconcile_note(local_order_id, "bracket_fill_assumed")
         except Exception as e:
             log.debug(f"[{ticker}] Order/slippage logging failed (non-critical): {e}")
 
@@ -1210,15 +1285,41 @@ def execute_approved(
         # TRIM re-places the stop for the remaining shares.
         if side == "SELL":
             if action == "EXIT":
-                db.delete_position_stop(ticker)
-                log.info(f"[{ticker}] Position closed — stop record deleted")
                 if filled_qty < float(shares) - 1e-6:
                     # Part filled: the order stays 'partial' and reconcile
                     # closes the outcome from the cumulative fill once the
                     # rest fills (professor M121), not at this part's price.
+                    # The stop record stays until the position is flat: the
+                    # unsold shares were left with no stop and no record when
+                    # the remainder was cancelled (audit 2026-11-02 #2). The
+                    # queued re-protect puts the recorded stop on whatever a
+                    # working sell won't sell, and closes the exit when flat.
                     log.info(f"[{ticker}] EXIT part-filled ({filled_qty:g} of {shares}); outcome "
-                             f"left open for reconcile")
+                             f"left open for reconcile, stop record kept until flat")
+                    queued = False
+                    try:
+                        tasks._queue_reprotect(
+                            ticker, {"intent": "EXIT",
+                                     "id": local_order_id if (local_order_id or 0) > 0 else None},
+                            current_price or None)
+                        queued = True
+                    except Exception as e:
+                        log.error(f"[{ticker}] Could not queue the stop for the EXIT remainder: {e}")
+                    try:
+                        alert_module._send(
+                            f"⚠️ EXIT PART-FILLED — {ticker}\n"
+                            f"Sold {filled_qty:g} of {shares}. The stop record is kept; "
+                            + ("the unsold shares get the recorded stop on the next reconcile "
+                               "cycle unless the rest of the sell is still working."
+                               if queued else
+                               "the stop retry could NOT be queued. Check TWS and protect the "
+                               "unsold shares.")
+                        )
+                    except Exception:
+                        pass
                 else:
+                    db.delete_position_stop(ticker)
+                    log.info(f"[{ticker}] Position closed — stop record deleted")
                     try:
                         db.close_trade_outcome(ticker, exit_price=current_price, exit_source="model_exit",
                                               exit_price_source=price_source,
@@ -1491,6 +1592,7 @@ def execute_manual(
 
     order_intent = f"MANUAL_{side}"
     held_before = 0.0
+    quote_price = None   # the BUY room check's quote; orders.submit_price
     if side == "BUY":
         # Read before sending, so a late fill knows whether it opened or added
         # (a read right after a fill can be stale; A0253-4).
@@ -1520,6 +1622,7 @@ def execute_manual(
             _release_buy(ticker)   # nothing was sent
         return {"success": False, "filled_qty": 0, "fill_price": None, "stop_price": None,
                 "message": f"Order submission failed: {e}"}
+    submitted_at = _now_utc()   # record-keeping only (orders.submitted_at)
     try:
         order_result = ibkr.place_market_order(ticker, side, qty)
     except Exception as e:
@@ -1549,13 +1652,11 @@ def execute_manual(
         # and protect it; without one a late manual fill stayed invisible
         # (professor M108). No decision price: slippage stats stay
         # approval-path only.
-        try:
-            db.log_order(ticker=ticker, side=side, order_type="MARKET", qty=qty,
-                         broker_order_id=order_result.get("order_id"),
-                         perm_id=order_result.get("perm_id"),
-                         status="unconfirmed", intent=order_intent)
-        except Exception as e:
-            log.warning(f"[{ticker}] Could not log the unconfirmed manual order: {e}")
+        _log_unconfirmed_order(ticker=ticker, side=side, order_type="MARKET", qty=qty,
+                               broker_order_id=order_result.get("order_id"),
+                               perm_id=order_result.get("perm_id"),
+                               status="unconfirmed", intent=order_intent,
+                               submitted_at=submitted_at, submit_price=quote_price)
         stop_note = (" The broker stop was cancelled before the sell and NOT re-placed "
                      "(a late fill plus a full-size stop could short); check it."
                      if side == "SELL" else "")
@@ -1571,13 +1672,16 @@ def execute_manual(
         local_order_id = db.log_order(ticker=ticker, side=side, order_type="MARKET", qty=qty,
                                       broker_order_id=order_result.get("order_id"),
                                       perm_id=order_result.get("perm_id"),
-                                      status="submitted", intent=order_intent)
+                                      status="submitted", intent=order_intent,
+                                      submitted_at=submitted_at, submit_price=quote_price)
         if local_order_id > 0 and filled_qty > 0:
             # A part fill stays 'partial' so reconcile books the rest (M53);
             # a fill confirmed without a price is recorded with none.
-            db.update_order_fill(local_order_id, order_result.get("fill_price"), filled_qty,
-                                 "partial" if filled_qty < float(qty) - 1e-6 else "filled",
-                                 filled_at=order_result.get("fill_time"))
+            if not db.update_order_fill(local_order_id, order_result.get("fill_price"), filled_qty,
+                                        "partial" if filled_qty < float(qty) - 1e-6 else "filled",
+                                        filled_at=order_result.get("fill_time")):
+                log.warning(f"[{ticker}] fill write failed for order row {local_order_id}")
+                db.set_order_reconcile_note(local_order_id, "fill_write_failed")
     except Exception as e:
         log.debug(f"[{ticker}] Manual order logging failed (non-critical): {e}")
 

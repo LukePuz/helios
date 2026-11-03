@@ -364,11 +364,14 @@ def screen(event: dict) -> dict:
     # be tied to what made them.
     try:
         import hashlib
-        from agents.analyst import _CODE_SHA, _code_mixed_check
+        from agents.analyst import _CODE_SHA, _code_mixed_check, _config_env_record
         result["provenance"] = {
             "code_sha": _CODE_SHA["code_sha"],
             "head_sha": _CODE_SHA["head_sha"],
             **_code_mixed_check(),  # professor M75
+            # The screener's settings, and a hash of every env-overridable
+            # config.py setting, as in the analyst's provenance (M182).
+            "config": {"SCREENER_MODEL": SCREENER_MODEL, "env": _config_env_record()},
             "model": result.get("model_used") or "keyword_fallback",
             "model_digest": _screener_digest() if result.get("model_used") else None,
             "prompt_template_sha": hashlib.sha256(_SCREENER_PROMPT.encode()).hexdigest()[:12],

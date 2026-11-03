@@ -76,9 +76,9 @@ def test_adoption_skips_a_position_recorded_meanwhile():
 
 def test_adoption_stops_only_the_uncovered_shares():
     msg, place, _ = _adopt(resting=[{"qty": 4.0}])
-    place.assert_called_once_with("AMD", 6.0, 90.0)
+    place.assert_called_once_with("AMD", 6.0, 90.0, market_price=200.0)
     msg, place, upsert = _adopt(resting=[{"qty": 4.0, "stop_price": 95.0}])
-    place.assert_called_once_with("AMD", 6.0, 95.0)  # A0453-5: the resting level
+    place.assert_called_once_with("AMD", 6.0, 95.0, market_price=200.0)  # A0453-5: the resting level
     assert upsert.call_args.kwargs["stop_price"] == 95.0
     msg, place, upsert = _adopt(resting=[{"qty": 10.0}])
     place.assert_not_called(); upsert.assert_called_once()
@@ -121,3 +121,23 @@ def test_overrun_reconcile_reports_how_it_ended():
         _t.sleep(0.3)
     texts = [c[0][0] for c in send.call_args_list]
     assert any("slow" in x for x in texts) and any("finished after" in x for x in texts)
+
+
+def test_overrun_reconcile_failure_is_sent_as_a_critical_alert():
+    import time as _t
+    import alert_policy
+
+    def boom():
+        _t.sleep(0.15)
+        raise RuntimeError("broker hung")
+    with patch("main._startup_reconcile", side_effect=boom), patch("alerts._send") as send:
+        main._bounded_startup_reconcile(limit_s=0.05)
+        _t.sleep(0.3)
+    failed = [c[0][0] for c in send.call_args_list if "FAILED" in c[0][0]]
+    assert failed and failed[0].startswith("⚠️ <b>Startup reconciliation FAILED</b>")
+    assert "broker hung" in failed[0]
+    assert alert_policy.classify(failed[0])[0] == alert_policy.CRITICAL
+    ok = "ℹ️ <b>Startup reconciliation</b> finished after 412s."
+    assert alert_policy.classify(ok) == (alert_policy.LOW, "startup_info")
+    old_failure = "ℹ️ <b>Startup reconciliation</b> failed after 412s: broker hung."
+    assert alert_policy.classify(old_failure)[0] == alert_policy.CRITICAL

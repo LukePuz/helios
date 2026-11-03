@@ -152,7 +152,7 @@ def _adopt_position(client, rm, symbol, qty, manage_stop_place, resting_sell_sto
                 f"last price ({'unknown' if not last else f'${last:.2f}'}), nothing placed — "
                 f"set a stop in TWS)")
     try:
-        stop_result = manage_stop_place(symbol, need, stop_price)
+        stop_result = manage_stop_place(symbol, need, stop_price, market_price=last)
         db.set_stop_broker_order_id(symbol, stop_result["order_id"])
         return f"{symbol} ({need:g} shares, stop placed @ ${stop_price:.2f})"
     except Exception as e:
@@ -442,7 +442,10 @@ def _bounded_startup_reconcile(limit_s: float = _STARTUP_RECONCILE_LIMIT_S) -> N
                 logging.warning(f"Startup reconciliation {msg}")
                 try:
                     import alerts
-                    alerts._send(f"ℹ️ <b>Startup reconciliation</b> {msg}.")
+                    if outcome.get("ok"):
+                        alerts._send(f"ℹ️ <b>Startup reconciliation</b> {msg}.")
+                    else:
+                        alerts._send(f"⚠️ <b>Startup reconciliation FAILED</b>\n{msg}.")
                 except Exception:
                     pass
 
@@ -482,6 +485,13 @@ def _auto_start_services() -> None:
         # else: with beat and the other workers already up, overdue
         # reconcile tasks raced the adoption and a fresh market BUY could be
         # cancelled as "stale" (audit 02:53, A0253-5).
+        # Before beat starts: log which entries came due while the stack
+        # was down (read-only; beat fires each once at start).
+        try:
+            from beat_missed import log_missed_beat_entries
+            log_missed_beat_entries()
+        except Exception as e:
+            logging.warning(f"Beat due-at-boot record failed: {e}")
         if "celery_orders_worker" in pm.SERVICES:
             _start_one("celery_orders_worker")
         _bounded_startup_reconcile()
@@ -509,6 +519,14 @@ def main() -> None:
     import db
     db.init_db()
     logging.info("Database ready.")
+
+    # SEC EDGAR needs a contact address in the User-Agent. Alert once here,
+    # in the main process only, rather than on import in every worker.
+    try:
+        from ingestion import contact
+        contact.alert_if_missing()
+    except Exception as e:
+        logging.warning(f"CONTACT_EMAIL check failed: {e}")
 
     # 3. Ollama check
     print("  [3/6] Checking Ollama...")

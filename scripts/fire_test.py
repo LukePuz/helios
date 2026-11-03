@@ -201,7 +201,10 @@ def main():
         reasoning     = f"[TEST RUN] {reasoning}",
         analyst_json  = result,
         risk_json     = sizing,
+        is_test       = True,   # pending_approvals.is_test, not only the reasoning prefix
     )
+    if approval_id is None or approval_id < 0:
+        sys.exit("  Approval write failed (spilled); no approval request sent.")
     print(f"  Logged to DB -- approval ID: #{approval_id}")
 
     msg_id = alerts.send_approval_request(

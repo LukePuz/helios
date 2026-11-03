@@ -207,6 +207,31 @@ class TestConcentrationCapping:
 
         mock_log_approval.assert_not_called()
 
+    def test_an_errored_check_blocks_the_buy(self):
+        """Audit 2026-11-02 #3: a position-read error in the concentration
+        check let the BUY route at full size."""
+        import risk_manager
+        failing = risk_manager.RiskManager.__new__(risk_manager.RiskManager)
+        failing._client = MagicMock()
+        failing._client.get_all_positions.side_effect = Exception("IBKR down")
+        conc = failing.check_concentration("JPM", 0.10)
+        result = _analyst_result(action="ADD", ticker="JPM", conviction=8)
+
+        with patch("db.has_active_approval", return_value=False), \
+             patch("db.get_last_executed_approval", return_value=None), \
+             patch("agents.crew._get_price", return_value=100.0), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("agents.crew._log_route_exit") as route_exit, \
+             patch("db.log_pending_approval") as mock_log_approval, \
+             patch("catalyst_service.gates.catalyst_gate_check", return_value={"approved": True}):
+            mock_rm_cls.return_value.size_position.return_value = self._base_sizing()
+            mock_rm_cls.return_value.check_concentration.return_value = conc
+            mock_rm_cls.return_value.check_correlation.return_value = {"reduce_by": 0}
+            crew._route_to_approval(result, {"regime": "Neutral"}, MagicMock())
+
+        mock_log_approval.assert_not_called()
+        assert route_exit.call_args.args[1] == "ROUTE_CONCENTRATION_ZERO"
+
     def test_a_ticker_not_itself_ai_infra_is_never_capped(self):
         """cap=None means this ticker isn't what's driving the breach --
         must proceed at full proposed size, not get scaled to 0 by a stray

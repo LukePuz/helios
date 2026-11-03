@@ -5,6 +5,7 @@ Includes approval-request messages with inline buttons for human approval gate.
 
 import logging
 import os
+import re
 import time as _time
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +20,7 @@ log = logging.getLogger(__name__)
 
 import log_redaction  # noqa: E402
 log_redaction.install()
+import alert_policy  # noqa: E402
 
 _TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
 _CHAT_ID = os.getenv("TELEGRAM_CHAT_ID",   "")
@@ -30,29 +32,150 @@ _BASE    = f"https://api.telegram.org/bot{_TOKEN}"
 # Core send helpers
 # ---------------------------------------------------------------------------
 
-def _send(text: str, _max_attempts: int = 3) -> int | None:
-    """Send a plain text message. Returns message_id or None. Retries up to 3× on failure."""
+_TELEGRAM_MAX_CHARS = 4000   # Telegram's limit is 4096; leave room for HTML
+
+
+def _plain(text: str) -> str:
+    """HTML tags removed and entities unescaped, for a resend without
+    parse_mode."""
+    import html
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
+
+
+def _chunks(text: str, limit: int = _TELEGRAM_MAX_CHARS) -> list[str]:
+    """Split on line boundaries into pieces Telegram accepts."""
+    if len(text) <= limit:
+        return [text]
+    out, cur = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            if cur:
+                out.append(cur)
+                cur = ""
+            out.append(line[:limit])
+            line = line[limit:]
+        if cur and len(cur) + 1 + len(line) > limit:
+            out.append(cur)
+            cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        out.append(cur)
+    if len(out) > _MAX_PARTS:
+        out = out[:_MAX_PARTS]
+        out[-1] = out[-1][:limit - len(_TRUNCATED)] + _TRUNCATED
+    return out
+
+
+_MAX_PARTS = 3
+_TRUNCATED = "\n…(truncated)"
+
+
+def _truncate(text: str, limit: int = _TELEGRAM_MAX_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit - len(_TRUNCATED)] + _TRUNCATED
+
+
+def _post_message(payload: dict, _max_attempts: int, what: str) -> int | None:
+    """POST sendMessage with retries. A 400 is a formatting rejection
+    (unescaped '<' in model or exception text, or HTML Telegram won't
+    parse): retrying the same body can't help, so it is resent once as
+    plain text instead. On 2026-10-26 the weekly self-review was lost to
+    three identical 400s."""
+    for attempt in range(1, _max_attempts + 1):
+        try:
+            resp = requests.post(f"{_BASE}/sendMessage", json=payload, timeout=10)
+            if getattr(resp, "status_code", None) == 400 and payload.get("parse_mode"):
+                log.warning(f"Telegram {what} rejected as HTML (400); resending as plain text")
+                payload = {k: v for k, v in payload.items() if k != "parse_mode"}
+                payload["text"] = _plain(payload["text"])
+                resp = requests.post(f"{_BASE}/sendMessage", json=payload, timeout=10)
+            resp.raise_for_status()
+            return resp.json().get("result", {}).get("message_id")
+        except Exception as e:
+            log.warning(f"Telegram {what} attempt {attempt}/{_max_attempts} failed: {e}")
+            if attempt < _max_attempts:
+                _time.sleep(2 ** attempt)  # 2s, 4s
+    return None
+
+
+def _caller() -> str:
+    """file:function of the first frame outside this module."""
+    import sys
+    f = sys._getframe(1)
+    here = os.path.abspath(__file__)
+    while f is not None and os.path.abspath(f.f_code.co_filename) == here:
+        f = f.f_back
+    if f is None:
+        return "unknown"
+    try:
+        path = os.path.relpath(f.f_code.co_filename, os.path.dirname(here))
+    except ValueError:
+        path = f.f_code.co_filename
+    return f"{path}:{f.f_code.co_name}"
+
+
+def _send(text: str, _max_attempts: int = 3, severity: str | None = None) -> int | None:
+    """Send a plain text message. Returns message_id or None. Retries up to 3× on failure.
+
+    Routed by alert_policy: critical alerts (halts, stops, unprotected or
+    short positions, order blocks, broker/DB failures, and any text it does
+    not recognise) always go out at once. Only the known low-severity types
+    are deduplicated and rate limited; their repeats arrive in the digest
+    (flush_digest). Every alert is recorded in logs/telegram_outbox.jsonl."""
     if not _TOKEN or not _CHAT_ID:
         log.debug("Telegram not configured — alert skipped.")
         return None
     # Alert text often embeds a raw exception, which bypasses log redaction
     # (review of 23673b7).
     text = log_redaction.redact(str(text))
-    for attempt in range(1, _max_attempts + 1):
-        try:
-            resp = requests.post(
-                f"{_BASE}/sendMessage",
-                json={"chat_id": _CHAT_ID, "text": text, "parse_mode": "HTML"},
-                timeout=10,
-            )
-            resp.raise_for_status()
-            return resp.json().get("result", {}).get("message_id")
-        except Exception as e:
-            log.warning(f"Telegram send attempt {attempt}/{_max_attempts} failed: {e}")
-            if attempt < _max_attempts:
-                _time.sleep(2 ** attempt)  # 2s, 4s
-    log.error(f"Telegram send failed after {_max_attempts} attempts — message lost.")
-    return None
+    try:
+        source = _caller()
+    except Exception:
+        source = "unknown"
+    try:
+        sev, atype = alert_policy.classify(text)
+        if severity in (alert_policy.CRITICAL, alert_policy.REPORT, alert_policy.LOW):
+            sev = severity
+    except Exception:
+        sev, atype = alert_policy.CRITICAL, ""
+    if sev == alert_policy.LOW and not alert_policy.admit_low(atype, text):
+        log.info(f"Telegram alert held for digest ({atype}): {alert_policy.title(text)}")
+        alert_policy.record(source, text, sev, atype, "held")
+        return None
+    message_id = None
+    try:
+        parts = _chunks(text)
+    except Exception:
+        parts = [_truncate(text)]
+    for i, part in enumerate(parts):
+        mid = _post_message({"chat_id": _CHAT_ID, "text": part, "parse_mode": "HTML"},
+                            _max_attempts, "send")
+        if i == 0:
+            message_id = mid
+        if mid is None:
+            # Telegram is down or refusing: don't spend another ~36 s of
+            # retries per remaining part (the caller may be an order path).
+            break
+    if message_id is None:
+        log.error(f"Telegram send failed after {_max_attempts} attempts — message lost.")
+    alert_policy.record(source, text, sev, atype, "sent" if message_id is not None else "failed")
+    return message_id
+
+
+def flush_digest() -> int | None:
+    """Send one message listing the low-severity alerts held since the last
+    digest. No-op when nothing was held."""
+    text, snapshot = alert_policy.digest_text()
+    if not text:
+        return None
+    message_id = _send(text, severity=alert_policy.REPORT)
+    if message_id is not None:
+        # Cleared only once Telegram took it; a failed digest is retried
+        # with the next flush.
+        alert_policy.clear_digest(snapshot)
+    return message_id
 
 
 def _send_with_buttons(text: str, buttons: list[list[dict]], _max_attempts: int = 3) -> int | None:
@@ -66,26 +189,22 @@ def _send_with_buttons(text: str, buttons: list[list[dict]], _max_attempts: int 
         log.debug("Telegram not configured — approval request skipped.")
         return None
     text = log_redaction.redact(str(text))
-    for attempt in range(1, _max_attempts + 1):
-        try:
-            resp = requests.post(
-                f"{_BASE}/sendMessage",
-                json={
-                    "chat_id":      _CHAT_ID,
-                    "text":         text,
-                    "parse_mode":   "HTML",
-                    "reply_markup": {"inline_keyboard": buttons},
-                },
-                timeout=10,
-            )
-            resp.raise_for_status()
-            return resp.json().get("result", {}).get("message_id")
-        except Exception as e:
-            log.warning(f"Telegram button send attempt {attempt}/{_max_attempts} failed: {e}")
-            if attempt < _max_attempts:
-                _time.sleep(2 ** attempt)  # 2s, 4s
-    log.error(f"Telegram button send failed after {_max_attempts} attempts — approval message lost.")
-    return None
+    message_id = _post_message(
+        {
+            "chat_id":      _CHAT_ID,
+            "text":         _truncate(text),
+            "parse_mode":   "HTML",
+            "reply_markup": {"inline_keyboard": buttons},
+        },
+        _max_attempts, "button send")
+    if message_id is None:
+        log.error(f"Telegram button send failed after {_max_attempts} attempts — approval message lost.")
+    try:
+        alert_policy.record(_caller(), text, alert_policy.CRITICAL, "",
+                            "sent" if message_id is not None else "failed")
+    except Exception:
+        pass
+    return message_id
 
 
 def _edit_message(message_id: int, new_text: str) -> None:

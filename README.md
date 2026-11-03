@@ -10,7 +10,7 @@ A one-page overview is in [`docs/helios-overview.pdf`](docs/helios-overview.pdf)
 
 Does the conviction an LLM states for a trade predict that trade's return?
 
-The model's 1 to 10 conviction score is recorded at the moment of decision, and each position's outcome (return and return relative to SPY at 30, 60 and 90 days, and at exit) is recorded against it later. The question is whether higher stated conviction goes with better outcomes, or whether the number carries no information.
+The model's 1 to 10 conviction score is recorded at the moment of decision, and each position's outcome is recorded against it later: the return at exit, and the return relative to SPY at exit (SPY's price is stored at entry and at exit). While a position is open, a price checkpoint is also stored once it has been held 30 days and again at 60 days. The date each checkpoint was taken is not stored, there is no matching SPY checkpoint, and no live position has reached the 90-day checkpoint yet. The question is whether higher stated conviction goes with better outcomes, or whether the number carries no information.
 
 ### Why evaluation is forward only
 
@@ -19,7 +19,7 @@ There is no backtest, by design. The analyst is a general-purpose LLM whose trai
 To make that forward record usable:
 
 - each decision stores the full thesis as JSON, the stated conviction and sub-scores, the risk verdict, the position size and the stop;
-- SPY is recorded at entry, so return relative to SPY is computed for every trade at exit;
+- SPY's price is recorded at entry and at exit, so return relative to SPY is computed for every closed trade;
 - slippage between the decision price and the fill is recorded for each order;
 - the code version (git commit) that made each decision is stored with it.
 
@@ -44,7 +44,7 @@ flowchart LR
 1. An event arrives, for example an 8-K filing or an unusual options trade on a watchlist ticker.
 2. The screener (Qwen 2.5 7B) decides whether it is relevant enough to analyze.
 3. The context engine builds a brief: price action, fundamentals, the catalyst calendar and past theses retrieved from a vector store.
-4. The analyst (Qwen 2.5 72B) writes a thesis with a conviction score, an upside and downside estimate and a bucket (Compounder, Accelerator or Moonshot). It recommends OPEN, ADD, HOLD, WATCH, TRIM or EXIT.
+4. The analyst (Qwen 2.5 72B) writes a thesis with a conviction score, an upside and downside estimate and a suggested bucket (Compounder, Accelerator or Moonshot). It recommends OPEN, ADD, HOLD, WATCH, TRIM or EXIT. The model's bucket is stored for audit but not used for sizing: the bucket that sets the caps below is the ticker's role in the hand-written watchlist (`knowledge/watchlist.md`). An optional setup classifier, off by default, can replace the watchlist role; the model's own choice is never used.
 5. The risk manager sizes the trade from fixed tables, scaled by the market regime, sets a stop and enforces the limits below.
 6. Orders that pass go to Interactive Brokers automatically, with a stop. A Telegram message reports the trade afterwards.
 
@@ -61,7 +61,7 @@ These are deterministic code, covered by unit tests. The model's output is an in
 | Drawdown checked before every buy | at 10% below the high-water mark, buying halts until a person resumes it |
 | Drawdown checked every 30 minutes | at 15% below the high-water mark on 2 reads in a row, the same halt is set |
 | What a halt stops | new buys only; sells and protective stops keep working |
-| Maximum entry size by bucket | Compounder 12%, Accelerator 7%, Moonshot 2% (large-account values) |
+| Maximum entry size by bucket (watchlist role) | Compounder 12%, Accelerator 7%, Moonshot 2% (large-account values) |
 | Risk per trade | a stop-out may cost at most 2% of equity |
 | Total open risk ("portfolio heat") | 7% of equity |
 | Concentration | 35% per theme, 60% total AI infrastructure, 10% total Moonshots |
@@ -74,9 +74,9 @@ Small accounts: percentage caps sized for a large account round down to zero sha
 
 ## Status
 
-- Paper trading from June to August 2026; live since 2026-08-17. A `TRADING_ENV` setting selects paper or live, and every stateful table is separated by environment so the two records never mix. Live trading also needs a second, separate opt-in.
+- Paper trading from June to August 2026; live since 2026-08-17. A `TRADING_ENV` setting selects paper or live. The tables that make up the trade record (orders, trades, approvals, outcomes, stops, trade plans, signals and portfolio snapshots) carry the environment on every row, so paper and live trades never mix; a few logging tables (the activity feed, the market regime log, scanner candidates and the trade ladder) are not split by environment. Live trading also needs a second, separate opt-in.
 - Live record so far: 6 buys (the last on 2026-09-17), 4 closed trades, 2 open positions. Most recent analyst passes size to zero or one share at the current account size, which is why there have been no new live entries since mid-September.
-- Code: about 49,000 lines of Python in 166 files; 93 test files with 974 tests, run on every push by GitHub Actions; 730 commits since 2026-06-20.
+- Code: about 55,000 lines of Python in 195 files; 116 test files with 1,234 tests, run on every push by GitHub Actions; 735 commits since 2026-06-20 (as of 2026-11-02).
 
 ## Running the tests
 

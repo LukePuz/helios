@@ -52,6 +52,12 @@ from config import IB_HOST, IB_PORT, IB_CLIENT_ID as _IB_CLIENT_ID_BASE
 _ib: ibi.IB | None = None
 _client_id: int | None = None   # resolved lazily on first connect
 _last_heartbeat: float = 0.0   # time.monotonic() of last successful heartbeat
+# Connectivity record for this process (wall-clock time.time()): when the
+# current session connected, and the last 1100/1101/2110 error or failed
+# connect. Read by connectivity_error_free_for.
+_connected_at: float = 0.0
+_last_connectivity_error_at: float = 0.0
+_CONNECTIVITY_ERROR_CODES = (1100, 1101, 2110)
 
 _HEARTBEAT_INTERVAL_S = 30
 _HEARTBEAT_TIMEOUT_S  = 8
@@ -86,14 +92,56 @@ def _get_client_id() -> int:
 # Connection
 # ---------------------------------------------------------------------------
 
+def _on_ib_error(*args) -> None:
+    """errorEvent handler (reqId, errorCode, errorString, contract): stamps
+    the TWS connectivity errors 1100 (lost), 1101 (restored, data lost) and
+    2110 (TWS-server connectivity broken)."""
+    global _last_connectivity_error_at
+    import time
+    try:
+        code = int(args[1])
+    except (IndexError, TypeError, ValueError):
+        return
+    if code in _CONNECTIVITY_ERROR_CODES:
+        _last_connectivity_error_at = time.time()
+
+
+def connectivity_error_free_for(seconds: float) -> bool:
+    """True when this process's session has been connected for at least
+    `seconds` with no connectivity error or failed connect in that time."""
+    import time
+    ib = get_ib()
+    now = time.time()
+    return (ib.isConnected() and _connected_at > 0 and now - _connected_at >= seconds
+            and now - _last_connectivity_error_at >= seconds)
+
+
+def get_account_stock_value() -> float:
+    """The server's account-level stock value: GrossPositionValue from the
+    account summary, else StockMarketValue from the account values. Raises
+    when neither is reported."""
+    ib = get_ib()
+    for v in _bounded_req(ib, "accountSummary", ib.accountSummary):
+        if v.tag == "GrossPositionValue" and v.currency in ("USD", "BASE", ""):
+            return float(v.value)
+    for v in ib.accountValues():
+        if v.tag == "StockMarketValue" and v.currency in ("BASE", "USD"):
+            return float(v.value)
+    raise RuntimeError("no GrossPositionValue or StockMarketValue in the account view")
+
+
 def get_ib(max_attempts: int = 3) -> ibi.IB:
-    global _ib, _last_heartbeat, _client_id
+    global _ib, _last_heartbeat, _client_id, _connected_at, _last_connectivity_error_at
     import asyncio
     import time
     for attempt in range(1, max_attempts + 1):
         try:
             if _ib is None:
                 _ib = ibi.IB()
+                try:
+                    _ib.errorEvent += _on_ib_error
+                except Exception as e:
+                    log.warning(f"could not attach the IBKR error handler: {e}")
             if not _ib.isConnected():
                 cid = _get_client_id()
                 try:
@@ -114,6 +162,7 @@ def get_ib(max_attempts: int = 3) -> ibi.IB:
                     else:
                         raise
                 _last_heartbeat = 0.0
+                _connected_at = time.time()
                 log.info(f"Connected to IBKR TWS at {IB_HOST}:{IB_PORT} (clientId={cid})")
             # Heartbeat — round-trips to TWS to catch stale connections that
             # report isConnected()=True but are no longer communicating.
@@ -132,6 +181,8 @@ def get_ib(max_attempts: int = 3) -> ibi.IB:
             return _ib
         except Exception as e:
             log.warning(f"IBKR connect attempt {attempt}/{max_attempts} failed: {e}")
+            _last_connectivity_error_at = time.time()
+            _connected_at = 0.0
             try:
                 if _ib is not None:
                     _ib.disconnect()
@@ -288,6 +339,22 @@ def _refuse_sell_on_short(ib, ticker: str, qty: float | None = None) -> None:
     if bad:
         raise SellExceedsPosition(f"{ticker}: SELL {qty if qty is not None else ''} refused; "
                                   f"broker shows {held:g} shares")
+
+
+def get_fresh_stock_positions() -> dict[str, float]:
+    """{symbol: qty} for every non-zero stock position from a fresh
+    reqPositions() request, not the ib.portfolio() cache that
+    IBKRClient.get_all_positions reads. Used to confirm a position looks
+    gone before reconcile cancels its stop or deletes its record: the
+    portfolio cache can read empty or short after a reconnect (audit
+    2026-11-02 #6). Raises on any read failure."""
+    ib = get_ib()
+    out: dict[str, float] = {}
+    for p in _bounded_req(ib, "reqPositions", ib.reqPositions):
+        if getattr(p.contract, "secType", "STK") != "STK" or float(p.position) == 0:
+            continue
+        out[p.contract.symbol] = out.get(p.contract.symbol, 0.0) + float(p.position)
+    return out
 
 
 def place_market_order(ticker: str, side: str, qty: float, fill_timeout: float = 30.0) -> dict:
@@ -547,6 +614,71 @@ def place_bracket_order(
     }
 
 
+def round_sell_stop_up_to_tick(price: float, market_price: float | None = None) -> float:
+    """A SELL stop price on the US stock tick: $0.01 at $1 and up, $0.0001
+    below. An off-tick price (e.g. an unrounded average fill used as a
+    breakeven stop) can be rejected (Error 110), leaving the position with
+    no stop (audit 2026-11-02 #9). Rounds UP, so the stop is never wider
+    than the price the caller computed. Exception: when the caller knows the
+    market price and rounding up would put the stop at or above it (a SELL
+    stop there triggers at once), it rounds down instead and logs it.
+    The price is first snapped to 1e-6 (Decimal), so float noise such as
+    100*1.1 = 110.00000000000001 or 0.1+0.2 doesn't move an on-tick price up
+    a tick."""
+    from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN
+    d = Decimal(repr(float(price))).quantize(Decimal("0.000001"), rounding=ROUND_HALF_EVEN)
+    tick = Decimal("0.01") if d >= 1 else Decimal("0.0001")
+    up = float(d.quantize(tick, rounding=ROUND_CEILING))
+    if market_price is not None and up >= float(market_price) and Decimal(repr(up)) != d:
+        down = float(d.quantize(tick, rounding=ROUND_FLOOR))
+        log.warning(f"Stop ${float(price)} rounded up to ${up} would be at/above the market "
+                    f"${float(market_price)}; rounded down to ${down} instead")
+        return down
+    return up
+
+
+class StopNotAccepted(RuntimeError):
+    """The broker rejected, cancelled or deactivated a protective stop right
+    after it was placed (tick size, price cap, Error 110/201). The order is
+    not protecting anything, so callers must not record its id as the stop:
+    raising sends them down their retry/alert path instead."""
+
+
+# Statuses that mean a just-placed order is not working at the broker.
+_REJECTED_STATUSES = {"Cancelled", "ApiCancelled", "Inactive"}
+# Statuses that mean the broker has accepted it (PreSubmitted is normal for a
+# stop waiting on its trigger, or outside regular hours).
+_ACCEPTED_STATUSES = {"PreSubmitted", "Submitted", "Filled"}
+
+
+def _await_order_accepted(ib, trade, label: str, poll_seconds: int = 5) -> None:
+    """Wait on the IB event loop (ib.sleep, never time.sleep) for up to
+    poll_seconds for the broker's verdict on a just-placed order. Raises
+    StopNotAccepted if it lands rejected/cancelled/inactive. An order still
+    pending after the window is returned as placed (it may be live: raising
+    would make the caller stack a second one); reconcile checks coverage."""
+    status = None
+    for _ in range(max(1, poll_seconds)):
+        ib.sleep(1)
+        status = getattr(getattr(trade, "orderStatus", None), "status", None)
+        if status in _REJECTED_STATUSES or status in _ACCEPTED_STATUSES:
+            break
+    if status in _REJECTED_STATUSES:
+        reason = ""
+        try:
+            msgs = [e.message for e in (trade.log or []) if getattr(e, "message", "")]
+            reason = msgs[-1] if msgs else ""
+        except Exception:
+            pass
+        log.error(f"{label} NOT accepted by the broker: status={status}"
+                  + (f" ({reason})" if reason else ""))
+        raise StopNotAccepted(f"{label}: broker status {status}"
+                              + (f" ({reason})" if reason else ""))
+    if status not in _ACCEPTED_STATUSES:
+        log.warning(f"{label}: broker status still '{status}' after {poll_seconds}s; "
+                    f"treating as placed (reconcile verifies coverage)")
+
+
 def place_trailing_stop_order(
     ticker: str, qty: float,
     trail_percent: float | None = None, trail_amount: float | None = None,
@@ -574,21 +706,27 @@ def place_trailing_stop_order(
         action="SELL", totalQuantity=qty, orderType="TRAIL", tif="GTC", **order_kwargs,
     )
     trade = ib.placeOrder(contract, order)
-    ib.sleep(1)
     label = f"{trail_percent}%" if trail_percent is not None else f"${trail_amount:.2f}"
+    _await_order_accepted(ib, trade, f"Trailing stop SELL {qty} {ticker} trailing {label} "
+                                     f"(orderId={trade.order.orderId})")
     log.info(f"Native trailing stop placed: SELL {qty} {ticker} trailing {label} "
              f"(orderId={trade.order.orderId})")
     return {"order_id": trade.order.orderId, "trail_percent": trail_percent, "trail_amount": trail_amount}
 
 
-def place_stop_order(ticker: str, qty: float, stop_price: float) -> dict:
-    """Place a GTC sell stop-loss order. Returns order_id for lifecycle tracking."""
+def place_stop_order(ticker: str, qty: float, stop_price: float,
+                     market_price: float | None = None) -> dict:
+    """Place a GTC sell stop-loss order. Returns order_id for lifecycle tracking.
+    market_price, when the caller has the last price, keeps the tick
+    round-up from putting the stop at or above the market."""
+    stop_price = round_sell_stop_up_to_tick(stop_price, market_price)
     ib = get_ib()
     _refuse_sell_on_short(ib, ticker, qty)
     contract = _stock(ib, ticker)
     order    = ibi.StopOrder("SELL", qty, stop_price, tif="GTC")
     trade    = ib.placeOrder(contract, order)
-    ib.sleep(1)
+    _await_order_accepted(ib, trade, f"Stop SELL {qty} {ticker} @ ${stop_price:.2f} "
+                                     f"(orderId={trade.order.orderId})")
     log.info(f"Stop order placed: SELL {qty} {ticker} @ ${stop_price:.2f} "
              f"(orderId={trade.order.orderId})")
     return {"order_id": trade.order.orderId, "stop_price": stop_price}

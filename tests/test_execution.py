@@ -128,6 +128,36 @@ class TestSellClampAndDrift:
             assert close.called is closes
             assert upd.call_args.args[3] == ("filled" if closes else "partial")
 
+    def test_part_filled_exit_keeps_the_stop_record_and_queues_the_remainder(self):
+        """Audit 2026-11-02 #2: a part-filled EXIT deleted the stop record, so
+        the unsold shares had no stop and nothing to restore one from. The
+        record now stays until flat and the remainder is queued for a stop."""
+        approval = _approval(action="EXIT", shares_initial=999)
+        ibkr_client = MagicMock()
+        ibkr_client.get_open_position.return_value = MagicMock(qty=42.0)
+        for filled, deletes in ((20.0, False), (42.0, True)):
+            with patch("ibkr.get_ib"), \
+                 patch("ibkr.get_client", return_value=ibkr_client), \
+                 patch("ibkr.cancel_stop_orders_for", return_value=0), \
+                 patch("ibkr.place_market_order",
+                       return_value={"order_id": 1, "fill_price": 100.0, "filled_qty": filled}), \
+                 patch("ibkr.get_latest_price", return_value=100.0), \
+                 patch("market_data.get_priced_quote", return_value=None), \
+                 patch("config.USE_BRACKET_ORDERS", False), \
+                 patch("db.log_trade"), patch("db.log_order", return_value=7), \
+                 patch("db.update_order_fill"), patch("db.delete_position_stop") as delete, \
+                 patch("db.close_trade_outcome"), patch("db.log_trade_outcome"), \
+                 patch("tasks._queue_reprotect") as queue, patch("alerts._send"), \
+                 patch("alerts.send_trade_alert"):
+                execution.execute_approved(approval)
+            assert delete.called is deletes
+            if deletes:
+                queue.assert_not_called()
+            else:
+                queue.assert_called_once()
+                assert queue.call_args.args[0] == "NVDA"
+                assert queue.call_args.args[1] == {"intent": "EXIT", "id": 7}
+
     def test_sell_not_aborted_by_large_drift(self):
         """A >8% price move must never block a risk-reducing sell — that's
         backwards (big moves are often exactly why you're exiting), and
@@ -1357,3 +1387,79 @@ def test_every_execution_trigger_has_its_own_reason_label(trigger, label):
     """Professor M134: retries used to read "approved via Telegram"."""
     assert execution._TRIGGER_LABELS[trigger] == label
     assert len(set(execution._TRIGGER_LABELS.values())) == len(execution._TRIGGER_LABELS)
+
+
+def test_untracked_order_without_ids_is_alerted_once_not_reinserted():
+    """Review: a saved row with neither perm id nor order id can't be matched
+    to an existing row, so every cycle would insert it again."""
+    import json
+    import tasks
+    states = {}
+    with patch("db.get_state", side_effect=lambda k, d=None: states.get(k, d)), \
+         patch("db.set_state", side_effect=lambda k, v: states.__setitem__(k, v)):
+        assert tasks._save_untracked_order({"ticker": "NVDA", "side": "BUY", "qty": 3,
+                                            "status": "unconfirmed"})
+    with patch("db.get_state", side_effect=lambda k, d=None: states.get(k, d)), \
+         patch("db.set_state", side_effect=lambda k, v: states.__setitem__(k, v)), \
+         patch("db.order_row_exists", return_value=False), \
+         patch("db.log_order", return_value=12) as log_order, \
+         patch("alerts._send") as alert:
+        tasks._retry_untracked_orders()
+        tasks._retry_untracked_orders()
+    log_order.assert_not_called()
+    assert alert.call_count == 1 and "ORDER UNTRACKED" in alert.call_args.args[0]
+    assert json.loads(states["untracked_orders"]) == {}
+
+
+def test_failed_unconfirmed_order_row_is_kept_for_reconcile_and_alerted():
+    """Audit 2026-11-02 #7: log_order returning -1 on the 'unconfirmed' row
+    was ignored, so a late fill stayed invisible to reconcile. Now it is
+    saved for reconcile and alerted once (db.log_order owns the spill, and
+    its generic DB alert is held off); reconcile then writes the row
+    exactly once."""
+    import json
+    import db
+    import stop_lock
+    import tasks
+    approval = _approval(action="OPEN", shares_initial=10, stop_loss_price=90.0)
+    states = {}
+
+    def failing_log_order(**row):
+        db._record_write_failure("log_order", RuntimeError("insert failed"), row)   # as db does
+        return -1
+    with patch("ibkr.get_ib"), \
+         patch("ibkr.get_client", return_value=MagicMock()), \
+         patch("ibkr.place_market_order",
+               return_value={"order_id": 31, "perm_id": 3100, "fill_price": None,
+                             "filled_qty": 0.0, "status": "Submitted"}), \
+         patch("ibkr.get_latest_price", return_value=100.0), \
+         patch("market_data.get_priced_quote", return_value={"price": 100.0}), \
+         patch("config.USE_BRACKET_ORDERS", False), \
+         patch("db.log_order", side_effect=failing_log_order) as log_order, \
+         patch("db._spill") as spill, \
+         patch("db.get_state", side_effect=lambda k, d=None: states.get(k, d)), \
+         patch("db.set_state", side_effect=lambda k, v: states.__setitem__(k, v)), \
+         patch("tasks.open_manual_action"), \
+         patch("alerts._send") as alert, patch("alerts.send_trade_alert"):
+        execution.execute_approved(approval)
+    unconfirmed = [c for c in log_order.call_args_list if c.kwargs.get("status") == "unconfirmed"]
+    assert len(unconfirmed) == 1                       # reconcile is the retry
+    spill.assert_called_once()                         # db.log_order's own spill only
+    alerts = [c.args[0] for c in alert.call_args_list]
+    assert sum("ORDER UNTRACKED" in a for a in alerts) == 1
+    assert not any("DB WRITE FAILED" in a for a in alerts)
+    keys = list(stop_lock._redis().scan_iter("helios:untracked_order:*"))
+    assert len(keys) == 1 and "3100" in keys[0]
+    assert len(json.loads(states["untracked_orders"])) == 1
+
+    with patch("db.order_row_exists", return_value=False), \
+         patch("db.log_order", return_value=12) as log_order, \
+         patch("db.get_state", side_effect=lambda k, d=None: states.get(k, d)), \
+         patch("db.set_state", side_effect=lambda k, v: states.__setitem__(k, v)):
+        tasks._retry_untracked_orders()
+        tasks._retry_untracked_orders()                # nothing left: no second row
+    log_order.assert_called_once()
+    assert log_order.call_args.kwargs["status"] == "unconfirmed"
+    assert log_order.call_args.kwargs["perm_id"] == 3100
+    assert not list(stop_lock._redis().scan_iter("helios:untracked_order:*"))
+    assert json.loads(states["untracked_orders"]) == {}

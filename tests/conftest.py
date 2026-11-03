@@ -59,6 +59,11 @@ def _static_provenance(monkeypatch):
     monkeypatch.setattr(analyst, "_PROVENANCE_STATIC",
                         {"code_sha": "test", "model": "test", "model_digest": None,
                          "prompt_template_sha": "test"})
+    # The Ollama identity lookup (digest, version, model parameters): a fresh
+    # fixed value, so no test reaches a live Ollama server.
+    monkeypatch.setattr(analyst, "_OLLAMA_ID",
+                        {"at": float("inf"), "value": {"model_digest": "testdigest",
+                                                       "ollama_version": "test"}})
 
 
 class _FakeLock:
@@ -148,6 +153,17 @@ def _spill_to_tmp(tmp_path, monkeypatch):
     import db
     monkeypatch.setattr(db, "_SPILL_PATH", tmp_path / "db_write_spill.jsonl")
     monkeypatch.setattr(db, "_LAST_WRITE_ALERT", {})
+    # Transient connect retries still run, without the sleeps.
+    monkeypatch.setattr(db, "_CONNECT_RETRY_DELAYS", (0.0, 0.0))
+
+
+@pytest.fixture(autouse=True)
+def _alert_policy_to_tmp(tmp_path, monkeypatch):
+    """Keep the Telegram outbox and the dedup state out of logs/, fresh per
+    test."""
+    import alert_policy
+    monkeypatch.setattr(alert_policy, "OUTBOX_PATH", tmp_path / "telegram_outbox.jsonl")
+    monkeypatch.setattr(alert_policy, "STATE_PATH", tmp_path / ".alert_policy_state.json")
 
 
 @pytest.fixture(autouse=True)

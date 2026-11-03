@@ -885,12 +885,20 @@ class RiskManager:
             positions = self._client.get_all_positions()
             pv = self.portfolio_value()
         except Exception as e:
-            log.error(f"Concentration check ERRORED for {ticker}: {e}")
+            # Every cap is 0 on an error: callers only cut size when a cap
+            # is set, so with None here the BUY went ahead at full size
+            # despite passed=False (audit 2026-11-02 #3). A 0 cap leaves no
+            # room, so crew logs ROUTE_CONCENTRATION_ZERO and skips, and
+            # shares_after_concentration returns 0.
+            log.error(f"Concentration check ERRORED for {ticker}: {e}; blocking the buy (0 room)")
             return {"passed": False,
                     "flags": [f"RISK CHECK FAILED — could not verify concentration: {e}. "
-                              "Verify manually before approving."],
+                              "Buy blocked."],
+                    "errored": True,
                     "ai_infrastructure_total": 0,
-                    "ai_infra_size_cap_pct": None}
+                    "ai_infra_size_cap_pct": 0.0,
+                    "theme_size_cap_pct": 0.0,
+                    "moonshot_size_cap_pct": 0.0}
 
         flags: list[str] = []
 
@@ -1158,10 +1166,13 @@ class RiskManager:
         """shares_initial after the concentration caps, checked at the larger
         of target and order weight (same rule as crew._route_to_approval)."""
         shares = int(sizing.get("shares_initial", 0) or 0)
+        self.last_concentration_errored = False
         if shares <= 0:
             return 0
         proposed = max(sizing.get("position_size_pct") or 0, sizing.get("order_pct") or 0)
         conc = self.check_concentration(ticker, proposed, bucket=bucket)
+        # Lets a caller tell "no room" from "couldn't check" (both return 0).
+        self.last_concentration_errored = conc.get("errored") is True
         if conc.get("passed", False):
             return shares
         caps = [c for c in (conc.get("ai_infra_size_cap_pct"), conc.get("theme_size_cap_pct"),
@@ -1555,7 +1566,8 @@ class RiskManager:
             })
 
     @locked_by_ticker(lambda self, ticker, *a, **k: ticker, on_busy=False)
-    def _breakeven_without_sale(self, ticker: str, qty: float, new_stop: float) -> bool:
+    def _breakeven_without_sale(self, ticker: str, qty: float, new_stop: float,
+                                current_price: float | None = None) -> bool:
         """Profit target hit on a position too small to sell part of (1-3
         shares x 25-45% rounds to 0). Before 2026-10-28 that just continued,
         and the breakeven stop move lived inside the partial sale, so it never
@@ -1572,6 +1584,8 @@ class RiskManager:
         if changed:
             log.info(f"[{ticker}] Breakeven move skipped this run: {changed}")
             return False
+        import ibkr
+        new_stop = ibkr.round_sell_stop_up_to_tick(new_stop, current_price)   # raw fill price (audit 2026-11-02 #9)
 
         stop_rec = db.get_position_stop(ticker) or {}
         old_stop = stop_rec.get("stop_price")
@@ -1660,6 +1674,10 @@ class RiskManager:
                      if c is not None and c < decision_price]
             new_stop = max(below) if below else breakeven
             log.warning(f"[{ticker}] Recorded stop is at/above the price; using ${new_stop:.2f}")
+        # Breakeven is the raw average fill: put it on the tick, rounding
+        # up (never wider) unless that reaches the price, so the broker
+        # can't reject it (audit 2026-11-02 #9).
+        new_stop = ibkr.round_sell_stop_up_to_tick(new_stop, decision_price)
         try:
             tasks.manage_cancel_stop_orders_for(ticker)
         except Exception as e:
@@ -1691,14 +1709,13 @@ class RiskManager:
             log.error(f"[{ticker}] Profit-target sale not confirmed filled: {order_result}")
             # Logged unconfirmed so reconcile_unconfirmed_orders sees a late
             # fill and re-protects the rest (professor C12, 2026-10-28).
-            try:
-                db.log_order(ticker=ticker, side="SELL", order_type="MARKET", qty=sell_qty,
-                             broker_order_id=order_result.get("order_id"),
-                             perm_id=order_result.get("perm_id"),
-                             decision_price=decision_price, status="unconfirmed",
-                             intent="PROFIT_TARGET", stop_price=new_stop)
-            except Exception as e:
-                log.error(f"[{ticker}] Could not log the unconfirmed profit-target sale: {e}")
+            import execution
+            execution._log_unconfirmed_order(
+                ticker=ticker, side="SELL", order_type="MARKET", qty=sell_qty,
+                broker_order_id=order_result.get("order_id"),
+                perm_id=order_result.get("perm_id"),
+                decision_price=decision_price, status="unconfirmed",
+                intent="PROFIT_TARGET", stop_price=new_stop)
             alerts._send(
                 f"⚠️ PROFIT-TARGET SALE UNCONFIRMED — {ticker}\n"
                 f"SELL {sell_qty} submitted but no fill confirmed. The broker stop was "
@@ -1722,9 +1739,14 @@ class RiskManager:
                                     intent="PROFIT_TARGET", stop_price=new_stop)
             if local_id and local_id > 0 and order_result.get("fill_price"):
                 # A remainder may still fill: reconcile picks up 'partial' (M53).
-                db.update_order_fill(local_id, order_result["fill_price"], filled,
-                                     "filled" if filled >= float(sell_qty) - 1e-6 else "partial",
-                                     filled_at=order_result.get("fill_time"))
+                if not db.update_order_fill(local_id, order_result["fill_price"], filled,
+                                            "filled" if filled >= float(sell_qty) - 1e-6 else "partial",
+                                            filled_at=order_result.get("fill_time")):
+                    db.set_order_reconcile_note(local_id, "fill_write_failed")
+            elif local_id and local_id > 0:
+                # Filled with no price from the broker: the row stays
+                # 'submitted' (status unchanged); the note says why.
+                db.set_order_reconcile_note(local_id, "filled_no_price")
         except Exception as e:
             log.warning(f"[{ticker}] Profit-target sale logging failed: {e}")
 
@@ -1864,7 +1886,7 @@ class RiskManager:
             qty = abs(float(pos.qty))
             sell_qty = int(qty * partial_pct)  # whole shares; IBKR rejects fractional orders
             if sell_qty <= 0:
-                if self._breakeven_without_sale(ticker, qty, entry):
+                if self._breakeven_without_sale(ticker, qty, entry, current_price=current):
                     results.append({"ticker": ticker, "action": "BREAKEVEN_STOP", "shares_sold": 0,
                                     "new_stop": entry, "trade_style": trade_style,
                                     "gain_pct": gain_pct})
@@ -1957,7 +1979,7 @@ class RiskManager:
         qty = abs(float(pos.qty))
         sell_qty = int(qty * partial_pct)  # whole shares; IBKR rejects fractional orders
         if sell_qty <= 0:
-            return self._breakeven_without_sale(ticker, qty, entry)
+            return self._breakeven_without_sale(ticker, qty, entry, current_price=current)
 
         new_stop = entry  # breakeven on the remainder, same convention as the legacy path
         order_result = self._partial_sell_and_resize_stop(ticker, qty, sell_qty, new_stop,

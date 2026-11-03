@@ -12,6 +12,22 @@ Rule 8 citation requirement and the Form 2A AI Prompt Log.
 
 Capture code: `.claude/hooks/ai_log.py`, wired up in `.claude/settings.json`.
 
+## Commit hashes before 2026-10-31
+
+The repository history was rewritten on 2026-10-31, before it went public:
+personal details were removed and commit messages were reworded. Every commit
+got a new hash, so hashes cited in log entries (and code comments) written
+before that date are pre-rewrite hashes. To find the commit today, look up the
+old full hash in `history-rewrite-2026-10-31-commit-map.txt`, which lists old
+full hash and new full hash on each line.
+
+## "Professor"
+
+In these logs and in code comments, "professor" means an AI reviewer agent
+running on the same machine that audits the code and the data. It is not a
+person. Labels such as "professor M112" or "professor C13" refer to numbered
+findings from that agent.
+
 ## Why transcripts stay out of git
 
 A transcript holds everything shown in a session: command output, config

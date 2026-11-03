@@ -11,6 +11,8 @@ import re
 
 _PATTERNS = [
     (re.compile(r"bot\d{6,}:[A-Za-z0-9_-]{20,}"), "bot[REDACTED]"),
+    # A bot token without the URL's "bot" prefix (pasted, or in an error).
+    (re.compile(r"(?<![0-9])\d{6,}:[A-Za-z0-9_-]{30,}"), "[REDACTED]"),
     (re.compile(r"\b[UD]U?\d{7,8}\b"), "[ACCOUNT]"),
     # Credentials in a query string: FRED's api_key rode along in every
     # requests error message (audit A1031-0253-5).

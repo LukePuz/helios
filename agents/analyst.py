@@ -17,6 +17,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+import time as _time
 import requests
 from dotenv import load_dotenv
 
@@ -121,6 +122,9 @@ _OUTPUT_TOKEN_RESERVE = _NUM_PREDICT + 300
 _PROVENANCE_STATIC: dict | None = None
 
 
+_GIT_DEADLINE_S = 15.0   # total for one _git_code_sha (three git commands)
+
+
 def _git_code_sha() -> dict:
     """Commit identity of the checkout, read once at import so it names the
     code this process loaded, not whatever is checked out when the first
@@ -129,20 +133,38 @@ def _git_code_sha() -> dict:
     code_sha: last commit that touched anything outside research-log/ (from
     2026-10-28; before, it was HEAD, usually the research-log commit after
     the code commit). head_sha: HEAD. Both get -dirty if the checkout has
-    uncommitted tracked changes outside research-log/ or untracked .py files (untracked modules
+    uncommitted tracked changes outside research-log/ or untracked .py files,
+    including ones inside untracked directories (untracked modules
     running live was the C2 failure mode; professor C3-residual)."""
     import subprocess
+    import time
     repo = str(Path(__file__).resolve().parent.parent)
+    deadline = time.monotonic() + _GIT_DEADLINE_S
 
     def git(*args):
-        return subprocess.run(["git", "-C", repo, *args],
-                              capture_output=True, text=True, timeout=5).stdout
+        # Up to 10 s and one retry per command: under 72B load with swap in
+        # use, a 5 s limit timed out and the disk check then read as "not
+        # mixed" (M190). All three commands share one _GIT_DEADLINE_S budget,
+        # so a check never blocks longer than that; no retry once it's spent.
+        for attempt in (1, 2):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.5:
+                raise subprocess.TimeoutExpired(["git", *args], 0)
+            try:
+                return subprocess.run(["git", "-C", repo, *args], capture_output=True,
+                                      text=True, timeout=min(10.0, remaining)).stdout
+            except subprocess.TimeoutExpired:
+                if attempt == 2:
+                    raise
     try:
         head = git("rev-parse", "--short=12", "HEAD").strip()
         code = git("log", "-1", "--format=%h", "--abbrev=12", "--", ".",
                    ":(exclude)research-log").strip()
         # Not stripped: porcelain's leading space is part of the XY column.
-        status = git("status", "--porcelain").splitlines()
+        # --untracked-files=all lists each file in a new untracked directory;
+        # the default collapses it to "?? pkg/", which has no .py suffix, so
+        # an untracked package imported live read as clean (professor M186).
+        status = git("status", "--porcelain", "--untracked-files=all").splitlines()
         dirty = "-dirty" if [l for l in status
                              if not l[3:].startswith("research-log/")
                              and (not l.startswith("??") or l.rstrip().endswith(".py"))] else ""
@@ -153,14 +175,87 @@ def _git_code_sha() -> dict:
 
 
 _CODE_SHA = _git_code_sha()
+# This process at the moment _CODE_SHA was read (M181).
+_BOOT = {"pid": os.getpid(), "code_read_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
 _DISK_CHECK: dict = {"at": 0.0, "value": None}
+
+
+def _file_sha(path: Path) -> str | None:
+    import hashlib
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+    except Exception:
+        return None
+
+
+def _venv_record() -> dict:
+    """A hash of the installed distributions (name==version, sorted, the
+    content of `pip freeze` for normal installs) read from package metadata,
+    without running pip (m248)."""
+    import hashlib
+    from importlib import metadata
+    try:
+        pkgs = sorted({f"{(d.metadata['Name'] or '').lower()}=={d.version}"
+                       for d in metadata.distributions()})
+        return {"venv_sha": hashlib.sha256("\n".join(pkgs).encode()).hexdigest()[:12],
+                "venv_packages": len(pkgs)}
+    except Exception as e:
+        return {"venv_sha": None, "venv_error": type(e).__name__}
+
+
+def boot_record(service: str) -> dict:
+    """What a process started with (M181): commit, dirty flag, service, pid,
+    process start time, plus hashes of inputs code_sha can't see (m248): the
+    S&P 500 universe cache (gitignored) and the installed packages."""
+    import platform
+    import sys
+    started = None
+    try:
+        import psutil
+        started = datetime.fromtimestamp(psutil.Process().create_time(), timezone.utc
+                                         ).isoformat(timespec="seconds")
+    except Exception:
+        pass
+    code = _CODE_SHA.get("code_sha")
+    repo = Path(__file__).resolve().parent.parent
+    return {"service": service, "pid": os.getpid(), "process_started_at": started,
+            "code_read_at": _BOOT["code_read_at"], "code_read_pid": _BOOT["pid"],
+            "code_sha": code, "head_sha": _CODE_SHA.get("head_sha"),
+            "dirty": code.endswith("-dirty") if code else None,
+            "sp500_cache_sha": _file_sha(repo / "ingestion" / ".sp500_cache.json"),
+            "python": platform.python_version(), "executable_in_venv": sys.prefix != sys.base_prefix,
+            **_venv_record()}
+
+
+def record_boot(service: str) -> dict | None:
+    """Write the boot row: activity_feed stage 'boot'. Log-only; never raises.
+    Uses a one-off connection (db.log_boot_activity), not the pool, because
+    it runs in a Celery parent before the pool forks."""
+    try:
+        rec = boot_record(service)
+    except Exception as e:
+        log.warning(f"boot record unavailable: {e}")
+        return None
+    try:
+        import db
+        db.log_boot_activity(f"{service} started at {rec.get('code_sha')} (pid {rec['pid']})", rec)
+    except Exception as e:
+        log.warning(f"boot row not written: {e}")
+    return rec
+# Template hashes, filled in at the end of this module's import (they hash
+# functions defined below), so they describe the code this process loaded
+# at the same moment as _CODE_SHA, not the files on disk at the first
+# verdict (M187). See _template_shas().
+_TEMPLATE_SHAS: dict = {}
 
 
 def _code_mixed_check() -> dict:
     """HEAD on disk now vs the HEAD this process read at import. Modules
     imported later come from the files on disk, so a difference means this
     process may be running a mix of commits (professor M75, 2026-10-29: a
-    pull without a restart). Cached 60 s; one git call per minute at most."""
+    pull without a restart). Cached 60 s; one git call per minute at most.
+    code_mixed is None, not False, when either commit can't be read (a git
+    timeout or error): unknown must not read as "not mixed" (M190)."""
     import time
     now = time.monotonic()
     if _DISK_CHECK["value"] is None or now - _DISK_CHECK["at"] > 60:
@@ -171,7 +266,7 @@ def _code_mixed_check() -> dict:
         _DISK_CHECK.update(at=now, value={
             "disk_head_sha": disk_all.get("head_sha"),
             "disk_code_sha": disk,
-            "code_mixed": bool(disk and boot and disk != boot),
+            "code_mixed": (disk != boot) if (disk and boot) else None,
         })
     return _DISK_CHECK["value"]
 
@@ -299,14 +394,151 @@ def _event_burst(ticker: str, trigger: dict | None, gates: list[str]) -> dict | 
         return {"error": str(e)[:120]}
 
 
-def _brief_template_sha() -> str | None:
+def _module_source(name: str) -> str | None:
+    """A module's source text read from disk without importing it (the
+    same text inspect.getsource returns for the module)."""
     try:
-        import hashlib
-        import inspect
-        import context_engine
-        return hashlib.sha256(inspect.getsource(context_engine).encode()).hexdigest()[:12]
+        import importlib.util
+        spec = importlib.util.find_spec(name)
+        if spec is None or not spec.origin:
+            return None
+        with open(spec.origin, encoding="utf-8") as f:
+            return f.read()
     except Exception:
         return None
+
+
+def _brief_template_sha() -> str | None:
+    import hashlib
+    src = _module_source("context_engine")
+    return hashlib.sha256(src.encode()).hexdigest()[:12] if src is not None else None
+
+
+# Modules whose source shapes the situation brief (brief_template_full_sha):
+# context_engine and the section builders it calls.
+_BRIEF_MODULES = ("context_engine", "ingestion.macro", "ingestion.polygon_stream",
+                  "ingestion.options_flow", "ingestion.fundamentals", "vector_store",
+                  "market_data", "agents.price_action", "agents.chase_risk",
+                  "catalyst_service.client")
+
+
+def _prompt_template_full_text() -> str:
+    """Everything in this module that shapes the prompt text or the call,
+    besides _build_prompt itself (M171): the track-record text, the
+    philosophy section filter and its headings, the caps and budgets, the
+    request (_call_ollama) and the sampling options, plus knowledge_loader,
+    which picks the thesis and philosophy files."""
+    import inspect
+    parts = [inspect.getsource(f) for f in (
+        _build_prompt, _build_track_record_text, _philosophy_sections, _estimate_tokens,
+        _ollama_options, _call_ollama)]
+    parts.append(repr({
+        "_NUM_CTX": _NUM_CTX, "_BRIEF_MAX_CHARS": _BRIEF_MAX_CHARS, "_NUM_PREDICT": _NUM_PREDICT,
+        "_OUTPUT_TOKEN_RESERVE": _OUTPUT_TOKEN_RESERVE, "_THESIS_CAP": _THESIS_CAP,
+        "_PHILOSOPHY_CAP": _PHILOSOPHY_CAP, "_PHILOSOPHY_KEEP": _PHILOSOPHY_KEEP,
+        "_BUCKET_HEADINGS": _BUCKET_HEADINGS, "_SUBSCORE_LABELS": _SUBSCORE_LABELS,
+        "options": _ollama_options()}))
+    parts.append(_module_source("knowledge_loader") or "<knowledge_loader unreadable>")
+    return "\n\x00\n".join(parts)
+
+
+def _template_shas() -> dict:
+    """Template hashes, computed once at import (M187).
+    prompt_template_sha and brief_template_sha keep their old definitions
+    (the source of _build_prompt; the source of context_engine).
+    prompt_template_full_sha and brief_template_full_sha are the wider ones
+    (M171): see _prompt_template_full_text and _BRIEF_MODULES. The rendered
+    prompt actually sent (all of it: there is no separate system prompt on
+    /api/generate) is hashed per verdict as prompt_sha."""
+    import hashlib
+    import inspect
+    out = {"prompt_template_sha": None, "brief_template_sha": None,
+           "prompt_template_full_sha": None, "brief_template_full_sha": None}
+    try:
+        out["prompt_template_sha"] = hashlib.sha256(
+            inspect.getsource(_build_prompt).encode()).hexdigest()[:12]
+    except Exception as e:
+        log.warning(f"prompt template hash unavailable: {e}")
+    out["brief_template_sha"] = _brief_template_sha()
+    try:
+        out["prompt_template_full_sha"] = hashlib.sha256(
+            _prompt_template_full_text().encode()).hexdigest()[:12]
+    except Exception as e:
+        log.warning(f"full prompt template hash unavailable: {e}")
+    srcs = [f"{m}\n{_module_source(m) or '<unreadable>'}" for m in _BRIEF_MODULES]
+    out["brief_template_full_sha"] = hashlib.sha256("\n\x00\n".join(srcs).encode()).hexdigest()[:12]
+    return out
+
+
+# Env-backed config names left out of the config hash: a per-process
+# identity (each worker sets its own IB_CLIENT_ID) and an account figure.
+_CONFIG_ENV_EXCLUDED = ("IB_CLIENT_ID", "START_VALUE")
+_CONFIG_ENV_CACHE: dict = {}
+
+
+def _config_env_names() -> dict:
+    """{config name: env var} for every module-level assignment in config.py
+    whose value reads the environment (os.getenv, os.environ.get or
+    os.environ[...]), found by parsing config.py, so a new switch is
+    covered without being added to a hand-kept list (M182)."""
+    import ast
+    src = _module_source("config")
+    if src is None:
+        return {}
+    out: dict = {}
+
+    def env_key(node):
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute):
+                f = sub.func
+                is_getenv = f.attr == "getenv" and isinstance(f.value, ast.Name)
+                is_environ_get = (f.attr == "get" and isinstance(f.value, ast.Attribute)
+                                  and f.value.attr == "environ")
+                if (is_getenv or is_environ_get) and sub.args and isinstance(sub.args[0], ast.Constant):
+                    return sub.args[0].value
+            if (isinstance(sub, ast.Subscript) and isinstance(sub.value, ast.Attribute)
+                    and sub.value.attr == "environ" and isinstance(sub.slice, ast.Constant)):
+                return sub.slice.value
+        return None
+
+    def visit(stmts):
+        for st in stmts:
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if isinstance(st, (ast.Assign, ast.AnnAssign)) and st.value is not None:
+                key = env_key(st.value)
+                if key:
+                    targets = st.targets if isinstance(st, ast.Assign) else [st.target]
+                    for t in targets:
+                        if isinstance(t, ast.Name):
+                            out[t.id] = key
+            for field in ("body", "orelse", "finalbody", "handlers"):
+                block = getattr(st, field, None)
+                if isinstance(block, list):
+                    visit(block)
+    visit(ast.parse(src).body)
+    return out
+
+
+def _config_env_record() -> dict:
+    """A hash of every env-overridable setting in config.py (name and value),
+    the number hashed, and which of their env vars are set in this process
+    (names only, no values). Log-only; the hand-kept `config` block stays as
+    it was. Computed once per process: config values are fixed at import."""
+    if _CONFIG_ENV_CACHE:
+        return _CONFIG_ENV_CACHE
+    try:
+        import hashlib
+        import config
+        names = {k: v for k, v in _config_env_names().items() if k not in _CONFIG_ENV_EXCLUDED}
+        body = "\n".join(f"{k}={getattr(config, k, '<unset>')!r}" for k in sorted(names))
+        rec = {"env_sha": hashlib.sha256(body.encode()).hexdigest()[:12], "n": len(names),
+               "env_set": sorted(e for e in set(names.values()) if e in os.environ),
+               "excluded": list(_CONFIG_ENV_EXCLUDED)}
+    except Exception as e:
+        return {"error": type(e).__name__}
+    _CONFIG_ENV_CACHE.update(rec)
+    return _CONFIG_ENV_CACHE
 
 
 def _treatment_config() -> dict:
@@ -323,6 +555,66 @@ def _treatment_config() -> dict:
         "CATALYST_MONTH_MIDPOINT_ENABLED")}
 
 
+_OLLAMA_ID_TTL_S = 600
+_OLLAMA_ID_FAIL_TTL_S = 60          # a failed read is retried after this
+_OLLAMA_ID_TIMEOUT = (2, 3)         # (connect, read) seconds per request
+_OLLAMA_ID: dict = {"at": 0.0, "value": None}
+
+
+def _ollama_identity() -> dict:
+    """The analyst model's digest, the Ollama server version, and the model's
+    own default parameters (top_p, top_k, stop... whatever its Modelfile
+    sets; the call sends only _ollama_options). Cached _OLLAMA_ID_TTL_S, not
+    for the life of the process, so the digest names the weights in use
+    after an `ollama pull` (M7). A read without a digest is cached only
+    _OLLAMA_ID_FAIL_TTL_S, so an outage costs at most one try a minute; when
+    /api/tags fails, /api/version and /api/show aren't tried.
+    Log-only; never raises."""
+    import hashlib
+    import time
+    now = time.monotonic()
+    cached = _OLLAMA_ID["value"]
+    if cached is not None:
+        ttl = _OLLAMA_ID_TTL_S if cached.get("model_digest") else _OLLAMA_ID_FAIL_TTL_S
+        if now - _OLLAMA_ID["at"] < ttl:
+            return cached
+    out = {"model_digest": None, "ollama_version": None, "model_parameters": None,
+           "model_template_sha": None, "model_quantization": None,
+           "ollama_identity_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    t0 = _time.monotonic()
+    try:
+        tags = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=_OLLAMA_ID_TIMEOUT).json().get("models", [])
+        digest = next((m.get("digest") for m in tags if m.get("name") == ANALYST_MODEL), None)
+        out["model_digest"] = digest[:12] if digest else None
+    except Exception:
+        _OLLAMA_ID.update(at=now, value=out)
+        return out
+    if _time.monotonic() - t0 > 2:
+        # A slow server: skip the other two reads rather than hold up the
+        # verdict, and keep this partial read only as long as a failed one.
+        _OLLAMA_ID.update(at=now - (_OLLAMA_ID_TTL_S - _OLLAMA_ID_FAIL_TTL_S), value=out)
+        return out
+    try:
+        out["ollama_version"] = requests.get(f"{OLLAMA_HOST}/api/version",
+                                             timeout=_OLLAMA_ID_TIMEOUT).json().get("version")
+    except Exception:
+        pass
+    try:
+        show = requests.post(f"{OLLAMA_HOST}/api/show", json={"model": ANALYST_MODEL, "name": ANALYST_MODEL},
+                             timeout=_OLLAMA_ID_TIMEOUT).json()
+        params = show.get("parameters")
+        out["model_parameters"] = params[:1000] if isinstance(params, str) else None
+        tmpl = show.get("template")
+        out["model_template_sha"] = (hashlib.sha256(tmpl.encode()).hexdigest()[:12]
+                                     if isinstance(tmpl, str) else None)
+        details = show.get("details")
+        out["model_quantization"] = details.get("quantization_level") if isinstance(details, dict) else None
+    except Exception:
+        pass
+    _OLLAMA_ID.update(at=now, value=out)
+    return out
+
+
 def _provenance(prompt: str) -> dict:
     """What produced this decision (professor C3/M7, 2026-10-27): code commit
     (with -dirty if the checkout has uncommitted tracked changes), the
@@ -332,13 +624,6 @@ def _provenance(prompt: str) -> dict:
     can be tied to the exact code, model and prompt that made it."""
     global _PROVENANCE_STATIC
     if _PROVENANCE_STATIC is None:
-        import hashlib
-        import inspect
-        try:
-            tags = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5).json().get("models", [])
-            digest = next((m.get("digest") for m in tags if m.get("name") == ANALYST_MODEL), None)
-        except Exception:
-            digest = None
         _PROVENANCE_STATIC = {
             "code_sha": _CODE_SHA["code_sha"],
             "head_sha": _CODE_SHA["head_sha"],
@@ -346,25 +631,25 @@ def _provenance(prompt: str) -> dict:
             # with different values (professor C3-residual, 2026-10-28).
             "config": _treatment_config(),
             "model": ANALYST_MODEL,
-            "model_digest": digest[:12] if digest else None,
-            "prompt_template_sha": hashlib.sha256(
-                inspect.getsource(_build_prompt).encode()).hexdigest()[:12],
-            # The brief builder changes what the model sees without touching
-            # _build_prompt (professor C29, 10-29).
-            "brief_template_sha": _brief_template_sha(),
+            # Both read at import (M187). The brief builder changes what the
+            # model sees without touching _build_prompt (professor C29, 10-29).
+            "prompt_template_sha": _TEMPLATE_SHAS.get("prompt_template_sha"),
+            "brief_template_sha": _TEMPLATE_SHAS.get("brief_template_sha"),
+            # Wider hashes (M171): every function and constant in this module
+            # that shapes the prompt or the call, and every brief section module.
+            "prompt_template_full_sha": _TEMPLATE_SHAS.get("prompt_template_full_sha"),
+            "brief_template_full_sha": _TEMPLATE_SHAS.get("brief_template_full_sha"),
         }
-    if _PROVENANCE_STATIC.get("model_digest") is None:
-        # The first /api/tags call failed (Ollama still loading): don't stamp
-        # every decision of this process without a digest (professor M77).
-        try:
-            tags = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5).json().get("models", [])
-            digest = next((m.get("digest") for m in tags if m.get("name") == ANALYST_MODEL), None)
-            if digest:
-                _PROVENANCE_STATIC["model_digest"] = digest[:12]
-        except Exception:
-            pass
     import hashlib
-    return {**_PROVENANCE_STATIC, **_code_mixed_check(),
+    # model_digest, ollama_version and the model's default parameters, re-read
+    # every _OLLAMA_ID_TTL_S so an `ollama pull` mid-process shows up (M7);
+    # a failed read is retried on the next verdict (professor M77).
+    return {**_PROVENANCE_STATIC, **_ollama_identity(), **_code_mixed_check(),
+            # Every env-overridable config.py setting, hashed (M182).
+            "config_env": _config_env_record(),
+            # Which process, and when it read code_sha (joins to its boot row).
+            "process": {"pid": os.getpid(), "code_read_pid": _BOOT["pid"],
+                        "code_read_at": _BOOT["code_read_at"]},
             "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:12]}
 
 
@@ -770,23 +1055,36 @@ def _conviction_distribution(tokens) -> dict | None:
     return None
 
 
+def _ollama_options(num_ctx: int = _NUM_CTX) -> dict:
+    """The sampling options sent with every analyst call. Anything not here
+    (top_p, top_k, seed, ...) is left to the model's own defaults, which
+    _ollama_identity records as model_parameters. No seed is sent."""
+    return {
+        "temperature":    0.2,
+        "num_predict":    _NUM_PREDICT,
+        "num_ctx":        num_ctx,
+        "repeat_penalty": 1.1,
+    }
+
+
 def _call_ollama(prompt: str, num_ctx: int = _NUM_CTX) -> str | None:
     _LAST_CALL_STATS.clear()  # a failed call must not inherit the last one's counts
     payload = {
         "model":   ANALYST_MODEL,
         "prompt":  prompt,
         "stream":  False,
-        "options": {
-            "temperature":    0.2,
-            "num_predict":    _NUM_PREDICT,
-            "num_ctx":        num_ctx,
-            "repeat_penalty": 1.1,
-        },
+        "options": _ollama_options(num_ctx),
         # Token probabilities, for the log-only conviction distribution
         # (SEF research R5, 10-29). Doesn't change sampling.
         "logprobs":     True,
         "top_logprobs": 5,
     }
+    # What was sent, for provenance (M7): kept apart from _LAST_CALL_STATS,
+    # which holds only what a successful call returned.
+    _LAST_CALL_SENT.clear()
+    _LAST_CALL_SENT.update({"options": dict(payload["options"]),
+                            "seed": payload["options"].get("seed"),
+                            "top_logprobs": payload["top_logprobs"]})
     try:
         # Real 72B completions on this hardware routinely land at 182-195s
         # (CPU-offloaded portion of the model, ~47GB not fitting in VRAM) —
@@ -837,6 +1135,8 @@ def _call_ollama(prompt: str, num_ctx: int = _NUM_CTX) -> str | None:
 _LAST_CALL_FAILURE: dict = {"kind": None}
 # Token counts from the last successful call, recorded in provenance (C26).
 _LAST_CALL_STATS: dict = {}
+# The options the last call sent (M7), set before the request goes out.
+_LAST_CALL_SENT: dict = {}
 _STUB_REASONS = {"timeout": "Ollama timed out", "unreachable": "Ollama unreachable",
                  "error": "Ollama call failed"}
 
@@ -871,21 +1171,30 @@ def _prior_verdicts(ticker: str) -> list | None:
 def _catalyst_check(ticker: str, parsed: dict) -> dict:
     """Shadow record of how the model's catalyst date relates to the calendar
     (limitations audit 2026-10-28 14:53, #5). Logged only; the rate gate
-    is unchanged. past_or_today: the date floors to 1 day in
-    compute_weeks_to_catalyst, the most favourable rate. month_only: "YYYY-MM",
+    is unchanged. past_or_today: the date is on or before today's ET date
+    (it floors to 1 day in compute_weeks_to_catalyst, the most favourable
+    rate). month_only: "YYYY-MM",
     read as the 15th."""
     cat = parsed.get("catalyst") or {}
     raw = str(cat.get("date") or "").strip()
     out = {"model_date": raw or None, "past_or_today": None,
            "month_only": bool(re.fullmatch(r"\d{4}-\d{2}", raw)),
-           "calendar_next_earnings": None, "days_model_vs_calendar": None}
+           "calendar_next_earnings": None, "days_model_vs_calendar": None,
+           "weeks_to_catalyst_utc": None, "weeks_to_catalyst_et": None}
     try:
+        # The gate's UTC-midnight distance and an ET-midnight shadow, same
+        # clock reading (log-only; agents/catalyst_time.py).
+        from agents.catalyst_time import weeks_to_catalyst_et
+        now = datetime.now(timezone.utc)
+        out["weeks_to_catalyst_utc"] = compute_weeks_to_catalyst(raw or None, as_of=now)
+        out["weeks_to_catalyst_et"] = weeks_to_catalyst_et(raw or None, as_of=now)
         d = None
         if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
             d = datetime.strptime(raw, "%Y-%m-%d").date()
         elif out["month_only"]:
             d = datetime.strptime(raw + "-15", "%Y-%m-%d").date()
-        today = datetime.now(timezone.utc).date()
+        from agents.catalyst_time import today_et
+        today = today_et(now)   # the ET calendar day; log-only
         if d is not None:
             out["past_or_today"] = d <= today
         import db
@@ -1198,6 +1507,50 @@ def _stub_recommendation(candidate: dict, reason: str) -> dict:
 # Main analyst function
 # ---------------------------------------------------------------------------
 
+def _log_failed_analysis(candidate: dict, kind: str, reason: str, prompt: str | None = None,
+                         trigger: dict | None = None, raw: str | None = None,
+                         error: Exception | None = None, called: bool = True) -> None:
+    """A signals row (signal ANALYST_FAILED) for an analysis that produced no
+    verdict: an Ollama timeout, an unreachable server or error, an empty or
+    unparseable reply, a salvaged reply that isn't routed, or an exception
+    (M166). Without it the verdict table held only the successful draws.
+
+    Log-only. model is NULL (the attempted model is in provenance.model), so
+    filters on the model column don't count it as a verdict, and the prompt
+    text isn't stored (only its hash), so prompt replays don't sample it.
+    ANALYST_FAILED is in db._NON_ANALYST_SIGNALS. Never raises."""
+    ticker = candidate.get("ticker", "UNKNOWN")
+    try:
+        import hashlib
+        import db
+        try:
+            provenance = _provenance(prompt or "")
+        except Exception as e:
+            provenance = {"code_sha": _CODE_SHA.get("code_sha"), "head_sha": _CODE_SHA.get("head_sha"),
+                          "model": ANALYST_MODEL, "provenance_error": type(e).__name__}
+        if not prompt:
+            provenance["prompt_sha"] = None
+        provenance["trigger"] = trigger
+        # Only when this analysis reached the model: otherwise the module
+        # state belongs to an earlier call.
+        provenance["llm_call"] = ({**_LAST_CALL_STATS,
+                                   "prompt_tokens_est": _estimate_tokens(prompt) if prompt else None,
+                                   "options": _LAST_CALL_SENT.get("options"),
+                                   "seed": _LAST_CALL_SENT.get("seed")} if called else None)
+        failure = {"kind": kind, "reason": reason[:300],
+                   "ollama_failure": _LAST_CALL_FAILURE.get("kind") if called else None,
+                   "error_type": type(error).__name__ if error is not None else None,
+                   "error": str(error)[:300] if error is not None else None}
+        if raw:
+            failure.update(raw_reply_sha=hashlib.sha256(raw.encode()).hexdigest()[:12],
+                           raw_reply_len=len(raw),
+                           raw_reply_head=redact_account_figures(raw[:2000]))
+        db.log_signal(ticker, "ANALYST_FAILED", None, f"No verdict ({kind}): {reason}"[:500],
+                      model=None, provenance=provenance, decision={"failure": failure})
+    except Exception as e:
+        log.warning(f"[{ticker}] failed-analysis record not written: {e}")
+
+
 def trigger_record(path: str, event: dict | None = None) -> dict:
     """What started this analysis, for the verdict's provenance (audit 16:53,
     A1653-2). Log-only: never passed to the prompt."""
@@ -1232,7 +1585,31 @@ def analyze(
 
     Returns:
         Full analyst recommendation dict matching analyst_agent.md spec.
+
+    An exception is re-raised unchanged after an ANALYST_FAILED row is
+    written for it (M166); callers handle it as before.
     """
+    ctx: dict = {}
+    try:
+        return _analyze_inner(candidate, situation_brief, regime_packet, trigger, ctx)
+    except Exception as e:
+        if ctx.get("failure_logged"):
+            # A stub path already wrote this analysis's ANALYST_FAILED row
+            # and then _stub_recommendation raised: no second row.
+            raise
+        # After the verdict row was written, the row is kept and this one
+        # says the analysis still ended in an exception.
+        kind = "exception_after_verdict" if ctx.get("verdict_logged") else "exception"
+        _log_failed_analysis(candidate, kind, f"{type(e).__name__}: {e}",
+                             prompt=ctx.get("prompt"), trigger=trigger, raw=ctx.get("raw"),
+                             error=e, called=ctx.get("called", False))
+        raise
+
+
+def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | None,
+                   trigger: dict | None, ctx: dict) -> dict:
+    """analyze()'s body. ctx collects the prompt and the raw reply for the
+    failure record if this raises."""
     ticker = candidate.get("ticker", "UNKNOWN")
     log.info(f"[{ticker}] Analyzing with {ANALYST_MODEL}...")
 
@@ -1261,14 +1638,23 @@ def analyze(
     prompt = _build_prompt(candidate, situation_brief, thesis_text, regime_packet,
                            _philosophy_sections(philosophy_text, candidate.get("role", "Accelerator")))
 
+    ctx["prompt"] = prompt
+
     raw_response = _call_ollama(prompt)
+    ctx["called"], ctx["raw"] = True, raw_response
     if not raw_response:
-        return _stub_recommendation(
-            candidate, _STUB_REASONS.get(_LAST_CALL_FAILURE["kind"], "Ollama returned nothing"))
+        reason = _STUB_REASONS.get(_LAST_CALL_FAILURE["kind"], "Ollama returned nothing")
+        _log_failed_analysis(candidate, _LAST_CALL_FAILURE["kind"] or "empty_reply", reason,
+                             prompt=prompt, trigger=trigger, raw=raw_response)
+        ctx["failure_logged"] = True
+        return _stub_recommendation(candidate, reason)
 
     parsed = _extract_json(raw_response)
     if not parsed:
         log.warning(f"[{ticker}] Could not parse model response")
+        _log_failed_analysis(candidate, "parse_failed", "JSON parse failed",
+                             prompt=prompt, trigger=trigger, raw=raw_response)
+        ctx["failure_logged"] = True
         return _stub_recommendation(candidate, "JSON parse failed")
     if parsed.pop("_salvaged", False) and str(parsed.get("action", "")).upper() in (
             "OPEN", "ADD", "TRIM", "EXIT"):
@@ -1276,6 +1662,10 @@ def analyze(
         # risks; a sell gate that ignores pass_to_risk could still act on
         # them (audit 14:53, A1453-6). Never route one.
         log.warning(f"[{ticker}] Salvaged {parsed.get('action')} from malformed JSON; not routed")
+        _log_failed_analysis(candidate, "salvaged_not_routed",
+                             "JSON parse failed (fields salvaged, not routed)",
+                             prompt=prompt, trigger=trigger, raw=raw_response)
+        ctx["failure_logged"] = True
         return _stub_recommendation(candidate, "JSON parse failed (fields salvaged, not routed)")
 
     action     = str(parsed.get("action", "WATCH")).upper()
@@ -1559,12 +1949,20 @@ def analyze(
     # the model to cap its own conviction at 6 when fundamentals aren't
     # cached, but a prompt instruction isn't reliable enough on its own —
     # enforce it here too so an OPEN/ADD can't ride on an invented multiple.
+    # A failed read caps the same way as absent data, but is labelled apart
+    # from it in the gates and provenance (fundamentals_read).
+    fund_read = "ok"
     try:
         import db
         fund = db.get_fundamentals(ticker)
         fundamentals_missing = not fund or fund.get("market_cap") is None
-    except Exception:
+        if fundamentals_missing:
+            fund_read = "missing"
+    except Exception as e:
         fundamentals_missing = True
+        fund_read = f"read error: {type(e).__name__}"
+        log.warning(f"[{ticker}] Fundamentals read failed, treated as missing: {e}")
+    fund_label = "no fundamentals" if fund_read == "missing" else f"fundamentals {fund_read}"
     conviction_raw = conviction
     is_etf = False
     if fundamentals_missing and action in ("OPEN", "ADD") and conviction > 6:
@@ -1576,10 +1974,10 @@ def analyze(
     if fundamentals_missing and action in ("OPEN", "ADD") and conviction > 6:
         from config import ETF_FUNDAMENTALS_CAP_EXEMPT
         if is_etf and ETF_FUNDAMENTALS_CAP_EXEMPT:
-            gates.append(f"no fundamentals: ETF, cap not applied (conviction {conviction})")
+            gates.append(f"{fund_label}: ETF, cap not applied (conviction {conviction})")
         else:
-            log.info(f"[{ticker}] No cached fundamentals — capping conviction {conviction} -> 6")
-            gates.append(f"no fundamentals: conviction {conviction} -> 6"
+            log.info(f"[{ticker}] {fund_label} — capping conviction {conviction} -> 6")
+            gates.append(f"{fund_label}: conviction {conviction} -> 6"
                          + (" (ETF; exemption off)" if is_etf else ""))
             conviction = 6
 
@@ -1612,22 +2010,32 @@ def analyze(
     except Exception as e:
         log.debug(f"[{ticker}] knowledge coverage record failed: {e}")
     provenance.update(_decision_inputs_record(ticker, regime_packet))
+    provenance["fundamentals_read"] = fund_read
     try:
         provenance["brief_exposure"] = _brief_exposure(ticker, prompt)
         # The held flag the gates used (crew sets it from broker positions
         # before the call); the other held fields are read after it (M138).
         provenance["brief_exposure"].update(_held_at_gate(candidate))
     except Exception as e:
-        log.debug(f"[{ticker}] brief exposure record failed: {e}")
+        # Kept as an error, not dropped: a missing key read as "not
+        # applicable" (m239).
+        log.warning(f"[{ticker}] brief exposure record failed: {e}")
+        if isinstance(provenance.get("brief_exposure"), dict):   # the held fields failed
+            provenance["brief_exposure"]["error"] = type(e).__name__
+        else:
+            provenance["brief_exposure"] = {"error": type(e).__name__}
     try:
         provenance["gate_flags"] = _gate_flags(ticker, action, conviction, source_count,
                                                bool(parsed.get("pass_to_risk")),
                                                model_action, model_conviction)
     except Exception as e:
-        log.debug(f"[{ticker}] gate flags record failed: {e}")
+        log.warning(f"[{ticker}] gate flags record failed: {e}")
+        provenance["gate_flags"] = {"error": type(e).__name__}
     provenance["trigger"] = trigger
     est = _estimate_tokens(prompt)
-    llm = {**_LAST_CALL_STATS, "prompt_tokens_est": est}
+    llm = {**_LAST_CALL_STATS, "prompt_tokens_est": est,
+           # The options actually sent, and the seed (None: none is sent) (M7).
+           "options": _LAST_CALL_SENT.get("options"), "seed": _LAST_CALL_SENT.get("seed")}
     # Ollama may cut the prompt's head below num_ctx to keep room for the
     # reply, so compare what it read with our crude estimate: a flag, not
     # proof (professor C26 residual).
@@ -1646,7 +2054,7 @@ def analyze(
         log.warning(f"[{ticker}] plan shadow unavailable: {e}")
     try:
         import db
-        db.log_signal(
+        signal_id = db.log_signal(
             symbol=ticker,
             signal=action,
             confidence=conviction / 10.0,
@@ -1668,6 +2076,13 @@ def analyze(
             },
             prompt=redact_account_figures(prompt),
         )
+        ctx["verdict_logged"] = True
+        # The verdict's row id, carried in the result (and so in
+        # pending_approvals.analyst_json and .signal_id) after the row is
+        # written: the stored row doesn't contain it (M174). None if the
+        # full row wasn't written.
+        provenance["signal_id"] = (signal_id if isinstance(signal_id, int)
+                                   and not isinstance(signal_id, bool) else None)
     except Exception as e:
         log.warning(f"[{ticker}] Signal log failed: {e}")
 
@@ -1777,6 +2192,27 @@ def analyze_batch(
             results.append(result)
         except Exception as e:
             log.error(f"[{ticker}] Analyze failed: {e}")
-            results.append(_stub_recommendation(candidate, f"Exception: {e}"))
+            # analyze() already wrote this candidate's ANALYST_FAILED row. If
+            # the stub itself raised here, analyze_batch would raise mid-batch
+            # and the crew would log a NO_VERDICT for every candidate, a
+            # second row for each one already recorded. A bare stub keeps it
+            # at one row per lost candidate.
+            try:
+                stub = _stub_recommendation(candidate, f"Exception: {e}")
+            except Exception as stub_error:
+                log.error(f"[{ticker}] Stub recommendation failed too: {stub_error}")
+                stub = {
+                    "ticker": ticker, "action": "WATCH", "conviction": 1,
+                    "thesis_bucket": candidate.get("role", "Accelerator"),
+                    "pass_to_risk": False, "model_used": "stub",
+                    "key_risks": [f"No verdict: Exception: {e}"],
+                    "reasoning": f"Stub: Exception: {e}; stub construction failed: {stub_error}",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            results.append(stub)
 
     return results
+
+
+# At import, after every function above is defined (M187).
+_TEMPLATE_SHAS.update(_template_shas())

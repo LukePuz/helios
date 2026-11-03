@@ -52,9 +52,13 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 _START = "Then output ONLY valid JSON"
 _END = "\nRules:"
-OLD_COMMIT = "31d52f8^"
+# 31d52f8 before the 2026-10-31 history rewrite; translated through
+# research-log/history-rewrite-2026-10-31-commit-map.txt
+# (31d52f800c4a250c2b26fcd5acca3efdd8ae5579 -> 01aecd8...).
+OLD_COMMIT = "01aecd8ccb6d94a10690ad94dc7b506d4d2cd0c1^"
 # The old block, saved from git 31d52f8^ on 10-30, so the run doesn't depend
-# on that commit surviving the history rewrite (professor M112).
+# on that commit being in the history (professor M112). --old-schema git
+# falls back to it when OLD_COMMIT can't be found.
 OLD_SCHEMA_FILE = os.path.join(REPO, "scripts", "prompt_ab_old_schema.txt")
 RULE_SHARE_PTS = 15.0     # research log 10-30 07:02 (set after the 10-28 pilot)
 RULE_EXPECTED = 0.5
@@ -69,6 +73,18 @@ def schema_block(source: str) -> str:
     i = source.index(_START)
     j = source.index(_END, i)
     return source[i:j].replace("{{", "{").replace("}}", "}")
+
+
+def old_block_from_git(repo: str = REPO, commit: str = OLD_COMMIT) -> tuple[str, str] | None:
+    """(old schema block, resolved commit hash) from git, or None when the
+    commit isn't in this history (shallow clone, another rewrite)."""
+    src = subprocess.run(["git", "-C", repo, "show", f"{commit}:agents/analyst.py"],
+                         capture_output=True, text=True)
+    if src.returncode:
+        return None
+    rev = subprocess.run(["git", "-C", repo, "rev-parse", commit],
+                         capture_output=True, text=True).stdout.strip()
+    return schema_block(src.stdout), rev
 
 
 def old_variant(prompt: str, new_block: str, old_block: str) -> str:
@@ -155,7 +171,8 @@ def main():
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--include-pilot", action="store_true")
     ap.add_argument("--old-schema", default=OLD_SCHEMA_FILE,
-                    help="file with the old schema block (default: the committed copy); 'git' reads 31d52f8^")
+                    help="file with the old schema block (default: the committed copy); 'git' reads OLD_COMMIT, "
+                         "falling back to the committed copy")
     args = ap.parse_args()
 
     live = subprocess.run(["systemctl", "is-active", "helios-local"], capture_output=True, text=True).stdout.strip()
@@ -170,11 +187,13 @@ def main():
         with open(args.old_schema) as f:
             old_block, old_commit = f.read(), f"file {args.old_schema}"
     else:
-        old_src = subprocess.run(["git", "-C", REPO, "show", f"{OLD_COMMIT}:agents/analyst.py"],
-                                 capture_output=True, text=True, check=True).stdout
-        old_block = schema_block(old_src)
-        old_commit = subprocess.run(["git", "-C", REPO, "rev-parse", OLD_COMMIT],
-                                    capture_output=True, text=True).stdout.strip()
+        found = old_block_from_git()
+        if found:
+            old_block, old_commit = found
+        else:
+            print(f"{OLD_COMMIT} not found in git; using {OLD_SCHEMA_FILE}", file=sys.stderr)
+            with open(OLD_SCHEMA_FILE) as f:
+                old_block, old_commit = f.read(), f"file {OLD_SCHEMA_FILE}"
     with open(os.path.join(REPO, "agents", "analyst.py")) as f:
         new_block = schema_block(f.read())
 

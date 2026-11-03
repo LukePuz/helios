@@ -50,6 +50,7 @@ _SNAPSHOT_STALE_MINUTES = 15
 
 
 _ALERT_THROTTLE_MINUTES = 30
+_ALERT_REPEAT_CAP_MINUTES = 240
 
 # --- Self-healing (--heal) ---------------------------------------------------
 # The 2026-10-19 -> 10-24 outage is the reason this exists. Detection was
@@ -81,45 +82,114 @@ _HEAL_MAX_PER_DAY = 4
 _HEAL_STATE_FILE = _BASE_DIR / "logs" / ".watchdog_heal_history.json"
 
 
-def _send_telegram(text: str) -> None:
-    if not _TOKEN or not _CHAT_ID:
-        print(f"[watchdog] No Telegram credentials configured — would have sent: {text}")
-        return
+def _say(msg: str) -> None:
+    """One stamped line in watchdog.log (it had no timestamps, so alerts
+    could only be dated by lining runs up with the systemd journal)."""
+    print(f"[watchdog] {datetime.now().astimezone().isoformat(timespec='seconds')} {msg}",
+          flush=True)
+
+
+def _record(text: str, status: str) -> None:
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{_TOKEN}/sendMessage",
-            json={"chat_id": _CHAT_ID, "text": text, "parse_mode": "HTML"},
-            timeout=10,
-        )
+        import alert_policy
+        source = f"deploy/watchdog.py:{sys._getframe(2).f_code.co_name}"
+        alert_policy.record(source, text, alert_policy.CRITICAL, "", status)
+    except Exception:
+        pass
+
+
+def _post(payload: dict):
+    return requests.post(f"https://api.telegram.org/bot{_TOKEN}/sendMessage",
+                         json=payload, timeout=10)
+
+
+def _send_telegram(text: str) -> bool:
+    """True only when Telegram accepted the message. A 400 (HTML Telegram
+    won't parse, or too long) is resent once as plain text. Never raises."""
+    if not _TOKEN or not _CHAT_ID:
+        _say(f"No Telegram credentials configured — would have sent: {text}")
+        return False
+    if len(text) > 4000:
+        text = text[:3980] + "\n…(truncated)"
+    try:
+        resp = _post({"chat_id": _CHAT_ID, "text": text, "parse_mode": "HTML"})
+        if getattr(resp, "status_code", None) == 400:
+            import html
+            _say("Telegram rejected the HTML (400); resending as plain text")
+            resp = _post({"chat_id": _CHAT_ID, "text": html.unescape(re.sub(r"<[^>]+>", "", text))})
+        ok = getattr(resp, "ok", True) is not False
+        if not ok:
+            _say(f"Telegram send rejected: HTTP {getattr(resp, 'status_code', '?')}")
     except Exception as e:
-        print(f"[watchdog] Telegram send failed: " + re.sub(r"bot\d+:[A-Za-z0-9_-]+", "bot[REDACTED]", str(e)))
+        _say(f"Telegram send failed: " + re.sub(r"bot\d+:[A-Za-z0-9_-]+", "bot[REDACTED]", str(e)))
+        ok = False
+    _record(text, "sent" if ok else "failed")
+    return ok
 
 
-def _alert_due(key: str = "watchdog_alert_at") -> bool:
-    """Re-fired on every 10-minute check with no throttling at all — an IBC
-    outage on 2026-07-18 (TWS's own nightly restart wasn't picked back up,
-    see ibc.service's Restart=always fix) produced repeated near-identical
-    "N min old" alerts before that root cause was fixed. Throttle re-alerts
-    of a still-unresolved problem to once per _ALERT_THROTTLE_MINUTES;
-    a problem clearing and recurring later still alerts immediately next
-    time since the throttle key naturally stops being touched once things
-    are healthy again."""
+def _problems_fingerprint(problems: list[str]) -> str:
+    """The problem set with numbers collapsed: '845 min old' and '905 min
+    old' are the same unresolved problem."""
+    return "|".join(sorted(re.sub(r"\d+(\.\d+)?", "N", p) for p in problems))
+
+
+def _repeat_interval_minutes(repeats: int) -> int:
+    """30, 60, 120, then every 240 min for an unchanged problem set."""
+    return min(_ALERT_THROTTLE_MINUTES * 2 ** max(repeats, 0), _ALERT_REPEAT_CAP_MINUTES)
+
+
+def _alert_due(key: str = "watchdog_alert_at", fingerprint: str = "") -> bool:
+    """Throttle for a still-unresolved problem. The first alert of a problem
+    set, and any change to the set, goes out at once; an unchanged set
+    re-alerts after 30, 60 and 120 min, then every 4 h. The 10-05..09 and
+    10-19..23 outages re-sent the same alert every 30 min, ~23 a day for
+    five days each, and the 11-01 Sunday 2FA login 17 times. _emit clears
+    the key on a clean run, so a problem that clears and comes back alerts
+    at once.
+
+    Stored as JSON {at, fp, n}; a bare ISO time from before is read as the
+    same problem with no repeats yet."""
     try:
         import db
+        import json
         from datetime import datetime as _dt, timezone as _tz
-        last = db.get_state(key)
+        raw = db.get_state(key)
         now = _dt.now(_tz.utc)
-        if last:
+        rec = None
+        if raw:
             try:
-                if (now - _dt.fromisoformat(last)).total_seconds() < _ALERT_THROTTLE_MINUTES * 60:
-                    return False
+                rec = json.loads(raw)
+                if not isinstance(rec, dict):
+                    raise ValueError
             except ValueError:
-                pass
-        db.set_state(key, now.isoformat())
+                rec = {"at": raw, "fp": fingerprint, "n": 0}
+        if rec and rec.get("fp") == fingerprint:
+            try:
+                elapsed = (now - _dt.fromisoformat(rec["at"])).total_seconds()
+            except (KeyError, TypeError, ValueError):
+                elapsed = None
+            n = int(rec.get("n") or 0)
+            # A negative elapsed (clock stepped back, future stamp) is due,
+            # so a bad timestamp can't silence the alert.
+            if elapsed is not None and 0 <= elapsed < _repeat_interval_minutes(n) * 60:
+                return False
+            new = {"at": now.isoformat(), "fp": fingerprint, "n": n + 1}
+        else:
+            new = {"at": now.isoformat(), "fp": fingerprint, "n": 0}
+        db.set_state(key, json.dumps(new))
         return True
     except Exception as e:
-        print(f"[watchdog] Throttle check failed, alerting anyway: {e}")
+        _say(f"Throttle check failed, alerting anyway: {e}")
         return True
+
+
+def _clear_alert_state(key: str) -> None:
+    try:
+        import db
+        if db.get_state(key):
+            db.set_state(key, "")
+    except Exception as e:
+        _say(f"Could not clear {key}: {e}")
 
 
 def _check_processes() -> list[str]:
@@ -169,7 +239,7 @@ def _service_is_active(service: str) -> bool:
                              capture_output=True, text=True, timeout=5)
         return out.stdout.strip() == "active"
     except Exception as e:
-        print(f"[watchdog] systemctl is-active {service} failed: {e}")
+        _say(f"systemctl is-active {service} failed: {e}")
         return False
 
 
@@ -187,7 +257,7 @@ def _service_state(service: str) -> str:
                              capture_output=True, text=True, timeout=5)
         return out.stdout.strip() or "unknown"
     except Exception as e:
-        print(f"[watchdog] systemctl is-active {service} failed: {e}")
+        _say(f"systemctl is-active {service} failed: {e}")
         return "unknown"
 
 
@@ -299,7 +369,7 @@ def _heal_history_record(ts: datetime) -> None:
         _HEAL_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         _HEAL_STATE_FILE.write_text(json.dumps([t.isoformat() for t in hist]))
     except Exception as e:
-        print(f"[watchdog] Could not persist heal history: {e}")
+        _say(f"Could not persist heal history: {e}")
 
 
 def _heal_allowed() -> tuple[bool, str]:
@@ -399,13 +469,18 @@ def _attempt_heal(trigger: str) -> list[str]:
 def _emit(problems: list[str], throttle_key: str) -> None:
     if problems:
         msg = "🚨 <b>Helios watchdog alert</b>\n" + "\n".join(f"• {p}" for p in problems)
-        if _alert_due(throttle_key):
-            print(f"[watchdog] {msg}")
-            _send_telegram(msg)
+        if _alert_due(throttle_key, _problems_fingerprint(problems)):
+            _say(f"{msg}")
+            if not _send_telegram(msg):
+                # The throttle was taken before the send; give it back so
+                # the next run retries instead of waiting out a window for
+                # an alert that never arrived.
+                _clear_alert_state(throttle_key)
         else:
-            print(f"[watchdog] (throttled, not re-sent) {msg}")
+            _say(f"(throttled, not re-sent) {msg}")
     else:
-        print("[watchdog] OK")
+        _clear_alert_state(throttle_key)
+        _say("OK")
 
 
 def main() -> None:
@@ -431,7 +506,7 @@ def main() -> None:
 
     state = _service_state(_HELIOS_SERVICE)
     if state in _TRANSITIONAL_STATES or _planned_restart_in_progress():
-        print(f"[watchdog] skipped: {_HELIOS_SERVICE} is {state}"
+        _say(f"skipped: {_HELIOS_SERVICE} is {state}"
               f"{' (planned restart)' if _planned_restart_in_progress() else ''}")
         return
 
@@ -460,7 +535,7 @@ def main() -> None:
     # took action must always arrive.
     if heal_notes:
         msg = "🔧 <b>Helios self-heal</b>\n" + "\n".join(heal_notes)
-        print(f"[watchdog] {msg}")
+        _say(f"{msg}")
         _send_telegram(msg)
 
 

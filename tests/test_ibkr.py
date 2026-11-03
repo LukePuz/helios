@@ -586,3 +586,109 @@ class TestFillTime:
         with patch("ibkr.get_ib", return_value=fake_ib):
             fill = ibkr.get_fill_for_order(764, ticker="CRWD", side="BUY")
         assert fill["fill_time"] == t.replace(tzinfo=timezone.utc)
+
+
+def _fake_ib_for_stop(status_seq):
+    """A held long of 10 AMD whose placed order walks through status_seq,
+    one status per ib.sleep."""
+    fake_ib = MagicMock()
+    fake_ib.positions.return_value = [MagicMock(contract=MagicMock(symbol="AMD", secType="STK"),
+                                                position=10)]
+    trade = MagicMock()
+    trade.order.orderId = 77
+    trade.log = []
+    trade.orderStatus.status = "PendingSubmit"
+    seq = list(status_seq)
+
+    def _sleep(_s):
+        if seq:
+            trade.orderStatus.status = seq.pop(0)
+    fake_ib.sleep.side_effect = _sleep
+    fake_ib.placeOrder.return_value = trade
+    return fake_ib
+
+
+def test_rejected_stop_is_not_reported_as_placed():
+    """Audit 2026-11-02 #1: a stop the broker rejects or deactivates must
+    raise, not return an order id the caller records as protection."""
+    import pytest
+    for dead in ("Cancelled", "Inactive", "ApiCancelled"):
+        fake_ib = _fake_ib_for_stop(["PendingSubmit", dead])
+        with patch.object(ibkr, "get_ib", return_value=fake_ib), \
+             patch.object(ibkr, "_stock", return_value=MagicMock()):
+            with pytest.raises(ibkr.StopNotAccepted):
+                ibkr.place_stop_order("AMD", 3, 90.0)
+        fake_ib2 = _fake_ib_for_stop(["PendingSubmit", dead])
+        with patch.object(ibkr, "get_ib", return_value=fake_ib2), \
+             patch.object(ibkr, "_stock", return_value=MagicMock()):
+            with pytest.raises(ibkr.StopNotAccepted):
+                ibkr.place_trailing_stop_order("AMD", 3, trail_percent=8.0)
+
+
+def test_accepted_stop_returns_order_id():
+    fake_ib = _fake_ib_for_stop(["PreSubmitted"])
+    with patch.object(ibkr, "get_ib", return_value=fake_ib), \
+         patch.object(ibkr, "_stock", return_value=MagicMock()):
+        assert ibkr.place_stop_order("AMD", 3, 90.0)["order_id"] == 77
+    assert fake_ib.sleep.call_count == 1   # stops waiting once accepted
+
+
+def test_stop_round_up_never_reaches_the_market_price():
+    """Review: callers with the last price pass it, so an off-tick stop just
+    under the market rounds down instead of up to the market (a SELL stop
+    there fills at once)."""
+    for market, expected in ((200.0, 199.99), (None, 200.0)):
+        fake_ib = _fake_ib_for_stop(["PreSubmitted"])
+        with patch.object(ibkr, "get_ib", return_value=fake_ib), \
+             patch.object(ibkr, "_stock", return_value=MagicMock()):
+            out = ibkr.place_stop_order("AMD", 3, 199.995, market_price=market)
+        assert out["stop_price"] == expected
+        assert fake_ib.placeOrder.call_args.args[1].auxPrice == expected
+
+
+def test_manage_stop_place_forwards_the_market_price():
+    import tasks
+    with patch("stop_lock.assert_held"), \
+         patch("ibkr.place_stop_order", return_value={"order_id": 4}) as place, \
+         patch("db.clear_trailing_active"):
+        tasks.manage_stop_place("AMD", 3, 150.0, market_price=200.0)
+        tasks.manage_stop_place("AMD", 3, 150.0)
+    assert place.call_args_list[0].kwargs == {"market_price": 200.0}
+    assert place.call_args_list[1].args == ("AMD", 3, 150.0) and place.call_args_list[1].kwargs == {}
+
+
+def test_connectivity_errors_are_stamped_and_gate_the_healthy_check():
+    """F3: 1100/1101/2110 within the window (or a session younger than it)
+    is not a healthy connection; other error codes don't count."""
+    fake_ib = MagicMock()
+    fake_ib.isConnected.return_value = True
+    now = time.time()
+    with patch("ibkr.get_ib", return_value=fake_ib), \
+         patch.object(ibkr, "_connected_at", now - 3600), \
+         patch.object(ibkr, "_last_connectivity_error_at", 0.0):
+        assert ibkr.connectivity_error_free_for(1800) is True
+        ibkr._on_ib_error(-1, 2104, "Market data farm connection is OK", None)
+        assert ibkr.connectivity_error_free_for(1800) is True
+        ibkr._on_ib_error(-1, 1100, "Connectivity between IB and TWS has been lost", None)
+        assert ibkr.connectivity_error_free_for(1800) is False
+    with patch("ibkr.get_ib", return_value=fake_ib), \
+         patch.object(ibkr, "_connected_at", now - 60), \
+         patch.object(ibkr, "_last_connectivity_error_at", 0.0):
+        assert ibkr.connectivity_error_free_for(1800) is False   # session too young
+
+
+def test_account_stock_value_reads_the_account_level_view():
+    from types import SimpleNamespace as V
+    fake_ib = MagicMock()
+    fake_ib.RequestTimeout = 0
+    fake_ib.accountSummary.return_value = [V(tag="NetLiquidation", value="5000", currency="USD"),
+                                           V(tag="GrossPositionValue", value="0.00", currency="USD")]
+    with patch("ibkr.get_ib", return_value=fake_ib):
+        assert ibkr.get_account_stock_value() == 0.0
+    fake_ib.accountSummary.return_value = []
+    fake_ib.accountValues.return_value = [V(tag="StockMarketValue", value="812.5", currency="BASE")]
+    with patch("ibkr.get_ib", return_value=fake_ib):
+        assert ibkr.get_account_stock_value() == 812.5
+    fake_ib.accountValues.return_value = []
+    with patch("ibkr.get_ib", return_value=fake_ib), pytest.raises(RuntimeError):
+        ibkr.get_account_stock_value()

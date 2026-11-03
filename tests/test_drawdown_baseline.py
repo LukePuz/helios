@@ -17,6 +17,7 @@ def _run(state):
     with patch("tasks._get_client", return_value=client), \
          patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
          patch("db.set_state", side_effect=set_state), \
+         patch("db.log_activity", return_value=True), \
          patch("alerts._send") as send, \
          patch("config.TRADING_ENV", "live"):
         tasks.check_portfolio_drawdown.run()

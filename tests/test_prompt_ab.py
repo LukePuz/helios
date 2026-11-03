@@ -79,10 +79,18 @@ def test_a_run_without_conviction_is_out_of_the_paired_mean_too():
 
 
 def test_committed_old_schema_matches_git():
-    import subprocess
     import pytest
-    src = subprocess.run(["git", "-C", REPO, "show", "31d52f8^:agents/analyst.py"],
-                         capture_output=True, text=True)
-    if src.returncode:
-        pytest.skip("31d52f8 not in this history (rewritten); the committed file is the record")
-    assert open(ab.OLD_SCHEMA_FILE).read() == ab.schema_block(src.stdout)
+    found = ab.old_block_from_git()
+    if found is None:
+        pytest.skip("OLD_COMMIT not in this history; the committed file is the record")
+    assert open(ab.OLD_SCHEMA_FILE).read() == found[0]
+
+
+def test_old_commit_is_the_mapped_rewrite_of_31d52f8():
+    with open(os.path.join(REPO, "research-log", "history-rewrite-2026-10-31-commit-map.txt")) as f:
+        new = dict(line.split()[:2] for line in f if line.strip())["31d52f800c4a250c2b26fcd5acca3efdd8ae5579"]
+    assert ab.OLD_COMMIT == new + "^"
+
+
+def test_missing_commit_gives_none():
+    assert ab.old_block_from_git(commit="0" * 40 + "^") is None

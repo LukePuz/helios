@@ -25,6 +25,13 @@ class TestSlippage:
     def test_missing_fill_price_returns_none(self):
         assert db.compute_slippage_pct(100.0, None, "BUY") is None
 
+    def test_result_is_a_fraction_not_a_percent(self):
+        # 2% worse fill -> 0.02, not 2.0; the docstring and the orders
+        # column comment say so.
+        assert db.compute_slippage_pct(50.0, 51.0, "BUY") == pytest.approx(0.02)
+        assert "FRACTION" in db.compute_slippage_pct.__doc__
+        assert "not a percent" in db._CREATE_TABLES.split("slippage_pct", 1)[1].split("\n", 1)[0]
+
 
 class TestOutcomeMetrics:
     def test_winning_trade_with_positive_alpha(self):
@@ -80,7 +87,7 @@ def test_log_order_stores_the_permanent_id():
             assert db.log_order("NVDA", "SELL", "MARKET", 3, broker_order_id=12, perm_id=perm) == 7
         sql, params = cur.execute.call_args.args
         assert "perm_id" in sql and sql.count("%s") == len(params)
-        assert params[-1] == stored
+        assert params[13] == stored                     # perm_id, before submitted_at/submit_price
 
 
 class TestRecordedSellOrderIds:

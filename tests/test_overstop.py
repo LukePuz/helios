@@ -21,7 +21,7 @@ def test_fix_overstop_rebuilds_one_stop_for_the_held_qty():
          patch("db.set_stop_broker_order_id"):
         msg = tasks._fix_overstop("AMD")
     cancel.assert_called_once_with("AMD")
-    place.assert_called_once_with("AMD", 10.0, 150.0)
+    place.assert_called_once_with("AMD", 10.0, 150.0, market_price=200.0)
     assert "placed a stop for 10" in msg
 
 
@@ -76,7 +76,7 @@ def test_partly_covered_position_gets_the_missing_shares_stopped():
          patch("db.set_stop_broker_order_id"):
         msg = tasks._fix_overstop("AMD")
     cancel.assert_not_called()
-    place.assert_called_once_with("AMD", 6.0, 150.0)
+    place.assert_called_once_with("AMD", 6.0, 150.0, market_price=200.0)
     assert "only 4 of 10" in msg
 
 
@@ -91,8 +91,33 @@ def test_naked_position_gets_a_stop_at_the_recorded_level():
          patch("tasks.manage_stop_place", return_value={"order_id": 9}) as place, \
          patch("db.set_stop_broker_order_id"):
         msg = tasks._fix_overstop("AMD")
-    place.assert_called_once_with("AMD", 10.0, 150.0)
+    place.assert_called_once_with("AMD", 10.0, 150.0, market_price=200.0)
     assert msg.startswith("🔧")
+
+
+def test_fresh_read_quantity_stops_a_position_the_cache_reads_flat_and_never_cancels():
+    """Roadmap 00 (d): the auto-stop for a disagreeing ticker sizes from the
+    fresh read while the cache shows no position, and only ever adds."""
+    client = MagicMock()
+    client.get_all_positions.return_value = []
+    with patch("ibkr.get_client", return_value=client), \
+         patch("ibkr.get_open_orders", return_value=[]), \
+         patch("db.get_position_stop", return_value={"stop_price": 150.0}), \
+         patch("ibkr.get_latest_price", return_value=200.0), \
+         patch("tasks.manage_stop_place", return_value={"order_id": 9}) as place, \
+         patch("db.set_stop_broker_order_id"):
+        msg = tasks._fix_overstop("AMD", fresh_qty=10.0)
+    place.assert_called_once_with("AMD", 10.0, 150.0, market_price=200.0)
+    assert msg.startswith("🔧")
+    with patch("ibkr.get_client", return_value=client), \
+         patch("ibkr.get_open_orders", return_value=_orders(10, 10)), \
+         patch("db.get_position_stop", return_value={"stop_price": 150.0}), \
+         patch("ibkr.get_latest_price", return_value=200.0), \
+         patch("tasks.manage_cancel_stop_orders_for") as cancel, \
+         patch("tasks.manage_stop_place") as place:
+        msg = tasks._fix_overstop("AMD", fresh_qty=10.0)
+    cancel.assert_not_called(); place.assert_not_called()
+    assert "nothing cancelled" in msg
 
 
 def test_no_stop_placed_at_or_above_the_last_price():
@@ -145,6 +170,7 @@ class TestBackstopSellReads:
 
     def test_stuck_stop_shares_are_not_sold_again(self):
         with patch("ibkr.get_client", return_value=self._client(10)), \
+             patch("market_data.is_market_hours", return_value=True), \
              patch("tasks.manage_cancel_stop_orders_for"), \
              patch("ibkr.get_open_orders", return_value=_orders(4)), \
              patch("ibkr.place_market_order", return_value={"filled_qty": 6, "fill_price": 140.0}) as order, \
@@ -162,6 +188,7 @@ def test_backstop_sale_gets_an_orders_row_and_a_part_fill_waits_for_reconcile():
     client.get_all_positions.return_value = [MagicMock(symbol="AMD", qty=10)]
     for filled, status, closes in ((6, "partial", False), (10, "filled", True)):
         with patch("ibkr.get_client", return_value=client), \
+             patch("market_data.is_market_hours", return_value=True), \
              patch("tasks.manage_cancel_stop_orders_for"), \
              patch("ibkr.get_open_orders", return_value=[]), \
              patch("ibkr.place_market_order",
@@ -189,7 +216,8 @@ def test_backstop_does_not_sell_shares_a_working_sell_already_covers():
                 "qty": 10.0, "stop_price": None, "status": "Submitted", "remaining": 4.0}]
     for open_orders, sold in ((working, 6.0), ([{**working[0], "remaining": 10.0}], None)):
         with patch("ibkr.get_client", return_value=client), \
-             patch("tasks.manage_cancel_stop_orders_for"), \
+             patch("market_data.is_market_hours", return_value=True), \
+             patch("tasks.manage_cancel_stop_orders_for") as cancel, \
              patch("ibkr.get_open_orders", return_value=open_orders), \
              patch("ibkr.place_market_order",
                    return_value={"order_id": 78, "filled_qty": 6, "fill_price": 140.0}) as order, \
@@ -199,6 +227,7 @@ def test_backstop_does_not_sell_shares_a_working_sell_already_covers():
             tasks._execute_backstop_sell("AMD", TestBackstopSellReads._alert)
         if sold is None:
             order.assert_not_called()
+            cancel.assert_not_called()   # nothing to sell: stops stay (audit 2026-11-02 #11)
         else:
             order.assert_called_once_with("AMD", "SELL", sold)
             # The working order may still be cancelled: keep the record, and
@@ -207,6 +236,7 @@ def test_backstop_does_not_sell_shares_a_working_sell_already_covers():
     # A manual limit sell (e.g. above the market in TWS) is not cover.
     lmt = [{**working[0], "order_type": "LMT", "remaining": 10.0}]
     with patch("ibkr.get_client", return_value=client), \
+         patch("market_data.is_market_hours", return_value=True), \
          patch("tasks.manage_cancel_stop_orders_for"), \
          patch("ibkr.get_open_orders", return_value=lmt), \
          patch("ibkr.place_market_order",
@@ -230,7 +260,7 @@ def test_fix_overstop_leaves_out_shares_a_working_market_sell_is_selling():
          patch("tasks.manage_stop_place", return_value={"order_id": 3}) as place, \
          patch("db.set_stop_broker_order_id"):
         tasks._fix_overstop("AMD")
-    place.assert_called_once_with("AMD", 6.0, 150.0)
+    place.assert_called_once_with("AMD", 6.0, 150.0, market_price=200.0)
 
 
 def test_late_sell_reprotect_sizes_the_stop_net_of_the_working_remainder():
@@ -356,7 +386,7 @@ def test_slow_cancel_gets_a_second_look():
          patch("tasks.manage_stop_place", return_value={"order_id": 9}) as place, \
          patch("db.set_stop_broker_order_id"):
         tasks._fix_overstop("AMD")
-    place.assert_called_once_with("AMD", 10.0, 150.0)
+    place.assert_called_once_with("AMD", 10.0, 150.0, market_price=200.0)
 
 
 def test_short_position_gets_no_sell_stop():
@@ -746,3 +776,85 @@ def test_queued_flat_exit_passes_its_orders_fill_time():
                                         "created_at": _T0, "filled_at": "FILLED-AT"})
     assert r is None
     assert close.call_args.kwargs["exit_fill_at"] == "FILLED-AT"
+
+
+def test_backstop_outside_regular_hours_cancels_nothing_and_retries_at_the_open():
+    """Audit 2026-11-02 #11: the backstop cancelled the stops, then the
+    after-hours market SELL was cancelled after its fill wait, leaving the
+    position with no stop overnight."""
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="AMD", qty=10)]
+    with patch("ibkr.get_client", return_value=client), \
+         patch("market_data.is_market_hours", return_value=False), \
+         patch("tasks.manage_cancel_stop_orders_for") as cancel, \
+         patch("ibkr.get_open_orders", return_value=[]), \
+         patch("ibkr.place_market_order") as order, \
+         patch("tasks._schedule_backstop_retry") as retry:
+        assert tasks._execute_backstop_sell("AMD", TestBackstopSellReads._alert) is False
+    cancel.assert_not_called()
+    order.assert_not_called()
+    retry.assert_called_once()
+
+
+def _retry_run(open_orders, qty=10, open_orders_error=None):
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="AMD", qty=qty)]
+    oo = {"side_effect": open_orders_error} if open_orders_error else {"return_value": open_orders}
+    with patch("ibkr.get_client", return_value=client), \
+         patch("market_data.is_market_hours", return_value=True), \
+         patch("tasks.manage_cancel_stop_orders_for") as cancel, \
+         patch("ibkr.get_open_orders", **oo), \
+         patch("ibkr.place_market_order",
+               return_value={"order_id": 80, "filled_qty": qty, "fill_price": 140.0}) as order, \
+         patch("db.log_trade"), patch("db.delete_position_stop"), patch("db.log_order", return_value=5), \
+         patch("db.update_order_fill"), patch("db.close_trade_outcome"), \
+         patch("tasks._schedule_backstop_retry"), patch("alerts._send") as alert:
+        tasks.retry_backstop_sell.run("AMD", TestBackstopSellReads._alert)
+    return cancel, order, alert
+
+
+def test_backstop_retries_at_the_open_sell_only_once_per_session():
+    """Review of 5f13c44: several retry_backstop_sell tasks queued for the same
+    open each cancelled the stops and sold."""
+    _, order, _ = _retry_run([])
+    order.assert_called_once()
+    cancel, order, alert = _retry_run([])
+    cancel.assert_not_called()
+    order.assert_not_called()
+    assert "BACKSTOP RETRY SKIPPED" in alert.call_args.args[0]
+
+
+def test_backstop_retry_rechecks_cover_and_working_sells_first():
+    stop = _orders(10)
+    cancel, order, _ = _retry_run(stop)                 # a stop covers it again
+    cancel.assert_not_called(); order.assert_not_called()
+    working = [{"order_id": 77, "ticker": "AMD", "action": "SELL", "order_type": "MKT",
+                "qty": 4.0, "stop_price": None, "status": "Submitted", "remaining": 4.0}]
+    cancel, order, alert = _retry_run(working)          # part of it is being sold
+    cancel.assert_not_called(); order.assert_not_called()
+    assert "still working" in alert.call_args.args[0]
+    cancel, order, alert = _retry_run(None, open_orders_error=RuntimeError("gateway"))
+    cancel.assert_not_called(); order.assert_not_called()
+
+
+def test_backstop_retry_failing_after_the_cancel_sends_the_critical_alert():
+    """Roadmap 00 (a): a retry has no further retry, so an exception after its
+    stops were cancelled must page, not only log."""
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="AMD", qty=10)]
+    for raise_in, expect in (("place", "BACKSTOP RETRY FAILED"), ("claim", "BACKSTOP RETRY SKIPPED")):
+        with patch("ibkr.get_client", return_value=client), \
+             patch("market_data.is_market_hours", return_value=True), \
+             patch("tasks.manage_cancel_stop_orders_for") as cancel, \
+             patch("ibkr.get_open_orders", return_value=[]), \
+             patch("tasks._claim_backstop_retry_send",
+                   side_effect=RuntimeError("boom") if raise_in == "claim" else None,
+                   return_value=True), \
+             patch("ibkr.place_market_order", side_effect=RuntimeError("gateway")), \
+             patch("tasks._schedule_backstop_retry") as retry, \
+             patch("alerts._send") as alert:
+            assert tasks._execute_backstop_sell("AMD", TestBackstopSellReads._alert,
+                                                _is_retry=True) is False
+        retry.assert_not_called()
+        assert cancel.called is (raise_in == "place")
+        assert expect in alert.call_args.args[0]

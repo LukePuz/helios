@@ -82,3 +82,64 @@ def test_connection_failure_spills_instead_of_raising(spill, call, writer):
     put.assert_not_called()
     if writer == "log_order":
         assert result == -1
+
+
+_DNS = 'could not translate host name "db" to address'
+
+
+def test_pending_approval_connect_failure_spills_and_returns_minus_one(spill):
+    with patch("db._get_conn", side_effect=psycopg2.OperationalError(_DNS)), \
+         patch("db._put_conn") as put, patch("alerts._send"):
+        got = db.log_pending_approval("NVDA", "OPEN", 7, "growth", 0.03, 95.0, "s", "r",
+                                      {"action": "OPEN"}, {"shares_initial": 3})
+    assert got == -1
+    put.assert_not_called()
+    row = json.loads(spill.read_text())
+    assert row["writer"] == "log_pending_approval" and row["record"]["ticker"] == "NVDA"
+
+
+def test_pending_approval_insert_failure_spills(spill):
+    conn, _ = _conn(RuntimeError("db down"))
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"), patch("alerts._send"):
+        got = db.log_pending_approval("NVDA", "OPEN", 7, "growth", 0.03, 95.0, "s", "r", {}, {})
+    assert got == -1 and json.loads(spill.read_text())["writer"] == "log_pending_approval"
+
+
+def test_log_activity_connect_failure_spills_and_returns_false(spill):
+    with patch("db._get_conn", side_effect=psycopg2.OperationalError(_DNS)), \
+         patch("db._put_conn"), patch("alerts._send"):
+        assert db.log_activity("halt", "", "m", extra={"event": "halt"}) is False
+    row = json.loads(spill.read_text())
+    assert row["writer"] == "log_activity" and row["record"]["extra"] == {"event": "halt"}
+
+
+def test_log_activity_returns_true_on_success(spill):
+    conn, cur = _conn(None)
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
+        assert db.log_activity("halt", "NVDA", "m") is True
+    assert "activity_feed" in cur.execute.call_args.args[0] and not spill.exists()
+
+
+def test_log_activity_insert_failure_returns_false(spill):
+    conn, _ = _conn(RuntimeError("db down"))
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"), patch("alerts._send"):
+        assert db.log_activity("halt", "NVDA", "m") is False
+    assert json.loads(spill.read_text())["writer"] == "log_activity"
+
+
+def test_log_regime_connect_failure_spills(spill):
+    err = psycopg2.OperationalError("pool exhausted")
+    with patch("db._get_conn", side_effect=err), patch("db._put_conn"), patch("alerts._send"):
+        db.log_regime("Neutral", 0.1, 0.5, {"vix": 17}, {}, "r", regime_type="gics_sector", sector_etf="XLK")
+    row = json.loads(spill.read_text())
+    assert row["writer"] == "log_regime" and row["record"]["sector_etf"] == "XLK"
+
+
+def test_log_regime_insert_failure_spills_and_keeps_the_log_line(spill, caplog):
+    import logging
+    conn, _ = _conn(RuntimeError("db down"))
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"), patch("alerts._send"):
+        db.log_regime("Bull", 0.6, 0.7, {}, {}, "r")
+    row = json.loads(spill.read_text())
+    assert row["writer"] == "log_regime" and row["record"]["regime"] == "Bull"
+    assert any("log_regime failed" in r.getMessage() and r.levelno == logging.ERROR for r in caplog.records)

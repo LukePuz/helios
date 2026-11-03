@@ -240,6 +240,21 @@ class TestConcentrationFailsClosed:
         assert result["passed"] is False
         assert "RISK CHECK FAILED" in result["flags"][0]
 
+    def test_errored_check_leaves_no_room_to_buy(self):
+        """Audit 2026-11-02 #3: the errored result carried no cap, and callers
+        only cut size when a cap is set, so the buy went at full size."""
+        client = MagicMock()
+        client.get_all_positions.side_effect = Exception("IBKR down")
+        rm = risk_manager.RiskManager.__new__(risk_manager.RiskManager)
+        rm._client = client
+        result = rm.check_concentration("JPM", 0.05)   # not an AI-infra name
+        assert result["errored"] is True
+        assert result["ai_infra_size_cap_pct"] == 0.0
+        assert result["theme_size_cap_pct"] == 0.0
+        assert result["moonshot_size_cap_pct"] == 0.0
+        sizing = {"shares_initial": 10, "position_size_pct": 0.05, "order_pct": 0.05}
+        assert rm.shares_after_concentration("JPM", sizing, "Accelerator") == 0
+
     def test_healthy_check_passes(self):
         client = _make_client(positions=[])
         rm = risk_manager.RiskManager.__new__(risk_manager.RiskManager)

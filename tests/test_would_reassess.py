@@ -7,13 +7,22 @@ ROW = {"regime": "Neutral", "regime_source": "overall", "timestamp": "2026-11-02
        "signals_json": {"volatility": {"vix": 17.0}}}
 
 
-def _run(live, state, row=ROW):
+def _run(live, state, row=ROW, written=True):
     with patch("db.get_latest_regime", return_value=row), \
          patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
          patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
-         patch("db.log_activity") as act, patch("config.TRADING_ENV", "live"):
+         patch("db.log_activity", return_value=written) as act, patch("config.TRADING_ENV", "live"):
         tasks._log_would_reassess(live)
     return act
+
+
+def test_a_failed_write_leaves_the_key_unset_so_the_next_run_retries():
+    state = {}
+    _run(23.5, state, written=False).assert_called_once()
+    assert state == {}
+    _run(23.5, state).assert_called_once()                 # retried, now written
+    assert state == {"would_reassess_logged_live": ROW["timestamp"]}
+    _run(23.5, state).assert_not_called()
 
 
 def test_logs_once_per_regime_row_when_vix_moves_more_than_5():

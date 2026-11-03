@@ -51,16 +51,26 @@ def test_missing_model_digest_is_retried():
     """Professor M77: a failed first lookup no longer sticks for the process."""
     from unittest.mock import MagicMock, patch
     from agents import analyst
-    saved = analyst._PROVENANCE_STATIC
+    saved = analyst._PROVENANCE_STATIC, dict(analyst._OLLAMA_ID)
     analyst._PROVENANCE_STATIC = {"code_sha": "x", "model_digest": None}
+    analyst._OLLAMA_ID.update(at=0.0, value=None)
     try:
-        resp = MagicMock()
+        bad, resp = MagicMock(), MagicMock()
+        bad.json.side_effect = ValueError("still loading")
         resp.json.return_value = {"models": [{"name": analyst.ANALYST_MODEL, "digest": "abcdef1234567890"}]}
+        with patch.object(analyst.requests, "get", return_value=bad), \
+             patch.object(analyst.requests, "post", return_value=bad), \
+             patch.object(analyst, "_code_mixed_check", return_value={}):
+            assert analyst._provenance("p")["model_digest"] is None
+        # A failure is cached for _OLLAMA_ID_FAIL_TTL_S, then retried.
+        analyst._OLLAMA_ID["at"] -= analyst._OLLAMA_ID_FAIL_TTL_S + 1
         with patch.object(analyst.requests, "get", return_value=resp), \
+             patch.object(analyst.requests, "post", return_value=bad), \
              patch.object(analyst, "_code_mixed_check", return_value={}):
             assert analyst._provenance("p")["model_digest"] == "abcdef123456"
     finally:
-        analyst._PROVENANCE_STATIC = saved
+        analyst._PROVENANCE_STATIC = saved[0]
+        analyst._OLLAMA_ID.update(saved[1])
 
 
 def test_regime_fallback_filter_follows_the_flag(monkeypatch):

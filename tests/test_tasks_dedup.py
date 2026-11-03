@@ -13,6 +13,19 @@ import pytest
 import db
 import tasks
 
+# Reconcile counts a cycle only 10 min after the last one (its own retries
+# must not stand in for later cycles), so the cycle harnesses below run each
+# call 15 min after the previous one on reconcile's clock.
+_OLD = "2000-01-01T00:00:00+00:00"   # a marker armed long ago
+
+
+def _cycle(state):
+    from datetime import datetime, timedelta, timezone
+    n = state.get("__cycle__", 0) + 1
+    state["__cycle__"] = n
+    return patch("tasks._reconcile_now",
+                 return_value=datetime(2026, 11, 2, 15, 0, tzinfo=timezone.utc) + timedelta(minutes=15 * n))
+
 
 class TestOptionsFlowDedup:
     def test_same_ticker_dispatches_once_per_day(self):
@@ -190,9 +203,11 @@ class TestReconciliationAlertThrottle:
 
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger="tasks"), \
+             _cycle(state), \
              patch("ibkr.get_client", return_value=client), \
              patch("ibkr.get_open_orders", return_value=open_orders), \
              patch("ibkr.cancel_order", return_value=cancel_returns), \
+             patch("ibkr.get_fresh_stock_positions", return_value={}), \
              patch("db.get_all_position_stops", return_value=[]), \
              patch("db.get_state", side_effect=fake_get_state), \
              patch("db.set_state", side_effect=fake_set_state):
@@ -875,7 +890,7 @@ class TestNoStopTelegramEscalation:
                  "no_stop_seen_AMD": (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()}
         place = MagicMock(return_value={"order_id": 9})
         mock_alert = self._run(state, record={"stop_price": 150.0}, place=place)
-        place.assert_called_once_with("AMD", 50.0, 150.0)
+        place.assert_called_once_with("AMD", 50.0, 150.0, market_price=200.0)
         assert "UNPROTECTED" not in mock_alert.call_args[0][0]
 
     def test_first_sighting_does_not_alert_telegram(self):
@@ -952,7 +967,9 @@ class TestStaleStopReconciliation:
             state[key] = value
 
         with patch("ibkr.get_client", return_value=client), \
+             _cycle(state), \
              patch("ibkr.get_open_orders", return_value=[]), \
+             patch("ibkr.get_fresh_stock_positions", return_value={"ZZZ": 1.0}), \
              patch("db.get_all_position_stops", return_value=[stale_rec]), \
              patch("db.get_state", side_effect=fake_get_state), \
              patch("db.set_state", side_effect=fake_set_state), \
@@ -1121,6 +1138,7 @@ class TestBackstopSellRetry:
              patch("ibkr.place_market_order",
                    return_value={"filled_qty": 50.0, "fill_price": 424.0, "order_id": 1122}), \
              patch("db.log_trade"), patch("db.delete_position_stop"), patch("db.close_trade_outcome"), \
+             patch("market_data.is_market_hours", return_value=True), \
              patch("tasks.retry_backstop_sell") as mock_retry_task:
             mock_get_client.return_value.get_all_positions.return_value = [MagicMock(symbol="AMD", qty=50.0)]
             with patch("ibkr.get_open_orders", return_value=[]):
@@ -1847,9 +1865,10 @@ class TestCancelledUnconfirmedOrder:
              patch("db.mark_order_cancelled", return_value=True) as mark, \
              patch("db.close_trade_outcome") as close, \
              patch("tasks._reconcile_alert_due", return_value=True), patch("alerts._send") as alert, \
-             patch("db.log_trade") as trade:
+             patch("db.log_trade") as trade, patch("tasks._queue_reprotect") as queue:
             tasks.reconcile_unconfirmed_orders.run()
         trade.assert_not_called()
+        self.queue = queue
         return mark, close, alert, read
 
     @staticmethod
@@ -1885,6 +1904,17 @@ class TestCancelledUnconfirmedOrder:
                                       fill={"filled_qty": 8.0, "fill_price": 181.0}, order=part)
         mark.assert_called_once_with(44, 8.0)
         close.assert_not_called()
+
+    def test_a_cancelled_sell_queues_the_stop_for_the_unsold_shares(self):
+        """Audit 2026-11-02 #2: a cancelled (part-filled or unfilled) SELL left
+        the unsold shares with no stop coming back; reconcile now queues the
+        recorded stop. A cancel that is not confirmed queues nothing."""
+        part = {**self.ORDER, "filled_qty": 8.0, "fill_price": 181.0}
+        self._run(self._done(status="Cancelled", filled=8.0),
+                  fill={"filled_qty": 8.0, "fill_price": 181.0}, order=part)
+        self.queue.assert_called_once_with("CRWD", {"intent": "RESTORE"}, None)
+        self._run(self._done(status="Filled"))
+        self.queue.assert_not_called()
 
     def test_less_filled_at_the_broker_than_recorded_is_left_open(self):
         part = {**self.ORDER, "filled_qty": 8.0, "fill_price": 181.0}
@@ -2136,3 +2166,267 @@ def test_claim_deferred_entry_sql():
     sql, params = cur.execute.call_args[0]
     assert "SET status='PROCESSING', decided_at=NOW()" in sql and "status='FAILED'" in sql
     assert params == (7, "%swept:%")
+
+
+class TestReconcileConfirmsAFlatRead:
+    """Audit 2026-11-02 #6: one empty portfolio-cache read on two cycles
+    cancelled every stop and deleted every record. A fresh positions read
+    must agree before sections 1 and 2 act."""
+
+    STOP = {"ticker": "AMD", "order_id": 5, "action": "SELL", "order_type": "STP",
+            "qty": 10, "stop_price": 90.0, "status": "Submitted"}
+    REC = {"ticker": "AMD", "entry_price": 100.0, "stop_price": 90.0, "broker_order_id": 5}
+
+    def _run(self, state, fresh, orders=None, account=0.0, healthy=True):
+        client = MagicMock()
+        client.get_all_positions.return_value = []   # the cache reads flat
+        kw = {"side_effect": fresh} if isinstance(fresh, Exception) else {"return_value": fresh}
+        acct = {"side_effect": account} if isinstance(account, Exception) else {"return_value": account}
+        with patch("ibkr.get_client", return_value=client), \
+             _cycle(state), \
+             patch("ibkr.get_open_orders", return_value=[self.STOP] if orders is None else orders), \
+             patch("ibkr.get_fresh_stock_positions", **kw), \
+             patch("ibkr.get_account_stock_value", **acct), \
+             patch("ibkr.connectivity_error_free_for", return_value=healthy), \
+             patch("ibkr.cancel_order", return_value=True) as cancel, \
+             patch("db.get_all_position_stops", return_value=[self.REC]), \
+             patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
+             patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+             patch("db.get_unconfirmed_orders", return_value=[]), \
+             patch("db.recorded_sell_order_ids", return_value=(frozenset(), frozenset())), \
+             patch("ibkr.get_recent_sell_fill", return_value=None), \
+             patch("db.flag_orphan_outcomes_for"), \
+             patch("db.delete_position_stop") as delete, \
+             patch("tasks._reconcile_alert_due", return_value=True), \
+             patch("alerts._send") as alert:
+            tasks.reconcile_stop_orders.run()
+        return cancel, delete, alert
+
+    def test_reads_that_disagree_change_nothing_and_alert(self):
+        state = {"orphan_pending_AMD": _OLD, "stale_stop_pending_AMD": _OLD}
+        cancel, delete, alert = self._run(state, {"AMD": 10.0})
+        cancel.assert_not_called()
+        delete.assert_not_called()
+        assert any("STOP CHECK PAUSED" in c.args[0] for c in alert.call_args_list)
+
+    def test_a_failed_confirming_read_waits(self):
+        state = {"orphan_pending_AMD": _OLD, "stale_stop_pending_AMD": _OLD}
+        cancel, delete, _ = self._run(state, RuntimeError("gateway"))
+        cancel.assert_not_called()
+        delete.assert_not_called()
+
+    def test_a_confirmed_flat_still_cleans_up(self):
+        state = {"orphan_pending_AMD": _OLD, "stale_stop_pending_AMD": _OLD}
+        cancel, delete, _ = self._run(state, {"NVDA": 5.0})
+        cancel.assert_called_once_with(5)
+        delete.assert_not_called()   # the record goes a cycle after its stop (F3)
+        cancel, delete, _ = self._run(state, {"NVDA": 5.0}, orders=[])
+        cancel.assert_not_called()
+        delete.assert_called_once_with("AMD")
+
+    def test_an_empty_fresh_read_with_stop_records_waits(self):
+        """Roadmap 00 (c): an empty fresh read while records exist is the same
+        reconnect gap, not a confirmed flat; cancel and delete wait."""
+        state = {"orphan_pending_AMD": _OLD, "stale_stop_pending_AMD": _OLD}
+        cancel, delete, _ = self._run(state, {})
+        cancel.assert_not_called()
+        delete.assert_not_called()
+
+    @staticmethod
+    def _sent(alert):
+        return [c.args[0] for c in alert.call_args_list]
+
+    def test_empty_reads_confirm_flat_on_the_third_cycle(self):
+        """An always-empty fresh read on a truly flat account would keep an
+        orphan stop forever (it could open a short): 3 consecutive cycles with
+        both reads empty confirm the flat, with an alert at the start and at
+        the cleanup."""
+        state = {}
+        cancel, delete, alert = self._run(state, {})
+        cancel.assert_not_called(); delete.assert_not_called()
+        assert any("STOP CHECK" in m and "AMD" in m and "confirming over 3 cycles" in m
+                   for m in self._sent(alert))
+        cancel, delete, alert = self._run(state, {})
+        cancel.assert_not_called(); delete.assert_not_called()
+        assert not any("STOP CHECK" in m for m in self._sent(alert))
+        cancel, delete, alert = self._run(state, {})
+        cancel.assert_called_once_with(5)
+        delete.assert_not_called()   # the record outlives its stop by a cycle
+        assert any("STOP CHECK" in m and "AMD" in m and "treating as flat" in m
+                   for m in self._sent(alert))
+        cancel, delete, _ = self._run(state, {}, orders=[])
+        delete.assert_called_once_with("AMD")
+
+    def test_the_account_level_view_must_agree_before_an_empty_read_flat(self):
+        """F3: the cache and the fresh read come from one session; the
+        server's account value and a clean connection must agree too, and a
+        disagreement re-alerts at most hourly."""
+        for kw, why in (({"account": 1234.5}, "$1,234.50 in stock"),
+                        ({"account": RuntimeError("no reply")}, "could not be read"),
+                        ({"healthy": False}, "connectivity error")):
+            state = {}
+            with patch.object(tasks, "_empty_read_gate_alert_at", 0.0):
+                for i in range(5):
+                    cancel, delete, alert = self._run(state, {}, **kw)
+                    cancel.assert_not_called(); delete.assert_not_called()
+                    gate = [m for m in self._sent(alert) if why in m]
+                    assert len(gate) == (1 if i == 2 else 0), (kw, i)
+            cancel, delete, alert = self._run(state, {})   # now everything agrees
+            cancel.assert_called_once_with(5)
+
+    def test_a_non_empty_fresh_read_resets_the_empty_read_count(self):
+        state = {}
+        for _ in range(2):
+            cancel, _, _ = self._run(state, {})
+            cancel.assert_not_called()
+        cancel, delete, _ = self._run(state, {"AMD": 10.0})   # held after all
+        cancel.assert_not_called(); delete.assert_not_called()
+        assert not state.get("flat_empty_reads_AMD")
+        for _ in range(2):
+            cancel, delete, _ = self._run(state, {})
+            cancel.assert_not_called(); delete.assert_not_called()
+        cancel, delete, _ = self._run(state, {})
+        cancel.assert_called_once_with(5)
+
+    def test_an_unavailable_counter_store_confirms_nothing_and_alerts_hourly(self):
+        state = {}
+        with patch("db.set_state_verified", side_effect=lambda w: [k for k, _ in w]), \
+             patch.object(tasks, "_empty_read_store_alert_at", 0.0):
+            for i in range(4):
+                cancel, delete, alert = self._run(state, {})
+                cancel.assert_not_called(); delete.assert_not_called()
+                store = [m for m in self._sent(alert) if "can't be read or saved" in m]
+                assert len(store) == (1 if i == 0 else 0)
+
+    def test_back_to_back_runs_confirm_nothing(self):
+        """Celery retries (+2/+4 min) and duplicate runs must not count as later
+        cycles: three runs in a row on the real clock cancel and delete nothing."""
+        state = {}
+        client = MagicMock()
+        client.get_all_positions.return_value = []
+        for fresh in ({}, {}, {}, {"NVDA": 5.0}, {"NVDA": 5.0}):
+            with patch("ibkr.get_client", return_value=client), \
+                 patch("ibkr.get_open_orders", return_value=[self.STOP]), \
+                 patch("ibkr.get_fresh_stock_positions", return_value=fresh), \
+                 patch("ibkr.cancel_order", return_value=True) as cancel, \
+                 patch("db.get_all_position_stops", return_value=[self.REC]), \
+                 patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
+                 patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+                 patch("db.get_unconfirmed_orders", return_value=[]), \
+                 patch("db.recorded_sell_order_ids", return_value=(frozenset(), frozenset())), \
+                 patch("ibkr.get_recent_sell_fill", return_value=None), \
+                 patch("db.flag_orphan_outcomes_for"), \
+                 patch("db.delete_position_stop") as delete, \
+                 patch("tasks._reconcile_alert_due", return_value=True), \
+                 patch("alerts._send"):
+                tasks.reconcile_stop_orders.run()
+            cancel.assert_not_called()
+            delete.assert_not_called()
+        assert state["flat_empty_reads_AMD"] == ""   # the non-empty reads reset it
+
+    def test_a_naked_disagreeing_ticker_gets_the_alert_and_the_auto_stop(self):
+        """Roadmap 00 (d): section 3 walked only the cache's positions, so a
+        ticker the cache read flat but the fresh read showed held, with no
+        stop, got neither the UNPROTECTED alert nor the auto-stop."""
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
+        state = {"no_stop_since_AMD": (now - timedelta(hours=1)).isoformat(),
+                 "no_stop_seen_AMD": (now - timedelta(minutes=15)).isoformat()}
+        client = MagicMock()
+        client.get_all_positions.return_value = []   # the cache reads AMD flat
+        with patch("ibkr.get_client", return_value=client), \
+             patch("ibkr.get_open_orders", return_value=[]), \
+             patch("ibkr.get_fresh_stock_positions", return_value={"AMD": 10.0}), \
+             patch("ibkr.cancel_order", return_value=True) as cancel, \
+             patch("db.get_all_position_stops", return_value=[self.REC]), \
+             patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
+             patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+             patch("db.get_unconfirmed_orders", return_value=[]), \
+             patch("db.delete_position_stop") as delete, \
+             patch("tasks._fix_overstop_safe", return_value="🚨 AMD: fix failed") as fix, \
+             patch("tasks._reconcile_alert_due", return_value=True), \
+             patch("alerts._send") as alert:
+            tasks.reconcile_stop_orders.run()
+        cancel.assert_not_called()
+        delete.assert_not_called()
+        fix.assert_called_once_with("AMD", fresh_qty=10.0, allow_cancel=False)
+        assert any("UNPROTECTED POSITION" in c.args[0] and "AMD" in c.args[0] and "10 shares" in c.args[0]
+                   for c in alert.call_args_list)
+
+    def test_a_disagreement_still_protects_other_naked_positions(self):
+        """Review of 5d9082a: returning on a disagreement skipped sections 2b
+        and 3 for every ticker, so a naked position elsewhere got no stop and
+        no UNPROTECTED alert."""
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
+        state = {"orphan_pending_AMD": "armed", "stale_stop_pending_AMD": "armed",
+                 "no_stop_since_NVDA": (now - timedelta(hours=1)).isoformat(),
+                 "no_stop_seen_NVDA": (now - timedelta(minutes=15)).isoformat()}
+        client = MagicMock()
+        client.get_all_positions.return_value = [MagicMock(symbol="NVDA", qty=5)]   # AMD missing
+        with patch("ibkr.get_client", return_value=client), \
+             patch("ibkr.get_open_orders", return_value=[self.STOP]), \
+             patch("ibkr.get_fresh_stock_positions", return_value={"AMD": 10.0, "NVDA": 5.0}), \
+             patch("ibkr.cancel_order", return_value=True) as cancel, \
+             patch("db.get_all_position_stops", return_value=[self.REC]), \
+             patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
+             patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+             patch("db.get_unconfirmed_orders", return_value=[]), \
+             patch("db.delete_position_stop") as delete, \
+             patch("tasks._fix_overstop_safe", return_value="🚨 NVDA: fix failed") as fix, \
+             patch("tasks._reconcile_alert_due", return_value=True), \
+             patch("alerts._send") as alert:
+            tasks.reconcile_stop_orders.run()
+        cancel.assert_not_called()
+        delete.assert_not_called()
+        fix.assert_called_once_with("NVDA", allow_cancel=False)
+        sent = [c.args[0] for c in alert.call_args_list]
+        assert any("STOP CHECK PAUSED" in m for m in sent)
+        assert any("UNPROTECTED POSITION" in m and "NVDA" in m for m in sent)
+
+
+def test_over_cover_fix_waits_only_for_the_ticker_the_reads_disagree_on():
+    """Roadmap 00 (e), F4: a ticker the reads disagree on gets no over-cover
+    cancel or shrink, and a throttled critical alert; a held ticker's
+    over-cover is fixed as usual."""
+    stop_amd = {**TestReconcileConfirmsAFlatRead.STOP, "qty": 20}   # 20 vs 10 per the fresh read
+    stop_nvda = {"ticker": "NVDA", "order_id": 6, "action": "SELL", "order_type": "STP",
+                 "qty": 10, "stop_price": 90.0, "status": "Submitted"}
+    state = {"overstop_pending_NVDA": "armed", "overstop_pending_AMD": "armed"}
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="NVDA", qty=5)]   # AMD missing
+    with patch("ibkr.get_client", return_value=client), \
+         patch("ibkr.get_open_orders", return_value=[stop_amd, stop_nvda]), \
+         patch("ibkr.get_fresh_stock_positions", return_value={"AMD": 10.0, "NVDA": 5.0}), \
+         patch("ibkr.cancel_order", return_value=True) as cancel, \
+         patch("db.get_all_position_stops", return_value=[TestReconcileConfirmsAFlatRead.REC]), \
+         patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
+         patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+         patch("db.get_unconfirmed_orders", return_value=[]), \
+         patch("db.delete_position_stop") as delete, \
+         patch("tasks._fix_overstop_safe", return_value="ok") as fix, \
+         patch("tasks._reconcile_alert_due", return_value=True) as due, \
+         patch("alerts._send") as alert:
+        tasks.reconcile_stop_orders.run()
+    cancel.assert_not_called()
+    delete.assert_not_called()
+    fix.assert_called_once_with("NVDA")
+    due.assert_any_call("overstop_disagree_AMD")
+    assert any("STOP CHECK" in c.args[0] and "AMD" in c.args[0] and "nothing was cancelled" in c.args[0]
+               for c in alert.call_args_list)
+
+
+def test_fix_overstop_without_cancel_only_reports_an_over_cover():
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="AMD", qty=10)]
+    stops = [{"order_id": i, "ticker": "AMD", "action": "SELL", "order_type": "STP",
+              "qty": 10, "stop_price": 150.0, "status": "Submitted"} for i in range(2)]
+    with patch("ibkr.get_client", return_value=client), \
+         patch("ibkr.get_open_orders", return_value=stops), \
+         patch("db.get_position_stop", return_value={"stop_price": 150.0}), \
+         patch("ibkr.get_latest_price", return_value=200.0), \
+         patch("tasks.manage_cancel_stop_orders_for") as cancel, \
+         patch("tasks.manage_stop_place") as place:
+        msg = tasks._fix_overstop("AMD", allow_cancel=False)
+    cancel.assert_not_called(); place.assert_not_called()
+    assert "nothing cancelled" in msg

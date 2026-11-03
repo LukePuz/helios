@@ -223,7 +223,7 @@ CREATE TABLE IF NOT EXISTS orders (
     decision_price    DECIMAL,
     fill_price        DECIMAL,
     filled_qty        DECIMAL,
-    slippage_pct      DECIMAL,
+    slippage_pct      DECIMAL,  -- a fraction (0.013 = 1.3%), not a percent; name kept for compatibility
     status            VARCHAR(20) DEFAULT 'submitted',
     approval_id       INTEGER REFERENCES pending_approvals(id),
     parent_order_id   BIGINT,
@@ -813,6 +813,24 @@ _MIGRATIONS: list[tuple[int, str]] = [
     # that raises the risk taken is measurable (audit A1031-1053-1).
     (73, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS planned_risk_per_share NUMERIC;"),
     (74, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS fill_risk_per_share NUMERIC;"),
+    # When an order was sent and the quote then (execution's pre-order price
+    # check), so submission is on record apart from the fill. status
+    # 'submitted' is not a fill record. NULL before 11-02; submitted_at
+    # defaults to the logging time for callers that don't pass it.
+    (75, "ALTER TABLE orders ADD COLUMN IF NOT EXISTS submitted_at TIMESTAMPTZ, "
+         "ADD COLUMN IF NOT EXISTS submit_price DECIMAL;"),
+    # A note from record-keeping checks, never read for trading: e.g.
+    # unconfirmed_stale_submitted (still 'submitted' long after it was sent),
+    # fill_write_failed, filled_no_price, bracket_fill_assumed. status keeps
+    # its values. NULL before 11-02.
+    (76, "ALTER TABLE orders ADD COLUMN IF NOT EXISTS reconcile_note VARCHAR(40);"),
+    # The verdict an approval came from (signals.id, from log_signal's
+    # RETURNING id), so the link isn't a prompt-hash match (professor M174);
+    # and whether the approval was written by scripts/fire_test.py. Both NULL
+    # before 11-02 (is_test is not backfilled: older test rows carry only
+    # the "[TEST RUN]" reasoning prefix).
+    (77, "ALTER TABLE pending_approvals ADD COLUMN IF NOT EXISTS signal_id INTEGER, "
+         "ADD COLUMN IF NOT EXISTS is_test BOOLEAN;"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -862,13 +880,24 @@ def init_db() -> None:
 DEGRADED_SIGNAL_PREFIX = "[degraded-log] "
 _SPILL_PATH = Path(__file__).parent / "logs" / "db_write_spill.jsonl"
 _LAST_WRITE_ALERT: dict[str, float] = {}
+# The kind of record each writer spills, so scripts/replay_spill.py knows
+# which table a line belongs to without parsing the writer name.
+_SPILL_KINDS = {"log_trade": "trade", "log_signal": "signal", "log_order": "order",
+                "log_regime": "regime", "log_pending_approval": "approval",
+                "log_activity": "activity"}
 
 
 def _spill(writer: str, record: dict, error: str) -> None:
+    """One JSONL line per failed write. uuid identifies the line for
+    scripts/replay_spill.py (its replay ledger); kind names the table; env is
+    the process's TRADING_ENV, which not every record carries."""
+    import uuid as _uuid
     try:
         _SPILL_PATH.parent.mkdir(exist_ok=True)
         with open(_SPILL_PATH, "a") as f:
             f.write(json.dumps({"at": datetime.now(timezone.utc).isoformat(), "writer": writer,
+                                "uuid": _uuid.uuid4().hex, "kind": _SPILL_KINDS.get(writer, writer),
+                                "env": TRADING_ENV,
                                 "error": error[:300], "record": record}, default=str) + "\n")
     except Exception as e:
         logging.error(f"{writer}: spill failed too: {e}")
@@ -898,15 +927,39 @@ def _rollback_quietly(conn) -> None:
         pass
 
 
+# A failed connect is retried after each of these delays (seconds) when the
+# error looks transient (DNS, refused, reset); about 2 s in all, so a short
+# blip doesn't spill the row. Writers only: reads keep failing fast.
+_CONNECT_RETRY_DELAYS: tuple[float, ...] = (0.5, 1.5)
+_TRANSIENT_CONNECT_MARKERS = (
+    "could not translate host", "temporary failure in name resolution",
+    "name or service not known", "connection refused", "connection reset",
+    "server closed the connection", "could not connect to server", "timeout expired",
+)
+
+
+def _is_transient_connect_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(m in msg for m in _TRANSIENT_CONNECT_MARKERS)
+
+
 def _writer_conn(writer: str, record: dict):
     """A pooled connection for a writer, or None after spilling the record.
     Getting the connection used to sit outside the writers' try, so a DNS or
-    pool failure lost the row with no spill (limitations audit 18:53, #8)."""
-    try:
-        return _get_conn()
-    except Exception as e:
-        _record_write_failure(writer, e, record)
-        return None
+    pool failure lost the row with no spill (limitations audit 18:53, #8).
+    A transient connect error is retried with a short backoff first."""
+    delays = list(_CONNECT_RETRY_DELAYS)
+    while True:
+        try:
+            return _get_conn()
+        except Exception as e:
+            if delays and _is_transient_connect_error(e):
+                delay = delays.pop(0)
+                logging.warning(f"{writer}: transient connect error, retrying in {delay}s: {e}")
+                _time.sleep(delay)
+                continue
+            _record_write_failure(writer, e, record)
+            return None
 
 
 def log_trade(symbol: str, side: str, quantity: int, price: float, reason: str,
@@ -962,7 +1015,9 @@ def _finite_json(o, replaced: list | None = None):
 
 def log_signal(symbol: str, signal: str, confidence: float, reasoning: str,
                model: str | None = None, provenance: dict | None = None,
-               decision: dict | None = None, prompt: str | None = None) -> None:
+               decision: dict | None = None, prompt: str | None = None) -> int | None:
+    """Returns the new row's id, or None if the full row wasn't written
+    (a fallback or degraded row, or a spill)."""
     replaced: list = []
     provenance, decision = _finite_json(provenance, replaced), _finite_json(decision, replaced)
     if replaced and isinstance(decision, dict):
@@ -972,19 +1027,23 @@ def log_signal(symbol: str, signal: str, confidence: float, reasoning: str,
            "decision": decision}
     conn = _writer_conn("log_signal", rec)
     if conn is None:
-        return
+        return None
+    new_id = None
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO signals (symbol, signal, confidence, reasoning, trading_env, model, "
-                "provenance, decision, prompt) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                "provenance, decision, prompt) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
                 (symbol, signal, confidence, reasoning, TRADING_ENV, model,
                  psycopg2.extras.Json(provenance) if provenance is not None else None,
                  psycopg2.extras.Json(decision, dumps=lambda o: json.dumps(o, default=str))
                  if decision is not None else None,
                  prompt),
             )
+            row = cur.fetchone()
+            new_id = row[0] if row else None
         conn.commit()
+        return new_id
     except psycopg2.errors.UndefinedColumn:
         # Migrations 55-56 (or older) not applied yet; they run in init_db at
         # stack start. Keep the verdict: first with env/model/provenance
@@ -1121,14 +1180,16 @@ def get_chat_history(user_id: str, limit: int = 12, max_age_hours: float = 4) ->
 _NON_ANALYST_SIGNALS = ("SCREENED_OUT", "CATALYST_BLOCKED", "COOLDOWN_SKIPPED", "SELL_NO_POSITION",
                         "SELL_POSITION_UNREADABLE",
                         "EARNINGS_BLOCKED", "ROUTE_APPROVAL_PENDING", "ROUTE_NO_PRICE",
-                        "ROUTE_ZERO_SHARES", "ROUTE_CONCENTRATION_ZERO",
+                        "ROUTE_ZERO_SHARES", "ROUTE_CONCENTRATION_ZERO", "ROUTE_NO_BROKER", "NO_VERDICT",
                         # Written at 0.0: read as a verdict it made a healthy
                         # holding look like conviction 0, a swap candidate.
                         "CATALYST_GATE_ERROR", "SHADOW_SWAP",
                         # Log-only plan level watcher (audit A2114-4).
                         "PLAN_LEVEL_HIT",
                         # A sell skipped because the market was closed (A0903-4).
-                        "SELL_SKIPPED_CLOSED")
+                        "SELL_SKIPPED_CLOSED",
+                        # An analysis that produced no verdict (log-only, M166).
+                        "ANALYST_FAILED")
 
 
 def get_latest_signal_for(ticker: str) -> dict | None:
@@ -1169,14 +1230,23 @@ def get_latest_signal_for(ticker: str) -> dict | None:
         _put_conn(conn)
 
 
+# Signal kinds written only for the record (from 11-02): an analysis with no
+# verdict (ANALYST_FAILED from the analyst, NO_VERDICT from the scan guard)
+# and a scan pass not routed for want of a broker (ROUTE_NO_BROKER).
+_RECORD_ONLY_SIGNALS = ("ANALYST_FAILED", "NO_VERDICT", "ROUTE_NO_BROKER")
+
+
 def get_recent_signals(limit: int = 50) -> list[dict]:
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
+            # Row kinds added on 11-02 for the record only are left out, so
+            # the setup gate's "recent signal" corroboration (and its 50-row
+            # window) reads what it read before.
             cur.execute(
                 "SELECT symbol, signal, confidence, timestamp, reasoning "
-                "FROM signals ORDER BY timestamp DESC LIMIT %s",
-                (limit,),
+                "FROM signals WHERE signal NOT IN %s ORDER BY timestamp DESC LIMIT %s",
+                (_RECORD_ONLY_SIGNALS, limit),
             )
             return [
                 {"symbol": r[0], "signal": r[1], "confidence": float(r[2] or 0),
@@ -1227,7 +1297,14 @@ def log_regime(
     regime_type: str = "overall",
     sector_etf: str | None = None,
 ) -> None:
-    conn = _get_conn()
+    """Failures (connection or insert) are spilled like the other writers,
+    so a lost regime row shows up in the spill count, not only the log."""
+    rec = {"regime": regime, "score": score, "confidence": confidence, "signals": signals,
+           "portfolio_impact": portfolio_impact, "reasoning": reasoning,
+           "regime_type": regime_type, "sector_etf": sector_etf}
+    conn = _writer_conn("log_regime", rec)
+    if conn is None:
+        return
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -1244,8 +1321,8 @@ def log_regime(
             )
         conn.commit()
     except Exception as e:
-        conn.rollback()
-        logging.error(f"log_regime failed: {e}")
+        _rollback_quietly(conn)
+        _record_write_failure("log_regime", e, rec)
     finally:
         _put_conn(conn)
 
@@ -1352,6 +1429,29 @@ def get_last_executed_approval(ticker: str, hours: int) -> dict | None:
         _put_conn(conn)
 
 
+# Account-level figures left out of a spilled approval (the spill keeps no
+# account values, as with log_signal's prompt). Trade-level sizing stays.
+# "flags" (exact key) too: its sizing notes quote the cash on hand.
+_APPROVAL_SPILL_DROP = ("cash", "equity", "portfolio", "buying_power", "account", "net_liq")
+
+
+def _approval_spill_record(ticker, action, conviction, bucket, size_pct, stop_price,
+                           entry_strategy, reasoning, analyst_json, risk_json,
+                           expires_at, signal_id, is_test) -> dict:
+    """The spill record for a failed approval write: log_pending_approval's
+    argument names (as scripts/replay_spill.py reports them) plus signal_id
+    and is_test, with account-level keys dropped from risk_json."""
+    risk = ({k: v for k, v in risk_json.items()
+             if str(k).lower() != "flags"
+             and not any(w in str(k).lower() for w in _APPROVAL_SPILL_DROP)}
+            if isinstance(risk_json, dict) else risk_json)
+    return {"ticker": ticker, "trading_env": TRADING_ENV, "action": action, "conviction": conviction,
+            "bucket": bucket, "size_pct": size_pct, "stop_price": stop_price,
+            "entry_strategy": entry_strategy, "reasoning": reasoning,
+            "analyst_json": analyst_json, "risk_json": risk, "expires_at": expires_at,
+            "signal_id": signal_id, "is_test": bool(is_test)}
+
+
 def log_pending_approval(
     ticker: str,
     action: str,
@@ -1363,32 +1463,61 @@ def log_pending_approval(
     reasoning: str,
     analyst_json: dict,
     risk_json: dict,
+    signal_id: int | None = None,
+    is_test: bool = False,
 ) -> int:
-    """Insert a pending approval and return its row id."""
+    """Insert a pending approval and return its row id, or -1 if the write
+    failed. A connection or insert failure is spilled, never raised: the
+    caller treats -1 as "not logged" and stops there.
+
+    signal_id: the verdict's signals.id; defaults to
+    analyst_json["provenance"]["signal_id"] (set by agents.analyst).
+    is_test: True for scripts/fire_test.py approvals."""
     from config import APPROVAL_EXPIRY_HOURS
     expires_at = datetime.now(timezone.utc) + timedelta(hours=APPROVAL_EXPIRY_HOURS)
-    conn = _get_conn()
+    if signal_id is None:
+        prov = analyst_json.get("provenance") if isinstance(analyst_json, dict) else None
+        sid = prov.get("signal_id") if isinstance(prov, dict) else None
+        signal_id = sid if isinstance(sid, int) and not isinstance(sid, bool) else None
+    rec = _approval_spill_record(ticker, action, conviction, bucket, size_pct, stop_price,
+                                 entry_strategy, reasoning, analyst_json, risk_json,
+                                 expires_at, signal_id, is_test)
+    conn = _writer_conn("log_pending_approval", rec)
+    if conn is None:
+        return -1
+    base_cols = ("ticker, trading_env, action, conviction, thesis_bucket, position_size_pct, "
+                 "stop_loss_price, entry_strategy, reasoning, analyst_json, risk_json, expires_at")
+    base_vals = (ticker, TRADING_ENV, action, conviction, bucket, size_pct, stop_price,
+                 entry_strategy, reasoning,
+                 psycopg2.extras.Json(analyst_json),
+                 psycopg2.extras.Json(risk_json),
+                 expires_at)
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO pending_approvals "
-                "(ticker, trading_env, action, conviction, thesis_bucket, position_size_pct, stop_loss_price, "
-                "entry_strategy, reasoning, analyst_json, risk_json, expires_at) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-                (
-                    ticker, TRADING_ENV, action, conviction, bucket, size_pct, stop_price,
-                    entry_strategy, reasoning,
-                    psycopg2.extras.Json(analyst_json),
-                    psycopg2.extras.Json(risk_json),
-                    expires_at,
-                ),
-            )
-            row_id: int = cur.fetchone()[0]
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"INSERT INTO pending_approvals ({base_cols}, signal_id, is_test) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                    (*base_vals, signal_id, bool(is_test)),
+                )
+                row_id: int = cur.fetchone()[0]
+        except psycopg2.errors.UndefinedColumn:
+            # Migration 77 not applied yet (it runs in init_db at stack start).
+            conn.rollback()
+            logging.warning(f"log_pending_approval: {ticker} stored without signal_id/is_test "
+                            f"(migration 77 pending)")
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"INSERT INTO pending_approvals ({base_cols}) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                    base_vals,
+                )
+                row_id = cur.fetchone()[0]
         conn.commit()
         return row_id
     except Exception as e:
-        conn.rollback()
-        logging.error(f"log_pending_approval failed: {e}")
+        _rollback_quietly(conn)
+        _record_write_failure("log_pending_approval", e, rec)
         return -1
     finally:
         _put_conn(conn)
@@ -1479,10 +1608,15 @@ def log_activity(
     message:   str,
     sentiment: str = "neutral",
     extra:     dict | None = None,
-) -> None:
-    """Insert one row into the live activity feed."""
+) -> bool:
+    """Insert one row into the live activity feed. True if it was written.
+    A connection or insert failure is spilled, never raised."""
     import json as _json
-    conn = _get_conn()
+    rec = {"stage": stage, "ticker": ticker, "message": message, "sentiment": sentiment,
+           "extra": extra}
+    conn = _writer_conn("log_activity", rec)
+    if conn is None:
+        return False
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -1492,9 +1626,11 @@ def log_activity(
                  _json.dumps(extra) if extra else None),
             )
         conn.commit()
+        return True
     except Exception as e:
-        conn.rollback()
-        logging.error(f"log_activity failed: {e}")
+        _rollback_quietly(conn)
+        _record_write_failure("log_activity", e, rec)
+        return False
     finally:
         _put_conn(conn)
 
@@ -1511,6 +1647,42 @@ def log_halt_event(event: str, source: str, reason: str = "", **fields) -> None:
                       "at": datetime.now(timezone.utc).isoformat(), **fields})
     except Exception as e:
         logging.warning(f"log_halt_event({event}) failed: {e}")
+
+
+def log_boot_activity(message: str, extra: dict) -> bool:
+    """An activity_feed row (stage "boot") when a process starts: its commit,
+    dirty flag, service, pid and start time, so loads that write no signals
+    still show in the record (professor M181). Opens and closes its own
+    connection instead of using the pool: it runs in a Celery parent before
+    the worker pool forks, and a pool created there would be shared by the
+    children. Never raises; returns whether the row was written."""
+    conn = None
+    try:
+        conn = psycopg2.connect(
+            host=os.getenv("SUPABASE_HOST"), port=int(os.getenv("SUPABASE_PORT", "5432")),
+            dbname=os.getenv("SUPABASE_DB", "postgres"), user=os.getenv("SUPABASE_USER", "postgres"),
+            password=os.getenv("SUPABASE_PASSWORD"), sslmode="require", connect_timeout=5,
+            # Bounded so a slow or dead server can't hold up a worker's start.
+            keepalives=1, tcp_user_timeout=10000)
+        with conn.cursor() as cur:
+            # SET LOCAL rather than a startup "options" parameter, which a
+            # connection pooler can refuse.
+            cur.execute("SET LOCAL statement_timeout = 5000")
+            cur.execute(
+                "INSERT INTO activity_feed (stage, ticker, message, sentiment, extra_json) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                ("boot", "", message, "neutral", json.dumps({**extra, "env": TRADING_ENV}, default=str)))
+        conn.commit()
+        return True
+    except Exception as e:
+        logging.warning(f"log_boot_activity failed: {e}")
+        return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def get_activity_feed(limit: int = 120) -> list[dict]:
@@ -1615,6 +1787,31 @@ def claim_deferred_entry_for_retry(approval_id: int) -> bool:
     except Exception as e:
         conn.rollback()
         logging.error(f"claim_deferred_entry_for_retry failed: {e}")
+        return False
+    finally:
+        _put_conn(conn)
+
+
+def expire_failed_entry(approval_id: int, reason: str) -> bool:
+    """FAILED -> EXPIRED only if still FAILED and not swept; True for the one
+    call that made the change. Duplicate deliveries of a stale deferred-entry
+    retry each used to expire it unconditionally and queue a re-analysis
+    (11-02: 2 of 12 copies for one approval). False on error."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE pending_approvals SET status='EXPIRED', decided_at=NOW(), status_reason=%s "
+                "WHERE id=%s AND status='FAILED' "
+                "AND COALESCE(status_reason, '') NOT LIKE %s RETURNING id",
+                (reason, approval_id, f"%{SWEPT_REASON_MARK}%"),
+            )
+            won = cur.fetchone() is not None
+        conn.commit()
+        return won
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"expire_failed_entry failed: {e}")
         return False
     finally:
         _put_conn(conn)
@@ -3140,35 +3337,60 @@ def log_order(
     status: str = "submitted",
     intent: str | None = None,
     perm_id: int | None = None,
+    submitted_at=None,
+    submit_price: float | None = None,
 ) -> int:
-    """Logs a newly-placed order. Returns the local orders.id (-1 on failure)."""
-    conn = _writer_conn("log_order", {
-        "ticker": ticker, "side": side, "order_type": order_type, "qty": qty,
-        "broker_order_id": broker_order_id, "stop_price": stop_price,
-        "decision_price": decision_price, "approval_id": approval_id, "status": status,
-        "intent": intent, "perm_id": perm_id})
+    """Logs a newly-placed order. Returns the local orders.id (-1 on failure).
+    submitted_at: when the order was sent (default: now, the logging time);
+    submit_price: the quote at submission, where the caller has one."""
+    rec = {"ticker": ticker, "side": side, "order_type": order_type, "qty": qty,
+           "broker_order_id": broker_order_id, "stop_price": stop_price,
+           "decision_price": decision_price, "approval_id": approval_id, "status": status,
+           "intent": intent, "perm_id": perm_id, "submitted_at": submitted_at,
+           "submit_price": submit_price}
+    conn = _writer_conn("log_order", rec)
     if conn is None:
         return -1
+    base = (broker_order_id, TRADING_ENV, ticker, side, order_type, qty, limit_price,
+            stop_price, decision_price, approval_id, parent_order_id, status, intent,
+            perm_id or None)
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO orders
-                    (broker_order_id, trading_env, ticker, side, order_type, qty, limit_price,
-                     stop_price, decision_price, approval_id, parent_order_id, status, intent, perm_id)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                RETURNING id
-                """,
-                (broker_order_id, TRADING_ENV, ticker, side, order_type, qty, limit_price,
-                 stop_price, decision_price, approval_id, parent_order_id, status, intent,
-                 perm_id or None),
-            )
-            order_id = cur.fetchone()[0]
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO orders
+                        (broker_order_id, trading_env, ticker, side, order_type, qty, limit_price,
+                         stop_price, decision_price, approval_id, parent_order_id, status, intent,
+                         perm_id, submitted_at, submit_price)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,COALESCE(%s, NOW()),%s)
+                    RETURNING id
+                    """,
+                    base + (submitted_at, submit_price),
+                )
+                order_id = cur.fetchone()[0]
+        except psycopg2.errors.UndefinedColumn:
+            # Migration 75 not applied yet: keep the order row without them.
+            conn.rollback()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO orders
+                        (broker_order_id, trading_env, ticker, side, order_type, qty, limit_price,
+                         stop_price, decision_price, approval_id, parent_order_id, status, intent, perm_id)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    RETURNING id
+                    """,
+                    base,
+                )
+                order_id = cur.fetchone()[0]
+            logging.warning(f"log_order: {ticker} stored without submitted_at/submit_price "
+                            f"(migration 75 pending)")
         conn.commit()
         return order_id
     except Exception as e:
-        conn.rollback()
-        logging.error(f"log_order failed: {e}")
+        _rollback_quietly(conn)
+        _record_write_failure("log_order", e, rec)
         return -1
     finally:
         _put_conn(conn)
@@ -3181,11 +3403,65 @@ def compute_slippage_pct(decision_price: float | None, fill_price: float | None,
     can be unit-tested without a database connection.
     Positive slippage = paid more than the decision-time price (BUY) or
     received less than it (SELL) — i.e. slippage is always "cost" signed.
+
+    Units: the return value is a FRACTION (0.013 means 1.3%), not a percent,
+    despite the name. orders.slippage_pct stores it as is; the column keeps
+    its name so existing readers and exports don't break. Multiply by 100
+    to show a percent.
     """
     if not decision_price or not fill_price:
         return None
     raw = (fill_price - decision_price) / decision_price
     return raw if side == "BUY" else -raw
+
+
+def set_order_reconcile_note(order_id: int, note: str) -> bool:
+    """Sets orders.reconcile_note on one row if it has none. A record-keeping
+    note only: status and fill columns are left alone. True if set."""
+    if not order_id or order_id < 0:
+        return False
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE orders SET reconcile_note=%s WHERE id=%s AND reconcile_note IS NULL",
+                        (note[:40], order_id))
+            n = cur.rowcount
+        conn.commit()
+        return n > 0
+    except Exception as e:
+        _rollback_quietly(conn)
+        logging.error(f"set_order_reconcile_note failed: {e}")
+        return False
+    finally:
+        _put_conn(conn)
+
+
+STALE_SUBMITTED_NOTE = "unconfirmed_stale_submitted"
+
+
+def mark_stale_submitted_orders(min_age_hours: int = 6) -> int | None:
+    """Notes orders still 'submitted' min_age_hours after they were sent:
+    nothing recorded a fill or a final state for them (a priceless fill, a
+    failed fill write, an assumed bracket fill). Sets reconcile_note only,
+    never status, in every env, with no broker call. Returns how many rows
+    were noted, or None on error."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE orders SET reconcile_note=%s WHERE status='submitted' AND reconcile_note IS NULL "
+                "AND COALESCE(submitted_at, created_at) < NOW() - make_interval(hours => %s)",
+                (STALE_SUBMITTED_NOTE, min_age_hours),
+            )
+            n = cur.rowcount
+        conn.commit()
+        return n
+    except Exception as e:
+        _rollback_quietly(conn)
+        logging.error(f"mark_stale_submitted_orders failed: {e}")
+        return None
+    finally:
+        _put_conn(conn)
 
 
 def set_order_perm_id(order_id: int, perm_id: int) -> bool:
@@ -3363,6 +3639,34 @@ def get_order_fill_state(order_id: int) -> dict | None:
                 "created_at": r[4], "filled_at": r[5]}
     except Exception as e:
         logging.error(f"get_order_fill_state failed: {e}")
+        raise
+    finally:
+        _put_conn(conn)
+
+
+def order_row_exists(ticker: str, side: str, broker_order_id: int | None,
+                     perm_id: int | None = None, max_age_hours: int = 72) -> bool:
+    """True if an orders row already records this broker order (by permId
+    when known, else broker order id within max_age_hours). Used before
+    re-writing an order row that failed to log, so a retry can't create a
+    second row for the same order. Raises on error."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            if perm_id:
+                cur.execute("SELECT 1 FROM orders WHERE trading_env=%s AND ticker=%s AND side=%s "
+                            "AND perm_id=%s LIMIT 1", (TRADING_ENV, ticker, side, perm_id))
+            else:
+                cur.execute("SELECT 1 FROM orders WHERE trading_env=%s AND ticker=%s AND side=%s "
+                            "AND broker_order_id=%s AND created_at > NOW() - (%s * INTERVAL '1 hour') "
+                            "LIMIT 1", (TRADING_ENV, ticker, side, broker_order_id, max_age_hours))
+            return cur.fetchone() is not None
+    except Exception as e:
+        logging.error(f"order_row_exists failed: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         raise
     finally:
         _put_conn(conn)
@@ -3968,22 +4272,40 @@ def get_subscore_calibration(dimension: str) -> list[dict]:
         _put_conn(conn)
 
 
-def update_outcome_price(approval_id: int, days: int, price: float) -> None:
+def update_outcome_price(approval_id: int, days: int, price: float,
+                         outcome_id: int | None = None) -> bool | None:
+    """Writes one 30/60/90-day checkpoint price on an open outcome row, once.
+    With outcome_id the row is matched by its id; without it, by approval_id
+    within this TRADING_ENV. Either way only an open row (exit_date NULL)
+    whose checkpoint is still NULL is written: matching on approval_id alone
+    wrote every row of an approval that has two. True if a row was written,
+    False if none matched, None if the write failed."""
     col_map = {30: "review_30d_price", 60: "review_60d_price", 90: "review_90d_price"}
     col = col_map.get(days)
     if not col:
-        return
+        return False
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                f"UPDATE trade_outcomes SET {col}=%s WHERE approval_id=%s",
-                (price, approval_id),
-            )
+            if outcome_id is not None:
+                cur.execute(
+                    f"UPDATE trade_outcomes SET {col}=%s WHERE id=%s "
+                    f"AND exit_date IS NULL AND {col} IS NULL",
+                    (price, outcome_id),
+                )
+            else:
+                cur.execute(
+                    f"UPDATE trade_outcomes SET {col}=%s WHERE approval_id=%s AND trading_env=%s "
+                    f"AND exit_date IS NULL AND {col} IS NULL",
+                    (price, approval_id, TRADING_ENV),
+                )
+            n = cur.rowcount
         conn.commit()
+        return n > 0
     except Exception as e:
-        conn.rollback()
+        _rollback_quietly(conn)
         logging.error(f"update_outcome_price failed: {e}")
+        return None
     finally:
         _put_conn(conn)
 
@@ -4012,17 +4334,22 @@ def update_outcome_entry_price(approval_id: int, entry_price: float) -> bool | N
         _put_conn(conn)
 
 
-def get_open_outcomes(strict: bool = False) -> list[dict]:
+def get_open_outcomes(strict: bool = False, all_envs: bool = False) -> list[dict]:
     """Returns trade outcomes where exit_date is NULL (position still open).
-    strict: raise on a DB error instead of returning [] (professor m114)."""
+    strict: raise on a DB error instead of returning [] (professor m114).
+    all_envs: rows of every trading_env, not just this one. Only for the
+    price-checkpoint review, which writes by row id and reads market data;
+    each row carries its own trading_env."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT approval_id, ticker, action, conviction, thesis_bucket, "
-                "entry_price, entry_date, review_30d_price, review_60d_price, review_90d_price "
-                "FROM trade_outcomes WHERE exit_date IS NULL AND trading_env=%s ORDER BY entry_date",
-                (TRADING_ENV,),
+                "entry_price, entry_date, review_30d_price, review_60d_price, review_90d_price, "
+                "id, trading_env "
+                "FROM trade_outcomes WHERE exit_date IS NULL "
+                + ("" if all_envs else "AND trading_env=%s ") + "ORDER BY entry_date",
+                () if all_envs else (TRADING_ENV,),
             )
             rows = cur.fetchall()
         return [
@@ -4033,6 +4360,7 @@ def get_open_outcomes(strict: bool = False) -> list[dict]:
                 "review_30d_price": float(r[7]) if r[7] else None,
                 "review_60d_price": float(r[8]) if r[8] else None,
                 "review_90d_price": float(r[9]) if r[9] else None,
+                "id": r[10], "trading_env": r[11],
             }
             for r in rows
         ]
@@ -4405,6 +4733,7 @@ def recent_event_verdicts(ticker: str, minutes: int = 15) -> list[dict]:
                 "SELECT timestamp, provenance->'trigger'->>'title', provenance->'trigger'->>'url', "
                 "decision->>'model_action' FROM signals "
                 "WHERE symbol=%s AND trading_env=%s AND provenance->'trigger'->>'path' = 'event' "
+                "AND signal <> 'ANALYST_FAILED' "
                 "AND timestamp > NOW() - make_interval(mins => %s) ORDER BY timestamp DESC",
                 (ticker, TRADING_ENV, minutes),
             )

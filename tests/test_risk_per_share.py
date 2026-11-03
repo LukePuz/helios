@@ -29,3 +29,15 @@ def test_the_outcome_row_carries_both():
         execution.log_buy_outcome(_approval(), "NVDA", "OPEN", 107.0)
     kw = log_outcome.call_args.kwargs
     assert kw["planned_risk_per_share"] == 5.0 and kw["fill_risk_per_share"] == 12.0
+
+
+def test_a_failed_risk_computation_is_logged_at_warning(caplog):
+    import logging
+    caplog.set_level(logging.WARNING, logger=execution.log.name)
+    with patch("execution._risk_per_share", side_effect=ValueError("bad")), \
+         patch("db.log_trade_outcome", return_value=True) as log_outcome:
+        execution.log_buy_outcome(_approval(), "NVDA", "OPEN", 107.0)
+    assert any("risk-per-share record failed" in r.getMessage() and r.levelno == logging.WARNING
+               for r in caplog.records)
+    kw = log_outcome.call_args.kwargs
+    assert kw["planned_risk_per_share"] is None and kw["fill_risk_per_share"] is None

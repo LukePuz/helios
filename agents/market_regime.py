@@ -277,19 +277,23 @@ def _score_credit(macro: dict) -> tuple[int, str]:
         return _SCORE["Very Bearish"], f"Yield spread {t10y2y:.2f}% — deeply inverted, significant credit stress"
 
 
-def _score_breadth(spy_bars: list[dict], sample_tickers: list[str]) -> tuple[int, str]:
+def _score_breadth(spy_bars: list[dict], sample_tickers: list[str],
+                   proxy_label: str = "SPY") -> tuple[int, str]:
     """
     Market breadth: estimate % of watchlist stocks above their 200DMA.
     Uses the Alpaca/Polygon data for a sample (avoids expensive full-market call).
+    proxy_label names the ETF whose bars are passed as spy_bars, for the
+    note when the sample is empty (the sector path passes the sector ETF).
     """
     if not sample_tickers:
-        # Fallback: use SPY price vs 200DMA as a single-name proxy
+        # Fallback: that ETF's price vs its 200DMA as a single-name proxy
         if len(spy_bars) >= 200:
             closes = [b["close"] for b in spy_bars]
             ma200 = sum(closes[-200:]) / 200
             current = closes[-1]
             pct = 65 if current > ma200 else 40
-            note = f"SPY proxy breadth: {'above' if current > ma200 else 'below'} 200DMA — estimated {pct}%"
+            note = (f"{proxy_label} proxy breadth: {'above' if current > ma200 else 'below'} "
+                    f"200DMA — estimated {pct}%")
             return _SCORE["Bullish"] if pct > 55 else _SCORE["Neutral"], note
         return _SCORE["Neutral"], "Breadth data unavailable"
 
@@ -834,6 +838,7 @@ def assess_sector_regime(
     spy_bars: list[dict] | None = None,
     breadth_tickers: list[str] | None = None,
     regime_type: str = "sector",
+    db_regime_type: str | None = None,
 ) -> dict:
     """
     Same regime classification as assess_regime(), scoped to one sector ETF
@@ -858,6 +863,11 @@ def assess_sector_regime(
     sweep (regime_type="gics_sector") don't collide as the same ticker can
     appear in both (XLK is both our thesis's sector ETF and the GICS
     Information Technology ETF).
+
+    db_regime_type: the regime_type the DB row is written under, when it
+    differs from the cache key's (default: regime_type). The gics_sector
+    cache-miss path uses "gics_sector_fallback": its breadth is the
+    watchlist sample, not the sector's constituents.
     """
     from agents.markov_regime import get_markov_packet, get_markov_packet_from_closes
 
@@ -910,7 +920,11 @@ def assess_sector_regime(
             log.debug(f"Sector breadth freshness for {sector_etf} unavailable: {e}")
     else:
         breadth_bars = _fetch_watchlist_bars_for_breadth()
-    breadth_raw, breadth_notes = _score_breadth(sector_bars, breadth_bars)
+    breadth_raw, breadth_notes = _score_breadth(sector_bars, breadth_bars, proxy_label=sector_etf)
+    # Log-only: where the breadth figure came from and how many tickers
+    # (>= 200 bars) are behind it; 0 means the ETF's own 200DMA proxy.
+    breadth_sample = {"source": "explicit_sample" if breadth_tickers is not None else "watchlist",
+                      "n_used": sum(1 for b in breadth_bars if len(b) >= 200)}
 
     volume_raw, volume_notes = _score_volume(sector_bars)
 
@@ -1000,6 +1014,7 @@ def assess_sector_regime(
             **{name: {"score": raw, "notes": notes} for name, (raw, notes) in scores_map.items()},
             "last_bar_date": sector_bars[-1].get("date") if sector_bars else None,  # A1053-2
             "breadth_freshness": breadth_freshness,
+            "breadth_sample": breadth_sample,
             "trade_style": {"label": trade_style, "efficiency_ratio": efficiency_ratio,
                              "notes": trade_style_notes},
         },
@@ -1012,7 +1027,7 @@ def assess_sector_regime(
         import db
         db.log_regime(
             regime, score, confidence, packet["signals"], {}, reasoning,
-            regime_type=regime_type, sector_etf=sector_etf,
+            regime_type=db_regime_type or regime_type, sector_etf=sector_etf,
         )
     except Exception as e:
         log.warning(f"Failed to persist sector regime to DB: {e}")
@@ -1026,15 +1041,23 @@ def assess_sector_regime(
 
 
 def get_cached_sector_regime(sector_etf: str = "XLK", regime_type: str = "sector") -> dict:
-    """Same TTL-cache/DB-fallback pattern as get_cached_regime(), scoped
-    per sector ETF (and per regime_type, since XLK is tracked both as our
-    thesis's sector ETF and as the GICS Information Technology ETF)."""
+    """TTL cache per sector ETF and regime_type (XLK is tracked both as our
+    thesis's sector ETF and as the GICS Information Technology ETF). There
+    is no DB fallback, unlike get_cached_regime(): the cache is in memory,
+    per process, so a miss recomputes with assess_sector_regime().
+
+    A recompute here samples breadth from the watchlist, not the sector's
+    constituents as the assess_market_sector_map() sweep does. For
+    regime_type "gics_sector" its row is therefore logged as
+    "gics_sector_fallback"; the packet and cache key are unchanged."""
     cache_key = f"{sector_etf}:{regime_type}"
     if cache_key in _sector_regime_cache and \
        (time.monotonic() - _sector_cache_ts.get(cache_key, 0)) < REGIME_CACHE_TTL_SECONDS:
         return _sector_regime_cache[cache_key]
     try:
-        return assess_sector_regime(sector_etf, regime_type=regime_type)
+        return assess_sector_regime(
+            sector_etf, regime_type=regime_type,
+            db_regime_type="gics_sector_fallback" if regime_type == "gics_sector" else None)
     except Exception as e:
         log.error(f"assess_sector_regime({sector_etf}, {regime_type}) failed: {e}")
         return {"available": False, "regime": "Neutral", "score": 50.0, "confidence": 0.0,

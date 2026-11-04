@@ -971,7 +971,7 @@ def get_fill_for_order(broker_order_id: int, ticker: str | None = None,
         if e.execution.orderId == broker_order_id
         and (ticker is None or e.contract.symbol == ticker)
         and (want_side is None or e.execution.side == want_side)
-        and (placed_at is None or _exec_time(e) is None or _exec_time(e) >= placed_at)
+        and (placed_at is None or (lambda t: t is None or t >= placed_at)(_exec_time(e)))
     ]
     if not matches:
         return None
@@ -992,19 +992,84 @@ def _weighted_exec_price(fills, total_qty: float) -> float:
 def _with_fill_time(result: dict, records) -> dict:
     """Adds fill_time, the last execution's time, when the executions carry
     one (professor M110: a late close otherwise has only its recording time)."""
-    times = [t for t in (_exec_time(r) for r in records) if t is not None]
-    if times:
-        result["fill_time"] = max(times)
+    timed = [(t, src) for t, src in (_fill_time_and_source(r) for r in records) if t is not None]
+    if timed:
+        result["fill_time"] = max(t for t, _ in timed)
+        n_receipt = sum(1 for _, src in timed if src == "receipt")
+        log.info(f"fill_time from {len(timed)} record(s): {n_receipt} receipt time, "
+                 f"{len(timed) - n_receipt} execution-time fallback")
     return result
 
 
+_FUTURE_FILL_SLACK_S = 60
+_relabel_warned: set = set()   # (execId, time): one warning per execution, not per lookup
+
+
+def _tws_zone():
+    """The zone ib_async labels a suffix-less execution time with:
+    ib.TimezoneTWS if set, else None (astimezone(None) is this host's local
+    zone, with the offset in force at that instant)."""
+    from zoneinfo import ZoneInfo
+    name = getattr(_ib, "TimezoneTWS", "") if _ib is not None else ""
+    if isinstance(name, str) and name:
+        try:
+            return ZoneInfo(name)
+        except Exception:
+            pass
+    return None
+
+
 def _exec_time(record):
-    """Execution time as an aware datetime, or None if it can't be read."""
-    from datetime import timezone
-    t = getattr(record.execution, "time", None)
-    if t is None or not hasattr(t, "tzinfo"):
-        return None
-    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+    """Fill time as an aware UTC-comparable datetime, or None if it can't be
+    read. TWS can send execution.time as a UTC wall clock with no zone, which
+    ib_async labels with the TWS/local zone: 20:07Z read as 20:07 ET =
+    01:07Z, 5 h late (MSFT 2026-11-03).
+
+    A live Fill records its own time: ib_async's lastTime, when the message
+    arrived here, not the exchange execution time. The two are usually under
+    a second apart. This is the time in orders.filled_at,
+    trade_outcomes.exit_fill_at and stop_slippage.fill_time for live fills.
+
+    A reqExecutions Fill's time is execution.time, so one more than 60 s in
+    the future is relabelled as UTC. Limit: a shifted time read more than
+    the zone offset (~4-5 h) after the fill is no longer in the future and
+    is returned unchanged, still late."""
+    return _fill_time_and_source(record)[0]
+
+
+def _fill_time_and_source(record):
+    """(time, source) behind _exec_time; source is "receipt" for a live
+    fill's own time, "execution" for the execution.time fallback, None when
+    there's no time."""
+    from datetime import datetime, timezone, timedelta
+    ex = getattr(record, "execution", record)
+    t = getattr(ex, "time", None)
+    if t is None or not isinstance(t, datetime):
+        return None, None
+    t = t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+    rt = getattr(record, "time", None)
+    if isinstance(rt, datetime) and rt.year >= 2000:   # datetime.min: no message yet
+        rt = rt if rt.tzinfo else rt.replace(tzinfo=timezone.utc)
+        if rt != t:
+            return rt, "receipt"
+    now = datetime.now(timezone.utc)
+    slack = timedelta(seconds=_FUTURE_FILL_SLACK_S)
+    if t <= now + slack:
+        return t, "execution"
+    fixed = t.astimezone(_tws_zone()).replace(tzinfo=timezone.utc)
+    bad = fixed > now + slack
+    key = (getattr(ex, "execId", None) or id(ex), t)
+    if key not in _relabel_warned:
+        if len(_relabel_warned) > 1000:
+            _relabel_warned.clear()
+        _relabel_warned.add(key)
+        if bad:
+            log.warning(f"Execution time {t.isoformat()} is in the future even read as UTC "
+                        f"({fixed.isoformat()}); no fill time recorded")
+        else:
+            log.warning(f"Execution time {t.isoformat()} is in the future; "
+                        f"read as UTC: {fixed.isoformat()}")
+    return (None, None) if bad else (fixed, "execution")
 
 
 def get_recent_sell_fill(ticker: str, exclude_order_ids=frozenset(),

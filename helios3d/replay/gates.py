@@ -11,7 +11,8 @@ and replay_gates() over a grid of synthetic outputs and asserts the same
 gates, final action, conviction and pass_to_risk.
 
 Order of the chain (as in live):
-  unheld coercion, UDR floor, source count, expected-return rate,
+  malformed catalyst, unheld coercion, UDR floor, source count,
+  malformed expected return, expected-return rate,
   Trend Template, Moonshot conviction, regime selectivity, fundamentals
   conviction cap, pass_to_risk validation, low-conviction sell.
 
@@ -31,7 +32,10 @@ Inputs (keys of ``inp``; a key that is ABSENT means "unknown"):
   min_return_per_week  config MIN_EXPECTED_RETURN_PCT_PER_WEEK
   month_midpoint       config CATALYST_MONTH_MIDPOINT_ENABLED
   etf_exempt           config ETF_FUNDAMENTALS_CAP_EXEMPT
-  (the harness sets the three config keys only from provenance.config; one
+  malformed_catalyst_policy
+                       provenance.config malformed_catalyst_policy
+                       ("watch" or "watch_rate_scoped")
+  (the harness sets the four config keys only from provenance.config; one
   not recorded leaves the step that needs it oracle, never today's value)
 
 Return-rate reason: matches live from 453a950 on ("no expected_return_pct"
@@ -48,6 +52,35 @@ db.log_signal arguments). Neither leaves a replayable record: ANALYST_FAILED
 rows are not_replayable and a missing row is never read, so the
 normalisation cannot create a false differ on decisions recorded before it.
 
+Malformed-catalyst policy (recorded as provenance.config
+malformed_catalyst_policy): a malformed field (malformed_catalyst_fields)
+makes live's verdict WATCH with a "malformed catalyst (...)" gate, written
+even when the model already said WATCH.
+  "watch"              every field, first in the chain (malformed_catalyst
+                       step), any action and bucket.
+  "watch_rate_scoped"  catalyst and catalyst.date as "watch";
+                       expected_return_pct (null, non-numeric, NaN/+-inf
+                       or a bool, on a dated catalyst) only where the rate
+                       gate reads it: Accelerator/Moonshot OPEN/ADD
+                       after the unheld, UDR and source gates
+                       (malformed_return step; oracle when the bucket is
+                       not recorded). Elsewhere it is not acted on (an
+                       Accelerator/Moonshot HOLD stays HOLD, flagged
+                       catalyst_stale); live records it as
+                       decision.return_malformed.
+With either policy in ``inp`` the steps are replayed; without it (a
+decision recorded before the policy, or a harness that does not pass it)
+both steps are oracle on a malformed output: malformed_catalyst fires only
+when the first recorded gate is a malformed one, malformed_return (on a
+buy with a malformed expected_return_pct) when one is still recorded, so a
+pre-policy row replays on the normalised catalyst as live wrote it.
+A policy string that is neither makes both steps oracle on a malformed
+output, with the reason "unknown policy <x>".
+When the stored output shows no malformed field but the first recorded
+gate is a malformed one (a NaN/inf catalyst.date, stored as null by
+db._finite_json), malformed_catalyst is oracle on that gate ("recorded
+malformed fields (value not stored)").
+
 When an input a step needs is unknown, the step is an "oracle" step: it takes
 whether the gate fired (and its text) from the recorded gate list instead of
 deciding it. Such a step is reported as oracle, never as replayed.
@@ -55,6 +88,7 @@ deciding it. Such a step is reported as oracle, never as replayed.
 from __future__ import annotations
 
 import copy
+import math
 import re
 from datetime import datetime, timezone
 
@@ -75,7 +109,8 @@ ORACLE = "oracle"
 NOT_APPLICABLE = "not_applicable"
 NOT_REPLAYABLE = "not_replayable"
 
-STEP_ORDER = ("unheld", "udr", "sources", "return_rate", "trend_template", "moonshot",
+STEP_ORDER = ("malformed_catalyst", "unheld", "udr", "sources", "malformed_return", "return_rate",
+              "trend_template", "moonshot",
               "regime", "fundamentals", "pass_validation", "low_conviction_sell")
 
 
@@ -170,6 +205,8 @@ def low_conviction_sell(action: str, conviction: int, prev: dict | None,
 
 def gate_kind(text: str) -> str:
     t = str(text)
+    if t.startswith("malformed catalyst"):
+        return "malformed_catalyst"
     if t.startswith("unheld "):
         return "unheld"
     if t.startswith("udr "):
@@ -215,9 +252,34 @@ class _Recorded:
 # The chain
 # ---------------------------------------------------------------------------
 
+_DATED_CHECK_AS_OF = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+
+def malformed_catalyst_fields(parsed: dict) -> list[str]:
+    """agents.analyst._malformed_catalyst_fields (on the raw output)."""
+    fields: list[str] = []
+    cat = parsed.get("catalyst")
+    if not isinstance(cat, (dict, type(None))):
+        fields.append("catalyst")
+        cat = None
+    date = (cat or {}).get("date")
+    if date is not None and not isinstance(date, str):
+        fields.append("catalyst.date")
+    elif isinstance(date, str) and compute_weeks_to_catalyst(date, _DATED_CHECK_AS_OF) is not None:
+        erp = parsed.get("expected_return_pct")
+        try:
+            ok = (erp is not None and not isinstance(erp, bool)
+                  and math.isfinite(float(erp)))
+        except (TypeError, ValueError, OverflowError):
+            ok = False
+        if not ok:
+            fields.append("expected_return_pct")
+    return fields
+
+
 def normalise_catalyst(parsed: dict) -> None:
-    """_analyze_inner's catalyst normalisation (in place, on the working
-    copy; model_output stays raw): a catalyst that is neither an object nor
+    """agents.analyst._normalise_catalyst (in place, on the working copy;
+    model_output stays raw): a catalyst that is neither an object nor
     None becomes {}, and a non-string catalyst.date becomes its text when it
     is an int or float (not a bool), else None."""
     if not isinstance(parsed.get("catalyst", {}), (dict, type(None))):
@@ -251,11 +313,47 @@ def replay_gates(model_output: dict, inp: dict, recorded_gates=()) -> dict:
         steps.append({"step": name, "status": status, "fired": bool(fired), "reason": reason})
 
     action, conviction, udr = parse_model_output(parsed)
+    malformed = malformed_catalyst_fields(parsed)
     normalise_catalyst(parsed)
     model_action, model_conviction = action, conviction
     model_pass = bool(parsed.get("pass_to_risk", False))
     bucket_known = "bucket" in inp
     bucket = inp.get("bucket")
+
+    # 0. malformed catalyst -> WATCH (live: MALFORMED_CATALYST_POLICY)
+    policy = inp.get("malformed_catalyst_policy")
+    policy_known = policy in ("watch", "watch_rate_scoped")
+    policy_reason = ("malformed_catalyst_policy not recorded" if policy is None
+                     else f"unknown policy {policy}")
+    # Left to 3b: always under "watch_rate_scoped"; with the policy unknown
+    # when step 0 does not take it.
+    return_malformed = policy != "watch" and "expected_return_pct" in malformed
+    if policy == "watch_rate_scoped":
+        malformed = [f for f in malformed if f != "expected_return_pct"]
+    if malformed:
+        if policy_known:
+            text = f"malformed catalyst ({', '.join(malformed)}): {action} -> WATCH"
+            step("malformed_catalyst", REPLAYED, True)
+        else:
+            # Step 0's gate, when it fired, is the first recorded.
+            text = (rec.take("malformed_catalyst")
+                    if rec.gates and gate_kind(rec.gates[0]) == "malformed_catalyst" else None)
+            step("malformed_catalyst", ORACLE, text is not None, policy_reason)
+        if text is not None:
+            gates.append(text)
+            action = "WATCH"
+            parsed["pass_to_risk"] = False
+    elif (not return_malformed and rec.gates
+          and gate_kind(rec.gates[0]) == "malformed_catalyst"):
+        # Live flagged a field the stored output no longer shows: a NaN/inf
+        # catalyst.date is stored as null (db._finite_json).
+        text = rec.take("malformed_catalyst")
+        step("malformed_catalyst", ORACLE, True, "recorded malformed fields (value not stored)")
+        gates.append(text)
+        action = "WATCH"
+        parsed["pass_to_risk"] = False
+    else:
+        step("malformed_catalyst", NOT_APPLICABLE)
 
     # 1. unheld ADD/HOLD
     if action in ("ADD", "HOLD"):
@@ -293,6 +391,25 @@ def replay_gates(model_output: dict, inp: dict, recorded_gates=()) -> dict:
         step("sources", REPLAYED, True)
     else:
         step("sources", REPLAYED if action in BUY_ACTIONS else NOT_APPLICABLE)
+
+    # 3b. malformed expected return at the rate gate ("watch_rate_scoped")
+    if return_malformed and action in BUY_ACTIONS:
+        if policy_known and bucket_known:
+            fired = bucket in RATE_BUCKETS
+            text = f"malformed catalyst (expected_return_pct): {action} -> WATCH"
+            step("malformed_return", REPLAYED if fired else NOT_APPLICABLE, fired,
+                 None if fired else f"bucket {bucket}")
+        else:
+            text = rec.take("malformed_catalyst")
+            fired = text is not None
+            step("malformed_return", ORACLE, fired,
+                 "bucket not recorded" if policy_known else policy_reason)
+        if fired:
+            gates.append(text)
+            action = "WATCH"
+            parsed["pass_to_risk"] = False
+    else:
+        step("malformed_return", NOT_APPLICABLE)
 
     # 4. expected-return rate (Accelerator/Moonshot buys).
     rate_cfg = "min_return_per_week" in inp and "month_midpoint" in inp

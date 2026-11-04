@@ -179,6 +179,14 @@ _TARGETED = [
     dict(action="OPEN", conviction=8, role="Accelerator", catalyst={"date": 20261201}),
     dict(action="OPEN", conviction=8, role="Accelerator", catalyst={"date": ["2026-12"]}),
     dict(action="OPEN", conviction=8, role="Moonshot", catalyst={"date": True}),
+    # A dated catalyst with no expected return: malformed only at the rate gate.
+    dict(action="OPEN", conviction=8, role="Compounder", ret=None),
+    dict(action="ADD", conviction=8, role="Compounder", ret=None),
+    dict(action="EXIT", conviction=8, role="Accelerator", ret=None),
+    dict(action="TRIM", conviction=8, role="Moonshot", ret=None),
+    dict(action="ADD", conviction=8, role="Moonshot", held=False, ret=None),
+    dict(action="ADD", conviction=8, role="Accelerator", ret=None),
+    dict(action="WATCH", conviction=8, role="Moonshot", ret=None),
 ]
 
 
@@ -215,10 +223,6 @@ def _run_live(case):
         patch("knowledge_loader.load_philosophy", return_value=""),
         patch("knowledge_loader.get_etf_tickers", return_value={ticker} if case["etf"] else set()),
         patch.object(config, "ETF_FUNDAMENTALS_CAP_EXEMPT", case["etf_exempt"]),
-        # The replay's catalyst normalisation is the tolerant reading. Off,
-        # live raises (ANALYST_FAILED) or writes no row on those outputs:
-        # neither leaves a record to replay.
-        patch.object(config, "ANALYST_TOLERATE_MALFORMED_CATALYST", True),
         patch("agents.chase_risk.compute_chase_risk", return_value=None),
         patch("agents.price_action.compute_price_action", return_value=None),
         patch("agents.price_action.compute_trend_template", return_value=tt),
@@ -252,7 +256,8 @@ def _replay(case, prev):
            "as_of": datetime.now(timezone.utc),
            "min_return_per_week": live.MIN_EXPECTED_RETURN_PCT_PER_WEEK,
            "month_midpoint": config.CATALYST_MONTH_MIDPOINT_ENABLED,
-           "etf_exempt": case["etf_exempt"]}
+           "etf_exempt": case["etf_exempt"],
+           "malformed_catalyst_policy": live.MALFORMED_CATALYST_POLICY}
     return G.replay_gates(case["model_output"], inp)
 
 
@@ -303,7 +308,7 @@ def test_grid_reaches_every_gate():
             continue
         kinds |= {G.gate_kind(g) for g in r["gates"]}
         finals.add((r["final_action"], r["final_pass_to_risk"]))
-    assert kinds >= {"unheld", "udr", "sources", "return_rate", "trend_template", "moonshot",
+    assert kinds >= {"malformed_catalyst", "unheld", "udr", "sources", "return_rate", "trend_template", "moonshot",
                      "regime", "fundamentals_cap", "fundamentals_etf_exempt", "pass_dropped",
                      "low_conviction_sell"}
     assert {("OPEN", True), ("ADD", True), ("TRIM", True), ("WATCH", False)} <= finals
@@ -314,7 +319,8 @@ def test_grid_reaches_every_gate():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("drop", ["held", "bucket", "regime", "fund_read", "is_etf",
-                                  "trend_template_pass", "prev_verdict"])
+                                  "trend_template_pass", "prev_verdict",
+                                  "malformed_catalyst_policy"])
 def test_oracle_reproduces_live_record(drop):
     for i in range(0, len(_RANDOM_CASES), 3):
         case = _RANDOM_CASES[i]
@@ -332,7 +338,8 @@ def test_oracle_reproduces_live_record(drop):
                "as_of": datetime.now(timezone.utc),
                "min_return_per_week": live.MIN_EXPECTED_RETURN_PCT_PER_WEEK,
                "month_midpoint": config.CATALYST_MONTH_MIDPOINT_ENABLED,
-               "etf_exempt": case["etf_exempt"]}
+               "etf_exempt": case["etf_exempt"],
+               "malformed_catalyst_policy": live.MALFORMED_CATALYST_POLICY}
         inp.pop(drop)
         got = G.replay_gates(case["model_output"], inp, want["gates"])
         for k in ("final_action", "final_conviction", "final_pass_to_risk", "gates"):
@@ -344,12 +351,20 @@ _BOUNDARY_EXPECT = [
     (11, ("OPEN", 7, True)), (12, ("OPEN", 10, True)), (13, ("OPEN", 7, True)),
     (14, ("OPEN", 10, True)), (15, ("WATCH", 6, False)), (16, ("OPEN", 6, True)),
     (17, ("OPEN", 6, True)), (18, ("ADD", 7, True)), (19, ("OPEN", 6, True)),
+    # 20-21 and 38-39: a malformed expected_return_pct on a rate-gated
+    # OPEN/ADD, 23-26 and 31-33: a malformed catalyst or catalyst.date on
+    # any verdict make it an unrouted WATCH. 22: an Accelerator HOLD with a
+    # null return stays HOLD (flagged catalyst_stale). 34-37 and 40: a null
+    # return elsewhere routes as usual.
     (20, ("WATCH", 8, False)), (21, ("WATCH", 8, False)), (22, ("HOLD", 6, False)),
-    (23, ("WATCH", 8, False)), (24, ("WATCH", 8, False)), (25, ("HOLD", 6, False)),
-    (26, ("OPEN", 8, True)),
+    (23, ("WATCH", 8, False)), (24, ("WATCH", 8, False)), (25, ("WATCH", 6, False)),
+    (26, ("WATCH", 8, False)),
     (27, ("TRIM", 3, False)), (28, ("EXIT", 2, False)), (29, ("OPEN", 8, True)),
     (30, ("ADD", 7, True)), (31, ("WATCH", 8, False)), (32, ("WATCH", 8, False)),
     (33, ("WATCH", 8, False)),
+    (34, ("OPEN", 8, True)), (35, ("ADD", 8, True)), (36, ("EXIT", 8, True)),
+    (37, ("TRIM", 8, True)), (38, ("WATCH", 8, False)), (39, ("WATCH", 8, False)),
+    (40, ("WATCH", 8, False)),
 ]
 
 
@@ -368,10 +383,20 @@ def test_boundary_cases_reach_live_as_intended(idx, expect):
         assert want is None
         return
     assert (want["final_action"], want["final_conviction"], want["final_pass_to_risk"]) == expect
-    if idx in (20, 21):
-        assert any("no expected_return_pct" in g for g in want["gates"])
-    if idx in (23, 24, 31, 32, 33):
-        assert any("no computable catalyst timeframe" in g for g in want["gates"])
+    malformed = {20: "expected_return_pct", 21: "expected_return_pct",
+                 23: "catalyst", 24: "catalyst", 25: "catalyst", 26: "catalyst",
+                 31: "catalyst.date", 32: "catalyst.date", 33: "catalyst.date",
+                 38: "expected_return_pct", 39: "expected_return_pct"}
+    if idx in malformed:
+        at = 1 if idx == 38 else 0          # after "unheld ADD -> OPEN"
+        assert want["gates"][at].startswith(f"malformed catalyst ({malformed[idx]}): ")
+        assert want["downgraded_reason"] == "malformed_catalyst"
+        assert want["malformed_fields"] == [malformed[idx]]
+    else:
+        assert want["downgraded_reason"] is None and want["malformed_fields"] is None
+    if idx == 22:       # the HOLD keeps its action; only the log-only flag is set
+        assert want["return_malformed"] is True
+        assert not any(g.startswith("malformed") for g in want["gates"])
 
 
 def test_catalyst_normalisation_keeps_model_output_raw():
@@ -396,3 +421,187 @@ def test_rate_step_not_applicable_for_known_non_rate_bucket_without_config():
     assert rr["status"] == G.NOT_APPLICABLE and rr["reason"] == "bucket Compounder"
     out = G.replay_gates(mo, {"bucket": "Moonshot", "as_of": _AS_OF})
     assert next(s for s in out["steps"] if s["step"] == "return_rate")["status"] == G.ORACLE
+
+
+def test_malformed_catalyst_fields_match_live():
+    from agents.analyst import _malformed_catalyst_fields
+    for case in _RANDOM_CASES + [_targeted_case(t) for t in _TARGETED]:
+        mo = case["model_output"]
+        assert G.malformed_catalyst_fields(mo) == _malformed_catalyst_fields(mo)
+    for extra in ({"catalyst": {"date": "2026-12"}, "expected_return_pct": True},
+                  {"catalyst": {"date": "2026-12-01"}, "expected_return_pct": "nan"},
+                  {"catalyst": {"date": "ongoing"}, "expected_return_pct": None},
+                  {"catalyst": 7}, {"catalyst": {"date": 0}}):
+        assert G.malformed_catalyst_fields(extra) == _malformed_catalyst_fields(extra)
+
+
+def test_pre_policy_malformed_row_replays_as_recorded():
+    """A decision recorded before the policy (no malformed_catalyst_policy
+    in provenance.config, so not in inp) with a malformed catalyst that
+    still wrote a row: a Compounder OPEN with a list catalyst.date was
+    routed as OPEN on the normalised catalyst. The step is oracle and does
+    not fire without a recorded malformed gate, so the replay matches."""
+    mo = {"action": "OPEN", "conviction": 8, "upside_downside_ratio": 3, "pass_to_risk": True,
+          "catalyst": {"date": ["2026-12"]}, "expected_return_pct": 25,
+          "sources": [{"type": "a", "detail": "1"}, {"type": "b", "detail": "2"}]}
+    inp = {"held": None, "bucket": "Compounder", "regime": "Risk-On", "fund_read": "ok",
+           "as_of": _AS_OF, "min_return_per_week": 1.0, "month_midpoint": False}
+    old = G.replay_gates(mo, inp, recorded_gates=[])
+    assert (old["final_action"], old["final_pass_to_risk"], old["gates"]) == ("OPEN", True, [])
+    step = next(s for s in old["steps"] if s["step"] == "malformed_catalyst")
+    assert step["status"] == G.ORACLE and step["fired"] is False
+    # The same output under the policy: WATCH; a policy row's recorded gate
+    # drives the oracle step the same way.
+    new = G.replay_gates(mo, {**inp, "malformed_catalyst_policy": "watch"})
+    assert (new["final_action"], new["final_pass_to_risk"]) == ("WATCH", False)
+    assert new["gates"] == ["malformed catalyst (catalyst.date): OPEN -> WATCH"]
+    oracle = G.replay_gates(mo, inp, recorded_gates=new["gates"])
+    assert (oracle["final_action"], oracle["gates"]) == ("WATCH", new["gates"])
+
+
+_NULL_RETURN = {"action": "OPEN", "conviction": 8, "upside_downside_ratio": 3, "pass_to_risk": True,
+                "catalyst": {"date": "2026-12-01"}, "expected_return_pct": None,
+                "sources": [{"type": "a", "detail": "1"}, {"type": "b", "detail": "2"}]}
+_RATE_INP = {"held": True, "regime": "Risk-On", "fund_read": "ok", "as_of": _AS_OF,
+             "min_return_per_week": 1.0, "month_midpoint": False, "trend_template_pass": True,
+             "is_etf": False, "prev_verdict": None}
+
+
+def _step(out, name):
+    return next(s for s in out["steps"] if s["step"] == name)
+
+
+def test_rate_scoped_return_check_needs_bucket_and_buy():
+    scoped = {**_RATE_INP, "malformed_catalyst_policy": "watch_rate_scoped"}
+    out = G.replay_gates(_NULL_RETURN, {**scoped, "bucket": "Moonshot"})
+    assert out["gates"] == ["malformed catalyst (expected_return_pct): OPEN -> WATCH"]
+    assert _step(out, "malformed_catalyst")["status"] == G.NOT_APPLICABLE
+    assert _step(out, "malformed_return")["status"] == G.REPLAYED
+    out = G.replay_gates(_NULL_RETURN, {**scoped, "bucket": "Compounder"})
+    assert (out["final_action"], out["gates"]) == ("OPEN", [])
+    rs = _step(out, "malformed_return")
+    assert rs["status"] == G.NOT_APPLICABLE and rs["reason"] == "bucket Compounder"
+    for action in ("EXIT", "TRIM", "WATCH"):
+        out = G.replay_gates({**_NULL_RETURN, "action": action}, {**scoped, "bucket": "Accelerator"})
+        assert not any(g.startswith("malformed") for g in out["gates"])
+        assert _step(out, "malformed_return")["status"] == G.NOT_APPLICABLE
+    # An Accelerator/Moonshot HOLD stays HOLD (live flags catalyst_stale).
+    hold = {**_NULL_RETURN, "action": "HOLD", "pass_to_risk": False}
+    for bucket in ("Moonshot", "Accelerator"):
+        out = G.replay_gates(hold, {**scoped, "bucket": bucket})
+        assert (out["final_action"], out["gates"]) == ("HOLD", [])
+        assert _step(out, "malformed_return")["status"] == G.NOT_APPLICABLE
+    out = G.replay_gates(hold, {**scoped, "bucket": "Compounder"})
+    assert (out["final_action"], out["gates"]) == ("HOLD", [])
+    out = G.replay_gates(hold, {**scoped, "held": False, "bucket": "Moonshot"})
+    assert out["gates"] == ["unheld HOLD -> WATCH"]
+    # "watch" (unscoped) still downgrades any verdict at step 0
+    out = G.replay_gates({**_NULL_RETURN, "action": "EXIT"},
+                         {**_RATE_INP, "bucket": "Compounder", "malformed_catalyst_policy": "watch"})
+    assert out["gates"] == ["malformed catalyst (expected_return_pct): EXIT -> WATCH"]
+    assert _step(out, "malformed_catalyst")["status"] == G.REPLAYED
+
+
+def test_rate_scoped_return_check_is_oracle_without_bucket():
+    scoped = {**_RATE_INP, "malformed_catalyst_policy": "watch_rate_scoped"}
+    rec = ["malformed catalyst (expected_return_pct): OPEN -> WATCH"]
+    out = G.replay_gates(_NULL_RETURN, scoped, recorded_gates=rec)
+    rs = _step(out, "malformed_return")
+    assert rs["status"] == G.ORACLE and rs["fired"] and rs["reason"] == "bucket not recorded"
+    assert (out["final_action"], out["gates"]) == ("WATCH", rec)
+    out = G.replay_gates(_NULL_RETURN, scoped, recorded_gates=[])
+    assert _step(out, "malformed_return")["fired"] is False and out["final_action"] == "OPEN"
+
+
+def test_unknown_policy_places_a_recorded_return_gate_after_the_unheld_one():
+    mo = {**_NULL_RETURN, "action": "ADD"}
+    rec = ["unheld ADD -> OPEN", "malformed catalyst (expected_return_pct): OPEN -> WATCH"]
+    out = G.replay_gates(mo, {**_RATE_INP, "held": False, "bucket": "Moonshot"}, recorded_gates=rec)
+    assert (out["final_action"], out["gates"]) == ("WATCH", rec)
+    assert _step(out, "malformed_catalyst")["fired"] is False
+    assert _step(out, "malformed_return")["status"] == G.ORACLE
+
+
+def test_an_unknown_policy_string_makes_the_steps_oracle():
+    """A recorded malformed_catalyst_policy that is neither "watch" nor
+    "watch_rate_scoped" is not acted on: both malformed steps take the
+    recorded gates, with the reason naming the policy."""
+    inp = {**_RATE_INP, "bucket": "Moonshot", "malformed_catalyst_policy": "watch_v9"}
+    bad_date = {**_NULL_RETURN, "catalyst": {"date": 20261201}, "expected_return_pct": 25}
+    rec = ["malformed catalyst (catalyst.date): OPEN -> WATCH"]
+    out = G.replay_gates(bad_date, inp, recorded_gates=rec)
+    s0 = _step(out, "malformed_catalyst")
+    assert s0 == {"step": "malformed_catalyst", "status": G.ORACLE, "fired": True,
+                  "reason": "unknown policy watch_v9"}
+    assert (out["final_action"], out["gates"]) == ("WATCH", rec)
+    out = G.replay_gates(bad_date, {**inp, "bucket": "Compounder"}, recorded_gates=[])
+    assert _step(out, "malformed_catalyst")["fired"] is False and out["final_action"] == "OPEN"
+    # A return gate recorded after the unheld one is the malformed_return step's.
+    add = {**_NULL_RETURN, "action": "ADD"}
+    rec = ["unheld ADD -> OPEN", "malformed catalyst (expected_return_pct): OPEN -> WATCH"]
+    out = G.replay_gates(add, {**inp, "held": False}, recorded_gates=rec)
+    s0, rs = _step(out, "malformed_catalyst"), _step(out, "malformed_return")
+    assert (s0["status"], s0["fired"], s0["reason"]) == (G.ORACLE, False, "unknown policy watch_v9")
+    assert (rs["status"], rs["fired"], rs["reason"]) == (G.ORACLE, True, "unknown policy watch_v9")
+    assert (out["final_action"], out["gates"]) == ("WATCH", rec)
+    # With no policy recorded the reason is unchanged.
+    out = G.replay_gates(add, {**_RATE_INP, "held": False, "bucket": "Moonshot"}, recorded_gates=rec)
+    assert _step(out, "malformed_return")["reason"] == "malformed_catalyst_policy not recorded"
+
+
+def test_well_formed_output_has_no_malformed_step():
+    mo = {"action": "OPEN", "conviction": 8, "upside_downside_ratio": 3, "pass_to_risk": True,
+          "catalyst": {"date": "2026-12-01"}, "expected_return_pct": 25,
+          "sources": [{"type": "a", "detail": "1"}, {"type": "b", "detail": "2"}]}
+    out = G.replay_gates(mo, {"bucket": "Compounder", "as_of": _AS_OF,
+                              "malformed_catalyst_policy": "watch"})
+    step = next(s for s in out["steps"] if s["step"] == "malformed_catalyst")
+    assert step["status"] == G.NOT_APPLICABLE and out["final_action"] == "OPEN"
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_catalyst_date_replays_on_the_recorded_gate(bad):
+    """Live flags a NaN/inf catalyst.date; the signals row stores it as
+    null (db._finite_json), so the stored output shows no malformed field.
+    The first step takes the recorded gate (oracle) and the replay matches."""
+    import db
+    raw = {"action": "OPEN", "conviction": 8, "upside_downside_ratio": 3, "pass_to_risk": True,
+           "catalyst": {"date": bad}, "expected_return_pct": 25,
+           "sources": [{"type": "a", "detail": "1"}, {"type": "b", "detail": "2"}]}
+    assert live._malformed_catalyst_fields(raw) == ["catalyst.date"]
+    stored = db._finite_json(raw)
+    assert stored["catalyst"]["date"] is None and G.malformed_catalyst_fields(stored) == []
+    recorded = ["malformed catalyst (catalyst.date): OPEN -> WATCH"]
+    inp = {"held": None, "bucket": "Compounder", "regime": "Risk-On", "fund_read": "ok",
+           "as_of": _AS_OF, "min_return_per_week": 1.0, "month_midpoint": False,
+           "malformed_catalyst_policy": "watch"}
+    out = G.replay_gates(stored, inp, recorded_gates=recorded)
+    assert (out["final_action"], out["final_pass_to_risk"], out["gates"]) == ("WATCH", False, recorded)
+    step = next(s for s in out["steps"] if s["step"] == "malformed_catalyst")
+    assert step == {"step": "malformed_catalyst", "status": G.ORACLE, "fired": True,
+                    "reason": "recorded malformed fields (value not stored)"}
+    # Without the recorded gate nothing fires.
+    plain = G.replay_gates(stored, inp, recorded_gates=[])
+    assert plain["final_action"] == "OPEN" and plain["gates"] == []
+    # Under the scoped policy too.
+    scoped = G.replay_gates(stored, {**inp, "malformed_catalyst_policy": "watch_rate_scoped"},
+                            recorded_gates=recorded)
+    assert (scoped["final_action"], scoped["gates"]) == ("WATCH", recorded)
+
+
+def test_a_recorded_return_gate_is_left_to_the_rate_step():
+    """A first recorded malformed gate on expected_return_pct, with the
+    stored output still showing it, is the malformed_return step's, not
+    the value-not-stored oracle."""
+    mo = {"action": "OPEN", "conviction": 8, "upside_downside_ratio": 3, "pass_to_risk": True,
+          "catalyst": {"date": "2026-12-01"}, "expected_return_pct": None,
+          "sources": [{"type": "a", "detail": "1"}, {"type": "b", "detail": "2"}]}
+    recorded = ["malformed catalyst (expected_return_pct): OPEN -> WATCH"]
+    inp = {"held": None, "bucket": "Accelerator", "regime": "Risk-On", "fund_read": "ok",
+           "as_of": _AS_OF, "min_return_per_week": 1.0, "month_midpoint": False,
+           "malformed_catalyst_policy": "watch_rate_scoped"}
+    out = G.replay_gates(mo, inp, recorded_gates=recorded)
+    steps = {s["step"]: s for s in out["steps"]}
+    assert steps["malformed_catalyst"]["status"] == G.NOT_APPLICABLE
+    assert steps["malformed_return"]["status"] == G.REPLAYED and steps["malformed_return"]["fired"]
+    assert (out["final_action"], out["gates"]) == ("WATCH", recorded)

@@ -1581,8 +1581,9 @@ def log_pending_approval(
                  "stop_loss_price, entry_strategy, reasoning, analyst_json, risk_json, expires_at")
     base_vals = (ticker, TRADING_ENV, action, conviction, bucket, size_pct, stop_price,
                  entry_strategy, reasoning,
-                 psycopg2.extras.Json(analyst_json),
-                 psycopg2.extras.Json(risk_json),
+                 # NaN/inf from model output or sizing would fail the jsonb write.
+                 psycopg2.extras.Json(_finite_json(analyst_json)),
+                 psycopg2.extras.Json(_finite_json(risk_json)),
                  expires_at)
     try:
         try:

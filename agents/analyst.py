@@ -12,6 +12,7 @@ Designed for 72B model reasoning quality; degrades gracefully on smaller models.
 """
 import json
 import logging
+import math
 import os
 import re
 from datetime import datetime, timezone
@@ -818,7 +819,7 @@ def shadow_versions() -> dict:
 
 def _treatment_config() -> dict:
     import config
-    return {k: getattr(config, k, None) for k in (
+    return {**{k: getattr(config, k, None) for k in (
         "EARNINGS_ENTRY_BLACKOUT_DAYS", "ALLOW_ONE_SHARE_ABOVE_ALLOCATION", "SETUP_GATES_ENABLED",
         "ANALYST_MODEL", "SCREENER_MODEL", "MIN_EXPECTED_RETURN_PCT_PER_WEEK",
         "BRIEF_PRICE_STRUCTURE", "BRIEF_POSITION_CONTEXT", "REGIME_OVERALL_ONLY",
@@ -827,9 +828,12 @@ def _treatment_config() -> dict:
         "TIER_MAX_CONCURRENT_POSITIONS", "MAX_TRADE_PCT_OF_CASH_RESERVE",
         "ETF_FUNDAMENTALS_CAP_EXEMPT", "PLAN_LEVEL_REVIEW_ENABLED",
         # Added 10-31 (A1031-0253-1): the month-only catalyst reading.
-        "CATALYST_MONTH_MIDPOINT_ENABLED",
-        # Added 11-03: the malformed-catalyst reading.
-        "ANALYST_TOLERATE_MALFORMED_CATALYST")}
+        "CATALYST_MONTH_MIDPOINT_ENABLED")},
+        # Added 11-03: fixed, not a switch (a malformed catalyst makes the
+        # verdict WATCH); separates verdicts from before it. "watch" was
+        # unscoped; "watch_rate_scoped" flags expected_return_pct only at
+        # the rate gate.
+        "malformed_catalyst_policy": MALFORMED_CATALYST_POLICY}
 
 
 _OLLAMA_ID_TTL_S = 600
@@ -1547,14 +1551,102 @@ def expected_return_per_week(expected_return_pct: float | None, weeks_to_catalys
     return expected_return_pct / weeks_to_catalyst
 
 
-def _null_return_not_tolerated(ticker: str) -> None:
-    """ANALYST_TOLERATE_MALFORMED_CATALYST off: a dated catalyst with a null
-    expected_return_pct raises the TypeError the rate gate's reason text
-    raised before it was tolerated (it formatted the None rate with :.2f),
-    so analyze() ends as ANALYST_FAILED as it did then."""
-    log.warning(f"[{ticker}] Malformed expected_return_pct: null on a dated catalyst; "
-                f"not tolerated (ANALYST_TOLERATE_MALFORMED_CATALYST off)")
-    raise TypeError("unsupported format string passed to NoneType.__format__")
+# A code constant, not a config.py setting: env_sha does not cover it.
+# provenance.config (malformed_catalyst_policy) and code_sha do.
+MALFORMED_CATALYST_POLICY = "watch_rate_scoped"
+_DATED_CHECK_AS_OF = datetime(2000, 1, 1, tzinfo=timezone.utc)   # dated-ness doesn't depend on it
+
+
+def _malformed_catalyst_fields(parsed: dict) -> list[str]:
+    """Which catalyst fields of the model's reply are malformed (before
+    _normalise_catalyst): "catalyst" when it is neither an object nor null,
+    "catalyst.date" when it is set and not a string, and
+    "expected_return_pct" when it is null or not a finite number (a bool
+    counts as not a number) while the catalyst carries a date
+    compute_weeks_to_catalyst can read. _analyze_inner acts on
+    "expected_return_pct" only at the rate gate. The replay gate chain
+    lifts this."""
+    fields: list[str] = []
+    cat = parsed.get("catalyst")
+    if not isinstance(cat, (dict, type(None))):
+        fields.append("catalyst")
+        cat = None
+    date = (cat or {}).get("date")
+    if date is not None and not isinstance(date, str):
+        fields.append("catalyst.date")
+    elif isinstance(date, str) and compute_weeks_to_catalyst(
+            date, as_of=_DATED_CHECK_AS_OF, month_midpoint=False) is not None:
+        erp = parsed.get("expected_return_pct")
+        try:
+            ok = (erp is not None and not isinstance(erp, bool)
+                  and math.isfinite(float(erp)))
+        except (TypeError, ValueError, OverflowError):
+            ok = False
+        if not ok:
+            fields.append("expected_return_pct")
+    return fields
+
+
+def _normalise_catalyst(parsed: dict) -> None:
+    """In place: a catalyst that is neither an object nor null becomes {},
+    and a non-string catalyst.date becomes its text when it is an int or
+    float (not a bool), else None. The replay gate chain
+    lifts this."""
+    if not isinstance(parsed.get("catalyst", {}), (dict, type(None))):
+        parsed["catalyst"] = {}
+    cat = parsed.get("catalyst")
+    if isinstance(cat, dict) and cat.get("date") is not None and not isinstance(cat["date"], str):
+        raw = cat["date"]
+        cat["date"] = (str(raw) if isinstance(raw, (int, float))
+                       and not isinstance(raw, bool) else None)
+
+
+def _malformed_catalyst_watch(ticker: str, parsed: dict, gates: list, fields: list[str],
+                              action: str) -> str:
+    """The malformed-catalyst downgrade: one WARNING, the gate, pass_to_risk
+    False and the reasoning note. Returns the new action (WATCH)."""
+    names = ", ".join(fields)
+    log.warning(f"[{ticker}] Malformed {names} in the model's reply: {action} -> WATCH, not routed")
+    gates.append(f"malformed catalyst ({names}): {action} -> WATCH")
+    parsed["pass_to_risk"] = False
+    parsed["reasoning"] = str(parsed.get("reasoning") or "") + f" [Downgraded: malformed {names}]"
+    return "WATCH"
+
+
+def _alert_held_sell_as_watch(ticker: str, model_action: str, fields: list[str]) -> None:
+    """A held position's TRIM/EXIT lowered to WATCH by the malformed-catalyst
+    rule: one Telegram per ticker and action per 24 h (system_state
+    malformed_sell_alert_at_<TICKER>_<ACTION>, written only after a send
+    that went out), so the model's wish to sell is not left in a log line.
+    A failed state read skips the alert this time. Never raises."""
+    try:
+        import db
+        from datetime import datetime as _dt, timezone as _tz
+        key = f"malformed_sell_alert_at_{ticker}_{model_action}"
+        try:
+            last = db.get_state_strict(key)
+        except Exception as e:
+            log.warning(f"[{ticker}] malformed-catalyst sell alert skipped: state read failed: {e}")
+            return
+        now = _dt.now(_tz.utc)
+        if last:
+            try:
+                sent = _dt.fromisoformat(last)
+                if sent.tzinfo is None:
+                    sent = sent.replace(tzinfo=_tz.utc)
+                if (now - sent).total_seconds() < 24 * 3600:
+                    return
+            except (ValueError, TypeError):
+                pass    # unreadable: send, and the write below replaces it
+        import alerts
+        if alerts._send(
+            f"⚠️ <b>{ticker}: model said {model_action} on a held position</b>\n"
+            f"The verdict was held as WATCH because of malformed field(s): "
+            f"{', '.join(fields)}. The stop is unchanged."
+        ) is not None:
+            db.set_state(key, now.isoformat())
+    except Exception as e:
+        log.warning(f"[{ticker}] malformed-catalyst sell alert failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1833,7 +1925,9 @@ def _log_failed_analysis(candidate: dict, kind: str, reason: str, prompt: str | 
                            raw_reply_len=len(raw),
                            raw_reply_head=redact_account_figures(raw[:2000]))
         db.log_signal(ticker, "ANALYST_FAILED", None, f"No verdict ({kind}): {reason}"[:500],
-                      model=None, provenance=provenance, decision={"failure": failure})
+                      model=None, provenance=provenance,
+                      decision={"failure": failure, "downgraded_reason": None, "malformed_fields": None,
+                                "return_malformed": None})
     except Exception as e:
         log.warning(f"[{ticker}] failed-analysis record not written: {e}")
 
@@ -1966,32 +2060,30 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
     model_pass = bool(parsed.get("pass_to_risk", False))
     model_action, model_conviction = action, conviction
     gates: list[str] = []
-    # The schema's catalyst is an object. A string or list from the model is
-    # read as no catalyst (no date), so the gates below take their None path
-    # instead of raising on .get(); model_output above keeps the raw value.
-    # ANALYST_TOLERATE_MALFORMED_CATALYST off (the default) leaves the reply
-    # as returned, so the rate gate raises on it as before (ANALYST_FAILED).
-    from config import ANALYST_TOLERATE_MALFORMED_CATALYST as tolerate_catalyst
-    if not isinstance(parsed.get("catalyst", {}), (dict, type(None))):
-        if tolerate_catalyst:
-            log.warning(f"[{ticker}] Non-object catalyst {type(parsed['catalyst']).__name__}; read as no catalyst")
-            parsed["catalyst"] = {}
-        else:
-            log.warning(f"[{ticker}] Malformed catalyst: {type(parsed['catalyst']).__name__}, not an object; "
-                        f"not tolerated (ANALYST_TOLERATE_MALFORMED_CATALYST off)")
-    # Same for catalyst.date: a number is read as its text (20261201 ->
-    # "20261201"), anything else that isn't a string as no date, so
-    # compute_weeks_to_catalyst never calls .strip() on a non-string.
-    _cat = parsed.get("catalyst")
-    if isinstance(_cat, dict) and _cat.get("date") is not None and not isinstance(_cat["date"], str):
-        _raw_date = _cat["date"]
-        if tolerate_catalyst:
-            _cat["date"] = (str(_raw_date) if isinstance(_raw_date, (int, float))
-                            and not isinstance(_raw_date, bool) else None)
-            log.warning(f"[{ticker}] Non-string catalyst date {type(_raw_date).__name__}; read as {_cat['date']!r}")
-        else:
-            log.warning(f"[{ticker}] Malformed catalyst.date: {type(_raw_date).__name__}, not a string; "
-                        f"not tolerated (ANALYST_TOLERATE_MALFORMED_CATALYST off)")
+    # A malformed catalyst (not an object) or catalyst.date (not a string):
+    # the verdict is WATCH, not routed, and its row is written as usual
+    # (MALFORMED_CATALYST_POLICY). An expected_return_pct that is null,
+    # non-numeric, NaN/+-inf or a bool on a dated catalyst does the same,
+    # but only where the rate gate reads it (Accelerator/Moonshot OPEN/ADD,
+    # below; an Accelerator/Moonshot HOLD stays HOLD, flagged
+    # catalyst_stale); NaN/+-inf used to pass the rate check and a bool was
+    # read as 1.0. return_malformed records the flag in the decision
+    # (log-only) whether or not that gate fired. The catalyst is then
+    # normalised (a non-object -> {}, a non-string date -> its text for a
+    # number, else None) so nothing below raises on it; model_output keeps
+    # the raw value.
+    malformed_fields = _malformed_catalyst_fields(parsed)
+    return_malformed = "expected_return_pct" in malformed_fields
+    malformed_fields = [f for f in malformed_fields if f != "expected_return_pct"]
+    _normalise_catalyst(parsed)
+    if malformed_fields:
+        action = _malformed_catalyst_watch(ticker, parsed, gates, malformed_fields, action)
+        # held_review: a held-position review (crew._analyze_held_position),
+        # whose candidate carries no "held" so the held flag recorded for
+        # the gates stays as it was.
+        if (candidate.get("held") is True or candidate.get("held_review") is True) \
+                and model_action in ("TRIM", "EXIT"):
+            _alert_held_sell_as_watch(ticker, model_action, malformed_fields)
 
     # The model doesn't reliably know what's held (ADD/HOLD on unheld MSFT
     # and AMZN, 10-15 and 10-26). An ADD on nothing is an OPEN and must pass
@@ -2022,10 +2114,16 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
         if value is None:
             return None
         try:
-            return float(value)
-        except (TypeError, ValueError):
+            out = float(value)
+        except (TypeError, ValueError, OverflowError):
             log.debug(f"[{ticker}] Non-numeric {field}: {value!r}")
             return None
+        # json.loads reads NaN/Infinity: such a value passes no comparison
+        # honestly and Postgres jsonb rejects it, so it is read as missing.
+        if not math.isfinite(out):
+            log.debug(f"[{ticker}] Non-finite {field}: {value!r}")
+            return None
+        return out
 
     thesis_strength        = _sub_score("thesis_strength")
     catalyst_quality       = _sub_score("catalyst_quality")
@@ -2156,14 +2254,17 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
     # own rubric already treating vague/ongoing timing as weak (1/5).
     weeks_to_catalyst = None
     per_week = None
-    catalyst_stale = False
-    if bucket in ("Accelerator", "Moonshot") and action in ("OPEN", "ADD"):
+    # None (not computed) on a verdict the malformed-catalyst rule lowered.
+    catalyst_stale = None if malformed_fields else False
+    if bucket in ("Accelerator", "Moonshot") and action in ("OPEN", "ADD") and return_malformed:
+        malformed_fields = ["expected_return_pct"]
+        action = _malformed_catalyst_watch(ticker, parsed, gates, malformed_fields, action)
+        catalyst_stale = None
+    elif bucket in ("Accelerator", "Moonshot") and action in ("OPEN", "ADD"):
         catalyst_date = (parsed.get("catalyst") or {}).get("date")
         weeks_to_catalyst = compute_weeks_to_catalyst(catalyst_date)
         per_week = expected_return_per_week(_optional_float("expected_return_pct"), weeks_to_catalyst)
         if per_week is None or per_week < MIN_EXPECTED_RETURN_PCT_PER_WEEK:
-            if per_week is None and weeks_to_catalyst is not None and not tolerate_catalyst:
-                _null_return_not_tolerated(ticker)
             reason = ("no computable catalyst timeframe" if weeks_to_catalyst is None
                       else "no expected_return_pct" if per_week is None
                       else f"{per_week:.2f}%/week < {MIN_EXPECTED_RETURN_PCT_PER_WEEK}%/week minimum")
@@ -2185,13 +2286,14 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
         # could auto-execute is a live-order behavior change, not a
         # visibility fix. catalyst_stale is surfaced in the result for
         # thesis-drift tracking (db.compute_thesis_drift) and reporting
-        # to actually force human attention instead.
+        # to actually force human attention instead. A malformed expected
+        # return (return_malformed; a bool would read as 1.0) counts as none:
+        # the HOLD stays HOLD, flagged stale, with no malformed gate.
         catalyst_date = (parsed.get("catalyst") or {}).get("date")
         weeks_to_catalyst = compute_weeks_to_catalyst(catalyst_date)
-        per_week = expected_return_per_week(_optional_float("expected_return_pct"), weeks_to_catalyst)
+        per_week = expected_return_per_week(
+            None if return_malformed else _optional_float("expected_return_pct"), weeks_to_catalyst)
         if per_week is None or per_week < MIN_EXPECTED_RETURN_PCT_PER_WEEK:
-            if per_week is None and weeks_to_catalyst is not None and not tolerate_catalyst:
-                _null_return_not_tolerated(ticker)
             catalyst_stale = True
             reason = ("no computable catalyst timeframe" if weeks_to_catalyst is None
                       else "no expected_return_pct" if per_week is None
@@ -2398,6 +2500,9 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
                 "udr_check": _udr_check(parsed, situation_brief),
                 "udr_structural": _udr_structural(ticker, parsed, udr, situation_brief),
                 "event_burst": _event_burst(ticker, trigger, gates),
+                "downgraded_reason": "malformed_catalyst" if malformed_fields else None,
+                "malformed_fields": malformed_fields or None,
+                "return_malformed": return_malformed,
             },
             prompt=redact_account_figures(prompt),
         )

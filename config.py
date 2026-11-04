@@ -544,16 +544,6 @@ STALE_ENTRY_EXPIRE_ONLY = os.getenv("STALE_ENTRY_EXPIRE_ONLY", "false").lower() 
 # off until Luke decides (audit A1031-0253-1).
 CATALYST_MONTH_MIDPOINT_ENABLED = os.getenv("CATALYST_MONTH_MIDPOINT_ENABLED", "false").lower() == "true"
 
-# A malformed catalyst in the analyst's reply. On: a catalyst that isn't an
-# object is read as {}, a catalyst.date that isn't a string as its text
-# (int/float) or None, and a dated catalyst with a null expected_return_pct
-# fails the rate gate as "no expected_return_pct". Off keeps the earlier
-# handling: the reply is used as returned, so on the Accelerator/Moonshot
-# rate path these raise and the analysis ends as ANALYST_FAILED. Changes
-# what reaches risk, so it is off until decided.
-ANALYST_TOLERATE_MALFORMED_CATALYST = os.getenv("ANALYST_TOLERATE_MALFORMED_CATALYST",
-                                                "false").lower() == "true"
-
 # Risk-per-trade-of-equity by LIVE setup category (Breakout/Catalyst/
 # Continuation) -- the SETUP_GATES_ENABLED equivalent of RISK_PCT_PER_TRADE
 # above, which stays exactly as-is and keeps governing Compounder/

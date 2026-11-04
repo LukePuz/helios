@@ -207,230 +207,462 @@ class TestExpectedReturnRateGateIntegration:
         assert result["expected_return_per_week"] > 1.0
 
 
-
-class TestNullExpectedReturnWithDatedCatalyst:
-    """A dated catalyst (weeks_to_catalyst computable) with a null
-    expected_return_pct leaves the rate uncomputable. The gate's None
-    branch already decides: OPEN/ADD fail closed to WATCH, a HOLD is
-    flagged stale. The reason text used to format the None rate and
-    raise TypeError, so analyze() logged ANALYST_FAILED instead."""
-
-    @pytest.fixture(autouse=True)
-    def _tolerate_malformed_catalyst(self):
-        with patch("config.ANALYST_TOLERATE_MALFORMED_CATALYST", True):
-            yield
-
-    def _run(self, action, extra_payload=None):
-        import json
-        payload = json.loads(_response(action, None, _THREE_WEEKS_OUT))
-        payload.update(extra_payload or {})
-        patches = _mock_analyze_deps(json.dumps(payload))
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], \
-             patches[6], patches[7] as log_signal, patches[8]:
-            from agents.analyst import analyze
-            result = analyze(_CANDIDATE, situation_brief="brief")
-        gates = log_signal.call_args.kwargs["decision"]["gates"]
-        return result, gates
-
-    def test_open_fails_closed_to_watch(self):
-        result, gates = self._run("OPEN")
-        assert result["action"] == "WATCH"
-        assert result["pass_to_risk"] is False
-        assert result["weeks_to_catalyst"] is not None
-        assert result["expected_return_per_week"] is None
-        assert "[Downgraded: no expected_return_pct]" in result["reasoning"]
-        assert any(g.startswith("return rate (no expected_return_pct)") for g in gates)
-
-    def test_add_fails_closed_to_watch(self):
-        result, _ = self._run("ADD")
-        assert result["action"] == "WATCH"
-        assert result["pass_to_risk"] is False
-
-    def test_hold_is_flagged_stale_not_downgraded(self):
-        result, _ = self._run("HOLD", {"pass_to_risk": False})
-        assert result["action"] == "HOLD"
-        assert result["catalyst_stale"] is True
-        assert "[STALE CATALYST ON HOLD: no expected_return_pct]" in result["reasoning"]
-
-
 def test_the_midpoint_switch_is_in_the_provenance_config():
     from agents.analyst import _treatment_config
     assert _treatment_config()["CATALYST_MONTH_MIDPOINT_ENABLED"] is False
 
 
-class TestNonObjectCatalyst:
-    """A catalyst the model returns as a string or a list (the schema asks
-    for an object) is read as no catalyst. Before, a Compounder OPEN lost
-    its signals row (_catalyst_check raised inside log_signal's arguments)
-    and an Accelerator/Moonshot buy or HOLD raised AttributeError, ending
-    as ANALYST_FAILED."""
-
-    @pytest.fixture(autouse=True)
-    def _tolerate_malformed_catalyst(self):
-        with patch("config.ANALYST_TOLERATE_MALFORMED_CATALYST", True):
-            yield
-
-    def _run(self, action, catalyst, role, extra_payload=None):
-        import json
-        payload = json.loads(_response(action, 20.0, _THREE_WEEKS_OUT, bucket=role))
-        payload["catalyst"] = catalyst
-        payload.update(extra_payload or {})
-        patches = _mock_analyze_deps(json.dumps(payload))
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], \
-             patches[6], patches[7] as log_signal, patches[8]:
-            from agents.analyst import analyze
-            result = analyze({**_CANDIDATE, "role": role}, situation_brief="brief")
-        assert log_signal.call_count == 1
-        decision = log_signal.call_args.kwargs["decision"]
-        return result, decision
-
-    @pytest.mark.parametrize("catalyst", ["earnings next month", [], ["earnings"]])
-    def test_compounder_open_still_writes_its_signal(self, catalyst):
-        result, decision = self._run("OPEN", catalyst, "Compounder")
-        assert result["action"] == "OPEN"
-        assert decision["final_action"] == "OPEN"
-        assert decision["catalyst_check"]["model_date"] is None
-        assert decision["model_output"]["catalyst"] == catalyst
-
-    @pytest.mark.parametrize("catalyst", ["earnings next month", [], ["earnings"]])
-    def test_accelerator_open_fails_closed(self, catalyst):
-        result, decision = self._run("OPEN", catalyst, "Accelerator")
-        assert result["action"] == "WATCH"
-        assert result["pass_to_risk"] is False
-        assert result["weeks_to_catalyst"] is None
-        assert any(g.startswith("return rate (no computable catalyst timeframe)")
-                   for g in decision["gates"])
-
-    @pytest.mark.parametrize("catalyst", ["earnings next month", [], ["earnings"]])
-    def test_moonshot_hold_is_flagged_stale(self, catalyst):
-        result, _ = self._run("HOLD", catalyst, "Moonshot", {"pass_to_risk": False})
-        assert result["action"] == "HOLD"
-        assert result["catalyst_stale"] is True
-        assert "[STALE CATALYST ON HOLD: no computable catalyst timeframe]" in result["reasoning"]
-
-
-class TestNonStringCatalystDate:
-    """A catalyst.date that isn't a string: a number is read as its text,
-    anything else as no date. Before, compute_weeks_to_catalyst called
-    .strip() on it and analyze() raised (ANALYST_FAILED)."""
-
-    @pytest.fixture(autouse=True)
-    def _tolerate_malformed_catalyst(self):
-        with patch("config.ANALYST_TOLERATE_MALFORMED_CATALYST", True):
-            yield
-
-    def _run(self, action, date, role, extra_payload=None):
-        import json
-        payload = json.loads(_response(action, 20.0, date, bucket=role))
-        payload.update(extra_payload or {})
-        patches = _mock_analyze_deps(json.dumps(payload))
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], \
-             patches[6], patches[7] as log_signal, patches[8]:
-            from agents.analyst import analyze
-            result = analyze({**_CANDIDATE, "role": role}, situation_brief="brief")
-        assert log_signal.call_count == 1
-        decision = log_signal.call_args.kwargs["decision"]
-        assert decision["model_output"]["catalyst"]["date"] == date
-        return result, decision
-
-    @pytest.mark.parametrize("date, read_as", [(20261201, "20261201"), (["2026-12"], None)])
-    def test_accelerator_open_fails_closed(self, date, read_as):
-        result, decision = self._run("OPEN", date, "Accelerator")
-        assert result["catalyst"]["date"] == read_as
-        assert result["action"] == "WATCH"
-        assert result["pass_to_risk"] is False
-        assert result["weeks_to_catalyst"] is None
-        assert any(g.startswith("return rate (no computable catalyst timeframe)")
-                   for g in decision["gates"])
-
-    @pytest.mark.parametrize("date", [20261201, ["2026-12"]])
-    def test_moonshot_hold_is_flagged_stale(self, date):
-        result, _ = self._run("HOLD", date, "Moonshot", {"pass_to_risk": False})
-        assert result["action"] == "HOLD"
-        assert result["catalyst_stale"] is True
-        assert "[STALE CATALYST ON HOLD: no computable catalyst timeframe]" in result["reasoning"]
-
-
-def test_the_malformed_catalyst_switch_ships_off():
+def test_the_malformed_catalyst_policy_is_a_fixed_provenance_marker():
     import config
     from agents.analyst import _treatment_config
-    assert config.ANALYST_TOLERATE_MALFORMED_CATALYST is False
-    assert _treatment_config()["ANALYST_TOLERATE_MALFORMED_CATALYST"] is False
+    cfg = _treatment_config()
+    assert cfg["malformed_catalyst_policy"] == "watch_rate_scoped"
+    assert "ANALYST_TOLERATE_MALFORMED_CATALYST" not in cfg
+    assert not hasattr(config, "ANALYST_TOLERATE_MALFORMED_CATALYST")
 
 
-class TestMalformedCatalystNotTolerated:
-    """ANALYST_TOLERATE_MALFORMED_CATALYST off: the three cases above end as
-    they did before they were tolerated. On the Accelerator/Moonshot rate
-    path analyze() raises the same exception, writes one ANALYST_FAILED
-    row (kind "exception") and no verdict row; a Compounder OPEN with a
-    non-object catalyst still loses its verdict row (_catalyst_check raises
-    inside log_signal's arguments)."""
+@pytest.mark.parametrize("parsed, want", [
+    ({"catalyst": "earnings"}, ["catalyst"]),
+    ({"catalyst": []}, ["catalyst"]),
+    ({"catalyst": ["earnings"]}, ["catalyst"]),
+    ({"catalyst": 5}, ["catalyst"]),
+    ({"catalyst": {"date": 20261201}}, ["catalyst.date"]),
+    ({"catalyst": {"date": 0}}, ["catalyst.date"]),
+    ({"catalyst": {"date": False}}, ["catalyst.date"]),
+    ({"catalyst": {"date": ["2026-12"]}}, ["catalyst.date"]),
+    ({"catalyst": {"date": "2026-12-01"}, "expected_return_pct": None}, ["expected_return_pct"]),
+    ({"catalyst": {"date": "2026-12"}}, ["expected_return_pct"]),
+    ({"catalyst": {"date": "2026-12-01"}, "expected_return_pct": "n/a"}, ["expected_return_pct"]),
+    ({"catalyst": {"date": "2026-12-01"}, "expected_return_pct": True}, ["expected_return_pct"]),
+    ({"catalyst": {"date": "2026-12-01"}, "expected_return_pct": "nan"}, ["expected_return_pct"]),
+    ({"catalyst": {"date": "2026-12-01"}, "expected_return_pct": {}}, ["expected_return_pct"]),
+    ({"catalyst": {"date": "2026-12-01"}, "expected_return_pct": 10 ** 400}, ["expected_return_pct"]),
+    # well-formed, or no date to rate against
+    ({"catalyst": {"date": "2026-12-01"}, "expected_return_pct": 20}, []),
+    ({"catalyst": {"date": "2026-12-01"}, "expected_return_pct": "20"}, []),
+    ({"catalyst": {"date": "ongoing"}, "expected_return_pct": None}, []),
+    ({"catalyst": {"date": "next quarter"}, "expected_return_pct": None}, []),
+    ({"catalyst": {"date": None}, "expected_return_pct": None}, []),
+    ({"catalyst": {}}, []),
+    ({"catalyst": None}, []),
+    ({}, []),
+])
+def test_malformed_catalyst_fields(parsed, want):
+    from agents.analyst import _malformed_catalyst_fields
+    assert _malformed_catalyst_fields(parsed) == want
 
-    @pytest.fixture(autouse=True)
-    def _not_tolerated(self):
-        with patch("config.ANALYST_TOLERATE_MALFORMED_CATALYST", False):
-            yield
 
-    def _run_failed(self, payload, role, error_type, caplog):
+# (payload changes, the malformed fields) for each malformed shape that
+# makes any verdict WATCH.
+_MALFORMED_SHAPES = {
+    "catalyst_str": ({"catalyst": "earnings next month"}, ["catalyst"]),
+    "catalyst_empty_list": ({"catalyst": []}, ["catalyst"]),
+    "catalyst_list": ({"catalyst": ["earnings"]}, ["catalyst"]),
+    "date_int": ({"catalyst": {"event": "earnings", "date": 20261201}}, ["catalyst.date"]),
+    "date_list": ({"catalyst": {"event": "earnings", "date": ["2026-12"]}}, ["catalyst.date"]),
+    "date_bool": ({"catalyst": {"event": "earnings", "date": True}}, ["catalyst.date"]),
+}
+# A dated catalyst with an expected return that is null, non-numeric,
+# NaN/+-inf or a bool: malformed only at the rate gate (Accelerator/Moonshot
+# OPEN/ADD); an Accelerator/Moonshot HOLD stays HOLD, flagged stale.
+_RETURN_SHAPES = {
+    "erp_null": None,
+    "erp_text": "n/a",
+    "erp_bool": True,
+    "erp_nan": "nan",
+}
+_DATED = "2026-12-01"
+
+
+def _run_analyze(payload, role, caplog, held=None):
+    import json
+    patches = _mock_analyze_deps(json.dumps(payload))
+    cand = {**_CANDIDATE, "role": role}
+    if held is not None:
+        cand["held"] = held
+    with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], \
+         patches[6], patches[7] as log_signal, patches[8], caplog.at_level("WARNING"):
+        from agents.analyst import analyze
+        result = analyze(cand, situation_brief="brief")
+    warnings = [r.getMessage() for r in caplog.records
+                if r.levelname == "WARNING" and "Malformed" in r.getMessage()]
+    return result, log_signal, warnings
+
+
+class TestMalformedCatalystIsWatch:
+    """A malformed catalyst or catalyst.date makes any verdict WATCH with
+    pass_to_risk False, in every bucket: one WARNING, one signals row (the
+    WATCH verdict, not ANALYST_FAILED), the raw model_output kept and the
+    reason in the decision record."""
+
+    @pytest.mark.parametrize("shape", sorted(_MALFORMED_SHAPES))
+    @pytest.mark.parametrize("action", ["OPEN", "ADD", "HOLD", "TRIM", "EXIT", "WATCH"])
+    @pytest.mark.parametrize("role", ["Compounder", "Accelerator", "Moonshot"])
+    def test_any_verdict_becomes_an_unrouted_watch(self, shape, action, role, caplog):
         import json
+        changes, fields = _MALFORMED_SHAPES[shape]
+        payload = {**json.loads(_response(action, 20.0, _THREE_WEEKS_OUT, bucket=role)), **changes}
+        result, log_signal, warnings = _run_analyze(payload, role, caplog)
+        assert result["action"] == "WATCH"
+        assert result["pass_to_risk"] is False
+        assert len(warnings) == 1 and ", ".join(fields) in warnings[0]
+        assert log_signal.call_count == 1
+        kwargs = log_signal.call_args.kwargs
+        assert kwargs["signal"] == "WATCH"
+        decision = kwargs["decision"]
+        assert decision["model_action"] == action
+        assert decision["final_action"] == "WATCH"
+        assert decision["final_pass_to_risk"] is False
+        assert decision["downgraded_reason"] == "malformed_catalyst"
+        assert decision["malformed_fields"] == fields
+        assert decision["gates"][0] == f"malformed catalyst ({', '.join(fields)}): {action} -> WATCH"
+        for key, raw in changes.items():
+            assert decision["model_output"][key] == raw
+
+    @pytest.mark.parametrize("shape", sorted(_MALFORMED_SHAPES))
+    @pytest.mark.parametrize("action", ["ADD", "HOLD"])
+    def test_held_flag_does_not_change_it(self, shape, action, caplog):
+        import json
+        changes, fields = _MALFORMED_SHAPES[shape]
+        payload = {**json.loads(_response(action, 20.0, _THREE_WEEKS_OUT)), **changes,
+                   "pass_to_risk": False}
+        for held in (True, False):
+            caplog.clear()
+            result, log_signal, warnings = _run_analyze(payload, "Accelerator", caplog, held=held)
+            assert result["action"] == "WATCH" and result["pass_to_risk"] is False
+            assert log_signal.call_args.kwargs["decision"]["gates"][0].startswith("malformed catalyst")
+
+
+def _run_with_alert_state(payload, role, caplog, held, state):
+    """_run_analyze with system_state in a dict and alerts._send mocked
+    (a send that went out returns a message id)."""
+    with patch("db.get_state_strict", side_effect=lambda k, d=None: state.get(k, d)), \
+         patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+         patch("alerts._send", return_value=101) as send:
+        result, log_signal, _ = _run_analyze(payload, role, caplog, held=held)
+    return result, log_signal, send
+
+
+class TestHeldSellLoweredToWatchAlerts:
+    """A held TRIM/EXIT lowered to WATCH by the malformed-catalyst rule sends
+    one Telegram per ticker and action per day; nothing else does."""
+
+    @pytest.mark.parametrize("shape", ["catalyst_str", "date_int"])
+    @pytest.mark.parametrize("action", ["TRIM", "EXIT"])
+    def test_held_trim_or_exit_alerts(self, shape, action, caplog):
+        import json
+        changes, fields = _MALFORMED_SHAPES[shape]
+        payload = {**json.loads(_response(action, 20.0, _THREE_WEEKS_OUT, bucket="Compounder")),
+                   **changes}
+        state = {}
+        result, _, send = _run_with_alert_state(payload, "Compounder", caplog, True, state)
+        assert result["action"] == "WATCH"
+        assert send.call_count == 1
+        assert send.call_args.args[0] == (
+            f"⚠️ <b>SNOW: model said {action} on a held position</b>\n"
+            f"The verdict was held as WATCH because of malformed field(s): "
+            f"{', '.join(fields)}. The stop is unchanged.")
+        assert f"malformed_sell_alert_at_SNOW_{action}" in state
+
+    @pytest.mark.parametrize("action, held", [
+        ("TRIM", False), ("EXIT", False), ("EXIT", None),
+        ("OPEN", True), ("ADD", True), ("HOLD", True), ("WATCH", True),
+    ])
+    def test_no_alert_otherwise(self, action, held, caplog):
+        import json
+        payload = {**json.loads(_response(action, 20.0, _THREE_WEEKS_OUT, bucket="Compounder")),
+                   "catalyst": "earnings next month"}
+        result, _, send = _run_with_alert_state(payload, "Compounder", caplog, held, {})
+        assert result["action"] == "WATCH"
+        send.assert_not_called()
+
+    @pytest.mark.parametrize("action", ["TRIM", "EXIT"])
+    def test_held_sell_with_a_malformed_return_is_not_lowered(self, action, caplog):
+        import json
+        payload = json.loads(_response(action, None, _DATED, bucket="Accelerator"))
+        result, _, send = _run_with_alert_state(payload, "Accelerator", caplog, True, {})
+        assert result["action"] == action
+        send.assert_not_called()
+
+    def test_well_formed_held_exit_does_not_alert(self, caplog):
+        import json
+        payload = json.loads(_response("EXIT", 20.0, _THREE_WEEKS_OUT, bucket="Compounder"))
+        result, _, send = _run_with_alert_state(payload, "Compounder", caplog, True, {})
+        assert result["action"] == "EXIT"
+        send.assert_not_called()
+
+    def test_throttled_to_one_a_day_per_ticker(self, caplog):
+        import json
+        from datetime import datetime, timedelta, timezone
+        payload = {**json.loads(_response("EXIT", 20.0, _THREE_WEEKS_OUT, bucket="Compounder")),
+                   "catalyst": "earnings next month"}
+        state = {}
+        _, _, first = _run_with_alert_state(payload, "Compounder", caplog, True, state)
+        _, _, second = _run_with_alert_state(payload, "Compounder", caplog, True, state)
+        assert first.call_count == 1 and second.call_count == 0
+        state["malformed_sell_alert_at_SNOW_EXIT"] = (
+            datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+        _, _, later = _run_with_alert_state(payload, "Compounder", caplog, True, state)
+        assert later.call_count == 1
+
+    def test_alert_failure_keeps_the_verdict(self, caplog):
+        import json
+        payload = {**json.loads(_response("EXIT", 20.0, _THREE_WEEKS_OUT, bucket="Compounder")),
+                   "catalyst": "earnings next month"}
+        with patch("db.get_state_strict", side_effect=RuntimeError("db down")), \
+             patch("db.set_state") as set_state, patch("alerts._send") as send:
+            result, log_signal, _ = _run_analyze(payload, "Compounder", caplog, held=True)
+        send.assert_not_called()
+        set_state.assert_not_called()
+        assert any("sell alert skipped: state read failed" in r.getMessage()
+                   for r in caplog.records if r.levelname == "WARNING")
+        assert result["action"] == "WATCH"
+        assert log_signal.call_args.kwargs["decision"]["downgraded_reason"] == "malformed_catalyst"
+
+    def test_throttle_is_per_action(self, caplog):
+        import json
+        state = {}
+        for action, sends in (("EXIT", 1), ("TRIM", 1), ("EXIT", 0)):
+            payload = {**json.loads(_response(action, 20.0, _THREE_WEEKS_OUT, bucket="Compounder")),
+                       "catalyst": "earnings next month"}
+            _, _, send = _run_with_alert_state(payload, "Compounder", caplog, True, state)
+            assert send.call_count == sends
+        assert set(state) == {"malformed_sell_alert_at_SNOW_EXIT", "malformed_sell_alert_at_SNOW_TRIM"}
+
+    def test_state_is_written_only_after_a_send_that_went_out(self, caplog):
+        import json
+        payload = {**json.loads(_response("EXIT", 20.0, _THREE_WEEKS_OUT, bucket="Compounder")),
+                   "catalyst": "earnings next month"}
+        state = {}
+        with patch("db.get_state_strict", side_effect=lambda k, d=None: state.get(k, d)), \
+             patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+             patch("alerts._send", return_value=None) as send:
+            _run_analyze(payload, "Compounder", caplog, held=True)
+            _run_analyze(payload, "Compounder", caplog, held=True)
+        assert send.call_count == 2 and state == {}
+
+    @pytest.mark.parametrize("hours_ago, sends", [(1, 0), (25, 1), (None, 1)])
+    def test_stored_time_is_read_robustly(self, hours_ago, sends, caplog):
+        """A naive stored time is UTC; an unreadable one sends."""
+        import json
+        payload = {**json.loads(_response("EXIT", 20.0, _THREE_WEEKS_OUT, bucket="Compounder")),
+                   "catalyst": "earnings next month"}
+        naive = (datetime.now(timezone.utc) - timedelta(hours=hours_ago or 0)).replace(tzinfo=None)
+        state = {"malformed_sell_alert_at_SNOW_EXIT":
+                 naive.isoformat() if hours_ago is not None else "not a time"}
+        _, _, send = _run_with_alert_state(payload, "Compounder", caplog, True, state)
+        assert send.call_count == sends
+
+    def test_a_non_string_stored_time_sends(self, caplog):
+        import json
+        payload = {**json.loads(_response("EXIT", 20.0, _THREE_WEEKS_OUT, bucket="Compounder")),
+                   "catalyst": "earnings next month"}
+        state = {"malformed_sell_alert_at_SNOW_EXIT": 12345}     # fromisoformat: TypeError
+        _, _, send = _run_with_alert_state(payload, "Compounder", caplog, True, state)
+        assert send.call_count == 1
+
+    @pytest.mark.parametrize("earnings_date", [None, "2026-11-02"])
+    def test_review_held_position_alerts_on_a_malformed_exit(self, earnings_date, caplog):
+        """The scheduled and earnings reviews build a candidate without
+        "held"; held_review makes the alert fire, and the held flag recorded
+        for the gates stays None."""
+        import json
+        from datetime import date
+        from agents import crew
+        payload = {**json.loads(_response("EXIT", 20.0, _THREE_WEEKS_OUT, bucket="Compounder")),
+                   "catalyst": "earnings next month", "pass_to_risk": True}
+        state = {}
         patches = _mock_analyze_deps(json.dumps(payload))
         with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], \
-             patches[6], patches[7] as log_signal, patches[8], caplog.at_level("WARNING"):
-            from agents.analyst import analyze
-            with pytest.raises(error_type) as exc:
-                analyze({**_CANDIDATE, "role": role}, situation_brief="brief")
-        assert log_signal.call_count == 1
-        args, kwargs = log_signal.call_args
-        assert args[:3] == ("SNOW", "ANALYST_FAILED", None)
-        assert args[3] == f"No verdict (exception): {error_type.__name__}: {exc.value}"
-        assert kwargs["model"] is None
-        failure = kwargs["decision"]["failure"]
-        assert failure["kind"] == "exception"
-        assert failure["error_type"] == error_type.__name__
-        warnings = [r.getMessage() for r in caplog.records
-                    if r.levelname == "WARNING" and "not tolerated" in r.getMessage()]
-        assert len(warnings) == 1
-        return str(exc.value), warnings[0]
+             patches[6], patches[7] as log_signal, patches[8], \
+             patch("context_engine.assemble_brief", return_value="brief"), \
+             patch("knowledge_loader.get_watchlist_entry", return_value={"role": "Compounder"}), \
+             patch("agents.crew._capture_latest_thesis"), \
+             patch("agents.crew._route_to_approval") as route, \
+             patch("db.get_state_strict", side_effect=lambda k, d=None: state.get(k, d)), \
+             patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+             patch("alerts._send", return_value=7) as send:
+            result = crew.review_held_position(
+                "SNOW", None, {"SNOW": {"current_price": 100.0}}, {"regime": "Neutral"},
+                earnings_date=date.fromisoformat(earnings_date) if earnings_date else None)
+        assert result["action"] == "WATCH" and result["pass_to_risk"] is False
+        route.assert_not_called()
+        assert send.call_count == 1
+        assert "SNOW: model said EXIT on a held position" in send.call_args.args[0]
+        assert "malformed_sell_alert_at_SNOW_EXIT" in state
+        exposure = log_signal.call_args.kwargs["provenance"]["brief_exposure"]
+        assert exposure["held_at_gate"] is None
 
-    @pytest.mark.parametrize("action, extra", [("OPEN", {}), ("ADD", {}),
-                                               ("HOLD", {"pass_to_risk": False})])
-    def test_null_expected_return_raises_type_error(self, action, extra, caplog):
+    def test_backfill_does_not_alert(self, caplog):
         import json
-        payload = {**json.loads(_response(action, None, _THREE_WEEKS_OUT)), **extra}
-        msg, warning = self._run_failed(payload, "Accelerator", TypeError, caplog)
-        assert msg == "unsupported format string passed to NoneType.__format__"
-        assert "expected_return_pct" in warning
-
-    @pytest.mark.parametrize("catalyst", ["earnings next month", ["earnings"]])
-    @pytest.mark.parametrize("action, role, extra", [("OPEN", "Accelerator", {}),
-                                                     ("HOLD", "Moonshot", {"pass_to_risk": False})])
-    def test_non_object_catalyst_raises_attribute_error(self, catalyst, action, role, extra, caplog):
-        import json
-        payload = {**json.loads(_response(action, 20.0, _THREE_WEEKS_OUT, bucket=role)),
-                   "catalyst": catalyst, **extra}
-        msg, warning = self._run_failed(payload, role, AttributeError, caplog)
-        assert msg == f"'{type(catalyst).__name__}' object has no attribute 'get'"
-        assert "Malformed catalyst:" in warning
-
-    @pytest.mark.parametrize("date", [20261201, ["2026-12"]])
-    @pytest.mark.parametrize("action, role, extra", [("OPEN", "Accelerator", {}),
-                                                     ("HOLD", "Moonshot", {"pass_to_risk": False})])
-    def test_non_string_date_raises_attribute_error(self, date, action, role, extra, caplog):
-        import json
-        payload = {**json.loads(_response(action, 20.0, date, bucket=role)), **extra}
-        msg, warning = self._run_failed(payload, role, AttributeError, caplog)
-        assert msg == f"'{type(date).__name__}' object has no attribute 'strip'"
-        assert "Malformed catalyst.date:" in warning
-
-    def test_compounder_open_with_non_object_catalyst_writes_no_verdict_row(self):
-        import json
-        payload = {**json.loads(_response("OPEN", 20.0, _THREE_WEEKS_OUT, bucket="Compounder")),
+        from agents import crew
+        payload = {**json.loads(_response("EXIT", 20.0, _THREE_WEEKS_OUT, bucket="Compounder")),
                    "catalyst": "earnings next month"}
         patches = _mock_analyze_deps(json.dumps(payload))
         with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], \
-             patches[6], patches[7] as log_signal, patches[8]:
-            from agents.analyst import analyze
-            result = analyze({**_CANDIDATE, "role": "Compounder"}, situation_brief="brief")
-        assert log_signal.call_count == 0
-        assert result["action"] == "OPEN"
-        assert result["catalyst"] == "earnings next month"
+             patches[6], patches[7], patches[8], \
+             patch("context_engine.assemble_brief", return_value="brief"), \
+             patch("knowledge_loader.get_watchlist_entry", return_value={"role": "Compounder"}), \
+             patch("db.get_state_strict", return_value=None), patch("db.set_state"), \
+             patch("alerts._send", return_value=7) as send:
+            result = crew._analyze_held_position("SNOW", None, {"SNOW": {"current_price": 100.0}},
+                                                 {"regime": "Neutral"}, path="backfill")
+        assert result["action"] == "WATCH"
+        send.assert_not_called()
+
+
+@pytest.mark.parametrize("action", ["HOLD", "OPEN"])
+def test_catalyst_stale_is_not_computed_on_a_lowered_verdict(action, caplog):
+    import json
+    payload = {**json.loads(_response(action, 20.0, _THREE_WEEKS_OUT, bucket="Accelerator")),
+               "catalyst": "earnings next month", "pass_to_risk": action == "OPEN"}
+    result, _, _ = _run_analyze(payload, "Accelerator", caplog, held=True)
+    assert result["action"] == "WATCH" and result["catalyst_stale"] is None
+    ok = json.loads(_response("HOLD", 20.0, _THREE_WEEKS_OUT, bucket="Accelerator"))
+    ok["pass_to_risk"] = False
+    result, _, _ = _run_analyze(ok, "Accelerator", caplog, held=True)
+    assert result["action"] == "HOLD" and result["catalyst_stale"] is False
+
+
+@pytest.mark.parametrize("shape", sorted(_RETURN_SHAPES))
+@pytest.mark.parametrize("role", ["Accelerator", "Moonshot"])
+def test_held_hold_with_a_malformed_return_stays_hold_flagged_stale(shape, role, caplog):
+    """Not lowered to WATCH: flagged catalyst_stale with the stale-HOLD note,
+    no malformed gate or WARNING; return_malformed records the flag."""
+    import json
+    from agents import analyst
+    payload = {**json.loads(_response("HOLD", _RETURN_SHAPES[shape], _DATED, bucket=role)),
+               "pass_to_risk": False}
+    with patch.object(analyst.log, "info") as info:
+        result, log_signal, warnings = _run_analyze(payload, role, caplog, held=True)
+    assert result["action"] == "HOLD" and result["catalyst_stale"] is True
+    assert result["expected_return_per_week"] is None
+    assert "[STALE CATALYST ON HOLD: no expected_return_pct]" in result["reasoning"]
+    assert any("HOLD carries a stale catalyst (no expected_return_pct)" in c.args[0]
+               for c in info.call_args_list)
+    assert warnings == []
+    decision = log_signal.call_args.kwargs["decision"]
+    assert decision["final_action"] == "HOLD" and decision["gates"] == []
+    assert decision["return_malformed"] is True
+    assert decision["malformed_fields"] is None and decision["downgraded_reason"] is None
+
+
+def test_failed_analysis_rows_carry_the_malformed_keys_as_none():
+    from agents import analyst
+    with patch("db.log_signal") as log_signal:
+        analyst._log_failed_analysis({"ticker": "NVDA"}, "timeout", "Ollama timed out", prompt="p")
+    decision = log_signal.call_args.kwargs["decision"]
+    assert decision["downgraded_reason"] is None and decision["malformed_fields"] is None
+    assert decision["return_malformed"] is None
+    assert decision["failure"]["kind"] == "timeout"
+
+
+class TestMalformedReturnOnlyAtTheRateGate:
+    """A dated catalyst with an expected_return_pct that is null,
+    non-numeric, NaN/+-inf or a bool is malformed only where the rate gate
+    reads it: Accelerator/Moonshot with OPEN or ADD at that gate.
+    Everywhere else the verdict routes as it would with no malformed check,
+    and decision.return_malformed (log-only) records the flag."""
+
+    @pytest.mark.parametrize("shape", sorted(_RETURN_SHAPES))
+    @pytest.mark.parametrize("action", ["OPEN", "ADD"])
+    @pytest.mark.parametrize("role", ["Accelerator", "Moonshot"])
+    @pytest.mark.parametrize("held", [None, True])
+    def test_rate_gated_verdict_becomes_an_unrouted_watch(self, shape, action, role, held, caplog):
+        import json
+        erp = _RETURN_SHAPES[shape]
+        payload = json.loads(_response(action, erp, _DATED, bucket=role))
+        result, log_signal, warnings = _run_analyze(payload, role, caplog, held=held)
+        assert result["action"] == "WATCH" and result["pass_to_risk"] is False
+        assert len(warnings) == 1 and "expected_return_pct" in warnings[0]
+        assert log_signal.call_count == 1
+        decision = log_signal.call_args.kwargs["decision"]
+        assert decision["final_action"] == "WATCH" and decision["final_pass_to_risk"] is False
+        assert decision["downgraded_reason"] == "malformed_catalyst"
+        assert decision["malformed_fields"] == ["expected_return_pct"]
+        assert decision["gates"] == [f"malformed catalyst (expected_return_pct): {action} -> WATCH"]
+        assert decision["model_output"]["expected_return_pct"] == erp
+        assert decision["return_malformed"] is True
+
+    @pytest.mark.parametrize("shape", sorted(_RETURN_SHAPES))
+    @pytest.mark.parametrize("action, role", [
+        *[(a, r) for a in ("EXIT", "TRIM", "WATCH")
+          for r in ("Compounder", "Accelerator", "Moonshot")],
+        ("OPEN", "Compounder"), ("ADD", "Compounder"), ("HOLD", "Compounder"),
+    ])
+    def test_other_verdicts_route_normally(self, shape, action, role, caplog):
+        import json
+        erp = _RETURN_SHAPES[shape]
+        payload = json.loads(_response(action, erp, _DATED, bucket=role))
+        if action in ("HOLD", "WATCH"):
+            payload["pass_to_risk"] = False
+        result, log_signal, warnings = _run_analyze(payload, role, caplog)
+        assert result["action"] == action
+        assert result["pass_to_risk"] is payload["pass_to_risk"]
+        assert warnings == []
+        decision = log_signal.call_args.kwargs["decision"]
+        assert decision["downgraded_reason"] is None
+        assert decision["malformed_fields"] is None
+        assert decision["gates"] == []
+        assert decision["return_malformed"] is True
+
+    @pytest.mark.parametrize("held, gates", [
+        (True, ["malformed catalyst (expected_return_pct): ADD -> WATCH"]),
+        (False, ["unheld ADD -> OPEN", "malformed catalyst (expected_return_pct): OPEN -> WATCH"]),
+    ])
+    def test_add_uses_the_action_after_the_unheld_coercion(self, held, gates, caplog):
+        import json
+        payload = json.loads(_response("ADD", None, _DATED))
+        result, log_signal, warnings = _run_analyze(payload, "Accelerator", caplog, held=held)
+        assert result["action"] == "WATCH" and len(warnings) == 1
+        decision = log_signal.call_args.kwargs["decision"]
+        assert decision["gates"] == gates
+        assert decision["malformed_fields"] == ["expected_return_pct"]
+
+    def test_unheld_hold_is_a_watch_not_malformed(self, caplog):
+        import json
+        payload = {**json.loads(_response("HOLD", None, _DATED)), "pass_to_risk": False}
+        result, log_signal, warnings = _run_analyze(payload, "Accelerator", caplog, held=False)
+        assert result["action"] == "WATCH" and warnings == []
+        decision = log_signal.call_args.kwargs["decision"]
+        assert decision["gates"] == ["unheld HOLD -> WATCH"]
+        assert decision["downgraded_reason"] is None and decision["malformed_fields"] is None
+
+    def test_a_buy_stopped_before_the_rate_gate_is_not_malformed(self, caplog):
+        import json
+        payload = {**json.loads(_response("OPEN", None, _DATED)), "upside_downside_ratio": 1.5}
+        result, log_signal, warnings = _run_analyze(payload, "Accelerator", caplog)
+        assert result["action"] == "WATCH" and warnings == []
+        decision = log_signal.call_args.kwargs["decision"]
+        assert decision["gates"] == ["udr 1.5 < 2.0: OPEN -> WATCH"]
+        assert decision["downgraded_reason"] is None and decision["malformed_fields"] is None
+        assert decision["return_malformed"] is True
+
+
+class TestWellFormedCatalystUnchanged:
+    """No malformed field: no WARNING, no malformed gate, the decision
+    record's downgraded_reason and malformed_fields are None and
+    return_malformed is False."""
+
+    @pytest.mark.parametrize("action, erp, date, role, want", [
+        ("OPEN", 20.0, _THREE_WEEKS_OUT, "Accelerator", "OPEN"),
+        ("OPEN", "20", _THREE_WEEKS_OUT, "Accelerator", "OPEN"),
+        ("OPEN", 2.0, _THREE_WEEKS_OUT, "Accelerator", "WATCH"),     # rate gate
+        ("OPEN", None, "ongoing", "Accelerator", "WATCH"),          # no timeframe
+        ("OPEN", None, "ongoing", "Compounder", "OPEN"),
+        ("HOLD", 2.0, "ongoing", "Moonshot", "HOLD"),
+        ("TRIM", 20.0, _THREE_WEEKS_OUT, "Compounder", "TRIM"),
+    ])
+    def test_verdict_as_before(self, action, erp, date, role, want, caplog):
+        import json
+        payload = json.loads(_response(action, erp, date, bucket=role))
+        if action in ("HOLD", "TRIM"):
+            payload["pass_to_risk"] = action == "TRIM"
+        result, log_signal, warnings = _run_analyze(payload, role, caplog)
+        assert result["action"] == want
+        assert warnings == []
+        decision = log_signal.call_args.kwargs["decision"]
+        assert decision["downgraded_reason"] is None
+        assert decision["malformed_fields"] is None
+        assert decision["return_malformed"] is False
+        assert not any(g.startswith("malformed catalyst") for g in decision["gates"])

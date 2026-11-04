@@ -224,6 +224,40 @@ def test_unrecorded_config_is_not_taken_from_today():
     assert "held" not in inp and "regime" not in inp and "fund_read" not in inp
 
 
+
+def test_the_malformed_catalyst_policy_is_passed_through_when_recorded():
+    for policy in ("watch", "watch_rate_scoped"):
+        prov = _prov(role_cfg={"malformed_catalyst_policy": policy})
+        inp, src = H.gate_inputs({"as_of_ts": T0}, {"provenance": prov, "prompt_role": None}, None)
+        assert inp["malformed_catalyst_policy"] == policy
+        assert src["malformed_catalyst_policy"] == "provenance.config"
+    inp, src = H.gate_inputs({"as_of_ts": T0}, {"provenance": _prov(), "prompt_role": None}, None)
+    assert "malformed_catalyst_policy" not in inp
+    assert src["malformed_catalyst_policy"] == "not recorded"
+
+
+@pytest.mark.parametrize("policy, action, role, want_gates", [
+    ("watch_rate_scoped", "OPEN", "Accelerator",
+     ["malformed catalyst (expected_return_pct): OPEN -> WATCH"]),
+    ("watch_rate_scoped", "EXIT", "Accelerator", []),
+    ("watch_rate_scoped", "OPEN", "Compounder", []),
+    ("watch", "EXIT", "Compounder", ["malformed catalyst (expected_return_pct): EXIT -> WATCH"]),
+])
+def test_null_return_rows_replay_under_their_recorded_policy(policy, action, role, want_gates):
+    src = FakeSource()
+    mo = _mo(action, 8, pass_to_risk=True, ret=None)
+    dec, prov, out = _decision(mo, {"bucket": role, "malformed_catalyst_policy": policy},
+                               role_cfg={"malformed_catalyst_policy": policy})
+    assert out["gates"] == want_gates
+    src.add(1, "AAA", mo, dec, prov, role=role)
+    if out["final_pass_to_risk"]:
+        src.route_rows.append({"id": 3, "ticker": "AAA", "kind": "ROUTE_ZERO_SHARES",
+                               "trading_env": "paper", "prompt_sha": "p1"})
+    e = _entry(H.run(DAY, DAY, src), 1)
+    assert e["status"] == "match" and e["gate_text_equal"]
+    st = {s["step"]: s["status"] for s in e["steps"]}
+    assert G.ORACLE not in (st["malformed_catalyst"], st["malformed_return"])
+
 def test_unrecorded_rate_config_makes_the_rate_step_oracle():
     src = FakeSource()
     mo = _mo("OPEN", 8, pass_to_risk=True, ret=1.0)

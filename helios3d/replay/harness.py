@@ -166,7 +166,8 @@ def gate_inputs(rec: dict, sig: dict, approval: dict | None) -> tuple[dict, dict
     # Config switches only as recorded; a missing one leaves its step oracle.
     for key, name in (("min_return_per_week", "MIN_EXPECTED_RETURN_PCT_PER_WEEK"),
                       ("month_midpoint", "CATALYST_MONTH_MIDPOINT_ENABLED"),
-                      ("etf_exempt", "ETF_FUNDAMENTALS_CAP_EXEMPT")):
+                      ("etf_exempt", "ETF_FUNDAMENTALS_CAP_EXEMPT"),
+                      ("malformed_catalyst_policy", "malformed_catalyst_policy")):
         if name in cfg and cfg[name] is not None:
             inp[key], src[key] = cfg[name], "provenance.config"
         else:

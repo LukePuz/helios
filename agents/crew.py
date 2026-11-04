@@ -312,13 +312,16 @@ def _earnings_review_event(ticker: str, earnings_date, today=None) -> dict:
 
 
 def _analyze_held_position(ticker: str, client, positions: dict, regime: dict,
-                           event: dict | None = None, path: str | None = None) -> dict:
+                           event: dict | None = None, path: str | None = None,
+                           held_review: bool = False) -> dict:
     """The brief-assembly + analyze() core shared by review_held_position
     and backfill_catalyst_tracking (2026-08-30) -- extracted so the
     backfill can get the same real catalyst/expected-return read every
     scheduled review already produces, without ALSO triggering
     review_held_position's approval-routing side effect (a backfill pass
-    exists to capture a catalyst snapshot, not to fire a new TRIM/EXIT)."""
+    exists to capture a catalyst snapshot, not to fire a new TRIM/EXIT).
+    held_review: a routed review of a held position; the analyst alerts
+    when such a TRIM/EXIT is lowered to WATCH by a malformed catalyst."""
     from agents.analyst import analyze
     from context_engine import assemble_brief
     from knowledge_loader import get_watchlist_entry
@@ -338,6 +341,8 @@ def _analyze_held_position(ticker: str, client, positions: dict, regime: dict,
         "sector":          wl_entry.get("sector", ""),
         "composite_score": 60,
     }
+    if held_review:
+        candidate["held_review"] = True
 
     from agents.analyst import trigger_record
     path = path or ("earnings_review" if event.get("type") == "earnings review" else "scheduled_review")
@@ -425,7 +430,8 @@ def review_held_position(ticker: str, client, positions: dict, regime: dict,
     log.info(f"[{ticker}] Scheduled position review"
              + (f" (earnings {earnings_date})" if earnings_date else ""))
     event = _earnings_review_event(ticker, earnings_date) if earnings_date else None
-    result = _analyze_held_position(ticker, client, positions, regime, event=event)
+    result = _analyze_held_position(ticker, client, positions, regime, event=event,
+                                    held_review=True)
     _capture_latest_thesis(ticker, result)
 
     if result.get("pass_to_risk"):
@@ -456,7 +462,7 @@ def review_plan_level(ticker: str, kind: str, level, price: float | None) -> dic
                  f"thesis and the plan still hold, and whether to hold, trim or exit."),
     }
     result = _analyze_held_position(ticker, client, positions, regime, event=event,
-                                    path="plan_level_review")
+                                    path="plan_level_review", held_review=True)
     _capture_latest_thesis(ticker, result)
     try:
         # Counts as this name's review for the 10:15 rotation's ordering.

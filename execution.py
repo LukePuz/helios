@@ -647,9 +647,12 @@ def _restore_sized_stop(ticker: str, held: float, stop_price: float, what: str,
     M227 follow-up). Same rule as _restore_stop_after_failed_sell.
 
     Returns ("placed", result), ("covered", None) when nothing is uncovered,
-    or ("unread", None) when coverage could not be read: then nothing is
-    placed, the restore is queued for the reconcile retry and an alert sent.
-    A placement error raises to the caller."""
+    ("unread", None) when coverage could not be read: then nothing is
+    placed, the restore is queued for the reconcile retry and an alert sent,
+    or ("sign_flip", None) when the cache reads long and a fresh read short:
+    no SELL stop is placed (it would add to a short), the sign-flip alert is
+    sent (throttled with reconcile's) and the restore is queued, its retry
+    checking the sign again. A placement error raises to the caller."""
     import alerts as alert_module
     import tasks
     # Size to what is held now: the caller's quantity was read before its
@@ -665,6 +668,24 @@ def _restore_sized_stop(ticker: str, held: float, stop_price: float, what: str,
                 direct = float(ibkr.get_fresh_stock_positions().get(ticker, 0.0))
                 if direct > 0:
                     fresh = round(min(fresh, direct), 4)
+                elif direct < 0:
+                    # Same rule as reconcile's _smaller_read: reads that
+                    # disagree on the sign get no SELL stop. The stop was
+                    # already cancelled, so alert and queue the restore (the
+                    # queued retry re-checks the sign before placing).
+                    log.error(f"[{ticker}] {what}: position reads disagree on sign (cache "
+                              f"{fresh:g}, fresh {direct:g}); no stop restored")
+                    tasks._sign_flip_alert(ticker, fresh, direct)
+                    try:
+                        tasks._queue_reprotect(ticker, {"intent": "RESTORE"}, None)
+                    except Exception as e:
+                        log.error(f"[{ticker}] Could not queue the stop restore: {e}")
+                    return "sign_flip", None
+                else:
+                    # Left at the cache: under-cover is worse than a stop the
+                    # broker layer refuses for being over the position.
+                    log.warning(f"[{ticker}] {what}: the fresh position read shows no {ticker} "
+                                f"(cache {fresh:g}); restore sized from the cache")
             except Exception as e:
                 log.warning(f"[{ticker}] {what}: fresh position read failed ({e}); using the cache")
             if abs(fresh - float(held)) > 1e-6:

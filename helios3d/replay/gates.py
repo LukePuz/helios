@@ -37,6 +37,11 @@ Inputs (keys of ``inp``; a key that is ABSENT means "unknown"):
                        ("watch" or "watch_rate_scoped")
   (the harness sets the four config keys only from provenance.config; one
   not recorded leaves the step that needs it oracle, never today's value)
+  nonfinite_replaced   decision.nonfinite_replaced: the count of NaN/+-inf
+                       values db._finite_json stored as null
+  nonfinite_paths      decision.nonfinite_paths: their dotted paths
+                       ("decision.model_output.expected_return_pct"); not
+                       on rows written before it
 
 Return-rate reason: matches live from 453a950 on ("no expected_return_pct"
 for a dated catalyst with no expected_return_pct). Before that commit live
@@ -81,6 +86,13 @@ gate is a malformed one (a NaN/inf catalyst.date, stored as null by
 db._finite_json), malformed_catalyst is oracle on that gate ("recorded
 malformed fields (value not stored)").
 
+When nonfinite_paths names decision.model_output.expected_return_pct or
+.catalyst.date, the return_rate step is oracle ("non-finite value not
+stored"): that null was a NaN/inf, which live read as a number that passed
+the rate check until it read non-finite as missing. A row with only the
+count (nonfinite_replaced, no paths), or with fewer paths than the count
+(log_signal keeps the first 50), goes oracle when either is null.
+
 When an input a step needs is unknown, the step is an "oracle" step: it takes
 whether the gate fired (and its text) from the recorded gate list instead of
 deciding it. Such a step is reported as oracle, never as replayed.
@@ -102,6 +114,9 @@ SELL_ACTIONS = ("TRIM", "EXIT")
 ACTIONABLE = ("OPEN", "ADD", "TRIM", "EXIT")
 CAUTIOUS_REGIMES = ("Neutral", "Risk-Off", "Strong Risk-Off")
 RATE_BUCKETS = ("Accelerator", "Moonshot")
+# db._finite_json paths of the two values the rate step reads.
+_RATE_NONFINITE_PATHS = frozenset({"decision.model_output.expected_return_pct",
+                                   "decision.model_output.catalyst.date"})
 
 # Statuses of one step.
 REPLAYED = "replayed"
@@ -162,14 +177,16 @@ def expected_return_per_week(expected_return_pct: float | None,
 
 
 def optional_float(parsed: dict, field: str) -> float | None:
-    """_analyze_inner's _optional_float."""
+    """_analyze_inner's _optional_float: a bool, NaN/+-inf and a value too
+    large for a float read as None."""
     value = parsed.get(field)
-    if value is None:
+    if value is None or isinstance(value, bool):
         return None
     try:
-        return float(value)
-    except (TypeError, ValueError):
+        out = float(value)
+    except (TypeError, ValueError, OverflowError):
         return None
+    return out if math.isfinite(out) else None
 
 
 def signal_age_days(signal: dict, now: datetime) -> float:
@@ -415,8 +432,21 @@ def replay_gates(model_output: dict, inp: dict, recorded_gates=()) -> dict:
     rate_cfg = "min_return_per_week" in inp and "month_midpoint" in inp
     if action in BUY_ACTIONS:
         if bucket_known and "as_of" in inp and rate_cfg:
-            if bucket in RATE_BUCKETS:
-                catalyst_date = (parsed.get("catalyst") or {}).get("date")
+            catalyst_date = (parsed.get("catalyst") or {}).get("date")
+            paths = inp.get("nonfinite_paths")
+            if isinstance(paths, list) and len(paths) == inp.get("nonfinite_replaced"):
+                nulled = bool(_RATE_NONFINITE_PATHS & set(paths))
+            else:
+                nulled = inp.get("nonfinite_replaced") and (
+                    parsed.get("expected_return_pct") is None or catalyst_date is None)
+            if bucket in RATE_BUCKETS and nulled:
+                text = rec.take("return_rate")
+                if text is not None:
+                    gates.append(text)
+                    action = "WATCH"
+                    parsed["pass_to_risk"] = False
+                step("return_rate", ORACLE, text is not None, "non-finite value not stored")
+            elif bucket in RATE_BUCKETS:
                 weeks = compute_weeks_to_catalyst(catalyst_date, inp["as_of"],
                                                   bool(inp["month_midpoint"]))
                 per_week = expected_return_per_week(optional_float(parsed, "expected_return_pct"),

@@ -5,6 +5,7 @@ and top-8 search) is the same before and after a rebuild.
 Embeddings are a deterministic hash of the text, so a re-embedded document
 gets the same vector it was stored with, as all-MiniLM-L6-v2 does."""
 import hashlib
+import json
 import os
 import random
 import subprocess
@@ -167,6 +168,7 @@ def test_a_store_that_fails_every_upsert_keeps_the_snapshot_and_stops_after_thre
         assert vs.rebuild_collection("news", resume_only=True)["resume_failures"] == n
     assert vs.rebuild_collection("news", resume_only=True)["method"] == "resume_gave_up"
     assert vs.snapshot_age_hours("news") is not None
+    assert not vs._deadletter_path("news").exists()   # a systemic failure dead-letters nothing
 
     # the cause fixed and the sidecar removed by hand: the next resume restores everything
     monkeypatch.setattr(vs, "embed_many", lambda texts: [_det(t) for t in texts])
@@ -290,3 +292,230 @@ def test_a_resume_that_kills_the_process_in_count_still_gives_up_and_alerts(stor
     assert tasks._alert_unfinished_rebuilds(vs) == ["news"]
     assert "resumes stopped after 3 failures" in sent[0]
     assert alert_policy.classify(sent[0])[0] == alert_policy.CRITICAL
+
+
+def _run(script):
+    return subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                          timeout=300, env={**os.environ, "CUDA_VISIBLE_DEVICES": ""})
+
+
+@pytest.mark.parametrize("mode", ["full", "incremental"])
+def test_a_resume_killed_in_an_upsert_counts_and_gives_up_after_three(store, mode):
+    if mode == "incremental":
+        vs._reopen_client()
+        _kill_after_first_batch(store)
+        assert vs.rebuild_state("news")["recreated"]
+    else:
+        # snapshot and sidecar, stopped before the delete: the resume rebuilds in full
+        vs._write_snapshot("news", vs._read_collection_docs("news"))
+        vs._save_rebuild_state("news", {"created": 0, "failures": 0, "last_error": None})
+        vs._reopen_client()
+    crash = textwrap.dedent(f"""
+        import os, sys
+        from pathlib import Path
+        sys.path.insert(0, {str(_REPO)!r})
+        import vector_store as vs
+        vs._DB_PATH = Path({str(store)!r}); vs._WRITE_LOCK_PATH = vs._DB_PATH / ".write.lock"
+        vs._warm_embedder = lambda: None
+        vs.embed_many = lambda texts: os._exit(137)    # killed while embedding an upsert batch
+        vs.rebuild_collection("news", resume_only=True)
+    """)
+    for n in (1, 2, 3):
+        died = _run(crash)
+        assert died.returncode == 137, died.stderr[-2000:]
+        assert vs.rebuild_state("news")["failures"] == n
+    report = vs.rebuild_collection("news", resume_only=True)
+    assert report["method"] == "resume_gave_up" and vs.pending_rebuilds() == ["news"]
+
+
+def test_a_resume_that_makes_progress_resets_the_failure_count(store, monkeypatch):
+    from celery.exceptions import SoftTimeLimitExceeded
+    vs._reopen_client()
+    _kill_after_first_batch(store)                            # 256 of 600 live
+    vs._save_rebuild_state("news", {**vs.rebuild_state("news"), "failures": 2,
+                                    "last_missing": _N_DOCS - 256})
+    calls = [0]
+
+    def cut_on_second(texts):
+        calls[0] += 1
+        if calls[0] == 2:
+            raise SoftTimeLimitExceeded()
+        return [_det(t) for t in texts]
+    monkeypatch.setattr(vs, "embed_many", cut_on_second)
+    with pytest.raises(SoftTimeLimitExceeded):
+        vs.rebuild_collection("news", resume_only=True)
+    state = vs.rebuild_state("news")
+    assert (state["failures"], state["last_missing"]) == (0, _N_DOCS - 512)   # 256 more landed
+
+    def cut_at_once(texts):
+        raise SoftTimeLimitExceeded()
+    monkeypatch.setattr(vs, "embed_many", cut_at_once)
+    with pytest.raises(SoftTimeLimitExceeded):
+        vs.rebuild_collection("news", resume_only=True)
+    state = vs.rebuild_state("news")
+    assert (state["failures"], state["last_missing"]) == (1, _N_DOCS - 512)   # no progress: counted
+
+    monkeypatch.setattr(vs, "embed_many", lambda texts: [_det(t) for t in texts])
+    report = vs.rebuild_collection("news", resume_only=True)
+    assert (report["remaining"], report["docs_after"]) == (0, _N_DOCS) and vs.pending_rebuilds() == []
+
+
+def test_a_record_that_fails_three_resumes_in_a_row_is_dead_lettered(store, monkeypatch, caplog):
+    import json
+    vs.store("news", "poison", "POISON record that never embeds", {"ticker": "X"})
+    before = _snapshot()
+
+    def embed_many(texts):
+        if any("POISON" in t for t in texts):
+            raise ValueError("cannot embed this text")
+        return [_det(t) for t in texts]
+    monkeypatch.setattr(vs, "embed_many", embed_many)
+    vs._reopen_client()
+    report = vs.rebuild_collection("news")                    # fresh: 1 missing, snapshot kept
+    assert report["remaining"] == 1 and vs.pending_rebuilds() == ["news"]
+    for n in (1, 2):
+        report = vs.rebuild_collection("news", resume_only=True)
+        assert (report["remaining"], report["dead_lettered"], report["landed"]) == (1, 0, 0)
+        assert vs.rebuild_state("news")["id_failures"] == {"poison": n}
+        assert vs.rebuild_state("news")["failures"] == n         # the canary is not progress
+    with caplog.at_level("WARNING", logger="vector_store"):
+        report = vs.rebuild_collection("news", resume_only=True)
+    assert (report["dead_lettered"], report["remaining"], report["error"]) == (1, 0, None)
+    assert vs.pending_rebuilds() == [] and vs.snapshot_age_hours("news") is None   # prune runs again
+    [line] = vs._deadletter_path("news").read_text().splitlines()
+    rec = json.loads(line)
+    assert rec["id"] == "poison" and "cannot embed" in rec["error"]
+    assert rec["document"] == "POISON record that never embeds" and rec["metadata"]["ticker"] == "X"
+    assert "moved to .rebuild-news.deadletter.jsonl" in caplog.text
+    records, _ = _snapshot()
+    assert records == [r for r in before[0] if r[0] != "poison"]
+
+
+def test_every_attempted_upsert_failing_dead_letters_nothing(store, monkeypatch):
+    """Reviewer's case: 600 records live, 5 more in the snapshot, and every
+    upsert fails (broken embedder, or a store that answers count/get but
+    takes no writes). The incremental resume tries only the 5, so "the rest
+    is back" holds; the canary re-upsert fails too, so nothing is set aside."""
+    vs._reopen_client()
+    live = vs._read_collection_docs("news")
+    ghosts = [(f"g{i}", f"ghost {i}", {"ticker": "X"}) for i in range(5)]
+    vs._write_snapshot("news", live + ghosts)
+    vs._save_rebuild_state("news", {"created": 0, "failures": 0, "recreated": True})
+
+    def disk_full(texts):
+        raise RuntimeError("chroma: database or disk is full")
+    monkeypatch.setattr(vs, "embed_many", disk_full)
+    seen = [vs.rebuild_collection("news", resume_only=True) for _ in range(4)]
+    assert [(r["method"], r["dead_lettered"]) for r in seen] == \
+        [("snapshot_resume", 0)] * 3 + [("resume_gave_up", 0)]
+    assert [r["resume_failures"] for r in seen[:3]] == [1, 2, 3]
+    assert not vs._deadletter_path("news").exists() and vs.pending_rebuilds() == ["news"]
+    vs._reopen_client()
+    assert vs._get_collection("news").count() == _N_DOCS
+
+
+def test_a_full_mode_attempt_is_not_progress(store, monkeypatch):
+    from celery.exceptions import SoftTimeLimitExceeded
+    vs._write_snapshot("news", vs._read_collection_docs("news"))
+    vs._save_rebuild_state("news", {"created": 0, "failures": 1, "last_error": None})
+    vs._reopen_client()
+    calls = [0]
+
+    def cut_on_second(texts):
+        calls[0] += 1
+        if calls[0] == 2:
+            raise SoftTimeLimitExceeded()
+        return [_det(t) for t in texts]
+    monkeypatch.setattr(vs, "embed_many", cut_on_second)
+    with pytest.raises(SoftTimeLimitExceeded):
+        vs.rebuild_collection("news", resume_only=True)      # full: deleted, 256 landed, cut
+    state = vs.rebuild_state("news")
+    assert state["failures"] == 2 and state["recreated"]     # counted; next resume is incremental
+
+
+def test_a_cut_before_the_bad_record_fails_three_times_still_sets_it_aside(store, monkeypatch):
+    """The professor's sequence: the first resume is cut by the soft limit
+    before anything lands, then two resumes where only the bad record fails.
+    That is three counted failures with the record at two, so resumes stop
+    before it can be dead-lettered; the final check sets it aside instead."""
+    from celery.exceptions import SoftTimeLimitExceeded
+    vs.store("news", "poison", "POISON record that never embeds", {"ticker": "X"})
+    before = _snapshot()
+
+    def embed_many(texts):
+        if any("POISON" in t for t in texts):
+            raise ValueError("cannot embed this text")
+        return [_det(t) for t in texts]
+    monkeypatch.setattr(vs, "embed_many", embed_many)
+    vs._reopen_client()
+    assert vs.rebuild_collection("news")["remaining"] == 1             # fresh: snapshot kept
+
+    def cut(texts):
+        raise SoftTimeLimitExceeded()
+    monkeypatch.setattr(vs, "embed_many", cut)
+    with pytest.raises(SoftTimeLimitExceeded):
+        vs.rebuild_collection("news", resume_only=True)
+    monkeypatch.setattr(vs, "embed_many", embed_many)
+    for _ in range(2):
+        vs.rebuild_collection("news", resume_only=True)
+    state = vs.rebuild_state("news")
+    assert state["failures"] == 3 and state["id_failures"] == {"poison": 2}
+
+    report = vs.rebuild_collection("news", resume_only=True)
+    assert (report["method"], report["dead_lettered"], report["remaining"]) == \
+        ("gave_up_set_aside", 1, 0)
+    assert vs.pending_rebuilds() == [] and vs.snapshot_age_hours("news") is None
+    assert [json.loads(l)["id"] for l in vs._deadletter_path("news").read_text().splitlines()] \
+        == ["poison"]
+    records, _ = _snapshot()
+    assert records == [r for r in before[0] if r[0] != "poison"]
+
+
+def test_the_final_check_runs_once(store, monkeypatch):
+    vs._reopen_client()
+    live = vs._read_collection_docs("news")
+    vs._write_snapshot("news", live + [("g0", "ghost", {"ticker": "X"})])
+    vs._save_rebuild_state("news", {"created": 0, "failures": 3, "recreated": True,
+                                    "id_failures": {"g0": 2}})
+    canaries = []
+    monkeypatch.setattr(vs, "_canary_upsert", lambda name, col: canaries.append(name) or False)
+    assert vs.rebuild_collection("news", resume_only=True)["method"] == "resume_gave_up"
+    assert vs.rebuild_collection("news", resume_only=True)["method"] == "resume_gave_up"
+    assert canaries == ["news"] and vs.rebuild_state("news")["final_check_done"]
+    assert vs.pending_rebuilds() == ["news"]
+
+
+def test_the_canary_leaves_nothing_behind(store):
+    vs._reopen_client()
+    col = vs._get_collection("news")
+    assert vs._canary_upsert("news", col) is True
+    assert col.count() == _N_DOCS and col.get(ids=[vs._CANARY_ID])["ids"] == []
+    assert vs._CANARY_TEXT not in [r["text"] for r in vs.search("news", vs._CANARY_TEXT, 8)]
+    assert vs._CANARY_ID not in {i for i, _, _ in vs._read_collection_docs("news")}
+
+
+def test_a_leftover_canary_is_never_searched_read_or_counted(monkeypatch, tmp_path):
+    """A process killed between the canary's upsert and its delete leaves
+    the scratch record, unscaled here to be the worst case, in a 3-document
+    collection."""
+    monkeypatch.setattr(vs, "_DB_PATH", tmp_path)
+    monkeypatch.setattr(vs, "_WRITE_LOCK_PATH", tmp_path / ".write.lock")
+    monkeypatch.setattr(vs, "_seen_generation", None)
+    monkeypatch.setattr(vs, "_client", None)
+    monkeypatch.setattr(vs, "_collections", {})
+    monkeypatch.setattr(vs, "embed", _det)
+    monkeypatch.setattr(vs, "embed_many", lambda texts: [_det(t) for t in texts])
+    try:
+        for i in range(3):
+            vs.store("news", f"u{i}", f"doc {i} about AAPL", {"ticker": "AAPL"})
+        col = vs._get_collection("news")
+        col.upsert(ids=[vs._CANARY_ID], embeddings=[_det(vs._CANARY_TEXT)],
+                   documents=[vs._CANARY_TEXT], metadatas=[{"canary": True}])
+        hits = vs.search("news", vs._CANARY_TEXT, 8)
+        assert len(hits) == 3 and vs._CANARY_TEXT not in [h["text"] for h in hits]
+        assert sorted(i for i, _, _ in vs._read_collection_docs("news")) == ["u0", "u1", "u2"]
+        assert vs._count_collection_rows("news") == 3
+        assert vs._canary_upsert("news", col) is True       # removes the leftover too
+        assert col.get(ids=[vs._CANARY_ID])["ids"] == [] and col.count() == 3
+    finally:
+        vs._reopen_client()

@@ -708,6 +708,24 @@ def test_free_text_caps():
     assert "catalyst" not in ms and ms["upside_downside_ratio"] == 2.5
 
 
+@pytest.mark.parametrize("keys", [
+    {"downgraded_reason": "malformed_catalyst", "malformed_fields": ["catalyst.date"],
+     "return_malformed": False},
+    {"downgraded_reason": None, "malformed_fields": None, "return_malformed": True},
+    {"downgraded_reason": None, "malformed_fields": None, "return_malformed": None},
+    {"malformed_sell_alert": "throttled"},
+    {"malformed_sell_alert": None},
+    {"nonfinite_paths": ["decision.model_output.expected_return_pct"]},
+    {"held_review": True},
+])
+def test_malformed_catalyst_keys_are_kept(keys):
+    inputs = D.recover_inputs(_prov(), _dec(**keys))
+    for k, v in keys.items():
+        assert inputs["decision"][k] == v
+        assert f"decision.{k}" not in inputs["_not_copied"]
+    assert not any("malformed" in k or "downgraded" in k for k in inputs["_dropped_keys"])
+
+
 def test_content_sha_uses_utc():
     from zoneinfo import ZoneInfo
     sig = {"signal_id": 1, "ticker": "MSFT", "action": "OPEN", "confidence": 0.8,

@@ -64,11 +64,37 @@ def test_log_signal_writes_decision_column():
     assert "decision" in sql and params[7].adapted == {"gates": ["x"]}
 
 
-def test_etf_exemption_from_the_missing_fundamentals_cap_is_off_by_default():
-    """Audit A0100-2: ETFs never have fundamentals; the exemption ships off."""
+def test_etf_exemption_from_the_missing_fundamentals_cap_is_on_by_default(monkeypatch):
+    """Audit A0100-2: ETFs never have fundamentals. The exemption is on by
+    default; the env var still turns it off."""
+    import importlib.util
+    import pathlib
+    import config
+
+    def fresh_default():
+        spec = importlib.util.spec_from_file_location(
+            "_config_fresh", pathlib.Path(config.__file__))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.ETF_FUNDAMENTALS_CAP_EXEMPT
+
+    monkeypatch.delenv("ETF_FUNDAMENTALS_CAP_EXEMPT", raising=False)
+    assert fresh_default() is True
+    monkeypatch.setenv("ETF_FUNDAMENTALS_CAP_EXEMPT", "false")
+    assert fresh_default() is False
+
+    # The loaded default (no patch): an ETF OPEN c8 keeps c8.
     etf = patch("knowledge_loader.get_etf_tickers", return_value={"MSFT"})
     d = _analyze(udr=3.0, fund=None, extra=(etf,))
+    assert d["final_action"] == "OPEN" and d["final_conviction"] == 8
+    assert any("ETF, cap not applied (conviction 8)" in g for g in d["gates"])
+    # A non-ETF with missing fundamentals is still capped.
+    d = _analyze(udr=3.0, fund=None, extra=(patch("knowledge_loader.get_etf_tickers",
+                                                  return_value=set()), patch(
+                                                      "config.ETF_FUNDAMENTALS_CAP_EXEMPT", True)))
+    assert d["final_conviction"] == 6 and not any("ETF" in g for g in d["gates"])
+    # Turned off, the ETF is capped as before.
+    off = patch("config.ETF_FUNDAMENTALS_CAP_EXEMPT", False)
+    d = _analyze(udr=3.0, fund=None, extra=(patch("knowledge_loader.get_etf_tickers",
+                                                  return_value={"MSFT"}), off))
     assert d["final_conviction"] == 6 and any("ETF; exemption off" in g for g in d["gates"])
-    on = patch("config.ETF_FUNDAMENTALS_CAP_EXEMPT", True)
-    d = _analyze(udr=3.0, fund=None, extra=(patch("knowledge_loader.get_etf_tickers", return_value={"MSFT"}), on))
-    assert d["final_conviction"] == 8 and any("ETF, cap not applied" in g for g in d["gates"])

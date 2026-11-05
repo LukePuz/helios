@@ -18,7 +18,11 @@ conviction, buyable, reason) so verdicts in signals can be joined to whether
 the account could have bought the name that day (limitations audit 07:00,
 finding 2). The reason is a category, never an amount. Each row also records
 the run time, the code commit and the price source (yfinance daily close of
-the last completed session) so it can be reproduced (professor M29). Bucket
+the last completed session) so it can be reproduced (professor M29). The
+commit (code_sha) and code_dirty describe the checkout this script runs from
+(Path(__file__).resolve().parent.parent), so a run from the live clone
+records the live code (professor m493); rows written before code_dirty was
+added recorded the dev checkout's HEAD and have code_dirty empty. Bucket
 is the watchlist role, which is what crew sizes with (analyst overrides the
 LLM's bucket with the watchlist role). The swap path is not simulated.
 """
@@ -28,8 +32,10 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 from collections import Counter
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -112,6 +118,49 @@ def size_like_crew(rm, ticker, conviction, bucket, regime, price):
     return sizing["shares_initial"], f"ok, target {sizing['position_size_pct']:.1%}"
 
 
+REPO = Path(__file__).resolve().parent.parent
+CSV_HEADER = ["date", "ticker", "bucket", "regime", "conviction", "buyable", "reason",
+              "run_at", "code_sha", "price_source", "code_dirty"]
+
+
+def _code_state(repo: Path = REPO) -> tuple[str, bool | None]:
+    """(HEAD as 12 hex chars, dirty) of the checkout at repo. dirty is True
+    when a tracked file differs from HEAD (untracked files are not counted),
+    None when git can't tell."""
+    sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "--short=12", "HEAD"],
+                         capture_output=True, text=True).stdout.strip()
+    st = subprocess.run(["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=no"],
+                        capture_output=True, text=True)
+    return sha, (bool(st.stdout.strip()) if st.returncode == 0 else None)
+
+
+def _append_csv(path: str, rows, regime, conviction, repo: Path = REPO) -> None:
+    """Append one row per ticker. A file whose header predates code_dirty
+    gets the column added to its header only; its old rows keep their ten
+    fields and read as empty code_dirty."""
+    import csv
+    from datetime import date, datetime
+    if os.path.exists(path):
+        with open(path, newline="") as f:
+            first = f.readline()
+            rest = f.read()
+        if first.rstrip("\r\n").split(",") == CSV_HEADER[:-1]:
+            tmp = path + ".tmp"
+            with open(tmp, "w", newline="") as f:
+                f.write(",".join(CSV_HEADER) + first[len(first.rstrip("\r\n")):] + rest)
+            os.replace(tmp, path)
+    new = not os.path.exists(path)
+    sha, dirty = _code_state(repo)
+    run_at = datetime.now().isoformat(timespec="seconds")
+    with open(path, "a", newline="") as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow(CSV_HEADER)
+        for t, bucket, ok, reason in rows:
+            w.writerow([date.today().isoformat(), t, bucket, regime, conviction, ok, reason,
+                        run_at, sha, "yfinance_last_daily_close", "" if dirty is None else dirty])
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--conviction", type=int, default=7)
@@ -120,7 +169,7 @@ def main():
     args = ap.parse_args()
 
     from dotenv import load_dotenv
-    load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+    load_dotenv(REPO / ".env")
     import db
     import risk_manager
     from knowledge_loader import load_watchlist
@@ -177,23 +226,7 @@ def main():
             print(f"{t:6} {bucket:11} ${price:>8.2f}  shares={shares:<3} {why}")
     print("\nOutcomes:", dict(outcomes))
     if args.csv:
-        import csv
-        from datetime import date
-        new = not os.path.exists(args.csv)
-        with open(args.csv, "a", newline="") as f:
-            w = csv.writer(f)
-            if new:
-                w.writerow(["date", "ticker", "bucket", "regime", "conviction", "buyable", "reason",
-                            "run_at", "code_sha", "price_source"])
-            import subprocess
-            from datetime import datetime
-            repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            sha = subprocess.run(["git", "-C", repo, "rev-parse", "--short=12", "HEAD"],
-                                 capture_output=True, text=True).stdout.strip()
-            run_at = datetime.now().isoformat(timespec="seconds")
-            for t, bucket, ok, reason in csv_rows:
-                w.writerow([date.today().isoformat(), t, bucket, regime, args.conviction, ok, reason,
-                            run_at, sha, "yfinance_last_daily_close"])
+        _append_csv(args.csv, csv_rows, regime, args.conviction)
         print(f"appended {len(csv_rows)} rows to {args.csv}")
 
 

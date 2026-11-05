@@ -344,3 +344,12 @@ def _buy_room_passes(request, monkeypatch):
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "real_buy_room: run the real execution-time cash/cap check")
+
+
+@pytest.fixture(autouse=True)
+def _new_fact_gate_off(monkeypatch):
+    """The buy gate on the screener's new_fact (crew.new_fact_gate) is on by
+    default; tests not about it route buys with it off, as before it existed.
+    Its own tests patch config.BUY_REQUIRES_NEW_FACT back on."""
+    import config
+    monkeypatch.setattr(config, "BUY_REQUIRES_NEW_FACT", False)

@@ -1,0 +1,424 @@
+patch_id,commit,committed,in_live,subject
+029b142ed750,a21646ffced179f88be0ff3eed41c6631036b29b,2026-11-03T16:05:34-05:00,no,"Add prompt_order_ab: offline A/B replay of stored analyst prompts under the pre- and post-31d52f8 answer order, with a r"
+029b142ed750,e73e25231950d5e993e3fe6bb67653f2fd60eee3,2026-11-03T17:08:21-05:00,yes,"Add prompt_order_ab: offline A/B replay of stored analyst prompts under the pre- and post-31d52f8 answer order, with a r"
+058d6163e14f,210746eac548ecbe7e2931e4af137f7ab5397d5e,2026-11-03T14:38:34-05:00,no,c6 bar shadow: run in its own ops task on a simulation RiskManager
+058d6163e14f,a1a6ff9587158693ac78b2736b8916b47deb68e0,2026-11-03T15:21:43-05:00,no,c6 bar shadow: run in its own ops task on a simulation RiskManager
+058d6163e14f,b7d3c30ebf42f851ce0e84e7d780a4d8914811e1,2026-11-03T16:51:40-05:00,no,c6 bar shadow: run in its own ops task on a simulation RiskManager
+058d6163e14f,dd77f3201c60965f3d24b41bc227b20acb863708,2026-11-03T17:29:42-05:00,no,c6 bar shadow: run in its own ops task on a simulation RiskManager
+071bcd4b67a0,a4e87c62fee2799a837733945a7979787ecf60c5,2026-11-03T09:21:54-05:00,no,stop_slippage keeps record-based stop_price/fill_price/slippage_pct; broker trigger in new fields only; strict trigger-c
+071bcd4b67a0,09e9d82cf993b96d0d3fe237fd69027e87100255,2026-11-03T09:23:52-05:00,yes,stop_slippage keeps record-based stop_price/fill_price/slippage_pct; broker trigger in new fields only; strict trigger-c
+07d0db755d41,c995ea97e7028bf2255c7636fe6318d5dbee5642,2026-11-03T20:58:18-05:00,no,Alert when the screener is on the keyword fallback and when a buy is blocked for its missing new_fact
+07d0db755d41,13febcd82934afa5f08fc3c58af1ca044de34162,2026-11-03T21:10:49-05:00,no,Alert when the screener is on the keyword fallback and when a buy is blocked for its missing new_fact
+08f6d1300605,d253f17bd44e75f624d7d5cd696ec2c089f2a297,2026-11-02T21:10:21-05:00,no,Daily-loss shadow: the baseline is the day's first snapshot with a positive value; earlier non-positive reads are counte
+08f6d1300605,8640b1a033751ca6901fabeabd7ff0b7f621741f,2026-11-02T21:26:51-05:00,yes,Daily-loss shadow: the baseline is the day's first snapshot with a positive value; earlier non-positive reads are counte
+0b5a38369d97,8d0de3f2940cd5c6fcc20f86aeafbe0a1f9e40c5,2026-11-03T19:33:20-05:00,no,Screener: log-only opinion_shadow in provenance from a deterministic opinion/listicle headline check
+0b5a38369d97,3a17a08dc9c44ae8efbdedda233eb95ba8b37772,2026-11-03T19:37:48-05:00,no,Screener: log-only opinion_shadow in provenance from a deterministic opinion/listicle headline check
+0b5a38369d97,0224e480c7cc1d38bcf8917fea71b21cc5492030,2026-11-03T21:14:58-05:00,no,Screener: log-only opinion_shadow in provenance from a deterministic opinion/listicle headline check
+0b934e66eb9c,f4f59302d0b56acc5e2f47f66e3f84eb034ea6bb,2026-11-03T05:05:19-05:00,no,Reconcile hold: a failed read refreshes only a live missing-held marker and never alerts; flat-stop alerts go out only a
+0b934e66eb9c,f09093ac2746590d05d396a5578fbfd299690569,2026-11-03T05:08:02-05:00,yes,Reconcile hold: a failed read refreshes only a live missing-held marker and never alerts; flat-stop alerts go out only a
+0e028c4123e4,74ff86344f65d60a4033b104bf6cfc72d7107a0b,2026-11-03T14:50:06-05:00,no,Replay: the non-finite paths are read only when none were cut by the cap
+0e028c4123e4,831cee325e93f73d0f446924e885bdf05daadc63,2026-11-03T16:51:40-05:00,no,Replay: the non-finite paths are read only when none were cut by the cap
+0e028c4123e4,cef32c3cfd1e9c8b56fdcd563b5b259fa2b66448,2026-11-03T17:29:42-05:00,no,Replay: the non-finite paths are read only when none were cut by the cap
+0e6452c8701e,3c870fe6148424181bbe96ed3ddbd60ccde21170,2026-11-02T21:11:16-05:00,no,"Pending-entry shadow: dedupe on a shadow_key stored in activity_feed, so a Redis flush does not duplicate rows"
+0e6452c8701e,f9c98695fa656f4abc3c0c68f61ddf5df45a676b,2026-11-02T21:26:51-05:00,yes,"Pending-entry shadow: dedupe on a shadow_key stored in activity_feed, so a Redis flush does not duplicate rows"
+0edfdc8a6983,872d88031d454c8482c3a8ebc8d78b57070fc981,2026-11-03T17:13:38-05:00,no,"Analyst: provenance.trigger records the item's own time (event_time, event_time_source); rating and news events carry th"
+0edfdc8a6983,8410d3bfc7e527064e5b5d5e98b8431e9417c03d,2026-11-03T17:42:17-05:00,no,"Analyst: provenance.trigger records the item's own time (event_time, event_time_source); rating and news events carry th"
+0f1935fabb7c,050f594ace1ae3d17fb20b2ab54002139e209354,2026-11-03T16:07:48-05:00,no,"Buy new-fact gate: defaults are news-triggered buys only, with a 24 h window"
+0f1935fabb7c,9e64aa25e3323ce160354203c67567fcbbb941c8,2026-11-03T16:51:40-05:00,no,"Buy new-fact gate: defaults are news-triggered buys only, with a 24 h window"
+0f1935fabb7c,420fdd7f59bc6de1b983228901bf95bc2d829730,2026-11-03T17:29:42-05:00,no,"Buy new-fact gate: defaults are news-triggered buys only, with a 24 h window"
+0f5be2d87981,b77f0cd9faf273296539062f3f23422a72399d8c,2026-11-03T04:56:27-05:00,no,"Reconcile: while the missing-held hold blocks orphan cleanup, a flat ticker with a working SELL stop alerts every cycle "
+0f5be2d87981,ce7380c88f49583524ec2f04dc974e315ff0f785,2026-11-03T05:08:02-05:00,yes,"Reconcile: while the missing-held hold blocks orphan cleanup, a flat ticker with a working SELL stop alerts every cycle "
+1038eb370aac,2e0fbdb95ed938f462a89cc5e5fe778a65da9c55,2026-11-02T20:31:35-05:00,no,Log-only pending_entries shadow: c>=6 WATCH and gated-down OPEN/ADD verdicts record their plan entry levels; the nightly
+1038eb370aac,98ce21c7a6f7c28c1c0c129a7582317e5f6bf044,2026-11-02T20:38:36-05:00,yes,Log-only pending_entries shadow: c>=6 WATCH and gated-down OPEN/ADD verdicts record their plan entry levels; the nightly
+103b82df26ae,9aacc571730e6374db14f158bbf6e8cc8c307173,2026-11-02T20:25:38-05:00,no,Log-only hold_fails_entry_rule shadow: a HOLD under the 2.0 UDR entry floor is recorded as a would-trim in signals.decis
+103b82df26ae,78aeeba5a7383a4edaf27d0709405ba1359f2988,2026-11-02T20:38:36-05:00,yes,Log-only hold_fails_entry_rule shadow: a HOLD under the 2.0 UDR entry floor is recorded as a would-trim in signals.decis
+122e02106359,baf4360015ec2a4b9f852d45e8784d253ad86a91,2026-11-03T15:36:02-05:00,no,Crew: scan verdicts reach the c6 bar shadow without a broker client
+122e02106359,a4515f8bf244fb96a5deb502169bd4778784d797,2026-11-03T16:51:40-05:00,no,Crew: scan verdicts reach the c6 bar shadow without a broker client
+122e02106359,4862cef7b1ea88773af0ba775d98ed655eec62d2,2026-11-03T17:29:42-05:00,no,Crew: scan verdicts reach the c6 bar shadow without a broker client
+145ca9d606f7,432416a9191ae034173eabed01c8294a4916fec7,2026-11-02T21:09:34-05:00,no,"Shadow rows (entry_shadow, risk_shadow) carry code_sha and env_sha in their extras"
+145ca9d606f7,03d848bd9d7a55cb499425d36199b087172c990d,2026-11-02T21:26:51-05:00,yes,"Shadow rows (entry_shadow, risk_shadow) carry code_sha and env_sha in their extras"
+152be4b33248,fe37764f9015b5525846085030e00c87b7c64d36,2026-11-03T15:33:39-05:00,no,Config: the ETF missing-fundamentals cap exemption is on by default
+152be4b33248,89b7d9922e8e76dcee44e2fc5a5ebdf911889786,2026-11-03T16:51:40-05:00,no,Config: the ETF missing-fundamentals cap exemption is on by default
+152be4b33248,3ce094f68856c82fcc17b40a50515eab8f11f08a,2026-11-03T17:29:42-05:00,no,Config: the ETF missing-fundamentals cap exemption is on by default
+15ee4ad0685a,a6af42ad32cb5e8512fe557bfd6415f2aaee6823,2026-11-03T08:25:30-05:00,no,"Insider Form 4 lookup reads data.sec.gov submissions JSON through edgar.py's fetch, timezone and 429-backoff helpers"
+15ee4ad0685a,9ccbc8adaf627776b61dc7cd09fd90a6f2b85019,2026-11-03T08:29:46-05:00,yes,"Insider Form 4 lookup reads data.sec.gov submissions JSON through edgar.py's fetch, timezone and 429-backoff helpers"
+17c9004e3780,3caf517acab99969268c2f0fc09baaa59af305f7,2026-11-03T16:04:29-05:00,no,Risk: the micro-tier name cap record holds no account dollar values
+17c9004e3780,efb257418776fd4c7a871cf872aa6a4e28785fb5,2026-11-03T16:51:40-05:00,no,Risk: the micro-tier name cap record holds no account dollar values
+17c9004e3780,2e93199cbe3a11daadd6808f17fb813b913d2590,2026-11-03T17:29:42-05:00,no,Risk: the micro-tier name cap record holds no account dollar values
+19b7fab08aa6,d2e6c61a8a1971641c9f8d60fae3b54ca8da9c78,2026-11-03T03:26:07-05:00,no,Log-only plan_cross_section snapshot: one activity_feed row per held or recently reviewed ticker after the nightly price
+19b7fab08aa6,5b8fdab1962ee563ada050c5f9583d7765bfcba5,2026-11-03T04:51:40-05:00,yes,Log-only plan_cross_section snapshot: one activity_feed row per held or recently reviewed ticker after the nightly price
+19d1975e4e4a,7b83838b9e479141c3e38a49d29dc184533f8621,2026-11-03T14:40:38-05:00,no,Replay: optional_float reads NaN/+-inf and a value too large for a float as None
+19d1975e4e4a,0c3ef0a823496a891cd1bebc62dd02eed97ad76b,2026-11-03T16:51:39-05:00,no,Replay: optional_float reads NaN/+-inf and a value too large for a float as None
+19d1975e4e4a,819d5c290fec195c054cf7715a4fdcb9d316143c,2026-11-03T17:29:41-05:00,no,Replay: optional_float reads NaN/+-inf and a value too large for a float as None
+1c037b30f2b9,d6f273144bd5ddb74ff11652d5cdbdfe79e25a84,2026-11-03T12:56:17-05:00,no,alert_triage: the saved head comes from the same read as the offset; a first row over 4 KB is fingerprinted by its first
+1c037b30f2b9,718724ee05feb2c55d0aa1b3beacf6cce87d1d17,2026-11-03T15:21:47-05:00,no,alert_triage: the saved head comes from the same read as the offset; a first row over 4 KB is fingerprinted by its first
+1c037b30f2b9,bc48d3023cda04d6f3ec15cf4b61598059ef46ec,2026-11-03T16:51:40-05:00,no,alert_triage: the saved head comes from the same read as the offset; a first row over 4 KB is fingerprinted by its first
+1c037b30f2b9,951d3ae46b78c6f5da5dda509698073c475d81e7,2026-11-03T17:29:42-05:00,no,alert_triage: the saved head comes from the same read as the offset; a first row over 4 KB is fingerprinted by its first
+1d70b9cea187,6fe2302d04a4eef6e5c5575462fe2e368ee0839d,2026-11-03T14:51:07-05:00,no,"c6 bar shadow task: never connects to IBKR, 20/30 s limits, retry-free enqueue"
+1d70b9cea187,63eb12b81b2866d3c551f8929bffc5d0157b14a7,2026-11-03T15:21:43-05:00,no,"c6 bar shadow task: never connects to IBKR, 20/30 s limits, retry-free enqueue"
+1d70b9cea187,f0cecbee51a38dcc97f57dded3f3511ca8f1df10,2026-11-03T16:51:40-05:00,no,"c6 bar shadow task: never connects to IBKR, 20/30 s limits, retry-free enqueue"
+1d70b9cea187,c65f1bfd07ffb4c28c08fa7067dba6540986f276,2026-11-03T17:29:42-05:00,no,"c6 bar shadow task: never connects to IBKR, 20/30 s limits, retry-free enqueue"
+1f9215c8f52c,ea01a70b17ea8f01c8bbe8e28edc2eb059b15852,2026-11-03T03:41:59-05:00,no,ATR fallback log: Redis and DB writes move to a daemon thread with their own short-timeout Redis client; the digest list
+1f9215c8f52c,ac29da2b8913e118749d3a873d573b31b29c4450,2026-11-03T04:51:40-05:00,yes,ATR fallback log: Redis and DB writes move to a daemon thread with their own short-timeout Redis client; the digest list
+23b351544a40,92b60d295d9d9332c66057643a05c656187d3066,2026-11-03T07:58:05-05:00,no,EDGAR: two-sided acceptanceDateTime timezone test pooled across responses; cap the 429 backoff
+23b351544a40,500a9b823cb4d004de7954897317dbae58400461,2026-11-03T07:59:47-05:00,yes,EDGAR: two-sided acceptanceDateTime timezone test pooled across responses; cap the 429 backoff
+24d23aa2492c,235c0ded3bd444e57cc9602ab6b5d383f7aca970,2026-11-03T16:36:51-05:00,no,prompt_order_ab: optional A2 noise-floor arm; report labels the action-change p-value as a symmetry test and marks secon
+24d23aa2492c,48741ded2c399253ec943e54b83c05ec78941b1d,2026-11-03T17:08:21-05:00,yes,prompt_order_ab: optional A2 noise-floor arm; report labels the action-change p-value as a symmetry test and marks secon
+252cef97dc2d,910861f66c5dae3b290182ab0bec3b69846dc167,2026-11-02T19:19:56-05:00,no,Add helios3d package: h3d schema runner and forward-return verdict labels
+252cef97dc2d,476849da4a8cbd8777c3de79d2931a0c344db3c1,2026-11-02T19:23:41-05:00,yes,Add helios3d package: h3d schema runner and forward-return verdict labels
+253debd0f0f8,1b27b576ce2e1d8c4cd0ac90540b6ae8147aabf3,2026-11-02T19:34:35-05:00,no,Reconcile: add no SELL stop when the position reads disagree on sign
+253debd0f0f8,c15ba82e93d3e0bbe01287278bac3a04512a5b90,2026-11-02T19:40:33-05:00,yes,Reconcile: add no SELL stop when the position reads disagree on sign
+26147edba0b1,d0e4c44ab3b9247c1c3d3be042d9460b2567b203,2026-11-04T00:59:02-05:00,no,panel timing db read and shadow readout skip rows whose kind is in db._NON_ANALYST_SIGNALS when reading provenance: rout
+26147edba0b1,aab23c8f07dd44ba483ef318baf65aa270f9ef53,2026-11-04T01:07:04-05:00,no,panel timing db read and shadow readout skip rows whose kind is in db._NON_ANALYST_SIGNALS when reading provenance: rout
+29723d9d5fba,a986670da9b5b331df69237c4eabb45ca5905afa,2026-11-03T17:03:43-05:00,no,"Screener: a reply with no JSON is recorded as keyword_fallback, and a reply without urgency gets eod instead of raising"
+29723d9d5fba,6a5679fa78f285997164f0336cb89676e28f8d43,2026-11-03T17:42:17-05:00,no,"Screener: a reply with no JSON is recorded as keyword_fallback, and a reply without urgency gets eod instead of raising"
+2c7943a21608,ff0aee8c1b4d5c82aa9c1ac5eb022ea132b8f952,2026-11-03T17:39:32-05:00,no,Pipeline: a screen or analysis task killed by the hard time limit or lost with its worker writes EVENT_LOST via task_fai
+2c7943a21608,d708d03f1640d96f51c3b66aebb40d886366acd9,2026-11-03T17:42:17-05:00,no,Pipeline: a screen or analysis task killed by the hard time limit or lost with its worker writes EVENT_LOST via task_fai
+2c833df6980d,ccbb3a631e8b3aa010c2a3b531db2ca50ec4aa28,2026-11-03T14:43:39-05:00,no,Test: set_original_thesis and both trade_outcomes sources_json writes store NaN/inf as null
+2c833df6980d,df37b09b15a638ea5db654869b2e85d308e209b5,2026-11-03T16:51:40-05:00,no,Test: set_original_thesis and both trade_outcomes sources_json writes store NaN/inf as null
+2c833df6980d,87d8c53e86e7b870635d1587b405676475395250,2026-11-03T17:29:41-05:00,no,Test: set_original_thesis and both trade_outcomes sources_json writes store NaN/inf as null
+3255c5d15fd9,f80791025973c53127d6045007a1887c237181ec,2026-11-03T11:48:57-05:00,no,"Coverage re-check: flat and sign-flip reads, over-stop wording after a refused-stop retry"
+3255c5d15fd9,afa4e5c77be82153008af60a3c518de921fdbaee,2026-11-03T12:53:55-05:00,no,"Coverage re-check: flat and sign-flip reads, over-stop wording after a refused-stop retry"
+3255c5d15fd9,e90a9f560d0866b38bdcbae05dfd38fee3cda214,2026-11-03T15:21:47-05:00,no,"Coverage re-check: flat and sign-flip reads, over-stop wording after a refused-stop retry"
+3255c5d15fd9,fab09a49fe6db919e15d41ce44f7418b48c6f1a0,2026-11-03T16:51:40-05:00,no,"Coverage re-check: flat and sign-flip reads, over-stop wording after a refused-stop retry"
+3255c5d15fd9,333c83b58306ff42f5cd7807e648713af83f752c,2026-11-03T17:29:42-05:00,no,"Coverage re-check: flat and sign-flip reads, over-stop wording after a refused-stop retry"
+34023f16564d,90e4cd4058f083b41efb71f97ad9011a00753bde,2026-11-03T15:46:28-05:00,no,"Risk: micro-tier per-name cap on new buys (30% of equity, MICRO_TIER_NAME_CAP_PCT)"
+34023f16564d,5beb60902e35183292950435fc03acfabfbdc7bd,2026-11-03T16:51:40-05:00,no,"Risk: micro-tier per-name cap on new buys (30% of equity, MICRO_TIER_NAME_CAP_PCT)"
+34023f16564d,7e57270d85a38a8c05468d7235f7e4ad8eb5b562,2026-11-03T17:29:42-05:00,no,"Risk: micro-tier per-name cap on new buys (30% of equity, MICRO_TIER_NAME_CAP_PCT)"
+3603f0ec2f38,e22cc954551a2fe46451b053154a64dfbfc5903f,2026-11-03T03:31:16-05:00,no,"plan_cross_section: stop at the first failed write, bound the held verdict read to 365 days, skip the day when no held s"
+3603f0ec2f38,2ce438c486fab0275a34d018ee379d2230fe8b1e,2026-11-03T04:51:40-05:00,yes,"plan_cross_section: stop at the first failed write, bound the held verdict read to 365 days, skip the day when no held s"
+39ae1f9b5afb,23bbfecaee266ccaa467b5c4993f58a925e904ee,2026-11-03T07:54:34-05:00,no,Log-only tranche2_shadow: held positions whose entry plan add_trigger is crossed by the latest daily close
+39ae1f9b5afb,3a72b562770cb83b237ed93691b7c5ac646228f7,2026-11-03T08:04:00-05:00,yes,Log-only tranche2_shadow: held positions whose entry plan add_trigger is crossed by the latest daily close
+39e482f79103,75c394199275b43f2b56aa70ae722d097faf9f49,2026-11-03T08:32:55-05:00,no,"Insider poll: transient Form 4 fetch failures retried, pass status, time budget, labelled fetch logs"
+39e482f79103,28248edc90638b14f22c983698a95772046598e2,2026-11-03T08:34:59-05:00,yes,"Insider poll: transient Form 4 fetch failures retried, pass status, time budget, labelled fetch logs"
+3bec9aef72c1,ed175d88913e9b4f03d98b59211245332397ae11,2026-11-03T14:07:19-05:00,no,Analyst: a non-finite numeric field is read as missing; the approval payload drops non-finite values
+3bec9aef72c1,3163d175b16c6ae9aaa3f0bf401d4aa5128b5e1a,2026-11-03T14:07:21-05:00,yes,Analyst: a non-finite numeric field is read as missing; the approval payload drops non-finite values
+3e7a8991c75a,92831738b18244bba48f2c5c1605fdf633d68f7a,2026-11-03T21:03:32-05:00,no,Record the Trend Template check in the signals decision and replay it from there
+3e7a8991c75a,3a81dd87b8eafd49aca06e660f2e5b9b0eb86619,2026-11-03T21:14:58-05:00,no,Record the Trend Template check in the signals decision and replay it from there
+3f3ec893871d,769a079f69dc09c4d193616333de4328364eb839,2026-11-02T21:02:00-05:00,no,"Pending-entry shadow: the expired row's would_fill says whether any level filled, and carries bars_in_window, last_bar_d"
+3f3ec893871d,5ba5bb47fa04e7cdbb0b902f74c78b8395bb78a5,2026-11-02T21:26:51-05:00,yes,"Pending-entry shadow: the expired row's would_fill says whether any level filled, and carries bars_in_window, last_bar_d"
+427b532d35de,fa8fa059082ad5a5fadc29fcbf8f4ac5ad023373,2026-11-03T14:51:25-05:00,no,DB: the thesis writers clean the thesis inside their try
+427b532d35de,dbcfd08cba0297aa3f626715eb442507f85a537e,2026-11-03T16:51:40-05:00,no,DB: the thesis writers clean the thesis inside their try
+427b532d35de,fb61e00d7c8a419ba221de53f42e2c93d40dc73f,2026-11-03T17:29:42-05:00,no,DB: the thesis writers clean the thesis inside their try
+430edaff2ece,b7206dbb1cdc07147d9c5520e8f855c6caee1cfd,2026-11-03T10:48:02-05:00,no,"helios3d: drop review-reference tags from comments, docstrings and a test name"
+430edaff2ece,2b4e842cadafb502b978c20049d5178337c21caf,2026-11-03T10:53:23-05:00,yes,"helios3d: drop review-reference tags from comments, docstrings and a test name"
+449d369dfc2a,be5c0ca924f7526f1a89f91ef6de029f33f45013,2026-11-03T04:15:02-05:00,no,"Decide the entry stop record from a read after placement, not the positions"
+449d369dfc2a,56a8ecbfbc53942f8f243b0618b0028a61041da9,2026-11-03T04:51:40-05:00,yes,"Decide the entry stop record from a read after placement, not the positions"
+49d66c69a44a,01e36a34a26be1f07a9a7e7857ca6d57ac851137,2026-11-03T04:07:07-05:00,no,Entry stop survives an unreadable prior record; clearer record-missing alerts
+49d66c69a44a,89f99fdf8b36201493762d9d9c6f6e930cf28544,2026-11-03T04:51:40-05:00,yes,Entry stop survives an unreadable prior record; clearer record-missing alerts
+4a6734143b22,2aa2464c536bd78f5f57db248f17f6d412334e7f,2026-11-03T13:30:51-05:00,no,Analyst: a malformed catalyst makes the verdict an unrouted WATCH
+4a6734143b22,12b264a31262cecbc2a9b89e294739b43a085442,2026-11-03T13:31:02-05:00,yes,Analyst: a malformed catalyst makes the verdict an unrouted WATCH
+4b3f30e1dbdd,983843294f531ef6708d05fd7a82bc9a0bc37bc0,2026-11-03T07:38:09-05:00,no,"EDGAR: poll data.sec.gov submissions JSON, one request per ticker"
+4b3f30e1dbdd,58228cd97216690b99435d60947b7a606120212d,2026-11-03T07:59:47-05:00,yes,"EDGAR: poll data.sec.gov submissions JSON, one request per ticker"
+4b8c10f201ae,fa8e3611c08bb5f8d5ead3a50ec758040ff3701b,2026-11-03T19:37:13-05:00,no,"Screener opinion_shadow: all matching pattern names, pattern-list sha, and error field"
+4b8c10f201ae,f3ba75a60e0af39c5461f83286fe7073bf2c2fb6,2026-11-03T19:37:48-05:00,no,"Screener opinion_shadow: all matching pattern names, pattern-list sha, and error field"
+4b8c10f201ae,d850f492c441e4cbb3bfbe70841ac3f81667d318,2026-11-03T21:14:58-05:00,no,"Screener opinion_shadow: all matching pattern names, pattern-list sha, and error field"
+4d80f759bb15,d96378c25d02071699d9257be134820859e84c93,2026-11-03T02:30:59-05:00,no,"Stop slippage row: name the symbol-matched fill, add matched order ids, write only after the trade row"
+4d80f759bb15,95bb83e635bb7831a11ed6480751e94daafb105f,2026-11-03T04:51:40-05:00,yes,"Stop slippage row: name the symbol-matched fill, add matched order ids, write only after the trade row"
+4db1a3c5fc4c,03d44462ba32411930dddb74a493e8c033e9be39,2026-11-03T02:25:44-05:00,no,Log-only stop slippage row: stop price vs fill on a reconciled stop exit
+4db1a3c5fc4c,860b8db097944846c594e93dd3145a8cd621591d,2026-11-03T04:51:40-05:00,yes,Log-only stop slippage row: stop price vs fill on a reconciled stop exit
+5403d4968cf6,820f79adfb2a0507c401a08e0547f443efd87d8f,2026-11-03T16:21:52-05:00,no,"prompt_order_ab: run only while the stack is down, skip and attempt records, per-run config checks in the report, option"
+5403d4968cf6,fa997c53f0c3bd7b785ef229139c25499d67e7ee,2026-11-03T17:08:21-05:00,yes,"prompt_order_ab: run only while the stack is down, skip and attempt records, per-run config checks in the report, option"
+5484ae4b1842,2700d7a28c7086d2efad708c7ed4f8ce31db503f,2026-11-03T09:27:55-05:00,no,"helios3d decision records: narrower year and date exemptions, public-text exemption by path, truncations recorded"
+5484ae4b1842,dcae540578cb2f7b4011ab3365f2bf97fbdb38fb,2026-11-03T09:29:41-05:00,yes,"helios3d decision records: narrower year and date exemptions, public-text exemption by path, truncations recorded"
+55c14877a708,4dd70c006806cb3fc8f1609bd7e1ca3eeb81f15a,2026-11-03T12:39:48-05:00,no,"Vector store: a leftover canary record is never searched, rebuilt or kept; held set-aside counts are flushed"
+55c14877a708,5f0a6298671de4223349d81e454ab9dfa3ee0bd2,2026-11-03T12:53:55-05:00,no,"Vector store: a leftover canary record is never searched, rebuilt or kept; held set-aside counts are flushed"
+55c14877a708,1d2ca777afb5fc05c130f4f8929e0f058de2bda4,2026-11-03T15:21:47-05:00,no,"Vector store: a leftover canary record is never searched, rebuilt or kept; held set-aside counts are flushed"
+55c14877a708,95f6ddbddf4534c9d852687c607d71a5ebf97b46,2026-11-03T16:51:40-05:00,no,"Vector store: a leftover canary record is never searched, rebuilt or kept; held set-aside counts are flushed"
+55c14877a708,76aa4f8a61359b880286e8ca58032efa556af80e,2026-11-03T17:29:42-05:00,no,"Vector store: a leftover canary record is never searched, rebuilt or kept; held set-aside counts are flushed"
+57e6f84b92e2,b169fa8477f4ac9e5b8176b9bb5c7445b6870bbb,2026-11-02T19:24:06-05:00,no,Reconcile 2b: skip over-cover cancel for held tickers whose fresh quantity differs while reads disagree
+57e6f84b92e2,d9939c2e173dabc663f21b7f0d12032cf3428f64,2026-11-02T19:28:55-05:00,yes,Reconcile 2b: skip over-cover cancel for held tickers whose fresh quantity differs while reads disagree
+584eb6519bd3,b6a9b8d15012e381350b1af132aac667a5595908,2026-11-03T16:25:02-05:00,no,"prompt_order_ab: --timeout defaults to and is capped by the live analyst call's timeout, read from the captured call"
+584eb6519bd3,87810d51f8fb4a9044b1a1065ec124d4821773e6,2026-11-03T17:08:21-05:00,yes,"prompt_order_ab: --timeout defaults to and is capped by the live analyst call's timeout, read from the captured call"
+594452c8cd35,9904c182961d09d00e1590e081b58d83ec6f9d4e,2026-11-03T19:18:03-05:00,no,Plan watcher: PLAN_LEVEL_HIT provenance records code_sha and env_sha
+594452c8cd35,4ccfeae26b3ab699e67e1ef21deb6cf34122fc5f,2026-11-03T21:14:58-05:00,no,Plan watcher: PLAN_LEVEL_HIT provenance records code_sha and env_sha
+5a43173f1ea8,daf725bd74b5b645f0899f73ae9994d0845dec19,2026-11-03T08:36:41-05:00,no,Insider: a 429 on a filing index or XML fetch raises edgar._RateLimited; broken chunked bodies are transient
+5a43173f1ea8,cb36d74f769d878fe3d113a37acaa7c5ffc51895,2026-11-03T08:37:56-05:00,yes,Insider: a 429 on a filing index or XML fetch raises edgar._RateLimited; broken chunked bodies are transient
+5b474de2261d,f08caa154e66e0d7ddd712d415dd3f695416d038,2026-11-03T02:58:22-05:00,no,"Pending-entry shadow: fallback from expiry + 7 days, log unparseable expiries"
+5b474de2261d,cc971b382ba794cfa636ba0807fd9cc06cbb512a,2026-11-03T04:51:40-05:00,yes,"Pending-entry shadow: fallback from expiry + 7 days, log unparseable expiries"
+5b6b5d8cf106,de2d06805edf3ae83b8043085114af9fe5430aa6,2026-11-02T21:35:52-05:00,no,Screener: log-only would_bypass_post_print row (stage screener_shadow) for a held name's earnings item dropped in the po
+5b6b5d8cf106,a3eba2c74961ab7a01cc18660cb889efddfa1305,2026-11-02T21:39:09-05:00,yes,Screener: log-only would_bypass_post_print row (stage screener_shadow) for a held name's earnings item dropped in the po
+5c8c9e1cf2b0,1ff0ebccf58e45ab307d7e60b69a3f219a7aa5db,2026-11-03T04:35:20-05:00,no,"Stop no-loosen check: alert on unreadable skips, compare on the tick"
+5c8c9e1cf2b0,e5cd81c856e3f8b1e961fb8fe4a49a64bf811ea0,2026-11-03T04:51:40-05:00,yes,"Stop no-loosen check: alert on unreadable skips, compare on the tick"
+5dc6b32d1084,2074eb93b97e171191b220dd96fe579d2461a8e0,2026-11-02T17:26:48-05:00,no,Send one Telegram alert at startup when CONTACT_EMAIL is unset
+5dc6b32d1084,7471b4a16e443fdbb5aa044b27d98eeee8d5c8ad,2026-11-02T17:27:11-05:00,yes,Send one Telegram alert at startup when CONTACT_EMAIL is unset
+5df2cf1ca1ae,25fd89824925aed7138275a3fed10741967d59eb,2026-11-02T19:39:01-05:00,no,Reconcile: alert on the first cycle for sign flips and tickers a fresh read leaves out
+5df2cf1ca1ae,ed1a5f8ff9f560e1e594a8524aa7f78bacef3741,2026-11-02T19:40:33-05:00,yes,Reconcile: alert on the first cycle for sign flips and tickers a fresh read leaves out
+60323d12a3a5,fc063113965841d436429a0e4fe49a0d8c0d0294,2026-11-03T12:19:26-05:00,no,Sized stop restore: no SELL stop when a fresh read shows a short
+60323d12a3a5,596f4b501fe78cb4aa9d870db4338b1a98c01c7f,2026-11-03T12:53:55-05:00,no,Sized stop restore: no SELL stop when a fresh read shows a short
+60323d12a3a5,b2ec74aa707b0b5b5a758aec17f78acc5db3e9b4,2026-11-03T15:21:47-05:00,no,Sized stop restore: no SELL stop when a fresh read shows a short
+60323d12a3a5,a34071e354e42cb071a77ab8d682195542f41169,2026-11-03T16:51:40-05:00,no,Sized stop restore: no SELL stop when a fresh read shows a short
+60323d12a3a5,339b2146ad43e4e9d610ee324dfee3dd87b5e0d5,2026-11-03T17:29:42-05:00,no,Sized stop restore: no SELL stop when a fresh read shows a short
+647111e6a77d,eb454e20aae0408cc7ba67f2cf69bbf1e12273c1,2026-11-02T21:13:39-05:00,no,Test: the screener decision is unchanged when the held-negative shadow takes its hit path
+647111e6a77d,f21dd5e6e42d9cb9abbfe6faba3066dde40b8519,2026-11-02T21:26:51-05:00,yes,Test: the screener decision is unchanged when the held-negative shadow takes its hit path
+6682a67a8bc9,b96c4fbc5cae026a3209514d4e81787bb74bb704,2026-11-03T20:01:18-05:00,no,Earnings consensus: log-only daily snapshot of estimates and EPS surprise history per watchlist ticker
+6682a67a8bc9,6a6684b6035a4a45a5047f44b8d468f2f07fa565,2026-11-03T21:14:58-05:00,no,Earnings consensus: log-only daily snapshot of estimates and EPS surprise history per watchlist ticker
+67a47e056e9c,acee6e718dc3e1c946357e58478ea801f589f028,2026-11-03T08:01:58-05:00,no,"tranche2_shadow: run after the cross-section, estimate from initial_dollar, stop at the first failed write, DB-key fallb"
+67a47e056e9c,e042fea59b0ef7a3aef61aa780042db31d391d39,2026-11-03T08:04:00-05:00,yes,"tranche2_shadow: run after the cross-section, estimate from initial_dollar, stop at the first failed write, DB-key fallb"
+68ccc1132d86,163ae74422e0b5bb0096ac41fc677ee2fef01206,2026-11-02T21:16:08-05:00,no,"Watchdog: the orders worker must answer a Celery ping; two missed checks in a row alert, never a self-heal"
+68ccc1132d86,917eff4b4bca7229a7bef5ef357877171c33ed37,2026-11-02T21:26:51-05:00,yes,"Watchdog: the orders worker must answer a Celery ping; two missed checks in a row alert, never a self-heal"
+69284848f624,53fe6cd11a93a18d7c94bd4e66a2b0d060df526c,2026-11-03T17:22:09-05:00,no,"Scanner: log each disqualified ticker with its reason; bar fetch, earnings check and DB log failures at WARNING"
+69284848f624,6d3bf88af006bf9dd1acbc91ae4596535695e328,2026-11-03T17:42:17-05:00,no,"Scanner: log each disqualified ticker with its reason; bar fetch, earnings check and DB log failures at WARNING"
+6ea72b37d9cb,9a73a57fb4a768eac4224eb596947936ae0052d5,2026-11-03T09:54:10-05:00,no,Backstop retry log names the real outcome: no shares held drops the stale record with an info line instead of reporting 
+6ea72b37d9cb,7e9541d0a361252165ae59715c9fb20998408586,2026-11-03T09:56:40-05:00,yes,Backstop retry log names the real outcome: no shares held drops the stale record with an info line instead of reporting 
+6efc9b4006ff,f5afe49ba8f1a78d97b7c2562b9ee4e12e8e73b9,2026-11-03T12:50:47-05:00,no,Queued restore give-up: sign-flip wording
+6efc9b4006ff,9a7aa20cd22a09acfce8f91c0a30f371dd0b0125,2026-11-03T12:53:55-05:00,no,Queued restore give-up: sign-flip wording
+6efc9b4006ff,92bca645c8e5ad47087a3a812c2d7d686233e8a1,2026-11-03T15:21:47-05:00,no,Queued restore give-up: sign-flip wording
+6efc9b4006ff,06206b45b5a7bf9f90b72b73edb81d3318bca5d7,2026-11-03T16:51:40-05:00,no,Queued restore give-up: sign-flip wording
+6efc9b4006ff,a40b12c8263e74296ef8533d8b168515a9f2efa2,2026-11-03T17:29:42-05:00,no,Queued restore give-up: sign-flip wording
+70b7bacda03f,c3943e411d8ad39122b328d105a762e28289b5c9,2026-11-03T17:41:56-05:00,no,"Screener: relevant is parsed as a bool or ""true""/""false""; anything else counts as missing and is flagged relevant_invali"
+70b7bacda03f,9ee9b9c8878e6b1f644f2812c2df2148b46d07a9,2026-11-03T17:42:17-05:00,no,"Screener: relevant is parsed as a bool or ""true""/""false""; anything else counts as missing and is flagged relevant_invali"
+727156fa70eb,f8b1ef4c8482721e8a471d583fa17beebe3fba39,2026-11-02T19:53:24-05:00,no,"Watchdog: check the orders, screen and ingestion workers"
+727156fa70eb,45cb587e92588c7eeac9576b067375cb18840058,2026-11-02T20:01:46-05:00,yes,"Watchdog: check the orders, screen and ingestion workers"
+7420b7a99944,a4b61941d0b50754c39e5efbb339f832192881d6,2026-11-03T16:27:37-05:00,no,Risk: the name cap's held read fails closed when position_stops lists a name the broker doesn't
+7420b7a99944,73c17daa6cbedc0a3a550bad520abf3c2e35b954,2026-11-03T16:51:40-05:00,no,Risk: the name cap's held read fails closed when position_stops lists a name the broker doesn't
+7420b7a99944,20470ce9ae8d16252f640b1510ff3f008f733a41,2026-11-03T17:29:42-05:00,no,Risk: the name cap's held read fails closed when position_stops lists a name the broker doesn't
+74802b164596,d9121ae53b937cbd342c667419a01fd079188a58,2026-11-03T14:41:44-05:00,no,Replay: the non-finite return-rate oracle reads the recorded paths
+74802b164596,46941fd0c6b740037d6bbf8c68b3766da6e5675f,2026-11-03T16:51:39-05:00,no,Replay: the non-finite return-rate oracle reads the recorded paths
+74802b164596,81412037807fbe9de72e18537ffecd53c57ce4fe,2026-11-03T17:29:41-05:00,no,Replay: the non-finite return-rate oracle reads the recorded paths
+7516197a0d31,e720787f308f47ab01ef2a9f5df14e806b7be6bc,2026-11-02T21:17:04-05:00,no,"helios3d: connect with HELIOS3D_DATABASE_URL when set, so it can run as its own database role"
+7516197a0d31,7320dab50e8b4f13f2e33c20153eeabe2430c364,2026-11-02T21:26:51-05:00,yes,"helios3d: connect with HELIOS3D_DATABASE_URL when set, so it can run as its own database role"
+75b91f14d4df,180456a981ce9e81fd5ca85484cbdcaaea4e6506,2026-11-02T21:12:37-05:00,no,"Pending-entry shadow: a later verdict that records no entry is noted on the ticker's existing entry (later_verdicts), an"
+75b91f14d4df,292a7f6ce2e3fecc66e402eae536051a16cbad19,2026-11-02T21:26:51-05:00,yes,"Pending-entry shadow: a later verdict that records no entry is noted on the ticker's existing entry (later_verdicts), an"
+775c7c7edd80,dc939e294913abe55013e62ca4e01128fd4cbcfe,2026-11-02T21:00:40-05:00,no,"Reconcile: re-read fresh positions once for a held ticker the fresh read leaves out; cap at the smaller read, else alert"
+775c7c7edd80,6d0807c3e67461826ae64bd17ac580f37fb7a5c5,2026-11-02T21:26:51-05:00,yes,"Reconcile: re-read fresh positions once for a held ticker the fresh read leaves out; cap at the smaller read, else alert"
+7765afffd32a,32f83ac8a12f5fa27d2591732400e0b289966193,2026-11-02T21:08:10-05:00,no,"helios3d labels: store entry_date, fwd_date, entry_close_at, code_sha and a per-label price hash; keep skipped pairs in "
+7765afffd32a,c7726ffa2dde1e835addbdf82f517f3637a3513f,2026-11-02T21:26:51-05:00,yes,"helios3d labels: store entry_date, fwd_date, entry_close_at, code_sha and a per-label price hash; keep skipped pairs in "
+7827110940ac,9378aaa8d73e6e612095445b579df8cf0de8a330,2026-11-03T14:44:08-05:00,no,"DB: snapshot, regime, ladder and scanner-candidate JSON store NaN/+-inf as null"
+7827110940ac,f915dc0d435aa3de847902663998618caddb54f5,2026-11-03T16:51:40-05:00,no,"DB: snapshot, regime, ladder and scanner-candidate JSON store NaN/+-inf as null"
+7827110940ac,d6df14efeaaed9b6f81465722a3906a968b8da68,2026-11-03T17:29:41-05:00,no,"DB: snapshot, regime, ladder and scanner-candidate JSON store NaN/+-inf as null"
+78e0f84d6a82,a2fc4982252b92bcda585396257f9236eef767cc,2026-11-02T20:26:27-05:00,no,Log-only would_pass_held_negative shadow: a negative event on a held name that the screener still drops is recorded in t
+78e0f84d6a82,ebf0932cab76e6edd45ae445732aa96be9c28552,2026-11-02T20:38:36-05:00,yes,Log-only would_pass_held_negative shadow: a negative event on a held name that the screener still drops is recorded in t
+798f2d1c9dd7,fb5568e9a5c7d778e62626885caa764a488f0c45,2026-11-03T06:55:19-05:00,no,tests: mock the broker reads that late-fill tests reached through the IBKR guard
+798f2d1c9dd7,e41e6cedbb51dad0c4c0d9be560c49382689c2e1,2026-11-03T06:56:14-05:00,yes,tests: mock the broker reads that late-fill tests reached through the IBKR guard
+7ac9c2861afc,61c2cf2ff087b380680162fb871b7596e61c57d5,2026-11-02T19:57:35-05:00,no,Tests can't publish Celery tasks; stale deferred entries can be expired without re-analysis
+7ac9c2861afc,54f807defa8f939c72c51f376b846d6cca888c6e,2026-11-02T20:01:46-05:00,yes,Tests can't publish Celery tasks; stale deferred entries can be expired without re-analysis
+7e9bc385004b,184b5ae074e112ba827b08dbfddda2a01ec77aa0,2026-11-03T11:13:20-05:00,no,"Vector store: atomic generation file, no double resume, prune waits for a pending rebuild"
+7e9bc385004b,52680787c9a806238a97c9d3814e4c3ac70aa9d4,2026-11-03T11:16:41-05:00,yes,"Vector store: atomic generation file, no double resume, prune waits for a pending rebuild"
+7ffe93fbd5ae,37a803c5110fef661dfd299271351d4427516c4e,2026-11-02T19:25:45-05:00,no,Account flat gate: report non-zero account stock value without the dollar amount
+7ffe93fbd5ae,3a08cf1b0afef2ccb9adceff3550c2603e540bf9,2026-11-02T19:28:55-05:00,yes,Account flat gate: report non-zero account stock value without the dollar amount
+81e0c5e3ae5c,53b42b26cccb806be2c9fe1e28a8027013f4c536,2026-11-03T09:58:14-05:00,no,Analyst: read a non-object catalyst as no catalyst
+81e0c5e3ae5c,89e6c3f7d62e4621e057b0d4932c0457ed3225d2,2026-11-03T09:59:43-05:00,no,Analyst: read a non-object catalyst as no catalyst
+81e0c5e3ae5c,ece060c974c1001734d773a72054aebc8d82c489,2026-11-03T10:03:39-05:00,yes,Analyst: read a non-object catalyst as no catalyst
+85936d25708c,fcb53cc8cdda74b12271b29a4cb1b45936bd6a94,2026-11-03T15:52:00-05:00,no,Screener: new_fact field in the 7B output (new factual information vs opinion/recap)
+85936d25708c,715f8a95cc20edeff2251232d81193323d87d304,2026-11-03T16:51:40-05:00,no,Screener: new_fact field in the 7B output (new factual information vs opinion/recap)
+85936d25708c,7c3dc9b54f4438c45cabbda5904fd1dd27fda46f,2026-11-03T17:29:42-05:00,no,Screener: new_fact field in the 7B output (new factual information vs opinion/recap)
+87a1ea1bceae,26458460172aa42315e64cd02a7d875002a6fb99,2026-11-03T15:34:21-05:00,no,Analyst: a bool expected_return_pct or expected_downside_pct is read as missing
+87a1ea1bceae,dbd0a5616788a876b800cc278d3fd6d6072dddc8,2026-11-03T16:51:40-05:00,no,Analyst: a bool expected_return_pct or expected_downside_pct is read as missing
+87a1ea1bceae,f2a8af5795c7dc5fd5e8a72974d5bd8b10844868,2026-11-03T17:29:42-05:00,no,Analyst: a bool expected_return_pct or expected_downside_pct is read as missing
+88dbe4be1d32,04a46dc00c5f7160a1df80e6e34f65b2d0ce46c7,2026-11-03T17:00:19-05:00,no,Crew: a routing raise after the verdict is written logs a ROUTE_ERROR row instead of retrying the analysis
+88dbe4be1d32,bc89b8fd1a21a7a0d303c71a992e691b068158ab,2026-11-03T17:42:17-05:00,no,Crew: a routing raise after the verdict is written logs a ROUTE_ERROR row instead of retrying the analysis
+89cd2c966ebc,fd945ec805be3b018d3153cdb1b323ec85045da9,2026-11-03T14:40:38-05:00,no,Replay: the return-rate step is oracle on a null that may have been a non-finite value
+89cd2c966ebc,ae1457241bec6180398f63b98a6b60d785bf649e,2026-11-03T16:51:39-05:00,no,Replay: the return-rate step is oracle on a null that may have been a non-finite value
+89cd2c966ebc,30b5ea6f4ae8137cac1da9b36820446b90e44be3,2026-11-03T17:29:41-05:00,no,Replay: the return-rate step is oracle on a null that may have been a non-finite value
+8c551ab044f8,dd0769964fdc9ccf8a61b4ed9a5b648247935ab2,2026-11-03T14:54:32-05:00,no,DB: a fundamentals raw value that isn't JSON is stored as text
+8c551ab044f8,3b6b8d7b6c2b6446e13b1a3f7c1c01ddd06f12ef,2026-11-03T16:51:40-05:00,no,DB: a fundamentals raw value that isn't JSON is stored as text
+8c551ab044f8,93a0f40c16330906a4d4ab0d314b4b2a4b7b0535,2026-11-03T17:29:42-05:00,no,DB: a fundamentals raw value that isn't JSON is stored as text
+8eb43b0739e1,6c0b568a284fbd1a65fe103108f2d0c535484394,2026-11-02T17:26:48-05:00,no,"README: outcome fields as recorded, which tables are split by environment, bucket comes from the watchlist role, current"
+8eb43b0739e1,8525873d449fbb7b598eca00e9d5a22d2933a163,2026-11-02T17:27:11-05:00,yes,"README: outcome fields as recorded, which tables are split by environment, bucket comes from the watchlist role, current"
+8f260e3b0551,ecc7d454bdcbc3aab663e64ae9b19e1788c1bdbe,2026-11-03T17:08:08-05:00,no,"Pipeline: a screener pass writes a SCREENED_IN row, and an expired, revoked or finally failed screen or analysis task wr"
+8f260e3b0551,56ff6599e532072fb55d9e5bdb2133565fb6c562,2026-11-03T17:42:17-05:00,no,"Pipeline: a screener pass writes a SCREENED_IN row, and an expired, revoked or finally failed screen or analysis task wr"
+8ff1fe49e7b7,2dcb9e07329bb385a3cdcea134d4979ee08d9b00,2026-11-03T04:27:41-05:00,no,Stop changes never replace a higher resting stop with a lower one
+8ff1fe49e7b7,678e0de5efa1cac38f797bc62056e940ba9b7574,2026-11-03T04:51:40-05:00,yes,Stop changes never replace a higher resting stop with a lower one
+9108405123c6,35e97b5524d633500f7ca6c94a0b5d16362b319a,2026-11-02T21:03:28-05:00,no,"Pending-entry shadow: record in_zone_at_verdict and the tested bar field per level; add_trigger fills on a close, as com"
+9108405123c6,a095b353e03ab11801c5b3a5bc68d881a6eff6ce,2026-11-02T21:26:51-05:00,yes,"Pending-entry shadow: record in_zone_at_verdict and the tested bar field per level; add_trigger fills on a close, as com"
+93a6db3b84b4,be7b934916c23cbb1e02918295296e2132dc6a94,2026-11-03T00:22:30-05:00,no,Stop-work failure alerts say when no stop record exists; outcome errors no longer skip the BUY stop
+93a6db3b84b4,dd4f9d2d3d6b1ece1504728632a2bfdb63469cda,2026-11-03T00:24:15-05:00,yes,Stop-work failure alerts say when no stop record exists; outcome errors no longer skip the BUY stop
+951763c80aea,ae2e1c32b27911b878dd5cfe3db8340c3e472989,2026-11-03T14:42:12-05:00,no,Analyst: a sell-alert failure before the send is recorded as error
+951763c80aea,fd8062c58997b796fc49d1b04e2111a6fdcfe106,2026-11-03T16:51:39-05:00,no,Analyst: a sell-alert failure before the send is recorded as error
+951763c80aea,fbfe228a2b4a46efd676ff40629d1db58faf0e87,2026-11-03T17:29:41-05:00,no,Analyst: a sell-alert failure before the send is recorded as error
+964905db76d4,47af012fa1b5575b0cbb9f7793affd86e78158f2,2026-11-03T16:31:51-05:00,no,"prompt_order_ab_report: live options, model tag, live timeout and num_predict per arm in the run-config check; required "
+964905db76d4,51ab888ef802844a24a952fafdafb5a703a1f6b6,2026-11-03T17:08:21-05:00,yes,"prompt_order_ab_report: live options, model tag, live timeout and num_predict per arm in the run-config check; required "
+9998fec37d53,7732c42aa1d52e0b92489eab541af02ea98dce79,2026-11-03T17:10:54-05:00,no,Regime: record how many bars the 200DMA averaged (signals.trend.ma200_bars_used); computation unchanged
+9998fec37d53,4ebd4b3ad14270ac16e89b099b55fb4ce24a9185,2026-11-03T17:42:17-05:00,no,Regime: record how many bars the 200DMA averaged (signals.trend.ma200_bars_used); computation unchanged
+9c0faae0c0d6,700fafb9063f8018ccfe73a44fd24b15dcb3c760,2026-11-02T21:14:21-05:00,no,helios3d panel timing: default repo and logs paths come from the checkout or HELIOS3D_REPO / HELIOS3D_LOGS_DIR
+9c0faae0c0d6,932dff7a1ac7e24dd7e44b1952e66dd0ec6d7dce,2026-11-02T21:26:51-05:00,yes,helios3d panel timing: default repo and logs paths come from the checkout or HELIOS3D_REPO / HELIOS3D_LOGS_DIR
+9cd4aee1f793,3e9ebc04eebea65358ccc6124215c767ffc6c5fa,2026-11-04T01:03:47-05:00,no,panel timing db read and shadow readout skip only rows whose provenance is a copy of the verdict's: rows with decision.r
+9cd4aee1f793,4c04995924f20aca20709cb5ddd5e3316a813b93,2026-11-04T01:07:04-05:00,no,panel timing db read and shadow readout skip only rows whose provenance is a copy of the verdict's: rows with decision.r
+9da19d4630e9,d8210d739acb2996ee5468e495922af9bfb1b9be,2026-11-03T16:39:35-05:00,no,"prompt_order_ab: pair status covers only the comparison arms, A2's outcome is repeat_status and never retried; noise flo"
+9da19d4630e9,0e75763bcd3471f24e931345ebc51ca91c70e29a,2026-11-03T17:08:21-05:00,yes,"prompt_order_ab: pair status covers only the comparison arms, A2's outcome is repeat_status and never retried; noise flo"
+9dca870efcbe,871617851cc4f7fbb7cfac770e83776a35791973,2026-11-02T20:27:39-05:00,no,Log-only daily-loss halt shadow: check_portfolio_drawdown logs would_halt_daily_loss once per ET day when equity is belo
+9dca870efcbe,d5443889cda931d3eebe69d9649a9352168f023b,2026-11-02T20:38:36-05:00,yes,Log-only daily-loss halt shadow: check_portfolio_drawdown logs would_halt_daily_loss once per ET day when equity is belo
+9f22e30cbaf8,740e4dc85b57b0c7038731f21e88d5e7c4998467,2026-11-03T11:33:33-05:00,no,Vector store: a resume fills the recreated collection in place instead of rebuilding it
+9f22e30cbaf8,65292fa8ed3538dcb41bebf3d274b834c29928c7,2026-11-03T11:38:35-05:00,yes,Vector store: a resume fills the recreated collection in place instead of rebuilding it
+9f5e5ddfe12c,65c60a46af9eea8dd2a49e20c08a5609dc69cba5,2026-11-02T20:52:09-05:00,no,Tests: keep db write spills out of the repo's logs/
+9f5e5ddfe12c,5a564abf8b31b0dd1c915e4abcb452434f00ec55,2026-11-02T20:52:51-05:00,yes,Tests: keep db write spills out of the repo's logs/
+9f974ba45391,b5269870dd9a364c3ec8b058b82b5c0dd56c1601,2026-11-03T02:54:32-05:00,no,Pending-entry shadow: hold the expired row until bars reach the expiry; add window_complete
+9f974ba45391,db51125572b12c3788ba2be58b1ce7660a4b1a81,2026-11-03T04:51:40-05:00,yes,Pending-entry shadow: hold the expired row until bars reach the expiry; add window_complete
+a0825a84c46e,896b2a7e0cc59e0cb3c3080fb31092abb3a6fb03,2026-11-03T19:34:30-05:00,no,Event tasks: the boot sweep keeps a running marker when its EVENT_LOST row could not be written
+a0825a84c46e,4600df17be0a8fc21bdc836e36a7af79233401cc,2026-11-03T19:37:48-05:00,no,Event tasks: the boot sweep keeps a running marker when its EVENT_LOST row could not be written
+a0825a84c46e,b6d776ea2155ca2ff03e3767c2936eaf99358a33,2026-11-03T21:14:58-05:00,no,Event tasks: the boot sweep keeps a running marker when its EVENT_LOST row could not be written
+a0b583080455,bbfc5a13b5960479bca1e001ea557ca516bfaa1d,2026-11-03T14:50:55-05:00,no,DB: fundamentals raw_json and activity extra_json store NaN/+-inf as null
+a0b583080455,d763535b3bf8e900d553c6c6ceaf5d3c689cda80,2026-11-03T16:51:40-05:00,no,DB: fundamentals raw_json and activity extra_json store NaN/+-inf as null
+a0b583080455,66de6e1fd07614f20aa3401bf7e0b9dc61ab7df5,2026-11-03T17:29:42-05:00,no,DB: fundamentals raw_json and activity extra_json store NaN/+-inf as null
+a304b016171b,0ac9a2f86c206c1023cdb65f0ccac71630f6adfb,2026-11-03T17:36:45-05:00,no,"Crew: a ROUTE_ERROR sends a Telegram, at most one per ticker per hour"
+a304b016171b,a8db1e7c993a6d34407d677523ee6f7d79a3afba,2026-11-03T17:42:17-05:00,no,"Crew: a ROUTE_ERROR sends a Telegram, at most one per ticker per hour"
+a534add45d26,4b72260d6f9d558132f00fad259b98c995726da2,2026-11-03T14:51:12-05:00,no,DB: a thesis write warns once about non-finite values
+a534add45d26,c475a9c9892dedabb3f565188e3303de7bddcc9b,2026-11-03T16:51:40-05:00,no,DB: a thesis write warns once about non-finite values
+a534add45d26,be30fb0f35eeedcf52eade558e1e7f7ac883c352,2026-11-03T17:29:42-05:00,no,DB: a thesis write warns once about non-finite values
+a78c6f64d276,fd097befa2eb90f3f52eb31390f31113c0b58ec7,2026-11-03T10:46:40-05:00,no,"helios3d.panel: account-id-only redaction on model output, account-qualified value/NAV labels, portless live URL fails c"
+a78c6f64d276,2a286ceb8b20fb1a57b21b6c49b93234f263ced7,2026-11-03T10:53:23-05:00,yes,"helios3d.panel: account-id-only redaction on model output, account-qualified value/NAV labels, portless live URL fails c"
+a7f387bc6337,6a688c789383359c24fe014e40423685b9f8e952,2026-11-03T16:33:22-05:00,no,Risk: the name cap records held_source and alerts a stop record with no broker position
+a7f387bc6337,c4e2488ab989ec820f69a5c4253c29aff59e286f,2026-11-03T16:51:40-05:00,no,Risk: the name cap records held_source and alerts a stop record with no broker position
+a7f387bc6337,7b0081e9334a41681023eb84bc455d4aa095a8f4,2026-11-03T17:29:42-05:00,no,Risk: the name cap records held_source and alerts a stop record with no broker position
+ade4ece000c6,32d284aa0671cdaf1a95fd39e81f2272b8554402,2026-11-03T10:00:58-05:00,no,"helios3d.replay: catalyst normalisation as in the analyst, rate step label for non-rate buckets"
+ade4ece000c6,228b95de2f331503c5fd3c013f3f1e8c3571641c,2026-11-03T10:03:39-05:00,yes,"helios3d.replay: catalyst normalisation as in the analyst, rate step label for non-rate buckets"
+af351d4851ee,ac5cb1fae847ea96c6ee57eeba1ec46e94d9a710,2026-11-03T12:39:34-05:00,no,"Sign-flip refusal: alert, queue the restore, and sign checks before SELL stops"
+af351d4851ee,bbc4ff478bd935a346c99b0677c921b6ee701c1c,2026-11-03T12:53:55-05:00,no,"Sign-flip refusal: alert, queue the restore, and sign checks before SELL stops"
+af351d4851ee,3377a6c4e5e178d41f23f273b99daf63e07e535a,2026-11-03T15:21:47-05:00,no,"Sign-flip refusal: alert, queue the restore, and sign checks before SELL stops"
+af351d4851ee,4d743393b02670faea50b67572f90d66457f99e0,2026-11-03T16:51:40-05:00,no,"Sign-flip refusal: alert, queue the restore, and sign checks before SELL stops"
+af351d4851ee,dc9c40a46a958eee30d89d0115b0f9a89c4cdebc,2026-11-03T17:29:42-05:00,no,"Sign-flip refusal: alert, queue the restore, and sign checks before SELL stops"
+b0edefda508d,8df8584cccad76dd5fe2dd9536159a95cc4c4353,2026-11-03T15:28:33-05:00,no,Fill time: document the receipt-time source and the relabel limit; log the source counts
+b0edefda508d,396479013bab5acc6ca1cead6660267cbc11a3ce,2026-11-03T15:29:29-05:00,yes,Fill time: document the receipt-time source and the relabel limit; log the source counts
+b0edefda508d,4b7c308f57e3269b3227edd7fe7012428878180b,2026-11-03T15:29:29-05:00,no,Fill time: document the receipt-time source and the relabel limit; log the source counts
+b0f37f0f0c09,ee761d211bc95a72c640a5f6fce5d353c27cfeb5,2026-11-03T07:40:49-05:00,no,EDGAR: keep the atom query's 5-per-form cap; log one acceptanceDateTime sample
+b0f37f0f0c09,3418088793c31b2b8bc5e250a66e25ef18f213ae,2026-11-03T07:59:47-05:00,yes,EDGAR: keep the atom query's 5-per-form cap; log one acceptanceDateTime sample
+b0fb4f5da932,4a6d6829544cea241f52d4bd623828fb298bb9a7,2026-11-03T20:08:33-05:00,no,"Earnings consensus: connect inside the writer's try, stop at a rate limit or deadline, let the soft time limit through"
+b0fb4f5da932,43dcedaf50b1fdb45ab1be4548f7c60cf90603ab,2026-11-03T21:14:58-05:00,no,"Earnings consensus: connect inside the writer's try, stop at a rate limit or deadline, let the soft time limit through"
+b1316df614b1,5a5fcccd836235eefcd6810eb556b491d7b00dca,2026-11-03T19:29:35-05:00,no,Event tasks: a screen or analysis task running when its worker is killed gets an EVENT_LOST row at the worker's next boo
+b1316df614b1,1ad9963861b5512648a207630cc8bd549ccace63,2026-11-03T19:37:48-05:00,no,Event tasks: a screen or analysis task running when its worker is killed gets an EVENT_LOST row at the worker's next boo
+b1316df614b1,a1a06afeb75b509b0b8ae72191cff3ded4f62890,2026-11-03T21:14:58-05:00,no,Event tasks: a screen or analysis task running when its worker is killed gets an EVENT_LOST row at the worker's next boo
+b193cb969e03,7dc0481240a7415c73061c20501745c509425bb1,2026-11-02T19:23:26-05:00,no,Add helios3d pure sizing limits with parity tests against RiskManager
+b193cb969e03,90f975a87e42721e6a65ef50bba3c0d6d6119604,2026-11-02T19:27:20-05:00,yes,Add helios3d pure sizing limits with parity tests against RiskManager
+b4865ccbacf2,09c54f08a0ee38a799d2ffac83907601cb430708,2026-11-03T17:29:05-05:00,no,"Backstop retry: a confirmed flat position is a no-op, logged at INFO, not a failed sale"
+b4865ccbacf2,8e88ae273b8700f1122de560d9820598ee791ccc,2026-11-03T17:29:42-05:00,no,"Backstop retry: a confirmed flat position is a no-op, logged at INFO, not a failed sale"
+b4924615a6ea,c22abde737ea44c2e9bc718fbeb624a32e8ca061,2026-11-03T14:43:12-05:00,no,DB: the thesis writers log a WARNING when they store a non-finite value as null
+b4924615a6ea,037e6d6bd01a29245eb250bbc771984a784628df,2026-11-03T16:51:40-05:00,no,DB: the thesis writers log a WARNING when they store a non-finite value as null
+b4924615a6ea,264fe0a0d1b144890d78f2f741d8a467513f54a4,2026-11-03T17:29:41-05:00,no,DB: the thesis writers log a WARNING when they store a non-finite value as null
+b8078ff8bbb5,1cc33579d8158cbdf0f771b3bf36f55b59d3fc95,2026-11-03T09:58:33-05:00,no,"Profit-target skip keyed by permId, with a throttled reminder"
+b8078ff8bbb5,b3375332676e10aa11beec140b71f49f28ba1e12,2026-11-03T10:00:05-05:00,yes,"Profit-target skip keyed by permId, with a throttled reminder"
+b81aa4572f0d,7b50dddbc1253dd6864eb09aae637cc57bb721b8,2026-11-03T21:14:13-05:00,no,Screener fallback alert: the text says a new-fact item from the last 24 h still unlocks buys
+b81aa4572f0d,9b807ba2bd3b724627b3515f0c6536f472f13c91,2026-11-03T21:14:20-05:00,no,Screener fallback alert: the text says a new-fact item from the last 24 h still unlocks buys
+b8982926fc02,a14fdedb13f4ec9090f1beba531941f529db9320,2026-11-03T21:08:34-05:00,no,Record installed library versions in the analyst verdict provenance and shadow_versions
+b8982926fc02,9dee0f7a91719491f77506c09c2642b2f6528144,2026-11-03T21:14:58-05:00,no,Record installed library versions in the analyst verdict provenance and shadow_versions
+b9ca7dba1ad6,26c4246ab8da1f5730f04f2d3d06bdbfe99cb49b,2026-11-04T00:58:11-05:00,no,Event analysis skipped for unreadable broker positions writes an EVENT_LOST row (reason positions_unavailable); still re
+b9ca7dba1ad6,e340950df02d3a27d4849feccd380278f38cfdb8,2026-11-04T01:07:04-05:00,no,Event analysis skipped for unreadable broker positions writes an EVENT_LOST row (reason positions_unavailable); still re
+ba3d601529ee,c756b2d74852686c0c94f18c22b86bb7ad3a96e4,2026-11-03T11:56:37-05:00,no,Coverage re-check: look again when the fresh read leaves the ticker out
+ba3d601529ee,f73b5ebf47856736947400c6e5f0063306558509,2026-11-03T12:53:55-05:00,no,Coverage re-check: look again when the fresh read leaves the ticker out
+ba3d601529ee,ec6efb9b543e75dc4e4d0506f35372a7403d0837,2026-11-03T15:21:47-05:00,no,Coverage re-check: look again when the fresh read leaves the ticker out
+ba3d601529ee,dff1267282063bec95962c45394fce6b9f96574e,2026-11-03T16:51:40-05:00,no,Coverage re-check: look again when the fresh read leaves the ticker out
+ba3d601529ee,717192fdbfdffb629712f398126c5e300194142e,2026-11-03T17:29:42-05:00,no,Coverage re-check: look again when the fresh read leaves the ticker out
+bc106ff6d4c8,2ece8c1acc52b69de356861cbfa8112f1d7bd260,2026-11-02T21:04:15-05:00,no,"Boot row: spill_path_default, true when the db-write spill is at the repo default path"
+bc106ff6d4c8,4fceb295b7d41febf41911b316a54381fdb4cf80,2026-11-02T21:26:51-05:00,yes,"Boot row: spill_path_default, true when the db-write spill is at the repo default path"
+bd6e35650884,7b2ba46e569d5b0616704cebd5d7807dc8581cc3,2026-11-03T16:19:57-05:00,no,Risk: the micro-tier name cap fails closed on unusable reads; swap pre-check keeps 0.5 pp slack
+bd6e35650884,ae34806be74b00dad8b3f93c12a91d55ff5021f3,2026-11-03T16:51:40-05:00,no,Risk: the micro-tier name cap fails closed on unusable reads; swap pre-check keeps 0.5 pp slack
+bd6e35650884,e6a3f12aabfba49e87b654dadd9469a40ada37f3,2026-11-03T17:29:42-05:00,no,Risk: the micro-tier name cap fails closed on unusable reads; swap pre-check keeps 0.5 pp slack
+bda3c90ff3dd,c7e770d5f23f897d58491ffa197fe94475ab82e1,2026-11-03T12:25:17-05:00,no,"Vector store: final set-aside check when resumes stop, scratch-record canary, 1% set-aside cap"
+bda3c90ff3dd,96711b4f56da88ab415bc89baafc26224a2a480b,2026-11-03T12:53:55-05:00,no,"Vector store: final set-aside check when resumes stop, scratch-record canary, 1% set-aside cap"
+bda3c90ff3dd,8a2417a11236ed11f74a201369aaf068cc42042a,2026-11-03T15:21:47-05:00,no,"Vector store: final set-aside check when resumes stop, scratch-record canary, 1% set-aside cap"
+bda3c90ff3dd,b53128a2a2845f07acb0d9a6fa032de052c92507,2026-11-03T16:51:40-05:00,no,"Vector store: final set-aside check when resumes stop, scratch-record canary, 1% set-aside cap"
+bda3c90ff3dd,1fc85dc67914c71c36621b57e070d2b4ce64365f,2026-11-03T17:29:42-05:00,no,"Vector store: final set-aside check when resumes stop, scratch-record canary, 1% set-aside cap"
+be7ead8bfd9e,1b5c7bb856d7e7563c4c843245dd7cf4afbf5d7b,2026-11-03T10:55:18-05:00,no,"helios3d.panel: LLM call error text keeps type and HTTP status, drops URL userinfo"
+be7ead8bfd9e,0198ab4afac516c72edfb73034b35342d240ee63,2026-11-03T10:55:35-05:00,yes,"helios3d.panel: LLM call error text keeps type and HTTP status, drops URL userinfo"
+bfcde8519cde,50e539ffe027cea05f2e7a92206f2f8a56a44346,2026-11-03T11:01:27-05:00,no,"Vector store: resumable batched rebuild, reopen only after another writer, activity rows"
+bfcde8519cde,24d4db5e11ab9b43d68fe2cbd9d9979e63275454,2026-11-03T11:09:14-05:00,yes,"Vector store: resumable batched rebuild, reopen only after another writer, activity rows"
+c0d143da7f19,79db3d5620b540cc3bfc06b1b4b43e82fd7527f3,2026-11-03T14:40:38-05:00,no,Analyst: record the malformed-catalyst sell alert's outcome in the decision
+c0d143da7f19,a0fe098c125b256681df3a552730cfd95efd07d6,2026-11-03T16:51:39-05:00,no,Analyst: record the malformed-catalyst sell alert's outcome in the decision
+c0d143da7f19,66ad8518c9d5f8fe17644f8b69a5550ffe1f16aa,2026-11-03T17:29:41-05:00,no,Analyst: record the malformed-catalyst sell alert's outcome in the decision
+c8c06c6fc9ac,da5a3a683d908a65395bbdf00a51545b139b25b4,2026-11-03T17:25:47-05:00,no,"Crew: cooldown, sell, catalyst-block and catalyst-gate-error rows carry the verdict's model and provenance; their write "
+c8c06c6fc9ac,590caa6a7309e87264f923a73682e0fb16754dc4,2026-11-03T17:42:17-05:00,no,"Crew: cooldown, sell, catalyst-block and catalyst-gate-error rows carry the verdict's model and provenance; their write "
+c99166247a77,e3c48f0489a2ef83b3366d8eecb2dd69e1ccf5ad,2026-11-03T04:11:42-05:00,no,Keep the stop record when the prior read fails on a possible add
+c99166247a77,41b49615bbba73c17ba13a253e8646f6987e7f6e,2026-11-03T04:51:40-05:00,yes,Keep the stop record when the prior read fails on a possible add
+ca1cd22b136d,fe16e9fabeac513e5ea14edba8864b7bb43c3d8a,2026-11-03T09:47:06-05:00,no,Vector store: write from a fresh client under the lock; rebuild keeps documents
+ca1cd22b136d,e3b8a1de268f06221d26a99fbf70bf945f3b5ab3,2026-11-03T10:34:14-05:00,no,Vector store: write from a fresh client under the lock; rebuild keeps documents
+ca1cd22b136d,2b4cd5cbe7d8ca1b236422eb35f3682a1d1d261b,2026-11-03T11:09:14-05:00,yes,Vector store: write from a fresh client under the lock; rebuild keeps documents
+ca68640c250b,bfff9cc54d2d10e8fa9daac554d20f8cf342ba04,2026-11-02T20:37:08-05:00,no,"Pending-entry shadow: prune 14 days after expiry, log superseded and evicted entries, skip entries with no expiry; daily"
+ca68640c250b,1a4ecbee02ed7b4e179739c15599bea13f5d3adb,2026-11-02T20:38:36-05:00,yes,"Pending-entry shadow: prune 14 days after expiry, log superseded and evicted entries, skip entries with no expiry; daily"
+cc446af2a15f,49886d5e30545d83b4dfdade234f63bc1d4f8878,2026-11-02T19:31:39-05:00,no,Reconcile 2b: compare the signed fresh quantity with a signed cache map while reads disagree
+cc446af2a15f,065e47983680137fe9fc44b4ae0b3e28e3ebf005,2026-11-02T19:40:33-05:00,yes,Reconcile 2b: compare the signed fresh quantity with a signed cache map while reads disagree
+cc82df6f782f,94057e566579adaa84e75f05b60b094e04fe346e,2026-11-03T14:42:44-05:00,no,Analyst: record held_review in the decision
+cc82df6f782f,2002f8eafc78215be6150a740058220fcb6cab28,2026-11-03T16:51:40-05:00,no,Analyst: record held_review in the decision
+cc82df6f782f,de08edf7ebd20c11f3c16a24ee9257462e50f701,2026-11-03T17:29:41-05:00,no,Analyst: record held_review in the decision
+cd65b659c734,84b7dd0a66c38b5eaca717745706fbaa737a6f0f,2026-11-03T15:34:48-05:00,no,Tasks: a failing pending-entries hook no longer skips the later price-refresh hooks
+cd65b659c734,19321c2878bf1397217822060aa981567a99fe43,2026-11-03T16:51:40-05:00,no,Tasks: a failing pending-entries hook no longer skips the later price-refresh hooks
+cd65b659c734,6de41a54c6b5f186aaf262b9118b8d81238adc82,2026-11-03T17:29:42-05:00,no,Tasks: a failing pending-entries hook no longer skips the later price-refresh hooks
+cde3bf13da78,c309db854fc83ae7f538f69c1ab0dba853f91648,2026-11-03T11:27:42-05:00,no,Vector store: an orphan rebuild sidecar no longer holds up prune
+cde3bf13da78,fbe7606cec14dbe607e2807bcb6464f33e80e6ce,2026-11-03T11:30:24-05:00,yes,Vector store: an orphan rebuild sidecar no longer holds up prune
+cdfcef6aa8c9,45e52d34ecf2a384ef1ad717ee551458d4cd1f70,2026-11-02T21:13:20-05:00,no,"hold_fails_entry_rule: document that it tests only the UDR clause, and record checks and conviction"
+cdfcef6aa8c9,65bdff8cd1c46f4a154226fc55a05561b57983d1,2026-11-02T21:26:51-05:00,yes,"hold_fails_entry_rule: document that it tests only the UDR clause, and record checks and conviction"
+cfb8f5e5ccd7,5d15e2fd02ca0d4c3859b466bcd4c7b669c40f73,2026-11-03T16:22:10-05:00,no,Crew: invalid new-fact gate settings alert once and fail closed; trigger records the screener digest
+cfb8f5e5ccd7,a3b82323cdcffcb4801f11717cd365a506121f52,2026-11-03T16:51:40-05:00,no,Crew: invalid new-fact gate settings alert once and fail closed; trigger records the screener digest
+cfb8f5e5ccd7,e0079f4face7559c44278fb9bc4d9a636b5884bd,2026-11-03T17:29:42-05:00,no,Crew: invalid new-fact gate settings alert once and fail closed; trigger records the screener digest
+d02917672abf,4115e88312dde512651da54e6f4c84484db3988a,2026-11-03T14:51:40-05:00,no,Test: drop the failed-state-write sell-alert case
+d02917672abf,ba501b89793d96b9c4bfdab14b340cb4abf919bd,2026-11-03T16:51:40-05:00,no,Test: drop the failed-state-write sell-alert case
+d02917672abf,1ae0321c685c310c5d2d894b6dce8779e054c8b2,2026-11-03T17:29:42-05:00,no,Test: drop the failed-state-write sell-alert case
+d195a5951a63,37150b045004b2f12421103e234e0c0158484690,2026-11-03T17:30:24-05:00,no,DB: get_all_outcomes keeps 0.0 prices and outcomes instead of reading them as None
+d195a5951a63,003f73ef13183b7ce7d7977cb3c82d9edf076e52,2026-11-03T17:42:17-05:00,no,DB: get_all_outcomes keeps 0.0 prices and outcomes instead of reading them as None
+d42461dbc348,d9c931bb33e75315dec17c31cbb5da92c57bac4c,2026-11-03T14:41:11-05:00,no,Swap pre-check: no ATR-fallback alert from its what-if sizing
+d42461dbc348,c98aed6901972e15a5031ffd31e06ea90b1031f5,2026-11-03T15:21:43-05:00,no,Swap pre-check: no ATR-fallback alert from its what-if sizing
+d42461dbc348,f7ed708fef31ac86755c319f63ab82ad3181c228,2026-11-03T16:51:40-05:00,no,Swap pre-check: no ATR-fallback alert from its what-if sizing
+d42461dbc348,df8e8dfcdd88d16fbd65b335db82cc8b7b7efa64,2026-11-03T17:29:42-05:00,no,Swap pre-check: no ATR-fallback alert from its what-if sizing
+d4c16a8d4009,ea1a043e3c6507aa1a70b8fc61ae59e2e7c107a4,2026-11-03T03:58:10-05:00,no,Place the post-fill stop even when its record write fails
+d4c16a8d4009,5e0752ae11a699188652f99469876651eed68d4b,2026-11-03T04:51:40-05:00,yes,Place the post-fill stop even when its record write fails
+d5f552ce217a,e982f217baefa7d1c9a5247bf4faeb88eb74a0f6,2026-11-03T14:40:38-05:00,no,"Decision record: keep downgraded_reason, malformed_fields and return_malformed"
+d5f552ce217a,39247f0cb38f0ff175146a7f55c269507debcede,2026-11-03T16:51:39-05:00,no,"Decision record: keep downgraded_reason, malformed_fields and return_malformed"
+d5f552ce217a,7d01a1ed0f88c7abd0a4514a0f9690abbd943e74,2026-11-03T17:29:41-05:00,no,"Decision record: keep downgraded_reason, malformed_fields and return_malformed"
+d7be8e543240,f20d6b55397efa85c95e0d98cb885334621cacd3,2026-11-03T11:22:27-05:00,no,Vector store: surface a stuck rebuild snapshot and stop retrying it after three failures
+d7be8e543240,39e84536dbd61116aeb69202529771e54832bc5b,2026-11-03T11:25:16-05:00,yes,Vector store: surface a stuck rebuild snapshot and stop retrying it after three failures
+dc50fba45c07,bcd03c58d04cbf76410e5bd70d8a8505e930c0be,2026-11-03T09:59:16-05:00,no,Analyst: read a non-string catalyst date as its text (numbers) or no date
+dc50fba45c07,9101fa71ea26227d17d4974c1446639549a23107,2026-11-03T09:59:43-05:00,no,Analyst: read a non-string catalyst date as its text (numbers) or no date
+dc50fba45c07,491ba80313b194eb9345902ec2e58c89f15bbcb7,2026-11-03T10:03:39-05:00,yes,Analyst: read a non-string catalyst date as its text (numbers) or no date
+dc80bbb44c9a,94afee8eb451899f6fa87baaf7141946180266e5,2026-11-03T14:40:38-05:00,no,DB: thesis and scanner sources JSON store NaN/+-inf as null
+dc80bbb44c9a,e37989891fa259bbff25523d5a0c902cd534e388,2026-11-03T16:51:39-05:00,no,DB: thesis and scanner sources JSON store NaN/+-inf as null
+dc80bbb44c9a,c3d0269eae6a425c1223a8f94ea8d86994f043f5,2026-11-03T17:29:41-05:00,no,DB: thesis and scanner sources JSON store NaN/+-inf as null
+df42348f147c,82f551ce9165aaa3aada66e7243c9d9ca6344f45,2026-11-03T21:05:24-05:00,no,"Earnings consensus: quarter end date per estimate row, yfinance version in parts, estimate flag counted after past dates"
+df42348f147c,1d049bd1c3c811d2d176b971e96073262e5cdac4,2026-11-03T21:14:58-05:00,no,"Earnings consensus: quarter end date per estimate row, yfinance version in parts, estimate flag counted after past dates"
+e26a1f3c6c32,118836a8d3e652ddf6b1fafaedf1826b26b98056,2026-11-02T19:33:27-05:00,no,Stop coverage fix: size stops against the smaller position read while reads disagree
+e26a1f3c6c32,213e223ddc776f4f907419a7d134103bc42953a8,2026-11-02T19:40:33-05:00,yes,Stop coverage fix: size stops against the smaller position read while reads disagree
+e4715df054ca,ac1c636e4cc1e106dfb85f90a2113a12c8824594,2026-11-03T17:16:00-05:00,no,"Crew: an event verdict on the fallback brief records brief_degraded, brief_built_at and the error class in provenance.tr"
+e4715df054ca,32e69dcfd6e0be18e6092e9aa431a9845c2914e0,2026-11-03T17:42:17-05:00,no,"Crew: an event verdict on the fallback brief records brief_degraded, brief_built_at and the error class in provenance.tr"
+e511caf77dde,bfa780687a9dcb603eb216a5393442b5d6b9e1fd,2026-11-03T03:33:14-05:00,no,Log ATR fallback stops: one activity_feed row per ticker per ET day (stage stop_atr_fallback) and a count line in the da
+e511caf77dde,b8df38a88ea78b0fd30e7621b93a768d2f91c14b,2026-11-03T04:51:40-05:00,yes,Log ATR fallback stops: one activity_feed row per ticker per ET day (stage stop_atr_fallback) and a count line in the da
+e525ca3bd4c3,b2645700ece5b2cf0bd459de5bca397e1918cdc8,2026-11-03T05:30:38-05:00,no,"Routing: a RiskManager init failure writes a ROUTE_RISK_INIT_FAILED row (exception class, would_retry shadow) and sends "
+e525ca3bd4c3,645b75b0ab4f5238a44319357ee32483fc1927f8,2026-11-03T05:35:24-05:00,yes,"Routing: a RiskManager init failure writes a ROUTE_RISK_INIT_FAILED row (exception class, would_retry shadow) and sends "
+e5593bdd6081,3c19d67828f31e1b304071d5334d00e08272bb36,2026-11-03T14:31:39-05:00,no,Log-only c6 bar shadow with forward outcomes
+e5593bdd6081,44f1260eec4f0c3764975a92c9b916be01a972ad,2026-11-03T15:21:43-05:00,no,Log-only c6 bar shadow with forward outcomes
+e5593bdd6081,ad53d0c5e8703c9635cacba43fd8a405aa3f1ace,2026-11-03T16:51:40-05:00,no,Log-only c6 bar shadow with forward outcomes
+e5593bdd6081,d56c1eadc0c7e2c412b12141eca591d327aa09a8,2026-11-03T17:29:42-05:00,no,Log-only c6 bar shadow with forward outcomes
+e5e69d973c13,81cc471bbb7979fd262bc7be6af523c0dbb908c1,2026-11-02T21:35:52-05:00,no,"Analyst: log-only udr_structural in the verdict decision record, reward-to-risk from compile_plan's structural stop to t"
+e5e69d973c13,f69a515a4fb34d22198cc21b293bdb447fafe0d6,2026-11-02T21:39:09-05:00,yes,"Analyst: log-only udr_structural in the verdict decision record, reward-to-risk from compile_plan's structural stop to t"
+e657816b7d67,960a5486ed0944d64fb445f0fdba87aaef19efed,2026-11-03T11:54:07-05:00,no,"Vector store: count every resume up front, reset on progress, dead-letter isolated failures"
+e657816b7d67,6b40fb238b838eba4f44b09e654bab056a69c172,2026-11-03T12:53:55-05:00,no,"Vector store: count every resume up front, reset on progress, dead-letter isolated failures"
+e657816b7d67,beeaf05f72eb023c955c2e5a59b938effdedde0e,2026-11-03T15:21:47-05:00,no,"Vector store: count every resume up front, reset on progress, dead-letter isolated failures"
+e657816b7d67,d0fd0d6724ee6731daee2f3566bfc4f1bcd61a87,2026-11-03T16:51:40-05:00,no,"Vector store: count every resume up front, reset on progress, dead-letter isolated failures"
+e657816b7d67,52c8bb7bb95ecfbec8c372806d76b635e20aef97,2026-11-03T17:29:42-05:00,no,"Vector store: count every resume up front, reset on progress, dead-letter isolated failures"
+e659fbc1b5e0,c437b789aff36a9f1dce37b4aac5d450ed749903,2026-11-03T17:18:49-05:00,no,"Analyst: the verdict records the Trend Template result or why there is none (not_run, insufficient_history, read_error);"
+e659fbc1b5e0,0949ebe3483061b45db23b7ea3b959479a714306,2026-11-03T17:42:17-05:00,no,"Analyst: the verdict records the Trend Template result or why there is none (not_run, insufficient_history, read_error);"
+e6fd7004f24a,ee031389e0d2e02e07f3ba2e5f6081d4ad61ce73,2026-11-03T10:37:31-05:00,no,"helios3d.panel: resolved shared-server check, retryable write failures, skip markers; scrubber account-id and value/NAV "
+e6fd7004f24a,addcab1b5d87e544a21599ff24ebda91024bc48d,2026-11-03T10:42:54-05:00,yes,"helios3d.panel: resolved shared-server check, retryable write failures, skip markers; scrubber account-id and value/NAV "
+e75cc23280b1,65bfee8244fae47caf3bebd5626bfd4b22cb8070,2026-11-03T09:11:09-05:00,no,helios3d.features: writer guard also catches UPDATE/DELETE/TRUNCATE; price_bars_asof selects id; capture refuses autocom
+e75cc23280b1,81f713ee5e561587756b7f5ae888124b9274471e,2026-11-03T09:12:05-05:00,yes,helios3d.features: writer guard also catches UPDATE/DELETE/TRUNCATE; price_bars_asof selects id; capture refuses autocom
+e8c83510ae21,3d82d180d89b30467ff11d06b91064920525944a,2026-11-03T00:55:47-05:00,no,Log-only implied-move shadow from the nearest-expiry option chain
+e8c83510ae21,31f25820e09cd2e2d123d0c20488db5a4d8c8027,2026-11-03T04:51:40-05:00,yes,Log-only implied-move shadow from the nearest-expiry option chain
+e902c0300c53,226f5af54b640a516972d2d830bb24b9d3272828,2026-11-02T17:26:48-05:00,no,"prompt_ab: point OLD_COMMIT at the rewritten hash of 31d52f8, fall back to the committed old-schema file when the commit"
+e902c0300c53,022ad61a9d5ba7264676c396ef63fe408dfefef1,2026-11-02T17:27:11-05:00,yes,"prompt_ab: point OLD_COMMIT at the rewritten hash of 31d52f8, fall back to the committed old-schema file when the commit"
+ebcf623219dc,774a879b71869fcf5a7117bc90b5b675ec87fd41,2026-11-03T05:55:49-05:00,no,trades.order_row_id: a trade row names the orders row it was booked from
+ebcf623219dc,b97f00e7916a8bf4d0829ec6b6d63905e5330f92,2026-11-03T05:59:24-05:00,yes,trades.order_row_id: a trade row names the orders row it was booked from
+eca8611f7eff,07ea1cdfbec532598e5893415b3b9eee5a74687a,2026-11-03T07:53:10-05:00,no,"EDGAR: acceptanceDateTime timezone from the data, rotation, 429 backoff, alert throttling"
+eca8611f7eff,043940070cadbb90935fcc56500d1bec1fdf4c31,2026-11-03T07:59:47-05:00,yes,"EDGAR: acceptanceDateTime timezone from the data, rotation, 429 backoff, alert throttling"
+eda0e3758ee5,d647bfb0bb1297c446b46a2d0d9b30d12c35fb37,2026-11-03T15:23:44-05:00,no,Fill time: use a live fill's receipt time; read a future execution time as UTC
+eda0e3758ee5,6ecdac1a5d2ad1e1dc8373c16cf9fa62db693ca9,2026-11-03T15:24:26-05:00,no,Fill time: use a live fill's receipt time; read a future execution time as UTC
+eda0e3758ee5,cf1fe4fcf035ffb9152e59f7438a330184997112,2026-11-03T15:28:25-05:00,yes,Fill time: use a live fill's receipt time; read a future execution time as UTC
+ee2ad91a89ac,ebe0ad562a478dfe6101e008120a4f844423a416,2026-11-03T09:14:20-05:00,no,Stop-slippage row uses the filled order's own fill and last-seen trigger; held risk-init alerts flushed on a timer; queu
+ee2ad91a89ac,1300cd718c62270d156af337048b63ff579fcdd1,2026-11-03T09:23:52-05:00,yes,Stop-slippage row uses the filled order's own fill and last-seen trigger; held risk-init alerts flushed on a timer; queu
+f6423d3ea225,71fceac9eff17aff6a275559fd11e7c7f638860b,2026-11-02T19:24:58-05:00,no,Reconcile 2b: overstop marker uses the 600 s minimum cycle spacing
+f6423d3ea225,04014fbe75cce2dd016b7b887dc7f363ec461d66,2026-11-02T19:28:55-05:00,yes,Reconcile 2b: overstop marker uses the 600 s minimum cycle spacing
+f7643b6d970b,c71bda692deb2481a8b5484a3bb4c53e194d5f77,2026-11-03T10:28:44-05:00,no,"helios3d.panel: input scrub exemptions, flattened regime signals, shared-server guard, write fallbacks, rerun bound, che"
+f7643b6d970b,72d18551f0750e0e14f2e8947d8c970f32371de2,2026-11-03T10:31:36-05:00,yes,"helios3d.panel: input scrub exemptions, flattened regime signals, shared-server guard, write fallbacks, rerun bound, che"
+f7b13208e697,5056143375d59e59c01218c524fadcee4d4dafa9,2026-11-04T01:00:45-05:00,no,"EVENT_LOST rows carry agents.analyst.shadow_versions() (code_sha, env_sha, lib_versions) as provenance. worker_shutdown "
+f7b13208e697,9b913d7824427c2decd7947f350631fed2749a41,2026-11-04T01:07:04-05:00,no,"EVENT_LOST rows carry agents.analyst.shadow_versions() (code_sha, env_sha, lib_versions) as provenance. worker_shutdown "
+f828ad907d10,153a19ed18f4186dc58c9ba86f8615f399a65a9f,2026-11-03T17:28:26-05:00,no,"Analyst: the verdict's decision and result list imputed_fields, the scores the model omitted and a default filled"
+f828ad907d10,2b473689c18ca4cb697e042b331255d4f53d89f6,2026-11-03T17:42:17-05:00,no,"Analyst: the verdict's decision and result list imputed_fields, the scores the model omitted and a default filled"
+f9da47076370,2b994a4c8e0680aecc983b03485118a28ab47127,2026-11-03T11:42:07-05:00,no,Vector store: recreated only after a real delete; count a resume attempt before reading the live collection
+f9da47076370,4741c0e187c34193d34747df270a5aad2e1fee1e,2026-11-03T11:42:21-05:00,yes,Vector store: recreated only after a real delete; count a resume attempt before reading the live collection
+fa290e3bb118,83445dc9cf8084e6a47bcbcd589c161e62d0e454,2026-11-03T16:00:49-05:00,no,Crew: an OPEN/ADD routes only with a screener new fact behind it (BUY_REQUIRES_NEW_FACT)
+fa290e3bb118,a233929c7bd25c0bdeb287bc31134ecd842558c2,2026-11-03T16:51:40-05:00,no,Crew: an OPEN/ADD routes only with a screener new fact behind it (BUY_REQUIRES_NEW_FACT)
+fa290e3bb118,d161b409c074bf9cd79205200216858b3a4823b9,2026-11-03T17:29:42-05:00,no,Crew: an OPEN/ADD routes only with a screener new fact behind it (BUY_REQUIRES_NEW_FACT)
+fa9ef6f27780,0e5df6edfb083732b8e0c598d9231a9d7a02b29c,2026-11-03T14:40:38-05:00,no,Analyst: a held name in the scan gets the malformed-catalyst sell alert
+fa9ef6f27780,74a8ea7ae3dc85d0d678fdb913ca4dc9495a43ca,2026-11-03T16:51:39-05:00,no,Analyst: a held name in the scan gets the malformed-catalyst sell alert
+fa9ef6f27780,a68b471539ba8648d47c99c5902b533181698560,2026-11-03T17:29:41-05:00,no,Analyst: a held name in the scan gets the malformed-catalyst sell alert
+faa573da3ebe,beb970d1f43fea204f82337cae7219c5aa9e9824,2026-11-03T12:06:23-05:00,no,Vector store: dead-letter only when the store takes writes; progress is records landed; resume keeps aged records
+faa573da3ebe,79e79b2025c4a390bf0342721c1d0dd5587982e3,2026-11-03T12:53:55-05:00,no,Vector store: dead-letter only when the store takes writes; progress is records landed; resume keeps aged records
+faa573da3ebe,ac227ae0a5f030235ade93f801d2ba78d986caf0,2026-11-03T15:21:47-05:00,no,Vector store: dead-letter only when the store takes writes; progress is records landed; resume keeps aged records
+faa573da3ebe,5da6507fedb7ec6fc9f4c6dbd2cf24248722653e,2026-11-03T16:51:40-05:00,no,Vector store: dead-letter only when the store takes writes; progress is records landed; resume keeps aged records
+faa573da3ebe,87ebc04de7a8d4fc701052b51ac73fbde2754933,2026-11-03T17:29:42-05:00,no,Vector store: dead-letter only when the store takes writes; progress is records landed; resume keeps aged records

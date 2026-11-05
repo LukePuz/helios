@@ -93,15 +93,31 @@ If relevant and you'd mark urgency "low" (background context, no action \
 needed), mark the event NOT relevant instead — there's no reason to pay for \
 a deep analysis of something you've just said doesn't need action.
 
+Separately from relevance, set "new_fact": true when the event itself reports \
+new factual information (an event, a filing, guidance, data, a deal, or a \
+rating change with a stated reason); false when it is opinion, a recap, a \
+listicle or roundup, or commentary on a price move.
+
 Respond ONLY with valid JSON, no other text:
 {{
   "relevant": true or false,
   "urgency": "immediate" or "eod",
   "affected_tickers": ["TICK1", "TICK2"],
   "reason": "one sentence explanation — if relevant, name the specific new fact",
-  "indirect_effects": "brief description of any second-order effects, or null"
+  "indirect_effects": "brief description of any second-order effects, or null",
+  "new_fact": true or false
 }}
 """
+
+
+def parse_new_fact(value) -> bool | None:
+    """The model's new_fact: a JSON bool, or the strings "true"/"false".
+    Anything else (missing, null, a number, other text) is None."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    return None
 
 
 def _call_ollama(prompt: str) -> str | None:
@@ -452,6 +468,65 @@ def _log_would_bypass_post_print(result: dict, event: dict, ticker: str, source:
         log.debug(f"[{ticker}] would_bypass_post_print log failed: {e}")
 
 
+# Outage alert for the keyword fallback (M275). Its new_fact is None, which
+# the crew new-fact gate counts as false, so a 7B outage blocks every
+# news-path buy. Alert only: nothing here changes a screen or a route.
+_FALLBACK_ALERT_COUNT = 3            # the 3rd fallback ...
+_FALLBACK_ALERT_WINDOW_S = 15 * 60   # ... within 15 minutes ...
+_FALLBACK_ALERT_THROTTLE_S = 3600    # ... alerts, at most once an hour
+
+
+def _note_keyword_fallback(reason: str, now=None) -> bool:
+    """Count a keyword-fallback screen (system_state, shared across worker
+    processes) and send one Telegram on the _FALLBACK_ALERT_COUNT-th within
+    _FALLBACK_ALERT_WINDOW_S, at most one per _FALLBACK_ALERT_THROTTLE_S
+    (that key is written only after a successful send). True when sent.
+    Never raises."""
+    try:
+        from datetime import datetime, timezone
+        import alerts
+        import db
+        from config import TRADING_ENV
+        now = now or datetime.now(timezone.utc)
+        times_key = f"screener_fallback_times:{TRADING_ENV}"
+        alert_key = f"screener_fallback_alert:{TRADING_ENV}"
+        try:
+            stamps = json.loads(db.get_state(times_key) or "[]")
+        except (TypeError, ValueError):
+            stamps = []
+        recent = []
+        for st in stamps if isinstance(stamps, list) else []:
+            try:
+                t = datetime.fromisoformat(st)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= (now - t).total_seconds() < _FALLBACK_ALERT_WINDOW_S:
+                recent.append(st)
+        recent.append(now.isoformat())
+        recent = recent[-_FALLBACK_ALERT_COUNT:]
+        db.set_state(times_key, json.dumps(recent))
+        if len(recent) < _FALLBACK_ALERT_COUNT:
+            return False
+        last = db.get_state(alert_key)
+        if last:
+            try:
+                if (now - datetime.fromisoformat(last)).total_seconds() < _FALLBACK_ALERT_THROTTLE_S:
+                    return False
+            except (TypeError, ValueError):
+                pass   # unreadable stamp: send
+        if alerts._send(f"Screener on the keyword fallback: {len(recent)} screens in "
+                        f"{_FALLBACK_ALERT_WINDOW_S // 60} min (last: {reason}). Its new_fact "
+                        f"is empty, so the new-fact gate blocks news-path OPEN/ADD unless a "
+                        f"new-fact item from the last 24 h exists; "
+                        f"check the 7B model server") is None:
+            return False
+        db.set_state(alert_key, now.isoformat())
+        return True
+    except Exception as e:
+        log.warning(f"screener fallback alert failed: {e}")
+        return False
+
+
 def screen(event: dict) -> dict:
     """
     Main entry point. Returns screening result dict.
@@ -484,18 +559,49 @@ def screen(event: dict) -> dict:
 
     raw = _call_ollama(prompt)
 
+    fallback_reason = None
+    urgency_missing = False
     if raw is None:
-        log.debug("Ollama unavailable — using keyword fallback for screening.")
+        log.warning("Ollama unavailable — using keyword fallback for screening.")
         result = _keyword_fallback(event, tier=tier)
+        fallback_reason = "ollama_unavailable"
     else:
         try:
             # Extract JSON from model response (model sometimes adds commentary)
             json_match = re.search(r"\{.*\}", raw, re.DOTALL)
-            result = json.loads(json_match.group()) if json_match else _keyword_fallback(event, tier=tier)
-            result["model_used"] = SCREENER_MODEL
+            if json_match:
+                result = json.loads(json_match.group())
+                result["model_used"] = SCREENER_MODEL
+            else:
+                # The fallback judged it, not the 7B: model_used says so.
+                log.warning("7B model returned no JSON — using fallback.")
+                result = _keyword_fallback(event, tier=tier)
+                fallback_reason = "no_json"
         except (json.JSONDecodeError, AttributeError):
             log.warning("7B model returned invalid JSON — using fallback.")
             result = _keyword_fallback(event, tier=tier)
+            fallback_reason = "invalid_json"
+    if fallback_reason:
+        _note_keyword_fallback(fallback_reason)   # alert only (M275)
+    # A 7B reply without urgency raised KeyError below and lost the event.
+    # "eod" is the fallback's non-urgent value and the prompt's default.
+    if result.get("urgency") is None:
+        urgency_missing = True
+        result["urgency"] = "eod"
+    # "false" (a string) read as relevant. Parsed like new_fact; anything
+    # else is dropped, which every reader takes as not relevant, as for a
+    # missing value.
+    relevant_invalid = False
+    if "relevant" in result:
+        relevant = parse_new_fact(result["relevant"])
+        if relevant is None:
+            relevant_invalid = True
+            result.pop("relevant")
+        else:
+            result["relevant"] = relevant
+    # The keyword fallback doesn't judge it: None there, as for a missing value.
+    result["new_fact"] = (parse_new_fact(result.get("new_fact"))
+                          if result.get("model_used") == SCREENER_MODEL else None)
 
     _held_negative_override(result, ticker, source, title, held)
     held_negative_shadow = _would_pass_held_negative(result, event, source, title, held)
@@ -515,19 +621,27 @@ def screen(event: dict) -> dict:
             # config.py setting, as in the analyst's provenance (M182).
             "config": {"SCREENER_MODEL": SCREENER_MODEL, "env": _config_env_record()},
             "model": result.get("model_used") or "keyword_fallback",
-            "model_digest": _screener_digest() if result.get("model_used") else None,
+            "model_digest": _screener_digest() if result.get("model_used") == SCREENER_MODEL else None,
             "prompt_template_sha": hashlib.sha256(_SCREENER_PROMPT.encode()).hexdigest()[:12],
             "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:12],
             "title_tone": title_tone(title),
+            "new_fact": result.get("new_fact"),
             "override": result.get("override"),
             "would_pass_held_negative": held_negative_shadow,
         }
+        if fallback_reason:
+            result["provenance"]["fallback_reason"] = fallback_reason
+        if urgency_missing:
+            result["provenance"]["urgency_missing"] = True
+        if relevant_invalid:
+            result["provenance"]["relevant_invalid"] = True
     except Exception as e:
         log.warning(f"screener provenance failed: {e}")
 
     log.info(
         f"Screened [{source}] {ticker}: "
-        f"relevant={result['relevant']} urgency={result['urgency']} tone={title_tone(title)} "
+        f"relevant={result.get('relevant')} urgency={result.get('urgency')} tone={title_tone(title)} "
+        f"new_fact={result.get('new_fact')} "
         f"tickers={result.get('affected_tickers',[])} "
         f"model={result.get('model_used','?')}"
     )

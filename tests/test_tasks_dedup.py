@@ -917,6 +917,19 @@ class TestNoStopTelegramEscalation:
         place.assert_called_once_with("AMD", 50.0, 150.0, market_price=200.0)
         assert "UNPROTECTED" not in mock_alert.call_args[0][0]
 
+    def test_second_naked_cycle_places_no_sell_stop_when_a_fresh_read_is_short(self):
+        """Cache long, fresh read short: no SELL stop (it would add to a
+        short); the sign-flip alert goes out instead."""
+        from datetime import datetime, timedelta, timezone
+        state = {"no_stop_since_AMD": (datetime.now(timezone.utc) - timedelta(minutes=16)).isoformat(),
+                 "no_stop_seen_AMD": (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()}
+        place = MagicMock(return_value={"order_id": 9})
+        with patch("ibkr.get_fresh_stock_positions", return_value={"AMD": -50.0}):
+            mock_alert = self._run(state, record={"stop_price": 150.0}, place=place)
+        place.assert_not_called()
+        assert any("disagree on sign" in c[0][0] for c in mock_alert.call_args_list)
+        assert state.get("reconcile_alert_sign_flip_AMD")   # reconcile's throttle key
+
     def test_first_sighting_does_not_alert_telegram(self):
         state = {}
         mock_alert = self._run(state)

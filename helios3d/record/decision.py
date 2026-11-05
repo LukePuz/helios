@@ -111,7 +111,9 @@ _DECISION_KEYS = ("model_action", "model_conviction", "model_pass_to_risk", "fin
                   "final_conviction", "final_pass_to_risk", "gates", "catalyst_check",
                   "prior_verdicts_72h", "rule_shadows", "trim_shadow", "hold_fails_entry_rule",
                   "pending_entry", "udr_check", "udr_structural", "event_burst",
-                  "nonfinite_replaced", "failure")
+                  "nonfinite_replaced", "nonfinite_paths", "failure", "downgraded_reason", "malformed_fields",
+                  "return_malformed", "malformed_sell_alert",
+                  "held_review")
 # Scalar fields of decision.model_output kept as inputs.model_scores.
 _MODEL_SCORE_KEYS = ("action", "conviction", "thesis_strength", "catalyst_quality",
                      "valuation_risk_reward", "data_completeness", "thesis_bucket",

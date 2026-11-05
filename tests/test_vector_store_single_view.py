@@ -665,3 +665,198 @@ def test_health_check_alerts_before_it_resumes(monkeypatch):
                         lambda name, **k: order.append("resume") or _report(name, "snapshot_resume"))
     tasks.check_vector_store_health.run()
     assert order[:2] == ["alert", "resume"]
+
+
+def test_a_resume_that_cannot_record_its_attempt_touches_nothing_and_alerts_at_once(monkeypatch,
+                                                                                   events):
+    import alert_policy
+    import alerts
+    import tasks
+    _pending_snapshot("news", failures=1)
+    _fake_state(monkeypatch)
+    sent = []
+    monkeypatch.setattr(alerts, "_send", lambda text, **k: sent.append(text))
+    rows = _rows(monkeypatch)
+
+    def enospc(name, state):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(vs, "_save_rebuild_state", enospc)
+    client = MagicMock()
+    monkeypatch.setattr(vs, "_get_client", lambda: client)
+    monkeypatch.setattr(vs, "_read_collection_docs", lambda name: pytest.fail("must not read"))
+    assert tasks._rebuild_and_log(vs, "news", resume_only=True) is None
+    client.delete_collection.assert_not_called()
+    assert rows[0][3]["method"] == "skipped_count_failed" and "No space" in rows[0][3]["error"]
+    [text] = sent
+    assert "rebuild blocked" in text and alert_policy.classify(text)[0] == alert_policy.CRITICAL
+    assert vs.pending_rebuilds() == ["news"]
+
+
+def test_a_resume_restores_records_past_the_prune_age(monkeypatch, events):
+    """Ageing out is prune's job, on prune's schedule: a resume puts back
+    everything in the snapshot."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    vs._write_snapshot("news", [("old", "OLD", {"timestamp": "2000-01-01T00:00:00+00:00"}),
+                                ("new", "NEW", {"timestamp": now})])
+    vs._save_rebuild_state("news", {"created": 0, "failures": 0})
+    monkeypatch.setattr(vs, "_read_collection_docs", lambda name: [])
+    monkeypatch.setattr(vs, "_count_collection_rows", lambda name: 0)
+    client, col = MagicMock(), MagicMock()
+    upserted = []
+    col.upsert.side_effect = lambda **k: upserted.extend(k["ids"])
+    col.get.side_effect = lambda ids, include: {"ids": list(ids)}
+    monkeypatch.setattr(vs, "_get_client", lambda: client)
+    monkeypatch.setattr(vs, "_get_collection", lambda name: col)
+    report = vs.rebuild_collection("news", resume_only=True)
+    assert sorted(upserted) == ["new", "old"] and "expired_dropped" not in report
+    assert report["error"] is None and vs.pending_rebuilds() == []
+
+
+def test_past_max_age_is_the_prune_test():
+    cutoff = "2026-08-05T00:00:00+00:00"
+    assert vs._past_max_age({"timestamp": "2026-08-04T23:00:00+00:00"}, cutoff)
+    assert vs._past_max_age({"date": "2026-01-01"}, cutoff)
+    assert not vs._past_max_age({"timestamp": "2026-09-01T00:00:00+00:00"}, cutoff)
+    assert not vs._past_max_age({}, cutoff) and not vs._past_max_age(None, cutoff)
+    assert not vs._past_max_age({"timestamp": 5}, cutoff)
+
+
+def test_a_dead_letter_file_is_not_a_pending_rebuild(scratch_store):
+    vs._deadletter_path("news").write_text('{"id": "x"}\n')
+    assert vs.pending_rebuilds() == []
+
+
+def test_set_aside_records_send_a_critical_alert_once_a_day(monkeypatch):
+    import alert_policy
+    import alerts
+    import tasks
+    _fake_state(monkeypatch)
+    _rows(monkeypatch)
+    sent = []
+    monkeypatch.setattr(alerts, "_send", lambda text, **k: sent.append(text))
+    report = _report("news", "snapshot_resume", 601, 600)
+    report["dead_lettered"] = 1
+    monkeypatch.setattr(vs, "rebuild_collection", lambda name, **k: dict(report))
+    tasks._rebuild_and_log(vs, "news", resume_only=True)
+    tasks._rebuild_and_log(vs, "news", resume_only=True)      # same day: throttled
+    [text] = sent
+    assert "records set aside" in text and ".rebuild-news.deadletter.jsonl" in text
+    assert alert_policy.classify(text)[0] == alert_policy.CRITICAL
+
+
+def test_an_upsert_landing_in_the_same_run_allows_the_dead_letter_without_a_canary(monkeypatch,
+                                                                                  events):
+    vs._write_snapshot("news", [("a", "A", {}), ("b", "B", {}), ("poison", "P", {})])
+    vs._save_rebuild_state("news", {"created": 0, "failures": 0, "id_failures": {"poison": 2}})
+    monkeypatch.setattr(vs, "_read_collection_docs", lambda name: [])
+    monkeypatch.setattr(vs, "_count_collection_rows", lambda name: 0)
+    monkeypatch.setattr(vs, "_canary_upsert", lambda *a: pytest.fail("no canary needed"))
+    client, col, live = MagicMock(), MagicMock(), set()
+
+    def upsert(ids, **k):
+        if "poison" in ids:
+            raise ValueError("cannot embed")
+        live.update(ids)
+    col.upsert.side_effect = upsert
+    col.get.side_effect = lambda ids, include: {"ids": [i for i in ids if i in live]}
+    monkeypatch.setattr(vs, "_get_client", lambda: client)
+    monkeypatch.setattr(vs, "_get_collection", lambda name: col)
+    report = vs.rebuild_collection("news", resume_only=True)
+    assert (report["landed"], report["dead_lettered"], report["remaining"]) == (2, 1, 0)
+    assert vs.pending_rebuilds() == []
+
+
+def test_isolated_cap_is_one_percent_between_one_and_ten():
+    assert [vs._isolated_cap(n) for n in (1, 12, 199, 600, 5000)] == [1, 1, 1, 6, 10]
+
+
+def test_a_small_collection_does_not_set_aside_more_than_its_cap(monkeypatch, events):
+    docs = [(f"d{i}", f"D{i}", {}) for i in range(10)] + [("p1", "P1", {}), ("p2", "P2", {})]
+    vs._write_snapshot("news", docs)
+    vs._save_rebuild_state("news", {"created": 0, "failures": 0,
+                                    "id_failures": {"p1": 2, "p2": 2}})
+    monkeypatch.setattr(vs, "_read_collection_docs", lambda name: [])
+    monkeypatch.setattr(vs, "_count_collection_rows", lambda name: 0)
+    monkeypatch.setattr(vs, "_canary_upsert", lambda *a: True)
+    client, col, live = MagicMock(), MagicMock(), set()
+
+    def upsert(ids, **k):
+        if {"p1", "p2"} & set(ids):
+            raise ValueError("cannot embed")
+        live.update(ids)
+    col.upsert.side_effect = upsert
+    col.get.side_effect = lambda ids, include: {"ids": [i for i in ids if i in live]}
+    monkeypatch.setattr(vs, "_get_client", lambda: client)
+    monkeypatch.setattr(vs, "_get_collection", lambda name: col)
+    report = vs.rebuild_collection("news", resume_only=True)
+    assert (report["dead_lettered"], report["remaining"]) == (0, 2)   # 2 of 12 is over the cap of 1
+    assert vs.pending_rebuilds() == ["news"]
+
+
+def test_a_canary_against_a_store_that_drops_writes_fails(monkeypatch):
+    monkeypatch.setattr(vs, "embed_many", lambda texts: [[0.1, 0.2] for _ in texts])
+    col = MagicMock()
+    col.get.side_effect = lambda ids, include: {"ids": [], "documents": []}   # nothing stored
+    assert vs._canary_upsert("news", col) is False
+    assert col.delete.call_args_list[-1].kwargs == {"ids": [vs._CANARY_ID]}   # cleaned up anyway
+
+
+def test_the_dead_letter_directory_is_fsynced_when_the_file_is_created(monkeypatch, scratch_store):
+    synced = []
+    monkeypatch.setattr(vs, "_fsync_dir", lambda path: synced.append(path))
+    vs._dead_letter("news", [("a", "A", {}, "err")])
+    vs._dead_letter("news", [("b", "B", {}, "err")])
+    assert synced == [scratch_store]
+    assert len(vs._deadletter_path("news").read_text().splitlines()) == 2
+
+
+def test_set_aside_alerts_carry_the_count_since_the_last_alert(monkeypatch):
+    import alert_policy
+    import alerts
+    import tasks
+    state = _fake_state(monkeypatch)
+    sent = []
+    monkeypatch.setattr(alerts, "_send", lambda text, **k: sent.append(text))
+    tasks._alert_set_aside(vs, "news", 1)
+    tasks._alert_set_aside(vs, "news", 2)                 # inside the day: held, added up
+    assert len(sent) == 1 and "1 since the last alert" in sent[0]
+    state.pop("vector_store_alert_dead_letter_news")      # a day later
+    tasks._alert_set_aside(vs, "news", 1)
+    assert len(sent) == 2 and "1 record(s) set aside in this run, 3 since the last alert" in sent[1]
+    assert "restore them manually" in sent[1] and "put back" not in sent[1]
+    assert alert_policy.classify(sent[1])[0] == alert_policy.CRITICAL
+
+
+def test_the_canary_deletes_a_leftover_before_writing(monkeypatch):
+    monkeypatch.setattr(vs, "embed_many", lambda texts: [[0.1, 0.2] for _ in texts])
+    calls = []
+    col = MagicMock()
+    col.delete.side_effect = lambda ids: calls.append("delete")
+    col.upsert.side_effect = lambda **k: calls.append("upsert")
+    col.get.side_effect = lambda ids, include: (
+        {"ids": [], "documents": [vs._CANARY_TEXT]} if "documents" in include else {"ids": []})
+    assert vs._canary_upsert("news", col) is True
+    assert calls == ["delete", "upsert", "delete"]
+
+
+def test_held_set_asides_are_flushed_by_the_hourly_check_once_the_throttle_allows(monkeypatch,
+                                                                                  scratch_store):
+    from datetime import datetime, timedelta, timezone
+    import alerts
+    import tasks
+    state = _fake_state(monkeypatch)
+    sent = []
+    monkeypatch.setattr(alerts, "_send", lambda text, **k: sent.append(text))
+    vs._deadletter_path("news").write_text('{"id": "x"}\n')
+    state["vector_store_dead_letter_unalerted_news"] = "2"
+    state["vector_store_alert_dead_letter_news"] = datetime.now(timezone.utc).isoformat()
+    tasks._alert_unfinished_rebuilds(vs)
+    assert sent == []                                     # throttle still running
+    state["vector_store_alert_dead_letter_news"] = (
+        datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+    tasks._alert_unfinished_rebuilds(vs)
+    assert len(sent) == 1 and "'news': 2 record(s) set aside since the last alert" in sent[0]
+    assert state["vector_store_dead_letter_unalerted_news"] == "0"
+    tasks._alert_unfinished_rebuilds(vs)
+    assert len(sent) == 1                                 # nothing held: no alert

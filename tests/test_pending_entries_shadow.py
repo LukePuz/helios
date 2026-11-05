@@ -415,3 +415,18 @@ def test_an_unparseable_expiry_writes_the_fallback_row():
     assert n == 1
     extra = act.call_args.args[4]
     assert extra["expired"] and extra["window_complete"] is False
+
+
+def test_a_failing_pending_entries_hook_does_not_skip_the_later_hooks(caplog):
+    with patch("ingestion.price_history.refresh_all_price_history", return_value=1), \
+         patch("tasks._heartbeat_ok"), patch("tasks._heartbeat_fail") as fail, \
+         patch("tasks._check_pending_entries", side_effect=RuntimeError("bars")), \
+         patch("tasks._log_plan_cross_section") as cross, \
+         patch("tasks._check_tranche2_shadow") as t2, \
+         patch("tasks._check_c6_bar_outcomes") as c6, caplog.at_level("WARNING"):
+        tasks.refresh_price_history.run()
+    cross.assert_called_once()
+    t2.assert_called_once()
+    c6.assert_called_once()
+    fail.assert_not_called()
+    assert any("pending entries hook failed: bars" in r.getMessage() for r in caplog.records)

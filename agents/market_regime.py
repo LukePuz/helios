@@ -73,6 +73,17 @@ def _regime_from_score(score: float) -> str:
 # Individual signal scorers
 # ---------------------------------------------------------------------------
 
+def _ma200_bars_used(bars: list[dict], label: str = "SPY") -> int | None:
+    """Log-only: how many closes _score_trend's "200DMA" averages (it falls
+    back to all of them below 200; the 220+30 calendar-day fetch gives about
+    170). None when the trend isn't scored (under 50 bars)."""
+    if len(bars) < 50:
+        return None
+    used = min(len(bars), 200)
+    log.info(f"{label} trend: 200DMA averaged {used} bars")
+    return used
+
+
 def _score_trend(spy_bars: list[dict]) -> tuple[int, str]:
     """
     Uses SPY bar data. Computes 50-day and 200-day SMAs.
@@ -768,7 +779,8 @@ def assess_regime() -> dict:
             # Log-only: today's date here means an in-progress bar was scored
             # (audit 10:53, A1053-2).
             "last_bar_date": spy_bars[-1].get("date") if spy_bars else None,
-            "trend":      {"score": trend_raw,      "notes": trend_notes},
+            "trend":      {"score": trend_raw,      "notes": trend_notes,
+                           "ma200_bars_used": _ma200_bars_used(spy_bars)},
             "trade_style": {"label": trade_style, "efficiency_ratio": efficiency_ratio,
                              "notes": trade_style_notes},
             "volatility": {"score": volatility_raw, "vix": vix, "notes": volatility_notes},
@@ -999,6 +1011,8 @@ def assess_sector_regime(
         f"Key risks: {'; '.join(key_risks) if key_risks else 'None'}"
     )
 
+    signals = {name: {"score": raw, "notes": notes} for name, (raw, notes) in scores_map.items()}
+    signals["trend"]["ma200_bars_used"] = _ma200_bars_used(sector_bars, sector_etf)
     packet = {
         "agent": "market_regime_sector",
         "sector_etf": sector_etf,
@@ -1011,7 +1025,7 @@ def assess_sector_regime(
         # directly by risk_manager.py rather than digging into `signals`.
         "trade_style": trade_style,
         "signals": {
-            **{name: {"score": raw, "notes": notes} for name, (raw, notes) in scores_map.items()},
+            **signals,
             "last_bar_date": sector_bars[-1].get("date") if sector_bars else None,  # A1053-2
             "breadth_freshness": breadth_freshness,
             "breadth_sample": breadth_sample,

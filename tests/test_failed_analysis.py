@@ -119,12 +119,15 @@ def test_failed_rows_are_not_verdicts_for_readers():
     with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
         db.get_recent_signals(10)
         db.recent_event_verdicts("NVDA", 15)
-    (recent_sql, recent_params), (event_sql, _) = [c.args for c in cur.execute.call_args_list]
+    (recent_sql, recent_params), (event_sql, event_params) = [c.args for c in cur.execute.call_args_list]
     assert "signal NOT IN %s" in recent_sql
     assert set(recent_params[0]) == {"ANALYST_FAILED", "NO_VERDICT", "ROUTE_NO_BROKER",
-                                     "ROUTE_RISK_INIT_FAILED"}
+                                     "ROUTE_RISK_INIT_FAILED", "ROUTE_ERROR",
+                                     "SCREENED_IN", "EVENT_LOST"}
     assert recent_params[1] == 10
-    assert "signal <> 'ANALYST_FAILED'" in event_sql
+    # Routing rows carry the verdict's trigger; they are not extra event verdicts.
+    assert "signal NOT IN %s" in event_sql
+    assert event_params[2] == db._NON_ANALYST_SIGNALS
 
 
 def test_setup_gate_corroboration_ignores_record_only_rows():

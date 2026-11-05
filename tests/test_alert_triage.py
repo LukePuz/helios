@@ -80,6 +80,18 @@ def test_a_file_recreated_on_the_same_inode_is_read_from_the_start(tmp_path, cap
     assert "2 new alert row(s)" in out
 
 
+def test_a_long_first_row_still_detects_a_recreated_file(tmp_path, capsys):
+    outbox = tmp_path / alert_triage.OUTBOX_NAME
+    outbox.write_text(json.dumps({"severity": "low", "type": "a", "title": "x" * 5000}) + "\n")
+    _run(tmp_path, capsys=capsys)
+    with open(outbox, "r+") as f:                    # same inode, new content
+        f.truncate(0)
+        f.write(json.dumps({"severity": "low", "type": "b", "title": "y" * 6000}) + "\n")
+        f.write(json.dumps({"severity": "low", "type": "c", "title": "z"}) + "\n")
+    _, out = _run(tmp_path, capsys=capsys)
+    assert "2 new alert row(s)" in out
+
+
 def test_missing_outbox_and_corrupt_cursor(tmp_path, capsys):
     (tmp_path / alert_triage.CURSOR_NAME).write_text("{bad")
     rc, out = _run(tmp_path, capsys=capsys)

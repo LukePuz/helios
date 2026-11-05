@@ -129,6 +129,18 @@ def _fetch_bars_for_atr(ticker: str, days: int = 20) -> list[dict]:
         return []
 
 
+def _cached_bars_for_atr(ticker: str, days: int = 20) -> list[dict]:
+    """_fetch_bars_for_atr's bars from the price_history cache: no broker
+    call (simulations)."""
+    try:
+        import db
+        bars = db.get_price_history(ticker, days=days + 5)
+        return [{"h": b["high"], "l": b["low"], "c": b["close"]} for b in bars]
+    except Exception as e:
+        log.debug(f"Cached ATR bar read failed for {ticker}: {e}")
+        return []
+
+
 def _compute_atr(bars: list[dict]) -> float | None:
     """True Range ATR over available bars."""
     if len(bars) < 2:
@@ -740,8 +752,26 @@ def _pt_hold_still_blocked(ticker: str) -> bool:
 # RiskManager class
 # ---------------------------------------------------------------------------
 
+class _StopRecordNoBroker(ValueError):
+    """position_stops lists the ticker but the broker positions don't."""
+
+
+# Percentage points below the micro-tier name cap that the swap pre-check
+# sizes against (would_size_after_swap).
+SWAP_NAME_CAP_SLACK_PP = 0.5
+
+
 class RiskManager:
-    def __init__(self, client: object | None = None, start_value: float | None = None):
+    simulation = False   # set per instance by __init__
+    # The ATR-fallback alert only (the swap pre-check); nothing else changes.
+    quiet_fallback_alert = False
+
+    def __init__(self, client: object | None = None, start_value: float | None = None,
+                 simulation: bool = False):
+        # simulation: a what-if sizing (swap pre-check, c6 bar shadow). The
+        # halt check only reads, ATR comes from the price_history cache and
+        # no alert is sent.
+        self.simulation = simulation
         if client is None:
             from ibkr import get_client
             client = get_client()
@@ -774,6 +804,8 @@ class RiskManager:
         back with 0 shares and crew.py would drop it with a debug log line,
         with nobody told why the system stopped opening new positions.
         Throttled to once per calendar day."""
+        if self.simulation:
+            return
         try:
             import db
             from datetime import date
@@ -844,6 +876,8 @@ class RiskManager:
             return True
 
         drawdown = (baseline - current) / baseline
+        if drawdown >= DRAWDOWN_HALT_PCT and self.simulation:
+            return True
         if drawdown >= DRAWDOWN_HALT_PCT:
             log.warning(
                 f"DRAWDOWN HALT — drawdown {drawdown:.1%} exceeds {DRAWDOWN_HALT_PCT:.0%} "
@@ -865,7 +899,7 @@ class RiskManager:
         # Ratchet the high-water mark up as the portfolio grows
         try:
             import db
-            if current > baseline:
+            if current > baseline and not self.simulation:
                 db.set_state(f"high_water_mark_{TRADING_ENV}", str(current))
         except Exception:
             pass
@@ -883,10 +917,13 @@ class RiskManager:
         regime: str,
         price: float,
         log_fallback: bool = True,
+        conviction_floor: int | None = None,
     ) -> dict:
         """
         Calculate full sizing parameters for a new position.
         log_fallback is passed to calculate_stop (False for simulations).
+        conviction_floor replaces the tier's conviction minimum (the c6 bar
+        shadow only; None, the live value, keeps the tier's).
 
         Returns a dict with:
             position_size_pct    — target allocation as % of portfolio
@@ -917,11 +954,12 @@ class RiskManager:
         # position slot on an unexecutable or marginal size; Reduced/Micro
         # require a higher bar before sizing even begins. No effect at
         # Standard (min_conviction_to_queue == today's MIN_CONVICTION_TO_QUEUE).
-        if conviction < limits["min_conviction_to_queue"]:
+        floor = limits["min_conviction_to_queue"] if conviction_floor is None else conviction_floor
+        if conviction < floor:
             return {"position_size_pct": 0, "dollar_amount": 0, "shares_initial": 0,
                     "cash_blocked": False,
                     "flags": [f"Conviction {conviction} below the {limits['tier']}-tier minimum "
-                              f"({limits['min_conviction_to_queue']}) — skipping"]}
+                              f"({floor}) — skipping"]}
 
         # Swing-trading cutover, Phase 4/5 (2026-10-11): when SETUP_GATES_
         # ENABLED and a live setup-gate classification + trade ladder exist
@@ -1364,7 +1402,7 @@ class RiskManager:
             _ATR_DIAG.error = None
         except Exception:
             pass
-        bars = _fetch_bars_for_atr(ticker, days=days)
+        bars = (_cached_bars_for_atr if self.simulation else _fetch_bars_for_atr)(ticker, days=days)
         try:
             _ATR_DIAG.last = {"ticker": ticker, "n_bars": len(bars),
                               "error": getattr(_ATR_DIAG, "error", None)}
@@ -1422,15 +1460,16 @@ class RiskManager:
                 f"[{ticker}] ATR unavailable — using flat {fallback_pct:.0%} fallback stop ${stop:.2f}. "
                 "Stop accuracy may be poor; verify manually."
             )
-            try:
-                import alerts as _al
-                _al._send(
-                    f"⚠️ ATR Fallback Stop — {ticker}\n"
-                    f"Could not compute ATR-based stop. Using flat <b>{fallback_pct:.0%}</b> stop "
-                    f"(${stop:.2f}). Verify this is appropriate before approving."
-                )
-            except Exception:
-                pass
+            if not (self.simulation or self.quiet_fallback_alert):
+                try:
+                    import alerts as _al
+                    _al._send(
+                        f"⚠️ ATR Fallback Stop — {ticker}\n"
+                        f"Could not compute ATR-based stop. Using flat <b>{fallback_pct:.0%}</b> stop "
+                        f"(${stop:.2f}). Verify this is appropriate before approving."
+                    )
+                except Exception:
+                    pass
             return stop, f"Fallback stop ({fallback_pct:.0%} below entry — ATR unavailable)"
 
         mult_lo, mult_hi = ATR_STOP_MULTIPLIER.get(bucket, (1.5, 2.0))
@@ -1747,26 +1786,136 @@ class RiskManager:
         candidates.sort(key=lambda c: (c["unrealized_pl"], c["conviction"]))
         return candidates[0]
 
-    def shares_after_concentration(self, ticker: str, sizing: dict, bucket: str) -> int:
+    def _held_value_strict(self, ticker: str) -> float:
+        """Market value held in ticker (0.0 when not held). Raises when the
+        positions can't be read or the value is NaN or not positive, unlike
+        current_position_value, which reads any error as 0. Also raises when
+        the broker list lacks the ticker but its stop record says it's held
+        (an empty portfolio right after a reconnect), or that read fails."""
+        import math
+        for p in self._client.get_all_positions():
+            if p.symbol == ticker:
+                mv = float(p.market_value)
+                if not math.isfinite(mv) or mv <= 0:
+                    raise ValueError(f"{ticker} market value unusable")
+                return mv
+        import db
+        if db.get_position_stop(ticker, strict=True) is not None:
+            raise _StopRecordNoBroker(f"{ticker} has a stop record but no broker position")
+        return 0.0
+
+    def _alert_stop_record_no_broker(self, ticker: str) -> None:
+        """One LOW Telegram per ticker per ET day when the name cap blocked a
+        buy because position_stops lists the ticker and the broker doesn't.
+        The day is stored after a successful send. None from simulations.
+        Never raises."""
+        if self.simulation or self.quiet_fallback_alert:
+            return
+        try:
+            from zoneinfo import ZoneInfo
+            import alert_policy
+            import alerts
+            import db
+            key = f"micro_cap_stop_record_alert_{ticker}"
+            today = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+            if db.get_state(key) == today:
+                return
+            if alerts._send(f"{ticker}: buy blocked by the name cap: a stop record exists but "
+                            f"the broker shows no position (stale record or a cache gap)",
+                            severity=alert_policy.LOW) is not None:
+                db.set_state(key, today)
+        except Exception as e:
+            log.warning(f"[{ticker}] name-cap stop-record alert failed: {e}")
+
+    def micro_name_cap(self, ticker: str, shares: int, price: float,
+                       slack_pp: float = 0.0) -> dict | None:
+        """Micro-tier per-name cap on a new buy: the most shares that keep
+        (held value + shares x price) / equity at or under
+        MICRO_TIER_NAME_CAP_PCT (less slack_pp percentage points: the swap
+        pre-check's margin). None when it doesn't apply (flag off, not the
+        micro tier). Never sells: a name already over the cap gets 0 new
+        shares, the holding is left alone. Fails closed: an unreadable
+        account or position, or a NaN/non-positive equity, price or market
+        value gives 0 (outcome "errored"); so a held position whose market
+        value reads 0 (no market data) blocks an ADD as errored.
+        held_source: broker (the broker list, checked against position_stops
+        when it lacks the ticker), stop_record_no_broker_position (errored,
+        alerted once a day per ticker), error (the held read failed), or None
+        (not reached). The record holds no account dollar values (equity,
+        held value): percentages, the share price and share counts only."""
+        import math
+        from config import MICRO_TIER_NAME_CAP_ENABLED, MICRO_TIER_NAME_CAP_PCT
+        if not MICRO_TIER_NAME_CAP_ENABLED:
+            return None
+        shares = max(int(shares or 0), 0)
+        rec = {"cap_pct": MICRO_TIER_NAME_CAP_PCT, "tier": None, "held_pct": None,
+               "price": price, "shares_before": shares, "max_shares": 0, "shares_after": 0,
+               "outcome": "errored", "held_source": None}
+        if slack_pp:
+            rec["slack_pp"] = slack_pp
+        try:
+            pv = float(self.portfolio_value())
+            if not math.isfinite(pv) or pv <= 0:
+                raise ValueError("equity not positive")
+            rec["tier"] = get_active_limits(pv)["tier"]
+            if rec["tier"] != "micro":
+                return None
+            px = float(price)
+            if not math.isfinite(px) or px <= 0:
+                raise ValueError("price not positive")
+            try:
+                held = self._held_value_strict(ticker)
+            except _StopRecordNoBroker:
+                rec["held_source"] = "stop_record_no_broker_position"
+                self._alert_stop_record_no_broker(ticker)
+                raise
+            except Exception:
+                rec["held_source"] = "error"
+                raise
+            rec["held_source"] = "broker"
+        except Exception as e:
+            log.error(f"[{ticker}] micro name cap: account, position or price unusable "
+                      f"({type(e).__name__}); blocking the buy")
+            return rec
+        room = pv * (MICRO_TIER_NAME_CAP_PCT - slack_pp) / 100 - held
+        max_shares = max(int(room / px + 1e-9), 0)
+        after = min(shares, max_shares)
+        rec.update(held_pct=round(held / pv * 100, 2), max_shares=max_shares, shares_after=after,
+                   outcome=("blocked" if after <= 0 < shares
+                            else "shrunk" if after < shares else "within_cap"))
+        return rec
+
+    def shares_after_concentration(self, ticker: str, sizing: dict, bucket: str,
+                                   name_cap: bool = False, price: float | None = None,
+                                   name_cap_slack_pp: float = 0.0) -> int:
         """shares_initial after the concentration caps, checked at the larger
-        of target and order weight (same rule as crew._route_to_approval)."""
+        of target and order weight (same rule as crew._route_to_approval).
+        With name_cap, then the micro-tier name cap at price (default the
+        sizing's price_at_sizing; none known gives 0 on the micro tier); its
+        record is kept on self.last_name_cap (None when it didn't apply)."""
         shares = int(sizing.get("shares_initial", 0) or 0)
         self.last_concentration_errored = False
+        self.last_name_cap = None
         if shares <= 0:
             return 0
         proposed = max(sizing.get("position_size_pct") or 0, sizing.get("order_pct") or 0)
         conc = self.check_concentration(ticker, proposed, bucket=bucket)
         # Lets a caller tell "no room" from "couldn't check" (both return 0).
         self.last_concentration_errored = conc.get("errored") is True
-        if conc.get("passed", False):
-            return shares
-        caps = [c for c in (conc.get("ai_infra_size_cap_pct"), conc.get("theme_size_cap_pct"),
-                            conc.get("moonshot_size_cap_pct")) if c is not None]
-        cap = min(caps) if caps else None
-        if cap is None or cap >= proposed:
-            return shares
-        base = (sizing.get("order_pct") or 0) or proposed
-        return min(shares, int(shares * cap / base + 1e-9)) if base > 0 else 0
+        if not conc.get("passed", False):
+            caps = [c for c in (conc.get("ai_infra_size_cap_pct"), conc.get("theme_size_cap_pct"),
+                                conc.get("moonshot_size_cap_pct")) if c is not None]
+            cap = min(caps) if caps else None
+            if cap is not None and cap < proposed:
+                base = (sizing.get("order_pct") or 0) or proposed
+                shares = min(shares, int(shares * cap / base + 1e-9)) if base > 0 else 0
+        if name_cap and shares > 0:
+            price = price or sizing.get("price_at_sizing")
+            self.last_name_cap = self.micro_name_cap(ticker, shares, float(price or 0),
+                                                     slack_pp=name_cap_slack_pp)
+            if self.last_name_cap is not None:
+                shares = self.last_name_cap["shares_after"]
+        return shares
 
     def would_size_after_swap(self, ticker: str, conviction: int, bucket: str,
                               regime: str, price: float, swap: dict) -> int:
@@ -1774,7 +1923,8 @@ class RiskManager:
         against the account with the swap's market value added to cash and
         its position removed. crew used to sell first and re-size after, so a
         buy that still sized to 0 left the holding sold and nothing bought
-        (limitations audit 2026-10-28 09:00, finding 9). Returns 0 on error."""
+        (limitations audit 2026-10-28 09:00, finding 9). Returns 0 on error.
+        No ATR-fallback alert from this pre-check."""
         from types import SimpleNamespace
         real = self._client
         try:
@@ -1803,11 +1953,17 @@ class RiskManager:
 
         try:
             sim = RiskManager(_View(), start_value=self.start_value)
+            sim.quiet_fallback_alert = True   # the real sizing after the swap still alerts
             sizing = sim.size_position(ticker, conviction, bucket, regime, price,
                                        log_fallback=False)
             # Same concentration cap crew applies after sizing (professor M36):
             # a swap whose buy the caps cut to 0 must not sell the holding.
-            return sim.shares_after_concentration(ticker, sizing, bucket)
+            # And the micro-tier name cap, as on the route after the swap,
+            # with SWAP_NAME_CAP_SLACK_PP of margin so a one-share boundary
+            # case doesn't sell a holding the post-sale cap then won't use.
+            return sim.shares_after_concentration(ticker, sizing, bucket, name_cap=True,
+                                                  price=price,
+                                                  name_cap_slack_pp=SWAP_NAME_CAP_SLACK_PP)
         except Exception as e:
             log.warning(f"[{ticker}] swap pre-check sizing failed: {e}")
             return 0
@@ -2288,7 +2444,8 @@ class RiskManager:
         to the shares no working stop covers. A restore above the record
         raises the record to match. Returns the outcome: "placed", "covered"
         (nothing uncovered), "unread" (coverage unreadable: nothing placed,
-        queued with an alert by _restore_sized_stop) or "failed" (the
+        queued with an alert by _restore_sized_stop), "sign_flip" (the
+        position reads disagree on the sign: nothing placed) or "failed" (the
         placement raised, for the caller's alert)."""
         import db
         import execution
@@ -2438,6 +2595,9 @@ class RiskManager:
                         protection = ("No previous stop was recorded, so none was put back"
                                       + ("; the restore is queued for the reconcile check"
                                          if queued else "") + ". Check the stop in TWS")
+                    elif outcome == "sign_flip":
+                        protection = ("No stop was placed: the position reads disagree on "
+                                      "whether it is long or short. Check the position in TWS")
                     elif outcome == "covered":
                         protection = ("No stop was placed: working stops already cover the "
                                       "position"

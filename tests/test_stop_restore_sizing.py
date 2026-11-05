@@ -1095,6 +1095,99 @@ def test_sized_restore_uses_the_smaller_of_cache_and_fresh_read(fresh, sized):
     place.assert_called_once_with("NVDA", sized, 90.0, market_price=100.0)
 
 
+def test_sized_restore_places_no_sell_when_the_fresh_read_is_short(caplog):
+    # cache long 7, fresh short -3: a SELL stop would add to a short
+    with patch("ibkr.get_fresh_stock_positions", return_value={"NVDA": -3.0}), \
+         caplog.at_level("ERROR", logger="execution"):
+        outcome, place = _sized_restore([MagicMock(symbol="NVDA", qty=7.0)])
+    assert outcome == "sign_flip"
+    place.assert_not_called()
+    assert any("disagree on sign" in r.getMessage() for r in caplog.records)
+
+
+def _sign_flipped(qty=7.0):
+    """Cache long, fresh read short, for the restore's position re-read."""
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="NVDA", qty=qty)]
+    return (patch("ibkr.get_client", return_value=client),
+            patch("ibkr.get_fresh_stock_positions", return_value={"NVDA": -3.0}))
+
+
+def test_sized_restore_sign_flip_alerts_once_and_queues_the_restore():
+    with patch("ibkr.get_fresh_stock_positions", return_value={"NVDA": -3.0}), \
+         patch("tasks._reconcile_alert_due", side_effect=[True, False]) as due, \
+         patch("tasks._queue_reprotect") as queue, patch("alerts._send") as send:
+        for _ in range(2):
+            outcome, place = _sized_restore([MagicMock(symbol="NVDA", qty=7.0)])
+            assert outcome == "sign_flip"
+            place.assert_not_called()
+    assert due.call_args_list == [call("sign_flip_NVDA")] * 2    # reconcile's key
+    assert _sent(send, "disagree on sign") == 1                   # throttled
+    assert queue.call_args_list == [call("NVDA", {"intent": "RESTORE"}, None)] * 2
+
+
+def test_breakeven_restore_on_a_sign_flip_alerts_and_queues():
+    a, b = _sign_flipped(qty=2.0)
+    with a, b:
+        ok, place, _, _, queue, send = _breakeven([[], []], [RuntimeError("down")])
+    assert ok is False and place.call_count == 1      # the failed move only
+    assert _sent(send, "disagree on sign") == 1
+    queue.assert_called_once_with("NVDA", {"intent": "RESTORE"}, None)
+
+
+def test_trail_restore_on_a_sign_flip_alerts_and_queues():
+    a, b = _sign_flipped()
+    with a, b:
+        r = _convert(RuntimeError("x"), [[_stp(92.0, order_type="STP")], []])
+    r["broker"].place.assert_not_called()
+    assert _sent(r["send"], "disagree on sign") == 1
+    assert call("NVDA", {"intent": "RESTORE"}, None) in r["queue"].call_args_list
+
+
+def test_ratchet_restore_on_a_sign_flip_alerts_and_queues():
+    a, b = _sign_flipped()
+    with a, b:
+        broker, _, queue, _, send, _ = _ratchet([RuntimeError("rejected")],
+                                                [[_stp(92.0, order_type="STP")], []])
+    assert broker.place.call_count == 1               # the failed ratchet only
+    assert _sent(send, "disagree on sign") == 1
+    queue.assert_called_once_with("NVDA", {"intent": "RESTORE"}, None)
+
+
+def test_queued_restore_waits_while_the_fresh_read_is_short():
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="NVDA", qty=7.0)]
+    with patch("ibkr.get_client", return_value=client), \
+         patch("ibkr.get_fresh_stock_positions", return_value={"NVDA": -3.0}), \
+         patch("tasks._reconcile_alert_due", return_value=True), \
+         patch("tasks.manage_stop_place") as place, patch("alerts._send") as send:
+        assert tasks._reprotect_after_late_sell("NVDA", {"intent": "RESTORE"}, None,
+                                                from_queue=True) is False
+    place.assert_not_called()
+    assert _sent(send, "disagree on sign") == 1
+
+
+def test_held_sale_alert_for_a_sign_flip_says_nothing_was_placed():
+    rm = _rm()
+    with patch.object(risk_manager.RiskManager, "_restore_previous_stop", return_value="sign_flip"), \
+         patch("tasks._queue_reprotect"), patch("tasks._reconcile_alert_due", return_value=True), \
+         patch("alerts._send") as send:
+        rm._hold_profit_target_sale("NVDA", 100, 90.0, None, 120.0, None, None)
+    held = [c[0][0] for c in send.call_args_list if "PROFIT-TARGET SALE HELD" in c[0][0]]
+    assert len(held) == 1 and "disagree on whether it is long or short" in held[0]
+    assert "Protection was put back" not in held[0]
+
+
+@pytest.mark.parametrize("fresh", [{}, {"NVDA": 0.0}])
+def test_sized_restore_warns_when_the_fresh_read_shows_no_position(fresh, caplog):
+    # still sized from the cache (under-cover is worse), with a warning
+    with patch("ibkr.get_fresh_stock_positions", return_value=fresh), \
+         caplog.at_level("WARNING", logger="execution"):
+        _, place = _sized_restore([MagicMock(symbol="NVDA", qty=7.0)])
+    place.assert_called_once_with("NVDA", 7.0, 90.0, market_price=100.0)
+    assert any("fresh position read shows no NVDA" in r.getMessage() for r in caplog.records)
+
+
 # ── Held PT sale with no recorded stop says nothing was put back ───────
 
 def test_held_sale_alert_without_an_old_stop_says_none_was_put_back():

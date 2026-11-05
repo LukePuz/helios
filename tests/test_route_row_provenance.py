@@ -1,6 +1,8 @@
 """Routing rows carry the verdict's model and provenance (SEF run 13)."""
 from unittest.mock import patch
 
+import pytest
+
 from agents import crew
 
 
@@ -256,7 +258,8 @@ def test_trigger_record_and_every_analyze_call_passes_one():
                                            "title": "Stifel raises MSFT", "url": "u",
                                            "timestamp": "2026-10-29T11:02"})
     assert rec == {"path": "event", "source": "analyst_ratings", "type": "pt_raise",
-                   "title": "Stifel raises MSFT", "url": "u", "published_at": "2026-10-29T11:02"}
+                   "title": "Stifel raises MSFT", "url": "u", "published_at": "2026-10-29T11:02",
+                   "event_time": "2026-10-29T11:02", "event_time_source": "timestamp"}
     assert "trigger" not in inspect.getsource(analyst._build_prompt)
     for mod in (analyst, crew):
         src = inspect.getsource(mod)
@@ -364,6 +367,232 @@ def test_log_signal_writes_null_for_nan_and_counts_it():
     assert json.loads(prov.dumps(prov.adapted)) == {"x": None}
     stored = json.loads(dec.dumps(dec.adapted))
     assert stored["udr"] is None and stored["ok"] == 1.0 and stored["nonfinite_replaced"] == 2
+    assert stored["nonfinite_paths"] == ["decision.udr", "provenance.x"]
+
+
+def test_model_output_paths_lead_past_the_cap():
+    """More than 50 non-finite values: the decision's model_output paths are
+    walked first, so they are inside the 50 kept."""
+    import json
+    from unittest.mock import MagicMock, patch
+    import db
+    conn = MagicMock()
+    cur = conn.cursor.return_value.__enter__.return_value
+    with patch("db._writer_conn", return_value=conn), patch("db._put_conn"):
+        db.log_signal("ZZZ", "OPEN", 0.8, "r",
+                      provenance={f"p{i}": float("nan") for i in range(60)},
+                      decision={"model_output": {"expected_return_pct": float("nan")}})
+    dec = cur.execute.call_args.args[1][7]
+    stored = json.loads(dec.dumps(dec.adapted))
+    assert stored["nonfinite_replaced"] == 61 and len(stored["nonfinite_paths"]) == 50
+    assert stored["nonfinite_paths"][0] == "decision.model_output.expected_return_pct"
+
+
+def test_finite_json_records_dotted_paths():
+    import db
+    replaced: list = []
+    out = db._finite_json({"model_output": {"expected_return_pct": float("nan"),
+                                            "catalyst": {"date": float("inf")}},
+                           "levels": [1.0, float("-inf")]}, replaced, "decision")
+    assert out["levels"] == [1.0, None]
+    assert replaced == ["decision.model_output.expected_return_pct",
+                        "decision.model_output.catalyst.date", "decision.levels.1"]
+    bare: list = []
+    db._finite_json(float("nan"), bare)
+    assert bare == [""]
+
+
+def test_thesis_writer_stores_null_for_nan():
+    """update_latest_thesis and the history row it writes: jsonb rejects
+    NaN/inf, so they are stored as null."""
+    import json
+    from unittest.mock import MagicMock, patch
+    import db
+    conn = MagicMock()
+    cur = conn.cursor.return_value.__enter__.return_value
+    thesis = {"expected_return_pct": float("nan"), "udr": float("inf"), "summary": "s",
+              "levels": [1.5, float("-inf")]}
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
+        db.update_latest_thesis("ZZZ", thesis)
+    stored = [p for c in cur.execute.call_args_list for p in c.args[1]
+              if hasattr(p, "adapted")]
+    assert len(stored) == 2    # latest_thesis and thesis_history.thesis_json
+    for p in stored:
+        assert json.loads(p.dumps(p.adapted)) == {"expected_return_pct": None, "udr": None,
+                                                  "summary": "s", "levels": [1.5, None]}
+        json.dumps(p.adapted, allow_nan=False)
+    assert thesis["udr"] == float("inf")     # the caller's dict is not changed
+    conn.rollback.assert_not_called()
+
+
+def test_thesis_writers_warn_once_with_the_count(caplog):
+    from unittest.mock import MagicMock, patch
+    import db
+    conn = MagicMock()
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"), \
+         caplog.at_level("WARNING"):
+        db.update_latest_thesis("ZZZ", {"a": float("nan"), "b": [float("inf"), 1.0]})
+        warned = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert warned == [
+            "[ZZZ] update_latest_thesis: 2 non-finite value(s) stored as null (a, b.0)"]
+        caplog.clear()
+        db.set_original_thesis("ZZZ", {"a": float("nan")})
+        warned = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert warned == ["[ZZZ] set_original_thesis: 1 non-finite value(s) stored as null (a)"]
+        caplog.clear()
+        db.log_thesis_history("ZZZ", {"a": float("nan")})
+        warned = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert warned == ["[ZZZ] log_thesis_history: 1 non-finite value(s) stored as null (a)"]
+        caplog.clear()
+        db.update_latest_thesis("ZZZ", {"a": 1.0})
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+def _json_params_written(call, **kw):
+    """Run a db writer against a mock connection; the Json params it wrote,
+    as parsed JSON (dumped with allow_nan=False, as jsonb would reject)."""
+    import json
+    from unittest.mock import MagicMock, patch
+    import db
+    conn = MagicMock()
+    cur = conn.cursor.return_value.__enter__.return_value
+    cur.fetchone.return_value = None
+    with patch("db._get_conn", return_value=conn), patch("db._writer_conn", return_value=conn), \
+         patch("db._put_conn"):
+        call(**kw)
+    conn.rollback.assert_not_called()
+    return [json.loads(json.dumps(p.adapted, allow_nan=False))
+            for c in cur.execute.call_args_list for p in c.args[1] if hasattr(p, "adapted")]
+
+
+def test_set_original_thesis_stores_null_for_nan():
+    import db
+    written = _json_params_written(db.set_original_thesis, ticker="ZZZ",
+                                   thesis={"udr": float("nan"), "s": "x"})
+    assert written == [{"udr": None, "s": "x"}] * 3    # original, latest, history
+
+
+_NAN_SOURCES = [{"type": "news", "score": float("nan")}, {"type": "filing", "w": float("inf")}]
+_CLEAN_SOURCES = [{"type": "news", "score": None}, {"type": "filing", "w": None}]
+
+
+def test_log_trade_outcome_sources_store_null_for_nan():
+    import db
+    written = _json_params_written(db.log_trade_outcome, approval_id=1, ticker="ZZZ",
+                                   action="OPEN", conviction=8, bucket="Compounder",
+                                   entry_price=10.0, entry_benchmark_price=500.0,
+                                   sources=_NAN_SOURCES, source_count=2)
+    assert written == [_CLEAN_SOURCES]
+
+
+def test_backfill_catalyst_outcome_sources_store_null_for_nan():
+    import db
+    written = _json_params_written(
+        db.backfill_catalyst_outcome, ticker="ZZZ", conviction=8, bucket="Compounder",
+        entry_price=10.0, entry_date=None, catalyst_event=None, catalyst_date=None,
+        catalyst_is_priced_in=None, expected_return_pct=None, expected_downside_pct=None,
+        thesis_summary=None, sources=_NAN_SOURCES, source_count=2)
+    assert written == [_CLEAN_SOURCES]
+
+
+_NAN = float("nan")
+
+
+def test_log_snapshot_stores_null_for_nan():
+    import db
+    written = _json_params_written(db.log_snapshot, total_value=1.0, cash=1.0,
+                                   positions={"ZZZ": {"pl_pct": _NAN}}, benchmark={"SPY": _NAN})
+    assert written == [{"ZZZ": {"pl_pct": None}}, {"SPY": None}]
+
+
+def test_log_regime_stores_null_for_nan():
+    import db
+    written = _json_params_written(db.log_regime, regime="Neutral", score=50.0, confidence=0.5,
+                                   signals={"vix": _NAN}, portfolio_impact={"beta": [_NAN]},
+                                   reasoning="r")
+    assert written == [{"vix": None}, {"beta": [None]}]
+
+
+def test_upsert_trade_ladder_stores_null_for_nan():
+    import db
+    written = _json_params_written(db.upsert_trade_ladder, ticker="ZZZ",
+                                   ladder={"rungs": [{"price": _NAN}],
+                                           "valuation_methods_used": [{"w": float("inf")}]})
+    assert written == [[{"price": None}], [{"w": None}]]
+
+
+def test_log_scanner_candidate_stores_null_for_nan():
+    import db
+    written = _json_params_written(
+        db.log_scanner_candidate, ticker="ZZZ", scan_type="daily", composite_score=60,
+        technical_score=1, momentum_score=1, catalyst_score=1, thesis_alignment_score=1,
+        priority="HIGH", catalyst_detail="", passed_to_analyst=True, regime_at_scan="Neutral",
+        setup_gates_detail={"rs": _NAN}, regime_detail={"score": float("-inf")})
+    assert written == [{"rs": None}, {"score": None}]
+
+
+def _strict_json_strings_written(call, **kw):
+    """Run a db writer against a mock connection (pool, writer or direct);
+    the JSON text params it wrote, parsed rejecting NaN/Infinity as jsonb does."""
+    import json
+    from unittest.mock import MagicMock, patch
+    import db
+    conn = MagicMock()
+    cur = conn.cursor.return_value.__enter__.return_value
+    with patch("db._get_conn", return_value=conn), patch("db._writer_conn", return_value=conn), \
+         patch("db._put_conn"), patch("psycopg2.connect", return_value=conn):
+        call(**kw)
+    conn.rollback.assert_not_called()
+
+    def reject(c):
+        raise ValueError(f"non-finite {c}")
+    out = []
+    for c in cur.execute.call_args_list:
+        for p in (c.args[1] if len(c.args) > 1 else ()):
+            if isinstance(p, str) and p.startswith(("{", "[")):
+                out.append(json.loads(p, parse_constant=reject))
+    return out
+
+
+def test_upsert_fundamentals_raw_stores_null_for_nan():
+    import db
+    written = _strict_json_strings_written(
+        db.upsert_fundamentals, ticker="ZZZ",
+        metrics={"market_cap": 1e9, "raw": {"pegRatio": _NAN, "beta": float("inf"), "x": 1}})
+    assert written == [{"pegRatio": None, "beta": None, "x": 1}]
+
+
+
+def test_upsert_fundamentals_raw_stores_a_non_json_value_as_text():
+    import datetime
+    import db
+    written = _strict_json_strings_written(
+        db.upsert_fundamentals, ticker="ZZZ",
+        metrics={"market_cap": 1e9, "raw": {"lastSplitDate": datetime.date(2024, 6, 10), "x": 1}})
+    assert written == [{"lastSplitDate": "2024-06-10", "x": 1}]
+
+@pytest.mark.parametrize("writer", ["log_activity", "log_boot_activity", "log_activity_direct"])
+def test_activity_extra_stores_null_for_nan(writer):
+    import db
+    kw = {"message": "m", "extra": {"pl": _NAN, "ok": 1}}
+    if writer != "log_boot_activity":
+        kw.update(stage="s", ticker="ZZZ")
+    written = _strict_json_strings_written(getattr(db, writer), **kw)
+    assert len(written) == 1 and written[0]["pl"] is None and written[0]["ok"] == 1
+
+
+@pytest.mark.parametrize("writer", ["set_original_thesis", "update_latest_thesis",
+                                    "log_thesis_history"])
+def test_a_thesis_cleaning_failure_is_logged_not_raised(writer, caplog):
+    from unittest.mock import MagicMock, patch
+    import db
+    conn = MagicMock()
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn") as put, \
+         patch("db._finite_json", side_effect=RecursionError("deep")), caplog.at_level("ERROR"):
+        getattr(db, writer)("ZZZ", {"a": 1.0})
+    conn.cursor.assert_not_called()
+    put.assert_called_once_with(conn)
+    assert any(f"{writer} failed: deep" in r.getMessage() for r in caplog.records)
 
 
 def test_udr_check_recomputes_and_flags_a_gate_disagreement():

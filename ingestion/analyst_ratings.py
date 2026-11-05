@@ -86,6 +86,7 @@ def _fetch_for_ticker(ticker: str) -> list[dict]:
             "title":  title,
             "url":    "",
             "text":   title,
+            "event_time": grade_dt.isoformat() if hasattr(grade_dt, "isoformat") else str(grade_dt),
             "_seen_keys": [(_SOURCE, item_id)],
         })
     return results

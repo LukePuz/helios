@@ -86,8 +86,31 @@ def screen_event_only(event: dict) -> dict:
             log.warning(f"[{ticker}] SCREENED_OUT signal log failed: {e}")
     else:
         log.info(f"[{ticker}] Relevant (urgency={screening.get('urgency')}) — queued for deep analysis")
+        # Log-only: a pass whose analysis later expires or fails still has a
+        # row (with EVENT_LOST from tasks.py).
+        try:
+            import db
+            prov = screening.get("provenance") or {}
+            db.log_signal(ticker, "SCREENED_IN", 0.0, str(screening.get("reason") or "")[:500],
+                          model=prov.get("model"), provenance=prov or None,
+                          decision={**event_item_fields(event),
+                                    "urgency": screening.get("urgency"),
+                                    "new_fact": screening.get("new_fact")})
+        except Exception as e:
+            log.warning(f"[{ticker}] SCREENED_IN signal log failed: {e}")
 
     return screening
+
+
+def event_item_fields(event) -> dict:
+    """The identifiers of an ingestion event for a log row: never its text."""
+    event = event if isinstance(event, dict) else {}
+    item_id = event.get("id") or event.get("url") or event.get("title")
+    return {"source": event.get("source"),
+            "title": str(event.get("title") or "")[:200] or None,
+            "url": str(event.get("url") or "")[:300] or None,
+            "item_id": str(item_id)[:300] if item_id else None,
+            "form": event.get("form") or event.get("type")}
 
 
 def deep_analyze(event: dict, screening: dict | None = None) -> dict:
@@ -116,6 +139,7 @@ def deep_analyze(event: dict, screening: dict | None = None) -> dict:
 
     # ── Assemble situation brief ──────────────────────────────────────────────
     held_as_of = None
+    brief_error = None
     try:
         from ibkr import IBKRClient
         client = IBKRClient()
@@ -137,6 +161,8 @@ def deep_analyze(event: dict, screening: dict | None = None) -> dict:
         brief = f"Event: {event.get('title', '')}\n{event.get('text', '')[:1000]}"
         positions = {}
         client = None
+        brief_error = type(e).__name__
+    brief_built_at = datetime.now(timezone.utc).isoformat()
 
     # Build a candidate-like dict from the event (for analyst interface)
     from knowledge_loader import get_watchlist_entry
@@ -150,6 +176,8 @@ def deep_analyze(event: dict, screening: dict | None = None) -> dict:
         # None when the brief failed; analyze() only coerces on a known value
         "held":            (ticker in positions) if client is not None else None,
         "held_as_of":      held_as_of if client is not None else None,   # M138
+        # The screener's read of the triggering item (None: not judged).
+        "new_fact":        (screening or {}).get("new_fact"),
     }
 
     # ── Analyze ────────────────────────────────────────────────────────────────
@@ -159,6 +187,17 @@ def deep_analyze(event: dict, screening: dict | None = None) -> dict:
         trigger = trigger_record("event", event)
         if screening and screening.get("override"):
             trigger["screen_override"] = screening["override"]   # review 4 #4
+        trigger["new_fact"] = candidate["new_fact"]
+        sprov = (screening or {}).get("provenance") or {}
+        trigger["screener_model_digest"] = sprov.get("model_digest")
+        trigger["screener_prompt_template_sha"] = sprov.get("prompt_template_sha")
+        # Why the keyword fallback judged it (None: the 7B did); M275 alert.
+        trigger["screener_fallback_reason"] = sprov.get("fallback_reason")
+        # Log-only: the fallback brief (event text only, no book or price).
+        trigger["brief_degraded"] = brief_error is not None
+        trigger["brief_built_at"] = brief_built_at
+        if brief_error:
+            trigger["brief_error"] = brief_error
         result = analyze(candidate, situation_brief=brief, regime_packet=regime,
                          trigger=trigger)
     except Exception as exc:
@@ -171,7 +210,9 @@ def deep_analyze(event: dict, screening: dict | None = None) -> dict:
 
     # ── Route to approval queue if actionable ─────────────────────────────────
     if result.get("pass_to_risk"):
-        _route_to_approval(result, regime, client)
+        _route_guarded(result, regime, client)
+    else:
+        _c6_bar_unrouted(result, regime, client)   # log-only
 
     return result
 
@@ -225,6 +266,51 @@ def _route_row_fields(result: dict, kind: str) -> dict:
         "decision": {"route_exit": kind, "verdict_action": result.get("action"),
                      "verdict_conviction": result.get("conviction")},
     }
+
+
+_ROUTE_ERROR_ALERT_WINDOW_S = 3600
+
+
+def _alert_route_error(ticker: str, error_class: str, now: datetime | None = None) -> bool:
+    """Telegram for a ROUTE_ERROR, at most one per ticker per hour (system_state
+    key written after a successful send). True when sent. Never raises."""
+    try:
+        import alerts
+        import db
+        from config import TRADING_ENV
+        now = now or datetime.now(timezone.utc)
+        key = f"route_error_alert:{TRADING_ENV}:{ticker}"
+        last = db.get_state(key)
+        if last:
+            try:
+                if (now - datetime.fromisoformat(last)).total_seconds() < _ROUTE_ERROR_ALERT_WINDOW_S:
+                    return False
+            except (TypeError, ValueError):
+                pass   # unreadable stamp: send
+        if alerts._send(f"{ticker}: routing raised {error_class} after the verdict; "
+                        f"check for a partial swap or order") is None:
+            return False
+        db.set_state(key, now.isoformat())
+        return True
+    except Exception as e:
+        log.warning(f"[{ticker}] ROUTE_ERROR alert failed: {e}")
+        return False
+
+
+def _route_guarded(result: dict, regime: dict, client) -> None:
+    """_route_to_approval for a verdict already written. A raise here used to
+    reach the Celery task, whose retry re-ran the analysis: a second verdict
+    and a second route. Now ERROR plus a ROUTE_ERROR row, and the caller
+    goes on."""
+    try:
+        _route_to_approval(result, regime, client)
+    except Exception as e:
+        ticker = result.get("ticker") or "UNKNOWN"
+        log.error(f"[{ticker}] Routing raised after the verdict was written; not retried: "
+                  f"{type(e).__name__}: {e}", exc_info=True)
+        _log_route_exit(ticker, "ROUTE_ERROR", result, f"{type(e).__name__}: {e}",
+                        {"error_class": type(e).__name__})
+        _alert_route_error(ticker, type(e).__name__)
 
 
 # Swap shadow (Luke 10-29: "sell my lowest rated one and buy the higher rated
@@ -435,7 +521,9 @@ def review_held_position(ticker: str, client, positions: dict, regime: dict,
     _capture_latest_thesis(ticker, result)
 
     if result.get("pass_to_risk"):
-        _route_to_approval(result, regime, client)
+        _route_guarded(result, regime, client)
+    else:
+        _c6_bar_unrouted(result, regime, client)   # log-only
 
     return result
 
@@ -474,7 +562,9 @@ def review_plan_level(ticker: str, kind: str, level, price: float | None) -> dic
     except Exception as e:
         log.warning(f"[{ticker}] Plan-level review: rotation cursor not updated: {e}")
     if result.get("pass_to_risk"):
-        _route_to_approval(result, regime, client)
+        _route_guarded(result, regime, client)
+    else:
+        _c6_bar_unrouted(result, regime, client)   # log-only
     return result
 
 
@@ -781,11 +871,18 @@ def process_candidates(candidates: list[dict], max_per_run: int = 5) -> list[dic
         from agents.scan_guard import alert_scan_without_broker, log_no_broker_passes
         log.warning(f"Scan ran without a broker ({broker_error}); verdicts logged, none routed")
         alert_scan_without_broker(broker_error, log_no_broker_passes(results, broker_error))
+        # The c6 shadow only enqueues (no broker call): verdicts that were
+        # not passes are sampled without a broker too.
+        for result in results:
+            if not result.get("pass_to_risk"):
+                _c6_bar_unrouted(result, regime, client)   # log-only
         return results
 
     for result in results:
         if result.get("pass_to_risk") and client:
-            _route_to_approval(result, regime, client)
+            _route_guarded(result, regime, client)
+        else:
+            _c6_bar_unrouted(result, regime, client)   # log-only
 
     return results
 
@@ -793,6 +890,27 @@ def process_candidates(candidates: list[dict], max_per_run: int = 5) -> list[dic
 # ---------------------------------------------------------------------------
 # Risk sizing + approval queue
 # ---------------------------------------------------------------------------
+
+def _c6_bar_unrouted(result: dict, regime: dict, client) -> None:
+    """c6 bar shadow (agents/c6_shadow.py) for a verdict not routed: a
+    fire-and-forget enqueue, no price or broker call here. Log-only, never
+    raises."""
+    try:
+        from agents.c6_shadow import observe_unrouted
+        observe_unrouted(result, regime)
+    except Exception as e:
+        log.warning(f"[{result.get('ticker')}] c6 bar shadow failed: {e}")
+
+
+def _c6_bar_tier_floor(result: dict, regime_str: str, price, sizing: dict) -> None:
+    """c6 bar shadow for a buy the tier floor sized to 0: a fire-and-forget
+    enqueue. Log-only, never raises."""
+    try:
+        from agents.c6_shadow import observe_tier_floor
+        observe_tier_floor(result, regime_str, price, sizing)
+    except Exception as e:
+        log.warning(f"[{result.get('ticker')}] c6 bar shadow failed: {e}")
+
 
 def _rule_shadow_average_down(ticker: str, bucket: str, trading_client) -> None:
     """Shadow check of a written rule nothing enforces: "Moonshots: never
@@ -1032,6 +1150,181 @@ def _record_risk_init_failed(ticker: str, result: dict, exc: Exception) -> None:
         log.warning(f"[{ticker}] risk-init failure record failed: {e}")
 
 
+NEW_FACT_SCOPES = ("all_buys", "news_only", "all_but_held_review_add")
+NEW_FACT_WINDOWS = {"same_run": 0, "24h": 24, "3d": 72}
+# Paths of a review of a held position (analyst.trigger_record's path).
+_HELD_REVIEW_PATHS = ("scheduled_review", "earnings_review", "plan_level_review")
+
+
+# Bad BUY_* new-fact settings already alerted in this process ("NAME=value").
+_NEW_FACT_SETTING_ALERTED: set = set()
+
+
+def _alert_bad_new_fact_setting(name: str, value, used: str) -> None:
+    """One low-severity Telegram per process per bad value. Never raises."""
+    key = f"{name}={value!r}"
+    if key in _NEW_FACT_SETTING_ALERTED:
+        return
+    _NEW_FACT_SETTING_ALERTED.add(key)
+    log.warning(f"{name} {value!r} is not a valid value; using {used}")
+    try:
+        import alert_policy
+        import alerts
+        alerts._send(f"Config: {name}={str(value)[:40]!r} is not a valid value; the buy "
+                     f"gate uses {used} (fail closed). Fix the setting in .env.",
+                     severity=alert_policy.LOW)
+    except Exception as e:
+        log.warning(f"bad-setting alert failed: {e}")
+
+
+def _new_fact_settings() -> tuple[bool, str, str]:
+    """(on, scope, window) from config, each invalid value replaced by the
+    strict choice (gate on, all_buys, same_run) and alerted once."""
+    import config
+    raw = getattr(config, "BUY_REQUIRES_NEW_FACT_RAW", "true")
+    if raw not in ("true", "false"):
+        _alert_bad_new_fact_setting("BUY_REQUIRES_NEW_FACT", raw, "true (gate on)")
+    on = bool(getattr(config, "BUY_REQUIRES_NEW_FACT", True))
+    scope = getattr(config, "BUY_NEW_FACT_SCOPE", "all_buys")
+    window = getattr(config, "BUY_NEW_FACT_WINDOW", "same_run")
+    if scope not in NEW_FACT_SCOPES:
+        _alert_bad_new_fact_setting("BUY_NEW_FACT_SCOPE", scope, "all_buys")
+        scope = "all_buys"
+    if window not in NEW_FACT_WINDOWS:
+        _alert_bad_new_fact_setting("BUY_NEW_FACT_WINDOW", window, "same_run")
+        window = "same_run"
+    return on, scope, window
+
+
+def new_fact_gate(ticker: str, action, trigger: dict | None) -> dict | None:
+    """Whether an OPEN/ADD may route under BUY_REQUIRES_NEW_FACT: the
+    screener's new_fact on the verdict's news item (trigger, the verdict's
+    provenance.trigger), per BUY_NEW_FACT_SCOPE and BUY_NEW_FACT_WINDOW.
+    None when the gate is off or the action isn't a buy. A missing new_fact
+    counts as false. An invalid setting falls back to the strict choice
+    (gate on, all_buys, same_run) and is alerted once (_new_fact_settings)."""
+    on, scope, window = _new_fact_settings()
+    if not on or action not in ("OPEN", "ADD"):
+        return None
+    trig = trigger if isinstance(trigger, dict) else {}
+    path = trig.get("path")
+    news = path == "event"
+    item = trig.get("new_fact") if news else None
+    rec = {"scope": scope, "window": window, "path": path, "news_item": news,
+           "item_new_fact": item if isinstance(item, bool) else None}
+    if (scope == "news_only" and not news) or (
+            scope == "all_but_held_review_add" and action == "ADD" and path in _HELD_REVIEW_PATHS):
+        rec.update(applies=False, passed=True, reason=f"not gated ({scope})")
+        return rec
+    rec["applies"] = True
+    if news and not isinstance(item, bool):
+        log.warning(f"[{ticker}] screener new_fact missing for the triggering item; "
+                    f"counted as false")
+        rec["item_new_fact_missing"] = True
+    if item is True:
+        rec.update(passed=True, reason="the triggering news item is a new fact")
+        return rec
+    if NEW_FACT_WINDOWS[window]:
+        import db
+        items = db.recent_new_fact_items(ticker, NEW_FACT_WINDOWS[window])
+        if items:
+            rec.update(passed=True, window_items=items,
+                       reason=f"a new-fact news item on {ticker} within {window}")
+            return rec
+        if items is None:
+            rec["window_lookup_error"] = True
+    what = ("the triggering item gave no new_fact (counted as false)" if news and item is None
+            else "the triggering item is not a new fact (opinion/recap)" if news
+            else f"a {path or 'unknown'} verdict has no news item")
+    also = ("" if window == "same_run" else
+            f"; no new-fact item on {ticker} within {window}"
+            + (" (lookup failed)" if rec.get("window_lookup_error") else ""))
+    rec.update(passed=False, reason=f"no new fact ({scope}, {window}): {what}{also}")
+    return rec
+
+
+_NEW_FACT_FALLBACK_ALERT_WINDOW_S = 3600
+
+
+def _alert_new_fact_fallback_block(ticker: str, gate: dict, trigger, now: datetime | None = None) -> bool:
+    """Telegram for a buy the new-fact gate blocked because the triggering
+    item's new_fact was missing after a keyword-fallback screen (not a real
+    false), at most one per hour (system_state key written after a successful
+    send). Alert only: the block stands. True when sent. Never raises."""
+    try:
+        reason = trigger.get("screener_fallback_reason") if isinstance(trigger, dict) else None
+        if not (reason and gate.get("item_new_fact_missing")):
+            return False
+        import alerts
+        import db
+        from config import TRADING_ENV
+        now = now or datetime.now(timezone.utc)
+        key = f"new_fact_fallback_block_alert:{TRADING_ENV}"
+        last = db.get_state(key)
+        if last:
+            try:
+                if (now - datetime.fromisoformat(last)).total_seconds() < _NEW_FACT_FALLBACK_ALERT_WINDOW_S:
+                    return False
+            except (TypeError, ValueError):
+                pass   # unreadable stamp: send
+        if alerts._send(f"{ticker}: buy blocked by the new-fact gate because the screener "
+                        f"was on the keyword fallback ({reason}), not a real new_fact=false; "
+                        f"check the 7B model server") is None:
+            return False
+        db.set_state(key, now.isoformat())
+        return True
+    except Exception as e:
+        log.warning(f"[{ticker}] new-fact fallback alert failed: {e}")
+        return False
+
+
+def _c6_bar_no_new_fact(result: dict, regime_str: str) -> None:
+    """c6 bar shadow for a buy the new-fact gate stopped before sizing (where
+    the tier floor would have been checked): a fire-and-forget enqueue.
+    Log-only, never raises."""
+    try:
+        from agents.c6_shadow import observe_new_fact_block
+        observe_new_fact_block(result, regime_str)
+    except Exception as e:
+        log.warning(f"[{result.get('ticker')}] c6 bar shadow failed: {e}")
+
+
+def _apply_micro_name_cap(rm, ticker: str, sizing: dict, price: float, result: dict) -> bool:
+    """Micro-tier per-name cap on an OPEN/ADD (RiskManager.micro_name_cap):
+    cuts sizing in place and records the decision in sizing["micro_name_cap"].
+    True when it leaves 0 shares; then a ROUTE_MICRO_NAME_CAP row is written
+    and the caller stops. Existing holdings are never sold."""
+    rec = rm.micro_name_cap(ticker, sizing["shares_initial"], price)
+    if rec is None:            # flag off or not the micro tier
+        return False
+    sizing["micro_name_cap"] = rec
+    old = sizing["shares_initial"]
+    if rec["shares_after"] >= old:
+        return False
+    if rec["shares_after"] <= 0:
+        reason = ("micro-tier name cap: account, position or price unusable, buy blocked"
+                  if rec["outcome"] == "errored" else
+                  f"micro-tier name cap {rec['cap_pct']:g}%: {ticker} held {rec['held_pct']}% of "
+                  f"equity; 1 share at ${price:,.2f} would take it over")
+        sizing["flags"].append(reason)
+        log.info(f"[{ticker}] Entry blocked: {reason}")
+        _log_route_exit(ticker, "ROUTE_MICRO_NAME_CAP", result, reason,
+                        decision_extra={"micro_name_cap": rec})
+        return True
+    new = rec["shares_after"]
+    sizing["shares_initial"] = new
+    sizing["initial_dollar"] = round(new * price, 2)
+    if sizing.get("order_pct"):
+        sizing["order_pct"] = round(sizing["order_pct"] * new / old, 4)
+    if rec.get("held_pct") is not None:
+        headroom = max(0.0, (rec["cap_pct"] - rec["held_pct"]) / 100)
+        sizing["position_size_pct"] = round(min(sizing["position_size_pct"], headroom), 4)
+    sizing["flags"].append(f"Cut from {old} to {new} shares by the micro-tier "
+                           f"{rec['cap_pct']:g}% name cap")
+    log.info(f"[{ticker}] Micro-tier name cap: {old} -> {new} shares")
+    return False
+
+
 def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
     """
     Run risk sizing on an analyst recommendation and auto-execute it (paper
@@ -1082,9 +1375,10 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
             try:
                 db.log_signal(ticker, "COOLDOWN_SKIPPED", conviction / 10.0,
                               f"Within {REBUY_COOLDOWN_HOURS}h of prior approved buy "
-                              f"at conviction {prior['conviction']}/10")
-            except Exception:
-                pass
+                              f"at conviction {prior['conviction']}/10",
+                              **_route_row_fields(result, "COOLDOWN_SKIPPED"))
+            except Exception as e:
+                log.warning(f"[{ticker}] COOLDOWN_SKIPPED signal log failed: {e}")
             return
 
     if action in ("TRIM", "EXIT"):
@@ -1101,9 +1395,10 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
             log.warning(f"[{ticker}] {action} recommended but broker positions unreadable — not sold")
             try:
                 db.log_signal(ticker, "SELL_POSITION_UNREADABLE", conviction / 10.0,
-                              result.get("reasoning", "")[:500])
-            except Exception:
-                pass
+                              result.get("reasoning", "")[:500],
+                              **_route_row_fields(result, "SELL_POSITION_UNREADABLE"))
+            except Exception as e:
+                log.warning(f"[{ticker}] SELL_POSITION_UNREADABLE signal log failed: {e}")
             try:
                 import alerts
                 alerts._send(f"⚠️ SELL NOT SENT — {ticker}\nThe model recommended {action}, but broker "
@@ -1118,9 +1413,10 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
             log.info(f"[{ticker}] {action} recommended but no position held — signal logged only")
             try:
                 db.log_signal(ticker, "SELL_NO_POSITION", conviction / 10.0,
-                              result.get("reasoning", "")[:500])
-            except Exception:
-                pass
+                              result.get("reasoning", "")[:500],
+                              **_route_row_fields(result, "SELL_NO_POSITION"))
+            except Exception as e:
+                log.warning(f"[{ticker}] SELL_NO_POSITION signal log failed: {e}")
             return
 
         try:
@@ -1154,7 +1450,11 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
                 if _feed_emit:
                     _feed_emit("risk", ticker, f"Blocked by catalyst gate — {reason}", "alert")
                 try:
-                    db.log_signal(ticker, "CATALYST_BLOCKED", 0.0, reason)
+                    db.log_signal(ticker, "CATALYST_BLOCKED", 0.0, reason,
+                                  **_route_row_fields(result, "CATALYST_BLOCKED"))
+                except Exception as e:
+                    log.warning(f"[{ticker}] CATALYST_BLOCKED signal log failed: {e}")
+                try:
                     alert_module._send(
                         f"CATALYST BLOCKED - {ticker}\n"
                         f"{reason}\n"
@@ -1168,9 +1468,10 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
             # call), but leaves a countable record (audit 16:53, A1653-1).
             log.error(f"[{ticker}] Catalyst gate skipped after an error: {e}")
             try:
-                db.log_signal(ticker, "CATALYST_GATE_ERROR", 0.0, str(e)[:500])
-            except Exception:
-                pass
+                db.log_signal(ticker, "CATALYST_GATE_ERROR", 0.0, str(e)[:500],
+                              **_route_row_fields(result, "CATALYST_GATE_ERROR"))
+            except Exception as log_error:
+                log.warning(f"[{ticker}] CATALYST_GATE_ERROR signal log failed: {log_error}")
 
         # Earnings blackout (2026-10-27, limitations audit). With 1-share buys
         # live, a stop 1.75x ATR away is no protection against an earnings
@@ -1195,8 +1496,23 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
             try:
                 db.log_signal(ticker, "EARNINGS_BLOCKED", conviction / 10.0, reason,
                               **_route_row_fields(result, "EARNINGS_BLOCKED"))
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning(f"[{ticker}] EARNINGS_BLOCKED signal log failed: {e}")
+            return
+
+        # New-fact gate: before sizing, so a swap never sells for a buy it blocks.
+        prov = result.get("provenance")
+        new_fact = new_fact_gate(ticker, action,
+                                 prov.get("trigger") if isinstance(prov, dict) else None)
+        if new_fact is not None and not new_fact["passed"]:
+            log.info(f"[{ticker}] Entry blocked: {new_fact['reason']}")
+            if _feed_emit:
+                _feed_emit("risk", ticker, f"Blocked — {new_fact['reason']}", "info")
+            _log_route_exit(ticker, "ROUTE_NO_NEW_FACT", result, new_fact["reason"],
+                            decision_extra={"new_fact_gate": new_fact})
+            _c6_bar_no_new_fact(result, regime_str)   # log-only
+            _alert_new_fact_fallback_block(            # alert only (M275)
+                ticker, new_fact, prov.get("trigger") if isinstance(prov, dict) else None)
             return
 
         try:
@@ -1217,6 +1533,7 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
         sizing = rm.size_position(ticker, conviction, bucket, regime_str, price)
         sizing["price_at_sizing"] = price
         _attach_shadows(sizing, ticker, result, price)
+        swap_sold = None   # the holding a swap sold for this buy, if any
         if sizing.get("shares_initial", 0) <= 0:
             # 2026-08-13: if this is specifically a cash shortage (not a
             # halt, not "already at target," not conviction too low for the
@@ -1299,6 +1616,7 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
                         # Re-size once the sale shows in cash: IBKR updates
                         # TotalCashValue late, and re-sizing at once could leave
                         # the holding sold and the buy at 0 (A1031-1253-3).
+                        swap_sold = swap["ticker"]
                         _wait_for_swap_cash(rm, cash_before, sell_result, ticker)
                         sizing = rm.size_position(ticker, conviction, bucket, regime_str, price)
                         sizing["price_at_sizing"] = price
@@ -1322,6 +1640,7 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
                 log.info(f"[{ticker}] Risk sizing returned 0 shares: {flags}")
                 _log_route_exit(ticker, "ROUTE_ZERO_SHARES", result, "; ".join(flags))
                 _shadow_swap(rm, ticker, conviction, sizing, result)
+                _c6_bar_tier_floor(result, regime_str, price, sizing)   # log-only
                 return
 
         # Concentration check. position_size_pct is the remaining target; the
@@ -1381,6 +1700,21 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
             log.info(f"[{ticker}] Correlation adjustment: reducing size 25% ({corr['note']})")
             sizing["shares_initial"] = max(1, int(sizing["shares_initial"] * 0.75))
             sizing["initial_dollar"] = round(sizing["initial_dollar"] * 0.75, 2)
+
+        # Last, so it bounds the final order (after the swap's re-size too).
+        if _apply_micro_name_cap(rm, ticker, sizing, price, result):
+            if swap_sold:
+                try:
+                    import alerts as alert_module
+                    alert_module._send(
+                        f"⚠️ SWAP INCOMPLETE — sold {swap_sold} to fund <b>{ticker}</b>, "
+                        f"but the micro-tier name cap leaves 0 shares. The cash is "
+                        f"free; the next {ticker} analysis can use it.")
+                except Exception:
+                    pass
+            return
+        if new_fact is not None:
+            sizing["new_fact_gate"] = new_fact
 
         entry_strategy = (
             f"{sizing['initial_entry_pct']:.0%} initial ({sizing['shares_initial']} shares @ ~${price:.2f}). "

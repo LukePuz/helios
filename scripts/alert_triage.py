@@ -57,28 +57,29 @@ def save_cursor(path: Path, cursor: dict) -> None:
 
 
 def _head(path: Path) -> str | None:
-    """Fingerprint of the file's first complete line, or None if it has none
-    yet. Tells a recreated file from the old one when the filesystem hands
+    """Fingerprint of the file's first complete line (its first 4 KB when
+    the line is longer), or None while that row is still being written. Tells a recreated file from the old one when the filesystem hands
     the freed inode straight back."""
     try:
         with open(path, "rb") as f:
             first = f.readline(4096)
     except OSError:
         return None
-    if not first.endswith(b"\n"):
-        return None
+    if not first.endswith(b"\n") and len(first) < 4096:
+        return None                                  # first row still being written
     return hashlib.sha1(first).hexdigest()
 
 
-def read_new_rows(outbox: Path, cursor: dict, from_start: bool = False) -> tuple[list[dict], int, int | None]:
-    """(rows, new_offset, inode). Starts over when the file was rotated
+def read_new_rows(outbox: Path, cursor: dict,
+                  from_start: bool = False) -> tuple[list[dict], int, int | None, str | None]:
+    """(rows, new_offset, inode, head), all describing the same file. Starts over when the file was rotated
     (other inode, or the same inode with a different first line) or truncated
     (shorter than the saved offset). Stops at the last complete line so a row
     being written is read next time."""
     try:
         st = outbox.stat()
     except FileNotFoundError:
-        return [], 0, None
+        return [], 0, None, None
     offset = 0 if from_start else int(cursor.get("offset") or 0)
     rows: list[dict] = []
     saved_head = cursor.get("head")
@@ -99,7 +100,7 @@ def read_new_rows(outbox: Path, cursor: dict, from_start: bool = False) -> tuple
         offset = 0
     data, end = _read_from(outbox, offset)
     rows += _parse(data)
-    return rows, offset + end, st.st_ino
+    return rows, offset + end, st.st_ino, head
 
 
 def _read_from(path: Path, offset: int) -> tuple[bytes, int]:
@@ -161,7 +162,7 @@ def main(argv: list[str] | None = None) -> int:
     outbox = args.logs_dir / OUTBOX_NAME
     cursor_path = args.logs_dir / CURSOR_NAME
     cursor = load_cursor(cursor_path)
-    rows, offset, inode = read_new_rows(outbox, cursor, args.from_start)
+    rows, offset, inode, head = read_new_rows(outbox, cursor, args.from_start)
     groups = group(rows)
     lines, new = report(groups, cursor["known"])
 
@@ -184,7 +185,7 @@ def main(argv: list[str] | None = None) -> int:
             cursor["known"].setdefault(k, groups[k]["first"] or "")
         cursor["offset"] = offset
         cursor["inode"] = inode
-        cursor["head"] = _head(outbox)
+        cursor["head"] = head
         try:
             save_cursor(cursor_path, cursor)
         except OSError as e:

@@ -334,7 +334,8 @@ def search(
     stored just before its analysis (crew.screen_event), so without this it
     comes back as its own top "historical context" hit.
     """
-    exclude_ids = exclude_ids or set()
+    # A canary record left by a process killed mid-check is never a result.
+    exclude_ids = (exclude_ids or set()) | {_CANARY_ID}
     if query_embedding is None:
         query_embedding = embed(query)
 
@@ -437,14 +438,40 @@ def store_arxiv(paper: dict) -> None:
     )
 
 
+# Prune age per collection (tasks.prune_vector_store). arxiv is intentionally
+# not pruned (papers are timeless reference material), nor is thesis.
+PRUNE_MAX_AGE_DAYS = {
+    "news":          90,
+    "options":       60,
+    "congressional": 180,
+    "filings":       90,
+    "insider":       365,
+    "macro":         180,
+}
+
+
+def _age_cutoff(max_age_days: int) -> str:
+    from datetime import timedelta
+    return (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
+
+
+def _past_max_age(meta: dict | None, cutoff: str) -> bool:
+    """prune_old_documents' test: the 'timestamp' (else 'date') metadata,
+    compared as an ISO string with the cutoff."""
+    ts = (meta or {}).get("timestamp") or (meta or {}).get("date") or ""
+    # Deliberate change from the old inline test: a timestamp that isn't a
+    # string skips that record instead of raising, which used to abort the
+    # whole prune of the collection.
+    return isinstance(ts, str) and bool(ts) and ts < cutoff
+
+
 def prune_old_documents(collection: str, max_age_days: int = 90) -> int:
     """
     Delete documents older than max_age_days from a collection.
     Uses the 'timestamp' metadata field set by store().
     Returns count of documents deleted.
     """
-    from datetime import timedelta
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
+    cutoff = _age_cutoff(max_age_days)
 
     # A delete is a write: same lock and reopen rule as store().
     with _locked_write():
@@ -461,8 +488,7 @@ def prune_old_documents(collection: str, max_age_days: int = 90) -> int:
             all_docs = col.get(include=["metadatas"])
             ids_to_delete = []
             for doc_id, meta in zip(all_docs["ids"], all_docs["metadatas"]):
-                ts = meta.get("timestamp") or meta.get("date") or ""
-                if ts and ts < cutoff:
+                if _past_max_age(meta, cutoff):
                     ids_to_delete.append(doc_id)
 
             if ids_to_delete:
@@ -503,11 +529,13 @@ def _read_collection_docs(name: str) -> list[tuple[str, str, dict]]:
             d["document"] = value
         elif value is not None and not key.startswith("chroma:"):
             d["metadata"][key] = value
-    without_text = [k for k, v in docs.items() if not v["document"]]
+    without_text = [k for k, v in docs.items() if not v["document"] and k != _CANARY_ID]
     if without_text:
         log.warning(f"vector_store: '{name}' has {len(without_text)} records with no document "
                     f"text; they can't be re-embedded and are left out: {without_text[:5]}")
-    return [(k, v["document"], v["metadata"]) for k, v in docs.items() if v["document"]]
+    # A canary record left by a process killed mid-check is not a document.
+    return [(k, v["document"], v["metadata"]) for k, v in docs.items()
+            if v["document"] and k != _CANARY_ID]
 
 
 def _count_collection_rows(name: str) -> int:
@@ -520,7 +548,8 @@ def _count_collection_rows(name: str) -> int:
         return con.execute(
             "SELECT COUNT(*) FROM embeddings e JOIN segments s ON s.id = e.segment_id "
             "JOIN collections c ON c.id = s.collection "
-            "WHERE c.name = ? AND s.scope = 'METADATA'", (name,)).fetchone()[0]
+            "WHERE c.name = ? AND s.scope = 'METADATA' AND e.embedding_id != ?",
+            (name, _CANARY_ID)).fetchone()[0]
     finally:
         con.close()
 
@@ -562,7 +591,8 @@ def pending_rebuilds() -> list[str]:
     """Collections with a snapshot left by a rebuild that did not finish."""
     if not _DB_PATH.exists():
         return []
-    return sorted(p.name[len(".rebuild-"):-len(".jsonl")] for p in _DB_PATH.glob(".rebuild-*.jsonl"))
+    return sorted(p.name[len(".rebuild-"):-len(".jsonl")] for p in _DB_PATH.glob(".rebuild-*.jsonl")
+                  if not p.name.endswith(".deadletter.jsonl"))
 
 
 # Resumes of one snapshot that may fail in a row before they stop: each one
@@ -634,14 +664,25 @@ def clear_orphan_rebuild_states() -> list[str]:
 
 @contextlib.contextmanager
 def _resume_attempt(name: str, report: dict[str, Any]):
-    """Wraps one rebuild_collection run under the lock. A run that started
-    with a snapshot on disk (a resume) and ends with it still there, by
-    raising or by returning, counts as a failed resume in the sidecar; the
-    count goes into report["resume_failures"]. A run that ends with no
-    snapshot removes the sidecar. Its own bookkeeping never raises, except
-    that a soft time limit landing during it is re-raised once the
-    bookkeeping has been finished (the new state is computed once, so the
-    second pass doesn't count the failure twice)."""
+    """Wraps one rebuild_collection run under the lock and keeps the
+    sidecar's bookkeeping. rebuild_collection counts a resume as failed
+    before it starts (the pre-count after its gave-up check), so a process
+    killed anywhere in it
+    (SIGKILL, out of memory, a segfault) has already been counted. At the
+    end of a resume that kept its snapshot, by raising or by returning, this
+    records last_error and the records still missing (last_missing, from
+    report["remaining"]). When records landed in this attempt
+    (report["landed"]) and it filled the collection in place (resume_mode
+    incremental), the resume made progress and failures goes back to 0.
+    Records that only left the snapshot (dead-lettered) are not progress,
+    and neither is a full-mode attempt, which starts over from an empty
+    collection. The count goes into report["resume_failures"]. A fresh
+    rebuild that kept its snapshot records last_missing only. A run that ends
+    with no snapshot removes the sidecar.
+
+    Its own bookkeeping never raises, except that a soft time limit landing
+    during it is re-raised once the bookkeeping has been finished (the new
+    state is computed once, so a second pass writes the same thing)."""
     resuming = _snapshot_path(name).exists()
     error = None
     planned: dict[str, Any] = {}
@@ -650,19 +691,33 @@ def _resume_attempt(name: str, report: dict[str, Any]):
         if not _snapshot_path(name).exists():
             _rebuild_state_path(name).unlink(missing_ok=True)
             return
-        if not resuming or report["method"] in ("already_resumed", "resume_gave_up"):
+        if report["method"] in ("already_resumed", "resume_gave_up", "skipped_count_failed"):
+            return
+        remaining = report.get("remaining")
+        if not resuming:
+            if remaining is not None and "state" not in planned:
+                planned["state"] = {**rebuild_state(name), "last_missing": remaining}
+            if "state" in planned:
+                _save_rebuild_state(name, planned["state"])
             return
         if "state" not in planned:
-            state = rebuild_state(name)
-            state["failures"] = int(state.get("failures") or 0) + 1
+            state = rebuild_state(name)          # this attempt is already counted in it
+            landed = int(report.get("landed") or 0)
+            if landed and report.get("resume_mode") == "incremental":
+                log.info(f"rebuild_collection: '{name}' resume made progress ({landed} records "
+                         f"landed); failure count reset")
+                state["failures"] = 0
+            if remaining is not None:
+                state["last_missing"] = remaining
             state["last_error"] = str(error or report.get("error") or report["method"])[:500]
             state.setdefault("created", _snapshot_path(name).stat().st_mtime)
             planned["state"] = state
         _save_rebuild_state(name, planned["state"])
-        report["resume_failures"] = planned["state"]["failures"]
-        log.error(f"rebuild_collection: resume of '{name}' failed "
-                  f"({planned['state']['failures']}/{_MAX_RESUME_FAILURES}): "
-                  f"{planned['state']['last_error']}")
+        report["resume_failures"] = int(planned["state"].get("failures") or 0)
+        if report["resume_failures"]:
+            log.error(f"rebuild_collection: resume of '{name}' failed "
+                      f"({report['resume_failures']}/{_MAX_RESUME_FAILURES}): "
+                      f"{planned['state']['last_error']}")
 
     try:
         yield resuming
@@ -705,13 +760,142 @@ def _resume_todo(col, docs: list[tuple[str, str, dict]]) -> list[tuple[str, str,
     return [d for d in docs if live.get(d[0]) != (d[1], d[2] or {})]
 
 
+def _deadletter_path(name: str) -> Path:
+    """Records a resume gave up on: they failed to upsert on
+    _MAX_RESUME_FAILURES resumes in a row, and were taken out of the
+    snapshot so it can finish."""
+    return _DB_PATH / f".rebuild-{name}.deadletter.jsonl"
+
+
+def _fsync_dir(path: Path) -> None:
+    """fsyncs a directory, so a file just created in it survives a crash."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _dead_letter(name: str, records: list[tuple[str, str, dict, str]]) -> None:
+    """Appends (id, document, metadata, error) records to the dead-letter
+    file, fsynced (and its directory, the first time), and logs them at
+    WARNING."""
+    now = datetime.now(timezone.utc).isoformat()
+    path = _deadletter_path(name)
+    created = not path.exists()
+    with open(path, "a", encoding="utf-8") as f:
+        for doc_id, text, meta, err in records:
+            f.write(json.dumps({"id": doc_id, "document": text, "metadata": meta,
+                                "error": err, "dead_lettered_at": now}) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    if created:
+        _fsync_dir(path.parent)
+    log.warning(f"rebuild_collection: '{name}' {len(records)} documents failed on "
+                f"{_MAX_RESUME_FAILURES} resumes in a row; moved to {_deadletter_path(name).name}: "
+                f"{[r[0] for r in records][:5]}")
+
+
+_CANARY_ID = "__vector_store_canary__"
+_CANARY_TEXT = "vector store write check"
+
+
+def _isolated_cap(n_docs: int) -> int:
+    """Most records a run may set aside: 1% of the snapshot, at least 1 and
+    at most 10, so a small collection can't lose most of itself."""
+    return min(10, max(1, n_docs // 100))
+
+
+def _canary_upsert(name: str, col) -> bool:
+    """Whether the store takes writes now: embeds a fixed text, upserts it
+    under a scratch id (_CANARY_ID), reads the document back, then deletes
+    it and checks it is gone. A new id is used, not a re-upsert of a record
+    already there: an unchanged record reads back the same whether or not the
+    write happened. Its embedding is the text's scaled by 1000, far from every
+    real (unit-length) one, so a search() in the few milliseconds it exists
+    ranks it last; it is deleted before the lock is released, so nothing
+    sees it afterwards. One left behind by a process killed mid-check is
+    deleted first, and search() and _read_collection_docs skip the id. False
+    when any step fails or the scratch record is still there."""
+    ok = False
+    try:
+        col.delete(ids=[_CANARY_ID])     # a leftover from a killed check
+        emb = [v * 1000.0 for v in embed_many([_CANARY_TEXT])[0]]
+        col.upsert(ids=[_CANARY_ID], embeddings=[emb], documents=[_CANARY_TEXT],
+                   metadatas=[{"canary": True}])
+        ok = col.get(ids=[_CANARY_ID], include=["documents"])["documents"] == [_CANARY_TEXT]
+    except _SoftTimeLimit:
+        raise
+    except Exception as e:
+        log.warning(f"rebuild_collection: '{name}' canary write failed ({e}); nothing dead-lettered")
+    finally:
+        try:
+            col.delete(ids=[_CANARY_ID])
+            if col.get(ids=[_CANARY_ID], include=[])["ids"]:
+                ok = False
+                log.error(f"rebuild_collection: '{name}' canary record still present after delete")
+        except _SoftTimeLimit:
+            ok = False
+            raise
+        except Exception as e:
+            ok = False
+            log.error(f"rebuild_collection: '{name}' could not delete the canary record: {e}")
+    return ok
+
+
+def _set_aside_after_giving_up(name: str, state: dict[str, Any], report: dict[str, Any]) -> None:
+    """One last look when resumes have just stopped: if the only records
+    still missing are ones that already failed to upsert (id_failures), are
+    few (_isolated_cap) and the store takes writes (_canary_upsert), they are
+    dead-lettered and the snapshot is removed, so prune can run again. A cut
+    or a crash can count a resume before a bad record has failed three
+    times, which would otherwise leave prune paused for good. It runs once
+    per snapshot (final_check_done is written before the live collection is
+    read), so a crash in it is not repeated every hour."""
+    failing = state.get("id_failures") or {}
+    if not failing or state.get("final_check_done"):
+        return
+    try:
+        _save_rebuild_state(name, {**state, "final_check_done": True})
+    except _SoftTimeLimit:
+        raise
+    except Exception as e:
+        log.error(f"rebuild_collection: '{name}' final check not recorded ({e}); skipped")
+        return
+    docs = _load_snapshot(name) or []
+    _reopen_client()
+    _bump_generation()
+    try:
+        col = _get_collection(name)
+        ids = [d[0] for d in docs]
+        present: set[str] = set()
+        for lo in range(0, len(ids), _UPSERT_BATCH):
+            present.update(col.get(ids=ids[lo:lo + _UPSERT_BATCH], include=[])["ids"])
+        missing = set(ids) - present
+        if not (missing and missing <= failing.keys() and len(missing) < len(docs)
+                and len(missing) <= _isolated_cap(len(docs)) and _canary_upsert(name, col)):
+            return
+        err = f"failed to upsert on resumes; last error: {state.get('last_error')}"[:300]
+        _dead_letter(name, [d + (err,) for d in docs if d[0] in missing])
+        _snapshot_path(name).unlink(missing_ok=True)
+        report.update(method="gave_up_set_aside", dead_lettered=len(missing), remaining=0,
+                      restored=len(present), docs_found=len(docs), error=None)
+    except _SoftTimeLimit:
+        raise
+    except Exception as e:
+        _forget_generation()
+        log.error(f"rebuild_collection: '{name}' final check after giving up failed: {e}")
+
+
 def rebuild_collection(name: str, resume_only: bool = False) -> dict[str, Any]:
     """Recreates a broken collection and puts its documents back. Returns a
     report: collection, method, docs_before (records in sqlite),
     docs_without_text (records with no document text, which can't be
     re-embedded), docs_found, restored, docs_after (count() afterwards),
     error, started_at, finished_at, resume_failures, resume_mode
-    (incremental or full, on a resume), upserted.
+    (incremental or full, on a resume), upserted (records attempted), landed
+    (records whose upsert succeeded in this run), remaining (snapshot records
+    still missing at the end), dead_lettered.
 
     The ids, texts and metadata (timestamp included, so prune ages are kept)
     are read from sqlite and written to a snapshot file (_snapshot_path)
@@ -732,6 +916,14 @@ def rebuild_collection(name: str, resume_only: bool = False) -> dict[str, Any]:
     index may still be there) or can't be read, the resume deletes and
     rebuilds it in full (resume_mode full).
 
+    A record whose upsert fails on _MAX_RESUME_FAILURES resumes in a row is
+    moved to the dead-letter file (_dead_letter) and out of the snapshot, so
+    the snapshot can finish and prune can run again. Only an isolated failure
+    qualifies, and only when the store is shown to take writes in the same
+    run: another upsert landed, or a canary re-upsert of a record already
+    present succeeds. A resume restores every record in the snapshot,
+    whatever its age; prune keeps its own schedule.
+
     Nothing is deleted when sqlite can't be read (skipped_read_failed) or
     yields no documents while the collection has records there
     (skipped_zero_docs); both are logged at ERROR and the store is left as it
@@ -742,15 +934,19 @@ def rebuild_collection(name: str, resume_only: bool = False) -> dict[str, Any]:
     another runner already finished it, and nothing is touched
     (already_resumed).
 
-    A resume that fails (raises, or leaves the snapshot) is counted in the
-    snapshot's sidecar (_resume_attempt). After _MAX_RESUME_FAILURES in a
-    row, calls stop touching the collection (resume_gave_up) and the snapshot
-    is kept; deleting .rebuild-<name>.state.json allows retries again."""
+    Every resume is counted as failed in the snapshot's sidecar before it
+    does anything (so a process killed partway is counted), and
+    _resume_attempt clears or keeps that count when it ends. A resume that
+    can't record the count does nothing (skipped_count_failed). After
+    _MAX_RESUME_FAILURES in a row without progress, calls stop touching the
+    collection (resume_gave_up) and the snapshot is kept; deleting
+    .rebuild-<name>.state.json allows retries again."""
     report: dict[str, Any] = {
         "collection": name, "method": "rebuild", "docs_before": None,
         "docs_without_text": None, "docs_found": 0, "restored": 0, "docs_after": None,
         "error": None, "started_at": datetime.now(timezone.utc).isoformat(), "finished_at": None,
-        "resume_failures": 0, "resume_mode": None, "upserted": 0,
+        "resume_failures": 0, "resume_mode": None, "upserted": 0, "landed": 0,
+        "remaining": None, "dead_lettered": 0,
     }
     _warm_embedder()
     with _write_lock(), _resume_attempt(name, report) as resuming:
@@ -766,6 +962,22 @@ def rebuild_collection(name: str, resume_only: bool = False) -> dict[str, Any]:
                 log.error(f"rebuild_collection: '{name}' resume failed {report['resume_failures']} "
                           f"times in a row; not retrying, snapshot kept")
                 report.update(method="resume_gave_up", error=state.get("last_error"),
+                              finished_at=datetime.now(timezone.utc).isoformat())
+                _set_aside_after_giving_up(name, state, report)
+                return report
+            # Counted before anything can go wrong: a process killed from here
+            # on (an upsert, an embed, the full rebuild's delete) still counts.
+            try:
+                _save_rebuild_state(name, {
+                    **state, "failures": report["resume_failures"] + 1,
+                    "last_error": "process died during the resume (killed, out of memory or crashed)"})
+            except _SoftTimeLimit:
+                raise
+            except Exception as e:
+                log.error(f"rebuild_collection: could not record the '{name}' resume attempt "
+                          f"({e}); not resuming")
+                report.update(method="skipped_count_failed",
+                              error=f"could not record the resume attempt: {e}",
                               finished_at=datetime.now(timezone.utc).isoformat())
                 return report
         try:
@@ -798,37 +1010,25 @@ def rebuild_collection(name: str, resume_only: bool = False) -> dict[str, Any]:
                 _save_rebuild_state(name, {"created": time.time(), "failures": 0,
                                            "last_error": None})
 
-        failed: set[str] = set()
+        failed: dict[str, str] = {}
+        landed: set[str] = set()
         _reopen_client()
         _bump_generation()   # before the delete: a kill from here on still makes others reopen
         try:
             col = None
             todo = docs
-            prior = rebuild_state(name) if pending is not None else {}
-            if prior.get("recreated"):
-                # count()/get() on the live collection is the call a broken
-                # index fails, possibly by killing the process. Count this
-                # attempt first, so three such deaths still reach
-                # resume_gave_up and the alert; the count goes back once the
-                # call returns (settle() counts a failed resume as usual).
-                _save_rebuild_state(name, {
-                    **prior, "failures": int(prior.get("failures") or 0) + 1,
-                    "last_error": "process died reading the live collection (count/get)"})
+            if pending is not None and rebuild_state(name).get("recreated"):
                 try:
                     col = _get_collection(name)
                     todo = _resume_todo(col, docs)
                     report["resume_mode"] = "incremental"
                 except _SoftTimeLimit:
-                    _save_rebuild_state(name, prior)
                     raise
                 except Exception as e:
-                    _save_rebuild_state(name, prior)
                     log.warning(f"rebuild_collection: '{name}' can't be read for an incremental "
                                 f"resume ({e}); rebuilding it in full")
                     col, todo = None, docs
                     _collections.pop(name, None)
-                else:
-                    _save_rebuild_state(name, prior)
             if col is None:
                 if pending is not None:
                     report["resume_mode"] = "full"
@@ -851,6 +1051,7 @@ def rebuild_collection(name: str, resume_only: bool = False) -> dict[str, Any]:
                     # index in use; the next resume then rebuilds in full again.
                     _save_rebuild_state(name, {**rebuild_state(name), "recreated": True})
             report["upserted"] = len(todo)
+            report["remaining"] = len(todo)    # counts down as batches land
             for lo in range(0, len(todo), _UPSERT_BATCH):
                 chunk = todo[lo:lo + _UPSERT_BATCH]
                 try:
@@ -858,6 +1059,9 @@ def rebuild_collection(name: str, resume_only: bool = False) -> dict[str, Any]:
                                embeddings=embed_many([d[1][:8192] for d in chunk]),
                                documents=[d[1] for d in chunk],
                                metadatas=[d[2] or None for d in chunk])
+                    report["remaining"] -= len(chunk)
+                    landed.update(d[0] for d in chunk)
+                    report["landed"] = len(landed)
                     continue
                 except _SoftTimeLimit:
                     raise   # cut off: keep the snapshot, the next run resumes
@@ -868,10 +1072,13 @@ def rebuild_collection(name: str, resume_only: bool = False) -> dict[str, Any]:
                     try:
                         col.upsert(ids=[doc_id], embeddings=embed_many([text[:8192]]),
                                    documents=[text], metadatas=[meta] if meta else None)
+                        report["remaining"] -= 1
+                        landed.add(doc_id)
+                        report["landed"] = len(landed)
                     except _SoftTimeLimit:
                         raise
                     except Exception as e:
-                        failed.add(doc_id)
+                        failed[doc_id] = f"{type(e).__name__}: {e}"[:300]
                         log.warning(f"rebuild_collection: '{name}' doc {doc_id!r} not restored: {e}")
             present: set[str] = set()
             ids = [d[0] for d in docs]
@@ -884,11 +1091,40 @@ def rebuild_collection(name: str, resume_only: bool = False) -> dict[str, Any]:
             raise
         # Any missing id keeps the snapshot, including ids whose upsert raised:
         # a disk-full store fails every upsert, and dropping the snapshot then
-        # would lose the collection. _resume_attempt bounds the retries.
+        # would lose the collection. _resume_attempt bounds the retries, and
+        # an id that fails on _MAX_RESUME_FAILURES resumes in a row is
+        # dead-lettered so the rest can finish.
         missing = set(ids) - present
+        if resuming and _snapshot_path(name).exists():
+            state = rebuild_state(name)
+            prior = state.get("id_failures") or {}
+            streak = {i: int(prior.get(i) or 0) + 1 for i in failed if i in missing}
+            dead = sorted(i for i, n in streak.items() if n >= _MAX_RESUME_FAILURES)
+            # Only isolated failures: everything else is back, and the
+            # failures are a few. A store that fails every upsert (disk full)
+            # must keep its snapshot, not dead-letter the whole collection.
+            isolated = (missing <= failed.keys()
+                        and len(missing) < len(docs)
+                        and len(missing) <= _isolated_cap(len(docs)))
+            # And the store must be shown to take writes in this same run: an
+            # incremental resume tries only the missing records, so "the rest
+            # is back" says nothing when every upsert it tried failed.
+            if dead and isolated and not (landed & present):
+                isolated = _canary_upsert(name, col)
+            if not isolated:
+                dead = []
+            if dead:
+                by_id = {d[0]: d for d in docs}
+                _dead_letter(name, [(*by_id[i], failed[i]) for i in dead])
+                _write_snapshot(name, [d for d in docs if d[0] not in set(dead)])
+                missing -= set(dead)
+                report["dead_lettered"] = len(dead)
+            state["id_failures"] = {i: n for i, n in streak.items() if i not in set(dead)}
+            _save_rebuild_state(name, state)
+        report["remaining"] = len(missing)
         if missing:
             report["error"] = (f"{len(missing)} documents missing after the rebuild "
-                               f"({len(missing & failed)} failed to upsert)")
+                               f"({len(missing & failed.keys())} failed to upsert)")
             log.error(f"rebuild_collection: '{name}' {report['error']}: {sorted(missing)[:5]}; "
                       f"keeping {_snapshot_path(name).name} for the next run")
         else:

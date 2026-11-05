@@ -1,0 +1,7 @@
+file: patch-id-map.csv
+generated_utc: 2026-11-04T17:59:46+00:00
+live_checkout: /home/luke-puzenski/Desktop/trading_bot
+live_head: 37c04bf56bfcc4500d9b58ad0d4f1036170a88ce
+since: 2026-10-15
+in_live: yes = the commit is an ancestor of live_head above, at generated_utc.
+It does not say which hash was running at any earlier time.

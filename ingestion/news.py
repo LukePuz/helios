@@ -138,6 +138,7 @@ def _yfinance_news(ticker: str) -> list[dict]:
             "url":    url,
             "image_url": _pick_thumbnail(content),
             "text":   f"{title}{pub_note}\n\n{summary}".strip(),
+            "published_at": published.isoformat() if published else None,
             # Not marked seen yet — tasks.poll_news marks both keys after a
             # successful dispatch, so a Celery retry can't lose the item.
             "_seen_keys": [(_SOURCE, item_id), (_TITLE_SOURCE, _title_key(title))],
@@ -229,7 +230,8 @@ def _google_news_rss(ticker: str, company: str = "") -> list[dict]:
         item_id = link or title
         if not title or not item_id or _is_seen(item_id) or _is_seen_title(title):
             continue
-        if _too_old(_parse_published(pub)):
+        published = _parse_published(pub)
+        if _too_old(published):
             continue
         if company and not mentions_company(ticker, company, title):
             _ENTITY_DROPS[ticker] = _ENTITY_DROPS.get(ticker, 0) + 1
@@ -246,6 +248,7 @@ def _google_news_rss(ticker: str, company: str = "") -> list[dict]:
             # ingestion.company_photos's fallback at log time instead.
             "image_url": None,
             "text":   f"{title} (published {pub})",
+            "published_at": published.isoformat() if published else None,
             "_seen_keys": [(_SOURCE, item_id), (_TITLE_SOURCE, _title_key(title))],
         })
     return results

@@ -94,7 +94,7 @@ class TestTrendTemplateGateIntegration:
         # return-rate gate does for "no catalyst timeframe".
         result = _run(_CANDIDATE, _response("OPEN"), None)
         assert result["action"] == "OPEN"
-        assert result["trend_template"] is None
+        assert result["trend_template"] == {"status": "insufficient_history"}
 
     def test_exception_in_trend_template_check_fails_safe_not_crash(self):
         patches = _mock_analyze_deps(_response("OPEN"))
@@ -103,4 +103,29 @@ class TestTrendTemplateGateIntegration:
              patch("agents.price_action.compute_trend_template", side_effect=Exception("db down")):
             result = analyze(_CANDIDATE, situation_brief="brief")
         assert result["action"] == "OPEN"
-        assert result["trend_template"] is None
+        assert result["trend_template"] == {"status": "read_error"}
+
+    def _run_real(self, candidate, response, history):
+        """compute_trend_template itself, over a patched bar read."""
+        patches = _mock_analyze_deps(response)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], \
+             patches[6], patches[7], patches[8], patch("db.get_price_history", **history):
+            return analyze(candidate, situation_brief="brief")
+
+    def test_bar_read_error_is_recorded_and_still_passes(self):
+        result = self._run_real(_CANDIDATE, _response("OPEN"),
+                                {"side_effect": RuntimeError("db down")})
+        assert result["action"] == "OPEN"
+        assert result["trend_template"] == {"status": "read_error"}
+
+    def test_short_history_is_recorded_and_still_passes(self):
+        bars = [{"close": 100.0 + i} for i in range(30)]
+        result = self._run_real(_CANDIDATE, _response("OPEN"), {"return_value": bars})
+        assert result["action"] == "OPEN"
+        assert result["trend_template"] == {"status": "insufficient_history"}
+
+    def test_ungated_verdict_records_not_run(self):
+        response = json.loads(_response("HOLD"))
+        response["pass_to_risk"] = False
+        result = _run(_CANDIDATE, json.dumps(response), None)
+        assert result["trend_template"] == {"status": "not_run"}

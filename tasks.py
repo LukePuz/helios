@@ -138,7 +138,7 @@ LLM_EVENT_EXPIRES_SECONDS = 4 * 3600
 # sets for it) — if so, call the broker directly; if not, dispatch a task to
 # the "orders" queue and wait for the result. The direct-call branch also
 # means celery_orders_worker's own tasks never call back into themselves.
-from celery.signals import beat_init, worker_init
+from celery.signals import beat_init, task_failure, task_revoked, worker_init
 
 
 def _boot_service_name(sender) -> str:
@@ -933,7 +933,66 @@ def _dispatch_event(event: dict, seen_source: str | None = None) -> None:
             log.warning(f"mark_seen failed for {seen_keys}: {e}")
 
 
-@app.task(name="tasks.screen_event", bind=True, max_retries=1)
+# Screen and analysis tasks whose loss gets an EVENT_LOST row: one that
+# expired in the queue, was revoked, or failed its last retry left no record.
+_EVENT_TASKS = ("tasks.screen_event", "tasks.deep_analyze_event")
+
+
+def _log_event_lost(task_name: str, reason: str, args, error_class: str | None = None) -> None:
+    """Log-only EVENT_LOST row: the task, why, and the event's identifiers
+    from the task args. Never raises."""
+    try:
+        import db
+        from agents.crew import event_item_fields
+        args = list(args or [])
+        event = args[0] if args and isinstance(args[0], dict) else {}
+        ticker = str(event.get("ticker") or "UNKNOWN").upper()
+        decision = {"task": task_name, "reason": reason, **event_item_fields(event)}
+        if error_class:
+            decision["error_class"] = error_class
+        log.error(f"[{ticker}] {task_name} lost the event ({reason}): {decision.get('title')}")
+        db.log_signal(ticker, "EVENT_LOST", 0.0, f"{task_name}: {reason}", decision=decision)
+    except Exception as e:
+        log.warning(f"EVENT_LOST log failed for {task_name}: {e}")
+
+
+def _event_task_failed(self, exc, task_id, args, kwargs, einfo):
+    """on_failure of the screen and analysis tasks: the final failure, after
+    any retries."""
+    retries = getattr(self.request, "retries", 0) or 0
+    reason = "max_retries" if self.max_retries and retries >= self.max_retries else type(exc).__name__
+    _log_event_lost(self.name, reason, args, type(exc).__name__)
+
+
+@task_failure.connect
+def _on_event_task_killed(sender=None, task_id=None, exception=None, args=None, **_):
+    """A screen or analysis task killed by the hard time limit or lost with
+    its worker process. Neither reaches the task's on_failure: the worker's
+    parent sends only this signal. Any other exception is left to
+    on_failure, which sees it in the child, so no task id gets two rows."""
+    from billiard.exceptions import TimeLimitExceeded, WorkerLostError
+    if getattr(sender, "name", None) not in _EVENT_TASKS:
+        return
+    if isinstance(exception, TimeLimitExceeded):
+        reason = "time_limit"
+    elif isinstance(exception, WorkerLostError):
+        reason = "worker_lost"
+    else:
+        return
+    _log_event_lost(sender.name, reason, args, type(exception).__name__)
+
+
+@task_revoked.connect
+def _on_event_task_revoked(sender=None, request=None, terminated=None, signum=None,
+                           expired=None, **_):
+    """A screen or analysis task that expired in the queue or was revoked."""
+    name = getattr(sender, "name", None) or getattr(request, "task_name", None)
+    if name not in _EVENT_TASKS:
+        return
+    _log_event_lost(name, "expired" if expired else "revoked", getattr(request, "args", None))
+
+
+@app.task(name="tasks.screen_event", bind=True, max_retries=1, on_failure=_event_task_failed)
 def screen_event(self, event: dict):
     """Fast 7B relevance screen (own queue/worker, CPU-only, higher
     concurrency than the 72B stage) — only events that pass are
@@ -954,7 +1013,7 @@ def screen_event(self, event: dict):
         raise self.retry(exc=e, countdown=60)
 
 
-@app.task(name="tasks.deep_analyze_event", bind=True, max_retries=1)
+@app.task(name="tasks.deep_analyze_event", bind=True, max_retries=1, on_failure=_event_task_failed)
 def deep_analyze_event(self, event: dict, screening: dict | None = None):
     """Full 72B analyst pipeline (LLM lane) for an event that already
     passed screening — see tasks.screen_event."""
@@ -1320,8 +1379,12 @@ def _deferred_buy_shares_now(approval: dict) -> int | None:
             log.warning(f"retry_deferred_entry: [{approval.get('ticker')}] halt check "
                         f"unreadable; not executed, kept for a retry")
             return _RESIZE_UNREADABLE
-        shares = rm.shares_after_concentration(approval["ticker"], sizing, bucket)
+        shares = rm.shares_after_concentration(approval["ticker"], sizing, bucket,
+                                               name_cap=True, price=float(price))
         if getattr(rm, "last_concentration_errored", False) is True:
+            return _RESIZE_UNREADABLE
+        name_cap = getattr(rm, "last_name_cap", None)
+        if isinstance(name_cap, dict) and name_cap.get("outcome") == "errored":
             return _RESIZE_UNREADABLE
         return shares
     except Exception as e:
@@ -2781,14 +2844,26 @@ def _retry_pending_reprotects() -> None:
             # ~20 min of failures: stop retrying (each try cancels and
             # re-places) and hand it to Luke (professor M79, m112).
             log.error(f"[{ticker}] reconcile: queued re-protect failed {tries} times; giving up")
+            sign_flip = ticker in _REPROTECT_SIGN_FLIP
             try:
                 import alerts
-                alerts._send(f"🚨 STOP NOT RESTORED — <b>{ticker}</b>\nThe automatic stop retry "
-                             f"failed {tries} times (~20 min) and has stopped. Check the position and "
-                             f"place a stop in TWS; the stop check keeps flagging it until covered.")
+                if sign_flip:
+                    # A SELL stop on a short adds to it: don't say "place one".
+                    alerts._send(f"🚨 STOP NOT RESTORED — <b>{ticker}</b>\nThe automatic stop "
+                                 f"retry stopped after {tries} tries (~20 min): a fresh read shows "
+                                 f"the position short while the portfolio cache shows it long. "
+                                 f"Check in TWS whether it is long or short before placing "
+                                 f"anything; a SELL stop on a short adds to it.")
+                else:
+                    alerts._send(f"🚨 STOP NOT RESTORED — <b>{ticker}</b>\nThe automatic stop "
+                                 f"retry failed {tries} times (~20 min) and has stopped. Check the "
+                                 f"position and place a stop in TWS; the stop check keeps flagging "
+                                 f"it until covered.")
             except Exception:
                 pass
-            open_manual_action(ticker, "the automatic stop retry gave up")
+            open_manual_action(ticker, "check whether the position is long or short (the reads "
+                                       "disagree) before placing a stop" if sign_flip
+                               else "the automatic stop retry gave up")
             outcome[ticker] = (rec, None)
         elif result is False or flat_buy:
             outcome[ticker] = (rec, {**rec, "tries": tries})
@@ -2828,6 +2903,51 @@ def _held_before_fill(ticker: str, fill_qty: float, action: str | None = None) -
     return round(held - float(fill_qty), 4) > 0
 
 
+# Tickers whose last _reprotect_after_late_sell try was refused because a
+# fresh read showed a short, for the queue's give-up alert (same process).
+_REPROTECT_SIGN_FLIP: set[str] = set()
+
+
+def _sign_flip_alert(ticker: str, cache_qty: float, fresh_qty: float) -> None:
+    """The cache reads long and a fresh read short: no SELL stop goes on (it
+    would add to a short). One 🚨, throttled on the same key as reconcile's
+    own sign-flip alert (sign_flip_<T>), so the two don't double up."""
+    log.error(f"[{ticker}] position reads disagree on sign (cache {cache_qty:g}, fresh "
+              f"{fresh_qty:g}); no SELL stop added")
+    try:
+        due = _reconcile_alert_due(f"sign_flip_{ticker}")
+    except Exception as e:
+        log.warning(f"[{ticker}] sign-flip alert throttle unreadable ({e}); sending")
+        due = True
+    if due:
+        try:
+            import alerts
+            alerts._send(f"🚨 STOP CHECK — <b>{ticker}</b>\nThe position reads disagree "
+                         f"on sign: the portfolio cache shows {cache_qty:g} shares, a "
+                         f"fresh read shows {fresh_qty:g}. No SELL stop added and "
+                         f"nothing cancelled. Check the position in TWS now.")
+        except Exception as e:
+            log.error(f"[{ticker}] could not send the sign-flip alert: {e}")
+
+
+def _fresh_read_short(ticker: str, cache_qty: float) -> bool:
+    """True (and the sign-flip alert) when the cache reads ticker long and a
+    fresh reqPositions() read shows it short. A failed read or one without
+    the ticker is False: the caller goes on as before."""
+    import ibkr
+    if cache_qty <= 0:
+        return False
+    try:
+        fresh = float(ibkr.get_fresh_stock_positions().get(ticker) or 0.0)
+    except Exception as e:
+        log.warning(f"[{ticker}] fresh position read for the sign check failed ({e})")
+        return False
+    if fresh < 0:
+        _sign_flip_alert(ticker, cache_qty, fresh)
+        return True
+    return False
+
+
 @locked_by_ticker(lambda ticker, *a, **k: ticker, on_busy=False)
 def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
                                fill_price: float | None = None,
@@ -2848,6 +2968,7 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
     import db
     import ibkr
     order = order or {}
+    _REPROTECT_SIGN_FLIP.discard(ticker)
     try:
         pos = next((p for p in ibkr.get_client().get_all_positions() if p.symbol == ticker), None)
         remaining = round(abs(float(pos.qty)), 4) if pos else 0.0
@@ -2874,6 +2995,11 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
         except Exception:
             pass
         return None
+    if from_queue and pos is not None and _fresh_read_short(ticker, float(pos.qty)):
+        # A queued restore after a sign-flip refusal (execution
+        # _restore_sized_stop): keep retrying until the reads agree.
+        _REPROTECT_SIGN_FLIP.add(ticker)
+        return False
     if expect_at_least and 0 < remaining < float(expect_at_least) - 1e-6:
         # The read lags a fill it should include (a manual ADD): resting stops
         # sized for the old position would look like full cover (review of
@@ -3366,7 +3492,7 @@ def _backstop_retry_skipped(ticker: str, why: str) -> None:
 
 
 @locked_by_ticker(lambda ticker, *a, **k: ticker, on_busy=False)
-def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) -> bool:
+def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) -> bool | None:
     """Market-sell the full position when its stop level is breached and no
     protective stop exists at the broker. This monitor is the last line of
     defence for exactly that case; the sell only ever reduces exposure.
@@ -3414,7 +3540,7 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
             # Stale stop record for a position that no longer exists
             log.info(f"[{ticker}] Backstop: no shares held; stale stop record dropped, nothing to sell")
             db.delete_position_stop(ticker)
-            return False
+            return None  # nothing to do, not a failed sale
 
         ratio = _split_ratio(ticker, pos)
         if ratio:
@@ -3606,6 +3732,8 @@ def retry_backstop_sell(self, ticker: str, alert: dict):
     success = _execute_backstop_sell(ticker, alert, _is_retry=True)
     if success:
         log.info(f"[{ticker}] Backstop sell succeeded on retry")
+    elif success is None:
+        log.info(f"[{ticker}] Backstop sell retry: nothing held, nothing to sell")
     else:
         log.error(f"[{ticker}] Backstop sell retry did not sell; the reason is logged above")
 
@@ -4506,6 +4634,154 @@ def _check_tranche2_shadow(today=None) -> int:
         return 0
 
 
+_C6_OUTCOME_HORIZONS = (5, 10, 20)   # trading days
+_C6_OUTCOME_EXPIRE_DAYS = 40         # sessions after which an incomplete verdict gets its status
+_C6_OUTCOME_LOOKBACK_DAYS = 75       # calendar days of verdict rows re-read each run
+_C6_OUTCOME_MARKER_TTL_S = 120 * 86400   # past the lookback plus the 40-session wait
+
+
+def _c6_trading_days_after(et_date: str, today: str) -> int:
+    """NYSE sessions after et_date up to and including today."""
+    from datetime import date, timedelta
+    from market_calendar import NYSE_HOLIDAYS
+    d, end, n = date.fromisoformat(et_date) + timedelta(days=1), date.fromisoformat(today), 0
+    while d <= end:
+        n += d.weekday() < 5 and d not in NYSE_HOLIDAYS
+        d += timedelta(days=1)
+    return n
+
+
+def _check_c6_bar_outcomes(today=None) -> int:
+    """Log-only forward outcomes for the c6 bar shadow (agents/c6_shadow.py).
+    For each c6_bar_shadow verdict row of the last _C6_OUTCOME_LOOKBACK_DAYS
+    days with an entry_ref_price, and each horizon N in
+    _C6_OUTCOME_HORIZONS: once the cache holds N daily bars dated after the
+    verdict's ET date, one row, stage c6_bar_shadow, kind outcome, with the
+    Nth bar's close and its return from entry_ref_price (and from the
+    verdict day's close when that bar is cached). Closes are adjusted; see
+    the c6_shadow docstring. Each verdict also gets one kind outcome_status
+    row, so attrition is countable: complete (every horizon logged), no_ref
+    (no entry_ref_price), or, _C6_OUTCOME_EXPIRE_DAYS sessions after the
+    verdict with horizons missing, missing_bars (some bars cached after the
+    verdict, too few) or expired (none). One row per key (shadow_key
+    <verdict key>:r<N> / :status, plus a Redis NX marker). The first failed
+    write stops the run. Reads the DB cache only. Never raises."""
+    try:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        import db
+        import stop_lock
+        from agents.c6_shadow import MARKER_PREFIX, STAGE
+        from agents.analyst import shadow_versions
+        rows = db.get_activity_rows(STAGE, "verdict", days=_C6_OUTCOME_LOOKBACK_DAYS)
+        rows = [v for v in (rows or []) if v.get("shadow_key") and v.get("as_of") and v.get("ticker")]
+        if not rows:
+            return 0
+        today = (today or datetime.now(ZoneInfo("America/New_York")).date()).isoformat()
+        done = db.get_activity_shadow_keys(STAGE)
+        try:
+            r = stop_lock._redis()
+        except Exception:
+            r = None
+        bars = db.get_price_history_bulk(sorted({v["ticker"] for v in rows}), days=90)
+        logged = 0
+
+        def write(key, ticker, msg, extra):
+            """None when written now, True when already there, False when
+            the write failed."""
+            if done is not None and key in done:
+                return True
+            marker = MARKER_PREFIX + key
+            try:
+                fresh = r.set(marker, "1", nx=True, ex=_C6_OUTCOME_MARKER_TTL_S)
+            except Exception:
+                fresh, marker = done is not None, None   # Redis down: the DB keys alone
+            if not fresh:
+                return True
+            if db.log_activity(STAGE, ticker, msg, "neutral",
+                               {**extra, "shadow_key": key, **shadow_versions()}):
+                return None
+            if marker:
+                try:
+                    r.delete(marker)      # a failed write retries on the next run
+                except Exception:
+                    pass
+            return False
+
+        for v in rows:
+            ticker = v["ticker"]
+            try:
+                et_date = datetime.fromisoformat(v["as_of"]).astimezone(
+                    ZoneInfo("America/New_York")).date().isoformat()
+                base = {"ticker": ticker, "env": v.get("env"), "signal_id": v.get("signal_id"),
+                        "verdict_shadow_key": v["shadow_key"], "verdict_et_date": et_date,
+                        "would_queue": v.get("would_queue"), "c7_gates": v.get("c7_gates"),
+                        "ref_price_source": v.get("ref_price_source")}
+                try:
+                    ref = float(v.get("entry_ref_price") or 0)
+                except (TypeError, ValueError):
+                    ref = 0.0
+                writes = []
+                have = []
+                status = None
+                after = []
+                if ref <= 0:
+                    status = "no_ref"
+                else:
+                    series = bars.get(ticker) or []
+                    after = [b for b in series if b["date"] > et_date]
+                    day0 = next((b for b in series if b["date"] == et_date), None)
+                    c0 = float(day0["close"]) if day0 else None
+                    for n in _C6_OUTCOME_HORIZONS:
+                        if len(after) < n:
+                            break
+                        bar = after[n - 1]
+                        close = float(bar["close"])
+                        writes.append((f"{v['shadow_key']}:r{n}",
+                                       f"c6 {v.get('action')} {n}-day return "
+                                       f"{(close / ref - 1) * 100:+.2f}% (verdict {et_date})",
+                                       {**base, "kind": "outcome", "horizon_days": n,
+                                        "entry_ref_price": ref, "close": close,
+                                        "close_date": bar["date"],
+                                        "return_pct": round((close / ref - 1) * 100, 4),
+                                        "verdict_day_close": c0,
+                                        "return_from_verdict_close_pct": (
+                                            round((close / c0 - 1) * 100, 4) if c0 else None)}))
+                        have.append(n)
+                    if len(have) == len(_C6_OUTCOME_HORIZONS):
+                        status = "complete"
+                    elif _c6_trading_days_after(et_date, today) >= _C6_OUTCOME_EXPIRE_DAYS:
+                        status = "missing_bars" if after else "expired"
+                if status:
+                    writes.append((f"{v['shadow_key']}:status",
+                                   f"c6 {v.get('action')} outcome: {status} (verdict {et_date})",
+                                   {**base, "kind": "outcome_status", "status": status,
+                                    "horizons_logged": have,
+                                    "bars_after_verdict": len(after) if ref > 0 else None}))
+                for key, msg, extra in writes:
+                    res = write(key, ticker, msg, extra)
+                    if res is False:
+                        log.warning(f"c6 bar outcomes: write failed at {ticker}; "
+                                    f"stopped after {logged} rows")
+                        return logged
+                    logged += res is None
+            except Exception as ex:
+                log.warning(f"[{ticker}] c6 bar outcome failed: {ex}")
+        return logged
+    except Exception as e:
+        log.warning(f"c6 bar outcomes failed: {e}")
+        return 0
+
+
+@app.task(name="tasks.c6_bar_shadow", ignore_result=True, soft_time_limit=20, time_limit=30)
+def c6_bar_shadow(payload: dict) -> None:
+    """Log-only c6 bar shadow row (agents/c6_shadow.py), enqueued on ops by
+    crew's routing so its broker, DB and cache reads never hold up the next
+    candidate. Raises only SoftTimeLimitExceeded."""
+    from agents.c6_shadow import run
+    run(payload)
+
+
 # Unheld tickers enter the plan_cross_section snapshot when their latest
 # analyst verdict is this many days old or newer (timestamp > now - N days).
 _CROSS_SECTION_VERDICT_DAYS = 5
@@ -4743,7 +5019,10 @@ def refresh_price_history(self):
         count = refresh_all_price_history()
         log.info(f"Price history refreshed: {count} tickers updated")
         _heartbeat_ok("price_history", count)
-        _check_pending_entries()   # log-only shadow on the bars just stored
+        try:
+            _check_pending_entries()   # log-only shadow on the bars just stored
+        except Exception as e:
+            log.warning(f"pending entries hook failed: {e}")
         try:
             _log_plan_cross_section()   # log-only snapshot; never fails this task
         except Exception as e:
@@ -4752,6 +5031,10 @@ def refresh_price_history(self):
             _check_tranche2_shadow()   # log-only; never fails this task
         except Exception as e:
             log.warning(f"tranche2 shadow hook failed: {e}")
+        try:
+            _check_c6_bar_outcomes()   # log-only; never fails this task
+        except Exception as e:
+            log.warning(f"c6 bar outcomes hook failed: {e}")
     except Exception as e:
         log.error(f"refresh_price_history failed: {e}")
         _heartbeat_fail("price_history", str(e))
@@ -5573,7 +5856,7 @@ def _stop_fix_alert_due(ticker: str, msg: str) -> bool:
 
 
 def _fix_refused_over_position(ticker: str, mine: list, refused, held: float,
-                               stop_price: float, last: float) -> str:
+                               stop_price: float, last: float, recheck_try: int = 1) -> str:
     """_fix_overstop when recorded stops that refused a cancel are, while
     working, bigger than the position (a partial sale since, say): if they
     fill, the account goes short. Their cancel is retried once per fix; our
@@ -5608,6 +5891,12 @@ def _fix_refused_over_position(ticker: str, mine: list, refused, held: float,
         db.set_stop_broker_order_id(ticker, result["order_id"])
         return (f"🔧 {ticker}: the refused stop(s) over the {held:g} held cancelled on retry; "
                 f"placed a stop for {need:g} @ ${float(stop_price):.2f}")
+    if ours > held + 1e-6:
+        # Ours alone are now over the position: the re-check trims them.
+        queued = _queue_stop_coverage_recheck(ticker, recheck_try)
+        return (f"⚠️ {ticker}: the refused stop(s) over the {held:g} held cancelled on retry; "
+                f"our stops for {ours:g} shares are over-stopped against the {held:g} held"
+                + (", re-check queued" if queued else ", reconcile re-checks"))
     return (f"🔧 {ticker}: the refused stop(s) over the {held:g} held cancelled on retry; "
             f"our stops cover {ours:g}")
 
@@ -5717,7 +6006,8 @@ def _fix_overstop(ticker: str, fresh_qty: float | None = None, allow_cancel: boo
             refused_cover = round(sum(float(o["qty"]) for o in mine
                                       if refused(o) and o.get("status") not in cancelling_now), 4)
             if refused_ids and refused_cover > held + 1e-6:
-                return _fix_refused_over_position(ticker, mine, refused, held, stop_price, last)
+                return _fix_refused_over_position(ticker, mine, refused, held, stop_price, last,
+                                                  recheck_try)
             target = round(max(held - refused_cover, 0.0), 4)
             others = [o for o in mine if not refused(o) and o.get("status") not in cancelling_now]
             sent = False
@@ -5788,7 +6078,7 @@ def _fix_overstop_safe(ticker: str, **kwargs) -> str:
         return f"🚨 {ticker}: stop coverage fix failed ({e}) — check TWS"
 
 
-def _recheck_position_reads(ticker: str) -> dict:
+def _recheck_position_reads(ticker: str) -> dict | None:
     """_fix_overstop arguments for recheck_stop_coverage, from the same two
     reads reconcile compares: the portfolio cache _fix_overstop sizes from
     and a fresh reqPositions() read. If they disagree (an ADD the cache
@@ -5796,7 +6086,10 @@ def _recheck_position_reads(ticker: str) -> dict:
     the smaller read, as in reconcile. A fresh read that fails or doesn't
     show the ticker (reconcile treats an empty read as a possible
     reconnect gap) is no cross-check: add-only, unsized, and an over-cover
-    is left to reconcile without an alert."""
+    is left to reconcile without an alert. A non-empty fresh read without
+    the ticker may be a real flat (zero positions are left out of it):
+    None, and the re-check does nothing. Reads that disagree on the sign
+    get max_qty 0, as reconcile's _smaller_read: no SELL stop is added."""
     import ibkr
     try:
         fresh_all = ibkr.get_fresh_stock_positions()
@@ -5804,9 +6097,13 @@ def _recheck_position_reads(ticker: str) -> dict:
         log.warning(f"[{ticker}] stop coverage re-check: fresh position read failed ({e}); "
                     f"no cancels this time")
         return {"allow_cancel": False, "no_cancel_reason": "the fresh position read failed"}
+    if fresh_all and not fresh_all.get(ticker):
+        log.warning(f"[{ticker}] stop coverage re-check: the fresh position read shows other "
+                    f"positions but not {ticker} (flat?); nothing done, reconcile checks it")
+        return None
     if not fresh_all.get(ticker):
-        log.warning(f"[{ticker}] stop coverage re-check: the fresh position read doesn't show "
-                    f"{ticker} (a reconnect gap?); no cancels this time")
+        log.warning(f"[{ticker}] stop coverage re-check: the fresh position read is empty "
+                    f"(a reconnect gap?); no cancels this time")
         return {"allow_cancel": False,
                 "no_cancel_reason": f"the fresh position read doesn't show {ticker}"}
     fresh = float(fresh_all[ticker])
@@ -5821,7 +6118,12 @@ def _recheck_position_reads(ticker: str) -> dict:
         return {}
     log.warning(f"[{ticker}] stop coverage re-check: position reads disagree (cache {cache:g}, "
                 f"fresh {fresh:g}); adding only, sized to the smaller")
-    smaller = abs(fresh) if not cache else min(abs(fresh), abs(cache))
+    if cache * fresh < 0:
+        log.error(f"[{ticker}] stop coverage re-check: position reads disagree on sign (cache "
+                  f"{cache:g}, fresh {fresh:g}); no SELL stop added")
+        smaller = 0.0
+    else:
+        smaller = abs(fresh) if not cache else min(abs(fresh), abs(cache))
     kw = {"allow_cancel": False, "max_qty": smaller}
     if not cache:
         kw["fresh_qty"] = fresh
@@ -5880,8 +6182,13 @@ def recheck_stop_coverage(ticker: str, attempt: int = 1):
                     log.info(f"[{ticker}] stop coverage re-check: a cancel is still pending; "
                              f"again in 60 s")
                 return
-            msg = _fix_overstop_safe(ticker, recheck_try=attempt + 1,
-                                     **_recheck_position_reads(ticker))
+            reads = _recheck_position_reads(ticker)
+            if reads is None:
+                # Maybe flat, maybe a reconnect gap that clears within a
+                # minute: look again (the chain stays capped).
+                _queue_stop_coverage_recheck(ticker, attempt + 1)
+                return
+            msg = _fix_overstop_safe(ticker, recheck_try=attempt + 1, **reads)
     except stop_lock.TickerBusy:
         if _queue_stop_coverage_recheck(ticker, attempt + 1):
             log.info(f"[{ticker}] stop coverage re-check: ticker busy; again in 60 s")
@@ -7109,6 +7416,11 @@ def _reconcile_stop_orders_body(self):
                     elif disagree:
                         fix = _fix_overstop_safe(ticker, allow_cancel=False,
                                                  max_qty=smaller.get(ticker, 0.0))
+                    elif _fresh_read_short(ticker, float(held.get(ticker, 0.0))):
+                        # The cache reads long, a fresh read short: a SELL
+                        # stop would add to a short (alert sent above).
+                        fix = (f"🚨 {ticker}: position reads disagree on sign; no SELL stop "
+                               f"placed — check the position in TWS")
                     else:
                         fix = _fix_overstop_safe(ticker)
                     all_actions.append(fix)
@@ -7311,7 +7623,8 @@ def _log_vector_store_rebuild(report: dict) -> bool:
         extra = {k: report.get(k) for k in ("collection", "docs_before", "docs_after", "method",
                                              "started_at", "finished_at", "docs_found", "restored",
                                              "docs_without_text", "resume_failures",
-                                             "snapshot_age_hours", "resume_mode", "upserted")}
+                                             "snapshot_age_hours", "resume_mode", "upserted",
+                                             "landed", "remaining", "dead_lettered")}
         if report.get("error"):
             extra["error"] = report["error"]
         method = str(report.get("method", ""))
@@ -7335,6 +7648,38 @@ def _log_vector_store_rebuild(report: dict) -> bool:
         return False
 
 
+def _alert_set_aside(vs, name: str, n: int) -> None:
+    """Critical alert for records a rebuild set aside, once a day per
+    collection. Set-asides inside the throttle window are added up in
+    system_state (vector_store_dead_letter_unalerted_<name>) and the next
+    alert gives the total since the last one. With n=0 (the hourly flush in
+    _alert_unfinished_rebuilds) it sends only a held total, once the
+    throttle allows. Never raises."""
+    try:
+        import db
+        key = f"vector_store_dead_letter_unalerted_{name}"
+        try:
+            total = int(db.get_state(key) or 0) + n
+        except Exception:
+            total = n
+        if not total:
+            return
+        if not _vector_store_alert_due(f"dead_letter_{name}"):
+            db.set_state(key, str(total))
+            return
+        import alerts
+        this_run = f"{n} record(s) set aside in this run, {total}" if n else f"{total} record(s) set aside"
+        alerts._send(
+            f"⚠️ <b>Vector store records set aside</b>\n"
+            f"'{name}': {this_run} since the last alert. "
+            f"Each failed to upsert on {vs._MAX_RESUME_FAILURES} resumes in a row. Their text, "
+            f"metadata and error are kept in .chromadb/.rebuild-{name}.deadletter.jsonl; restore "
+            f"them manually. Until then they are not in the analyst's retrieval.")
+        db.set_state(key, "0")
+    except Exception as e:
+        log.warning(f"check_vector_store_health: set-aside alert for '{name}' failed: {e}")
+
+
 def _rebuild_and_log(vs, name: str, resume_only: bool = False) -> str | None:
     """Runs vs.rebuild_collection(name), writes its activity row, and
     returns the alert line (None when another run had already resumed it,
@@ -7353,7 +7698,17 @@ def _rebuild_and_log(vs, name: str, resume_only: bool = False) -> str | None:
             "resume_failures": vs.rebuild_state(name).get("failures")})
         raise
     _log_vector_store_rebuild(report)
-    if report.get("method") in ("already_resumed", "resume_gave_up"):
+    if report.get("method") == "skipped_count_failed" and _vector_store_alert_due(f"count_failed_{name}"):
+        # Without the count, the three-failure bound can't hold: say so at once.
+        import alerts
+        alerts._send(
+            f"⚠️ <b>Vector store rebuild blocked</b>\n"
+            f"'{name}': the resume attempt could not be recorded ({report.get('error')}), "
+            f"so it was not resumed. The snapshot is kept and prune stays paused for '{name}'. "
+            f"Check free disk space under .chromadb.")
+    if report.get("dead_lettered"):
+        _alert_set_aside(vs, name, int(report["dead_lettered"]))
+    if report.get("method") in ("already_resumed", "resume_gave_up", "skipped_count_failed"):
         return None
     if str(report.get("method", "")).startswith("skipped"):
         return f"{name} NOT rebuilt ({report['method']}: {report.get('error')}; nothing deleted)"
@@ -7387,6 +7742,11 @@ def _alert_unfinished_rebuilds(vs) -> list[str]:
     while a snapshot is pending, prune skips that collection and old
     documents stay in retrieval. Returns the collections alerted."""
     import alerts
+    # Set-asides held back by the daily throttle go out once it allows,
+    # without waiting for the next set-aside.
+    for name in vs.COLLECTIONS:
+        if vs._deadletter_path(name).exists():
+            _alert_set_aside(vs, name, 0)
     sent = []
     for name in vs.pending_rebuilds():
         try:
@@ -7627,15 +7987,7 @@ def prune_vector_store(self):
     try:
         import vector_store
         # (collection, max_age_days)
-        pruning_rules = [
-            ("news",          90),
-            ("options",       60),
-            ("congressional", 180),
-            ("filings",       90),
-            ("insider",       365),
-            ("macro",         180),
-        ]
-        for collection, max_age in pruning_rules:
+        for collection, max_age in vector_store.PRUNE_MAX_AGE_DAYS.items():
             try:
                 age = vector_store.snapshot_age_hours(collection)
                 if age is not None:

@@ -82,3 +82,19 @@ def test_alert_never_raises():
 def test_route_no_broker_is_not_a_verdict():
     import db
     assert "ROUTE_NO_BROKER" in db._NON_ANALYST_SIGNALS
+
+
+def test_unrouted_verdicts_reach_the_c6_shadow_without_a_broker():
+    """No broker client: the non-pass verdict is still sampled (the shadow
+    only enqueues); the pass, logged ROUTE_NO_BROKER, is not."""
+    c6 = MagicMock()
+    with patch.object(crew, "_c6_bar_unrouted", c6):
+        _run(patch("ibkr.IBKRClient", side_effect=ConnectionError("gw down")))
+    assert [c.args[0]["ticker"] for c in c6.call_args_list] == ["BBB"]
+    assert c6.call_args.args[2] is None
+
+
+def test_c6_shadow_enqueues_with_a_none_client():
+    with patch("agents.c6_shadow.observe_unrouted") as observe:
+        crew._c6_bar_unrouted({"ticker": "BBB", "pass_to_risk": False}, {"regime": "Neutral"}, None)
+    observe.assert_called_once_with({"ticker": "BBB", "pass_to_risk": False}, {"regime": "Neutral"})

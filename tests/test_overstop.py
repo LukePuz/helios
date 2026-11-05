@@ -159,7 +159,7 @@ class TestBackstopSellReads:
         with patch("ibkr.get_client", return_value=self._client(None)), \
              patch("db.delete_position_stop") as delete, \
              patch("ibkr.place_market_order") as order:
-            assert tasks._execute_backstop_sell("AMD", self._alert) is False
+            assert tasks._execute_backstop_sell("AMD", self._alert) is None
         delete.assert_called_once_with("AMD"); order.assert_not_called()
 
     def test_a_retry_with_nothing_held_does_not_claim_the_position_is_unprotected(self, caplog):
@@ -174,6 +174,7 @@ class TestBackstopSellReads:
         text = caplog.text
         assert "no shares held" in text
         assert "unprotected" not in text
+        assert not [r for r in caplog.records if r.levelname == "ERROR"]
 
     def test_short_is_not_sold(self):
         with patch("ibkr.get_client", return_value=self._client(-10)), \
@@ -758,6 +759,33 @@ def test_queued_restore_gives_up_with_an_alert_and_a_manual_action():
     assert json.loads(state["reprotect_pending"]) == {}
     assert "STOP NOT RESTORED" in send.call_args[0][0]
     manual.assert_called_once()
+
+
+def test_queued_restore_giving_up_on_a_sign_flip_says_check_long_or_short():
+    # last try refused: cache long 20, fresh read short. The give-up alert
+    # must not tell anyone to place a SELL stop
+    import json
+    state = {"reprotect_pending": json.dumps(
+        {"CRWD": {"intent": "RESTORE", "tries": tasks._REPROTECT_MAX_TRIES - 1, "nonce": "n"}})}
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="CRWD", qty=20)]
+    with patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
+         patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+         patch("ibkr.get_client", return_value=client), \
+         patch("ibkr.get_fresh_stock_positions", return_value={"CRWD": -20.0}), \
+         patch("tasks._reconcile_alert_due", return_value=False), \
+         patch("tasks.manage_stop_place") as place, \
+         patch("tasks.open_manual_action") as manual, \
+         patch("alerts._send") as send:
+        tasks._retry_pending_reprotects()
+    place.assert_not_called()
+    assert json.loads(state["reprotect_pending"]) == {}
+    msg = send.call_args[0][0]
+    assert "STOP NOT RESTORED" in msg and "long or short before placing anything" in msg
+    assert "place a stop in TWS" not in msg
+    assert "long or short" in manual.call_args[0][1]
+    assert "CRWD" in tasks._REPROTECT_SIGN_FLIP
+    tasks._REPROTECT_SIGN_FLIP.discard("CRWD")
 
 
 def test_queued_restore_stops_everything_if_the_re_read_after_its_cancel_fails():
@@ -1346,6 +1374,15 @@ def test_refused_stop_over_the_position_that_cancels_on_retry_leaves_ours():
     assert b.cover() == 50 and list(b.orders) == [1]
 
 
+def test_ours_over_the_position_after_the_retry_lands_says_so_and_queues():
+    b = _refused_over_position(cross=False)
+    b.add(3, 30)                     # ours: 50 + 30 against 50 held
+    msg = b.run(lambda: tasks._fix_overstop("AMD"))
+    assert msg.startswith("⚠️") and "over-stopped" in msg and "cover" not in msg
+    assert "re-check queued" in msg and len(b.queued) == 1
+    assert 2 not in b.orders and b.cover() == 80   # ours left for the re-check
+
+
 def test_refused_stop_equal_to_the_position_keeps_the_cover_path():
     b = _refused_over_position()
     b.orders[2]["qty"] = 50
@@ -1377,15 +1414,53 @@ def test_recheck_reads_that_agree_allow_cancels():
         assert tasks._recheck_position_reads("AMD") == {}
 
 
-@pytest.mark.parametrize("fresh", [TimeoutError("read"), {}, {"NVDA": 5.0}])
-def test_a_fresh_read_failing_or_without_the_ticker_is_no_cross_check(fresh):
-    # an empty or partial fresh read may be a reconnect gap: add-only, no
+@pytest.mark.parametrize("fresh", [TimeoutError("read"), {}])
+def test_a_fresh_read_failing_or_empty_is_no_cross_check(fresh):
+    # a failed or empty fresh read may be a reconnect gap: add-only, no
     # max_qty (fresh 0 vs cache 50 is not a disagreement)
     kw = {"side_effect": fresh} if isinstance(fresh, Exception) else {"return_value": fresh}
     with patch("ibkr.get_fresh_stock_positions", **kw):
         out = tasks._recheck_position_reads("AMD")
     assert out["allow_cancel"] is False and "max_qty" not in out and "fresh_qty" not in out
     assert out["no_cancel_reason"].startswith("the fresh position read")
+
+
+def test_a_fresh_read_with_other_tickers_but_not_this_one_does_nothing():
+    # zero positions are left out of the fresh read, so this may be a real
+    # flat: no add, no cancel, no alert
+    b = _Broker(held=50)
+    b.fresh_read = {"NVDA": 5.0}
+    b.add(1, 20)
+    with patch("tasks._fix_overstop_safe") as fix:
+        b.run(lambda: tasks.recheck_stop_coverage("AMD"))
+    fix.assert_not_called()
+    assert b.sent == [] and b.cancels == {} and b.cover() == 20
+
+
+def test_a_fresh_read_without_the_ticker_queues_another_look_within_the_cap():
+    b = _Broker(held=50)
+    b.fresh_read = {"NVDA": 5.0}
+    b.add(1, 20)
+    with patch("tasks._fix_overstop_safe") as fix:
+        b.run(lambda: tasks.recheck_stop_coverage("AMD", attempt=2))
+        assert [a for _, a in b.queued] == [3]
+        b.queued.clear()
+        b.run(lambda: tasks.recheck_stop_coverage("AMD", attempt=tasks._COVERAGE_RECHECK_TRIES))
+    assert b.queued == []            # last try: no further look
+    fix.assert_not_called()
+    assert b.sent == []
+
+
+def test_reads_that_disagree_on_sign_add_no_stop():
+    # cache long 50, fresh short -10: max_qty 0, as reconcile's _smaller_read
+    b = _Broker(held=50)
+    b.fresh = -10
+    b.add(1, 20)
+    with patch("tasks._fix_overstop_safe", wraps=tasks._fix_overstop_safe) as fix:
+        b.run(lambda: tasks.recheck_stop_coverage("AMD"))
+    assert fix.call_args.kwargs["max_qty"] == 0.0
+    assert fix.call_args.kwargs["allow_cancel"] is False
+    assert b.next_id == 100 and b.cancels == {}   # nothing placed or cancelled
 
 
 @pytest.mark.parametrize("fresh", [TimeoutError("read"), {}])

@@ -47,7 +47,7 @@ def _fetch_bars(ticker: str, days: int = 90) -> list[dict]:
         return [{"date": b["t"][:10], "open": b["o"], "high": b["h"],
                  "low": b["l"], "close": b["c"], "volume": b["v"]} for b in bars]
     except Exception as e:
-        log.debug(f"Bar fetch failed for {ticker}: {e}")
+        log.warning(f"Bar fetch failed for {ticker}: {e}")
         return []
 
 
@@ -442,6 +442,7 @@ def run_scan(regime_packet: dict | None = None) -> dict:
         # Fetch bars
         bars = completed_bars(_fetch_bars(ticker, days=220))
         if not bars:
+            log.warning(f"[{ticker}] Disqualified: no price data available")
             disqualified.append({"ticker": ticker, "reason": "No price data available", "composite_score": 0})
             continue
 
@@ -455,8 +456,8 @@ def run_scan(regime_packet: dict | None = None) -> dict:
                 log.info(f"[{ticker}] Skipped — earnings within {_BLACKOUT} days")
                 disqualified.append({"ticker": ticker, "reason": f"Earnings within {_BLACKOUT} days (blackout)", "composite_score": 0})
                 continue
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"[{ticker}] Earnings blackout check failed, not applied: {e}")
 
         # Score each dimension
         tech_score,     tech_notes    = _score_technical(bars, ticker)
@@ -470,8 +471,8 @@ def run_scan(regime_packet: dict | None = None) -> dict:
                 if cat_score > 15:
                     cat_score = 15
                     cat_notes += " [earnings risk: within 10 days]"
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"[{ticker}] Earnings catalyst cap check failed, not applied: {e}")
         thesis_score,   thesis_notes  = _score_thesis_alignment(entry_with_ticker)
 
         composite = tech_score + mom_score + cat_score + thesis_score
@@ -528,9 +529,11 @@ def run_scan(regime_packet: dict | None = None) -> dict:
             candidate["setup_gates_shadow"] = {}
 
         if priority == "PASS":
+            reason = f"Score {composite}/100 below threshold ({threshold}) in {regime} regime"
+            log.info(f"[{ticker}] Disqualified: {reason}")
             disqualified.append({
                 "ticker": ticker,
-                "reason": f"Score {composite}/100 below threshold ({threshold}) in {regime} regime",
+                "reason": reason,
                 "composite_score": composite,
             })
         else:
@@ -557,7 +560,7 @@ def run_scan(regime_packet: dict | None = None) -> dict:
                 regime_detail=regime_detail,
             )
         except Exception as e:
-            log.debug(f"Scanner DB log failed for {ticker}: {e}")
+            log.warning(f"Scanner DB log failed for {ticker}: {e}")
 
     # Sort by composite score descending
     candidates.sort(key=lambda c: c["composite_score"], reverse=True)

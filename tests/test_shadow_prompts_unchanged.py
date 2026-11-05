@@ -1,7 +1,7 @@
 """The log-only shadows (roadmap 01(c)) must leave what the models read
 byte-identical. These hashes are the analyst and screener prompts at
 c93ebe5, before the shadows. A deliberate prompt change (Luke's call)
-updates them in the same commit."""
+updates them in the same commit: the screener's gained the new_fact field."""
 import hashlib
 from unittest.mock import patch
 
@@ -28,4 +28,4 @@ def test_analyst_rendered_prompt_unchanged():
 
 def test_screener_prompt_template_unchanged():
     assert _sha(screener._SCREENER_PROMPT) == (
-        "344564c4765893c4f8cec555d4ed68a30787747b8d6986f65e7782d1bb4447c9")
+        "ee4bf82515e1552f6896ab06be54e81183c029d8487330b2368628c1f8d83ec1")

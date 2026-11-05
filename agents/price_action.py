@@ -267,11 +267,15 @@ RS_PROXY_MIN_OUTPERFORMANCE = 0.0   # must simply be beating SPY, not just close
 
 def compute_trend_template(
     ticker: str, bars: list[dict] | None = None, spy_bars: list[dict] | None = None,
+    status: dict | None = None,
 ) -> dict | None:
     """
     Returns {"pass": bool, "criteria": {name: bool, ...}, "reasoning": str}
     or None if there isn't enough history yet (mirrors compute_price_action's
     own None-on-insufficient-data convention).
+
+    status, if given, gets "status" set on a None: "read_error" (the bar read
+    failed) or "insufficient_history". Log-only.
 
     `bars`/`spy_bars` can be passed in to avoid a redundant fetch; otherwise
     fetched fresh via trading_bot's own price history cache.
@@ -279,9 +283,12 @@ def compute_trend_template(
     if bars is None:
         try:
             import db
-            bars = db.get_price_history(ticker, days=TREND_TEMPLATE_RS_LOOKBACK + TREND_TEMPLATE_MA200_SLOPE_LOOKBACK + 10)
+            bars = db.get_price_history(ticker, days=TREND_TEMPLATE_RS_LOOKBACK + TREND_TEMPLATE_MA200_SLOPE_LOOKBACK + 10,
+                                        strict=True)
         except Exception as e:
-            log.debug(f"[{ticker}] trend_template: history fetch failed: {e}")
+            log.warning(f"[{ticker}] trend_template: history fetch failed: {e}")
+            if status is not None:
+                status["status"] = "read_error"
             return None
     if spy_bars is None:
         try:
@@ -293,6 +300,8 @@ def compute_trend_template(
 
     min_bars_needed = TREND_TEMPLATE_RS_LOOKBACK + TREND_TEMPLATE_MA200_SLOPE_LOOKBACK
     if len(bars) < min_bars_needed:
+        if status is not None:
+            status["status"] = "insufficient_history"
         return None
 
     closes = [b["close"] for b in bars]

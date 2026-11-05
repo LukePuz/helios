@@ -1050,22 +1050,25 @@ def log_trade(symbol: str, side: str, quantity: int, price: float, reason: str,
         _put_conn(conn)
 
 
-def _finite_json(o, replaced: list | None = None):
+def _finite_json(o, replaced: list | None = None, path: str = ""):
     """o with NaN/inf floats replaced by None: Postgres jsonb rejects them,
     and json.loads accepts "NaN" from model output, so one such value lost
-    the whole verdict row (professor M106). Appends to `replaced` once per
-    value swapped, so the caller can record how many."""
+    the whole verdict row (professor M106). Appends to `replaced` the dotted
+    path of each value swapped (a list item by its index; "" for o itself),
+    so the caller can record how many and where."""
     import math
     if isinstance(o, float):
         if math.isfinite(o):
             return o
         if replaced is not None:
-            replaced.append(1)
+            replaced.append(path)
         return None
     if isinstance(o, dict):
-        return {k: _finite_json(v, replaced) for k, v in o.items()}
+        return {k: _finite_json(v, replaced, f"{path}.{k}" if path else str(k))
+                for k, v in o.items()}
     if isinstance(o, (list, tuple)):
-        return [_finite_json(v, replaced) for v in o]
+        return [_finite_json(v, replaced, f"{path}.{i}" if path else str(i))
+                for i, v in enumerate(o)]
     return o
 
 
@@ -1075,9 +1078,12 @@ def log_signal(symbol: str, signal: str, confidence: float, reasoning: str,
     """Returns the new row's id, or None if the full row wasn't written
     (a fallback or degraded row, or a spill)."""
     replaced: list = []
-    provenance, decision = _finite_json(provenance, replaced), _finite_json(decision, replaced)
+    # decision first, so its model_output paths lead nonfinite_paths
+    decision = _finite_json(decision, replaced, "decision")
+    provenance = _finite_json(provenance, replaced, "provenance")
     if replaced and isinstance(decision, dict):
         decision["nonfinite_replaced"] = len(replaced)   # nulls that were NaN/inf
+        decision["nonfinite_paths"] = replaced[:50]      # where (decision.model_output....)
     rec = {"symbol": symbol, "signal": signal, "confidence": confidence, "reasoning": reasoning,
            "trading_env": TRADING_ENV, "model": model, "provenance": provenance,
            "decision": decision}
@@ -1153,8 +1159,8 @@ def log_snapshot(total_value: float, cash: float, positions: dict,
             cur.execute(
                 "INSERT INTO portfolio_snapshots (total_value, trading_env, cash, positions_json, benchmark_json) "
                 "VALUES (%s,%s,%s,%s,%s)",
-                (total_value, TRADING_ENV, cash, psycopg2.extras.Json(positions),
-                 psycopg2.extras.Json(benchmark) if benchmark else None),
+                (total_value, TRADING_ENV, cash, psycopg2.extras.Json(_finite_json(positions)),
+                 psycopg2.extras.Json(_finite_json(benchmark)) if benchmark else None),
             )
         conn.commit()
     except Exception as e:
@@ -1247,7 +1253,16 @@ _NON_ANALYST_SIGNALS = ("SCREENED_OUT", "CATALYST_BLOCKED", "COOLDOWN_SKIPPED", 
                         # An analysis that produced no verdict (log-only, M166).
                         "ANALYST_FAILED",
                         # A pass not sized because RiskManager could not start.
-                        "ROUTE_RISK_INIT_FAILED")
+                        "ROUTE_RISK_INIT_FAILED",
+                        # A buy the micro-tier per-name cap left at 0 shares.
+                        "ROUTE_MICRO_NAME_CAP",
+                        # A buy with no screener new fact behind it.
+                        "ROUTE_NO_NEW_FACT",
+                        # Routing raised after the verdict was written.
+                        "ROUTE_ERROR",
+                        # Log-only: a screener pass, and a screen or analysis
+                        # task that expired, was revoked or failed for good.
+                        "SCREENED_IN", "EVENT_LOST")
 
 
 def get_latest_signal_for(ticker: str) -> dict | None:
@@ -1292,8 +1307,10 @@ def get_latest_signal_for(ticker: str) -> dict | None:
 # verdict (ANALYST_FAILED from the analyst, NO_VERDICT from the scan guard)
 # and a scan pass not routed for want of a broker (ROUTE_NO_BROKER); from
 # 11-03 also a pass not sized because RiskManager could not start
-# (ROUTE_RISK_INIT_FAILED).
-_RECORD_ONLY_SIGNALS = ("ANALYST_FAILED", "NO_VERDICT", "ROUTE_NO_BROKER", "ROUTE_RISK_INIT_FAILED")
+# (ROUTE_RISK_INIT_FAILED), a routing raise (ROUTE_ERROR), a screener pass
+# (SCREENED_IN) and a lost screen or analysis task (EVENT_LOST).
+_RECORD_ONLY_SIGNALS = ("ANALYST_FAILED", "NO_VERDICT", "ROUTE_NO_BROKER", "ROUTE_RISK_INIT_FAILED",
+                        "ROUTE_ERROR", "SCREENED_IN", "EVENT_LOST")
 
 
 def get_recent_signals(limit: int = 50) -> list[dict]:
@@ -1406,8 +1423,8 @@ def log_regime(
                 "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
                 (
                     regime, score, confidence,
-                    psycopg2.extras.Json(signals),
-                    psycopg2.extras.Json(portfolio_impact),
+                    psycopg2.extras.Json(_finite_json(signals)),
+                    psycopg2.extras.Json(_finite_json(portfolio_impact)),
                     reasoning, regime_type, sector_etf,
                 ),
             )
@@ -1716,7 +1733,7 @@ def log_activity(
                 """INSERT INTO activity_feed (stage, ticker, message, sentiment, extra_json)
                    VALUES (%s, %s, %s, %s, %s)""",
                 (stage, ticker or "", message, sentiment,
-                 _json.dumps(extra) if extra else None),
+                 _json.dumps(_finite_json(extra)) if extra else None),
             )
         conn.commit()
         return True
@@ -1764,7 +1781,7 @@ def log_boot_activity(message: str, extra: dict) -> bool:
             cur.execute(
                 "INSERT INTO activity_feed (stage, ticker, message, sentiment, extra_json) "
                 "VALUES (%s, %s, %s, %s, %s)",
-                ("boot", "", message, "neutral", json.dumps({**extra, "env": TRADING_ENV}, default=str)))
+                ("boot", "", message, "neutral", json.dumps(_finite_json({**extra, "env": TRADING_ENV}), default=str)))
         conn.commit()
         return True
     except Exception as e:
@@ -1800,7 +1817,7 @@ def log_activity_direct(stage: str, ticker: str, message: str, sentiment: str = 
                 "INSERT INTO activity_feed (stage, ticker, message, sentiment, extra_json) "
                 "VALUES (%s, %s, %s, %s, %s)",
                 (stage, ticker or "", message, sentiment,
-                 json.dumps(extra, default=str) if extra else None))
+                 json.dumps(_finite_json(extra), default=str) if extra else None))
         conn.commit()
         return True
     except Exception as e:
@@ -1832,6 +1849,36 @@ def get_activity_shadow_keys(stage: str) -> set[str] | None:
             return {r[0] for r in cur.fetchall() if r[0]}
     except Exception as e:
         logging.error(f"get_activity_shadow_keys failed: {e}")
+        return None
+    finally:
+        if conn is not None:
+            _put_conn(conn)
+
+
+def get_activity_rows(stage: str, kind: str, days: int = 45) -> list[dict] | None:
+    """extra_json of one stage's activity_feed rows of one extra kind from
+    the last `days` days, oldest first, with the row's ts. None on a failed
+    read."""
+    conn = None
+    try:
+        conn = _get_conn()
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = 5000")
+            cur.execute(
+                "SELECT ts, extra_json FROM activity_feed WHERE stage=%s "
+                "AND extra_json->>'kind' = %s AND ts >= NOW() - make_interval(days => %s) "
+                "ORDER BY ts ASC",
+                (stage, kind, int(days)),
+            )
+            out = []
+            for ts, extra in cur.fetchall():
+                if isinstance(extra, str):
+                    extra = json.loads(extra)
+                if isinstance(extra, dict):
+                    out.append({**extra, "_ts": ts})
+            return out
+    except Exception as e:
+        logging.error(f"get_activity_rows failed: {e}")
         return None
     finally:
         if conn is not None:
@@ -2632,10 +2679,10 @@ def upsert_trade_ladder(ticker: str, ladder: dict) -> None:
                     ladder.get("peer_implied_fair_value"), ladder.get("street_consensus_target"),
                     ladder.get("fair_value_blended"), ladder.get("valuation_pct_of_fair"),
                     ladder.get("valuation_tier"), ladder.get("valuation_outlier", False),
-                    psycopg2.extras.Json(ladder.get("rungs", [])),
+                    psycopg2.extras.Json(_finite_json(ladder.get("rungs", []))),
                     ladder.get("dcf_fair_value"), ladder.get("comps_fair_value"),
                     ladder.get("rule40_fair_value"), ladder.get("peg_fair_value"),
-                    psycopg2.extras.Json(ladder.get("valuation_methods_used", [])),
+                    psycopg2.extras.Json(_finite_json(ladder.get("valuation_methods_used", []))),
                     ladder.get("valuation_confidence"),
                     ladder.get("street_target_low"), ladder.get("street_target_high"),
                     ladder.get("implied_growth_rate"), ladder.get("growth_gap_vs_actual"),
@@ -2711,17 +2758,29 @@ def get_all_trade_ladders() -> list[dict]:
 # just the latest, for drift analysis over a position's whole life.
 # ---------------------------------------------------------------------------
 
+def _finite_thesis(ticker: str, thesis, writer: str):
+    """thesis through _finite_json, with a WARNING naming how many NaN/inf
+    values were stored as null (the thesis JSON has no field for it)."""
+    replaced: list = []
+    clean = _finite_json(thesis, replaced)
+    if replaced:
+        logging.warning(f"[{ticker}] {writer}: {len(replaced)} non-finite value(s) stored as null "
+                        f"({', '.join(replaced[:5])})")
+    return clean
+
+
 def set_original_thesis(ticker: str, thesis: dict) -> None:
     conn = _get_conn()
     try:
+        clean = _finite_thesis(ticker, thesis, "set_original_thesis")
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE position_stops SET original_thesis=%s, latest_thesis=%s, thesis_updated_at=NOW() "
                 "WHERE ticker=%s AND trading_env=%s",
-                (psycopg2.extras.Json(thesis), psycopg2.extras.Json(thesis), ticker, TRADING_ENV),
+                (psycopg2.extras.Json(clean), psycopg2.extras.Json(clean), ticker, TRADING_ENV),
             )
         conn.commit()
-        log_thesis_history(ticker, thesis)
+        log_thesis_history(ticker, clean)     # already finite: warned once, above
     except Exception as e:
         conn.rollback()
         logging.error(f"[{ticker}] set_original_thesis failed: {e}")
@@ -2732,14 +2791,15 @@ def set_original_thesis(ticker: str, thesis: dict) -> None:
 def update_latest_thesis(ticker: str, thesis: dict) -> None:
     conn = _get_conn()
     try:
+        clean = _finite_thesis(ticker, thesis, "update_latest_thesis")
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE position_stops SET latest_thesis=%s, thesis_updated_at=NOW() "
                 "WHERE ticker=%s AND trading_env=%s",
-                (psycopg2.extras.Json(thesis), ticker, TRADING_ENV),
+                (psycopg2.extras.Json(clean), ticker, TRADING_ENV),
             )
         conn.commit()
-        log_thesis_history(ticker, thesis)
+        log_thesis_history(ticker, clean)     # already finite: warned once, above
     except Exception as e:
         conn.rollback()
         logging.error(f"[{ticker}] update_latest_thesis failed: {e}")
@@ -2780,10 +2840,11 @@ def get_thesis(ticker: str) -> dict | None:
 def log_thesis_history(ticker: str, thesis: dict) -> None:
     conn = _get_conn()
     try:
+        clean = _finite_thesis(ticker, thesis, "log_thesis_history")
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO thesis_history (ticker, trading_env, thesis_json) VALUES (%s, %s, %s)",
-                (ticker, TRADING_ENV, psycopg2.extras.Json(thesis)),
+                (ticker, TRADING_ENV, psycopg2.extras.Json(clean)),
             )
         conn.commit()
     except Exception as e:
@@ -3278,7 +3339,7 @@ def upsert_fundamentals(ticker: str, metrics: dict) -> None:
                     metrics.get("ev_to_ebitda"),
                     metrics.get("forward_pe"),
                     metrics.get("market_cap"),
-                    json.dumps(metrics.get("raw", {})),
+                    json.dumps(_finite_json(metrics.get("raw", {})), default=str),
                     metrics.get("shares_outstanding"),
                     metrics.get("target_mean_price"),
                     metrics.get("free_cash_flow"),
@@ -3449,8 +3510,10 @@ def upsert_price_bars(ticker: str, bars: list[dict]) -> int:
         _put_conn(conn)
 
 
-def get_price_history(ticker: str, days: int = 260) -> list[dict]:
-    """Returns up to `days` most recent daily bars for ticker, oldest first."""
+def get_price_history(ticker: str, days: int = 260, strict: bool = False) -> list[dict]:
+    """Returns up to `days` most recent daily bars for ticker, oldest first.
+    strict: raise on a failed read instead of returning [] (which reads as
+    "no history")."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
@@ -3468,6 +3531,8 @@ def get_price_history(ticker: str, days: int = 260) -> list[dict]:
         ]
     except Exception as e:
         logging.error(f"get_price_history({ticker}) failed: {e}")
+        if strict:
+            raise
         return []
     finally:
         _put_conn(conn)
@@ -4587,7 +4652,7 @@ def log_trade_outcome(
                  chase_risk_pct_from_kijun, price_action, price_action_structure,
                  catalyst_event, catalyst_date, catalyst_is_priced_in,
                  expected_return_pct, expected_downside_pct, thesis_summary,
-                 psycopg2.extras.Json(sources) if sources is not None else None, source_count,
+                 psycopg2.extras.Json(_finite_json(sources)) if sources is not None else None, source_count,
                  weeks_to_catalyst, expected_return_per_week, entry_date,
                  planned_risk_per_share, fill_risk_per_share),
             )
@@ -4656,7 +4721,7 @@ def backfill_catalyst_outcome(
     available entry data, with approval_id left NULL (nullable FK -- no
     real approval exists for a position that predates this tracking)."""
     conn = _get_conn()
-    sources_json = psycopg2.extras.Json(sources) if sources is not None else None
+    sources_json = psycopg2.extras.Json(_finite_json(sources)) if sources is not None else None
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -5035,18 +5100,19 @@ def get_all_outcomes(limit: int = 100) -> list[dict]:
                 (TRADING_ENV, limit),
             )
             rows = cur.fetchall()
+        # is not None: a breakeven 0.0 outcome read as "no outcome".
         return [
             {
                 "approval_id": r[0], "ticker": r[1], "action": r[2],
                 "conviction": r[3], "thesis_bucket": r[4],
-                "entry_price": float(r[5]) if r[5] else None,
+                "entry_price": float(r[5]) if r[5] is not None else None,
                 "entry_date": r[6],
-                "review_30d_price": float(r[7]) if r[7] else None,
-                "review_60d_price": float(r[8]) if r[8] else None,
-                "review_90d_price": float(r[9]) if r[9] else None,
-                "exit_price": float(r[10]) if r[10] else None,
+                "review_30d_price": float(r[7]) if r[7] is not None else None,
+                "review_60d_price": float(r[8]) if r[8] is not None else None,
+                "review_90d_price": float(r[9]) if r[9] is not None else None,
+                "exit_price": float(r[10]) if r[10] is not None else None,
                 "exit_date": r[11],
-                "outcome_pct": float(r[12]) if r[12] else None,
+                "outcome_pct": float(r[12]) if r[12] is not None else None,
                 "was_correct": r[13],
                 "alpha_pct": float(r[14]) if r[14] is not None else None,
             }
@@ -5383,15 +5449,46 @@ def recent_event_verdicts(ticker: str, minutes: int = 15) -> list[dict]:
                 "SELECT timestamp, provenance->'trigger'->>'title', provenance->'trigger'->>'url', "
                 "decision->>'model_action' FROM signals "
                 "WHERE symbol=%s AND trading_env=%s AND provenance->'trigger'->>'path' = 'event' "
-                "AND signal <> 'ANALYST_FAILED' "
+                "AND signal NOT IN %s "
                 "AND timestamp > NOW() - make_interval(mins => %s) ORDER BY timestamp DESC",
-                (ticker, TRADING_ENV, minutes),
+                (ticker, TRADING_ENV, _NON_ANALYST_SIGNALS, minutes),
             )
             return [{"timestamp": ts, "title": t, "url": u, "model_action": a}
                     for ts, t, u, a in cur.fetchall()]
     except Exception as e:
         logging.error(f"recent_event_verdicts({ticker}) failed: {e}")
         return []
+    finally:
+        _put_conn(conn)
+
+
+def recent_new_fact_items(ticker: str, hours: int) -> list[dict] | None:
+    """News items on the ticker (this env) the screener marked new_fact true
+    and that reached the analyst in the last `hours`, newest first, from the
+    verdict rows' provenance.trigger: [{signal_id, timestamp, title, url}].
+    None when the read failed (the buy gate then counts no item)."""
+    try:
+        conn = _get_conn()
+    except Exception as e:
+        logging.error(f"recent_new_fact_items({ticker}) failed: {e}")
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, timestamp, provenance->'trigger'->>'title', provenance->'trigger'->>'url' "
+                "FROM signals WHERE symbol=%s AND trading_env=%s "
+                "AND (signal NOT IN %s OR signal = 'ANALYST_FAILED') "
+                "AND provenance->'trigger'->>'path' = 'event' "
+                "AND provenance->'trigger'->>'new_fact' = 'true' "
+                "AND timestamp > NOW() - make_interval(hours => %s) "
+                "ORDER BY timestamp DESC LIMIT 5",
+                (ticker, TRADING_ENV, _NON_ANALYST_SIGNALS, int(hours)),
+            )
+            return [{"signal_id": i, "timestamp": str(ts), "title": (t or "")[:200] or None,
+                     "url": u} for i, ts, t, u in cur.fetchall()]
+    except Exception as e:
+        logging.error(f"recent_new_fact_items({ticker}) failed: {e}")
+        return None
     finally:
         _put_conn(conn)
 
@@ -5586,14 +5683,15 @@ def log_scanner_candidate(
         ticker, scan_type, composite_score, technical_score, momentum_score,
         catalyst_score, thesis_alignment_score, priority, catalyst_detail,
         passed_to_analyst, regime_at_scan, setup_category, setup_triggered,
-        psycopg2.extras.Json(setup_gates_detail) if setup_gates_detail is not None else None,
+        psycopg2.extras.Json(_finite_json(setup_gates_detail))
+        if setup_gates_detail is not None else None,
     )
     conn = _get_conn()
     try:
         try:
             with conn.cursor() as cur:
                 cur.execute(base.format(extra=", regime_detail", ph=",%s"),
-                            values + (psycopg2.extras.Json(regime_detail)
+                            values + (psycopg2.extras.Json(_finite_json(regime_detail))
                                       if regime_detail is not None else None,))
         except Exception as e:
             # Usually migration 61 not applied yet: log the row without it,

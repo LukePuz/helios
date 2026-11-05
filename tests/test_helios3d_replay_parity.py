@@ -56,6 +56,61 @@ def test_expected_return_per_week(ret, weeks):
     assert G.expected_return_per_week(ret, weeks) == live.expected_return_per_week(ret, weeks)
 
 
+@pytest.mark.parametrize("raw", [None, 7, 12.5, "12.5", " 3 ", "abc", "", [], {}, "nan", "inf",
+                                 "-Infinity", "1e400", 10 ** 400, float("nan"), float("inf"),
+                                 float("-inf"), True, False], ids=lambda v: repr(v)[:16])
+def test_optional_float_matches_live(raw):
+    """Live's _optional_float is nested in _analyze_inner: read it back from
+    analyze()'s expected_return_pct on a Compounder HOLD (no rate gate)."""
+    mo = {"action": "HOLD", "conviction": 6, "upside_downside_ratio": 3.0,
+          "expected_return_pct": raw, "pass_to_risk": False, "catalyst": {"date": "ongoing"},
+          "sources": [{"type": "news", "detail": "a"}, {"type": "filing", "detail": "b"}]}
+    with ExitStack() as stack:
+        for p in (patch("agents.analyst._call_ollama", return_value=json.dumps(mo)),
+                  patch("knowledge_loader.load_thesis", return_value=""),
+                  patch("knowledge_loader.load_philosophy", return_value=""),
+                  patch("agents.chase_risk.compute_chase_risk", return_value=None),
+                  patch("agents.price_action.compute_price_action", return_value=None),
+                  patch("db.get_fundamentals", return_value={"market_cap": 1_000_000_000}),
+                  patch("db.get_latest_signal_for", return_value=None),
+                  patch("db.get_conviction_calibration", return_value=[]),
+                  patch("db.log_signal"), patch("feed.emit")):
+            stack.enter_context(p)
+        result = live.analyze({"ticker": "TST", "role": "Compounder", "tier": "Watch",
+                               "sector": "Software", "held": True}, situation_brief="brief",
+                              regime_packet={"regime": "Neutral", "score": 50, "reasoning": ""})
+    assert result["action"] == "HOLD"
+    want = result["expected_return_pct"]
+    got = G.optional_float(json.loads(json.dumps(mo)), "expected_return_pct")
+    assert got == want and type(got) is type(want)
+    if isinstance(raw, bool):
+        assert want is None    # a bool is stored as null, not 1.0/0.0
+
+
+@pytest.mark.parametrize("raw", [True, False])
+def test_a_bool_downside_is_stored_as_null(raw):
+    mo = {"action": "HOLD", "conviction": 6, "upside_downside_ratio": 3.0,
+          "expected_return_pct": 10.0, "expected_downside_pct": raw, "pass_to_risk": False,
+          "catalyst": {"date": "ongoing"},
+          "sources": [{"type": "news", "detail": "a"}, {"type": "filing", "detail": "b"}]}
+    with ExitStack() as stack:
+        for p in (patch("agents.analyst._call_ollama", return_value=json.dumps(mo)),
+                  patch("knowledge_loader.load_thesis", return_value=""),
+                  patch("knowledge_loader.load_philosophy", return_value=""),
+                  patch("agents.chase_risk.compute_chase_risk", return_value=None),
+                  patch("agents.price_action.compute_price_action", return_value=None),
+                  patch("db.get_fundamentals", return_value={"market_cap": 1_000_000_000}),
+                  patch("db.get_latest_signal_for", return_value=None),
+                  patch("db.get_conviction_calibration", return_value=[]),
+                  patch("db.log_signal"), patch("feed.emit")):
+            stack.enter_context(p)
+        result = live.analyze({"ticker": "TST", "role": "Compounder", "tier": "Watch",
+                               "sector": "Software", "held": True}, situation_brief="brief",
+                              regime_packet={"regime": "Neutral", "score": 50, "reasoning": ""})
+    assert result["expected_downside_pct"] is None and result["expected_return_pct"] == 10.0
+    assert G.optional_float(mo, "expected_downside_pct") is None
+
+
 def _prev(conv, days_ago):
     ts = None if days_ago is None else datetime.now(timezone.utc) - timedelta(days=days_ago)
     return {"signal": "TRIM", "confidence": conv / 10, "timestamp": ts}
@@ -605,3 +660,83 @@ def test_a_recorded_return_gate_is_left_to_the_rate_step():
     assert steps["malformed_catalyst"]["status"] == G.NOT_APPLICABLE
     assert steps["malformed_return"]["status"] == G.REPLAYED and steps["malformed_return"]["fired"]
     assert (out["final_action"], out["gates"]) == ("WATCH", recorded)
+
+
+def test_a_nulled_non_finite_return_makes_the_rate_step_oracle():
+    """A pre-policy Accelerator OPEN whose NaN expected_return_pct passed the
+    rate check and was stored as null (decision.nonfinite_replaced): the
+    rate step is oracle on the recorded gates, so no false differ; without
+    the marker the null is replayed as before."""
+    from helios3d.replay import harness as H
+    mo = {"action": "OPEN", "conviction": 8, "upside_downside_ratio": 3, "pass_to_risk": True,
+          "catalyst": {"date": (_AS_OF + timedelta(days=21)).date().isoformat()},
+          "expected_return_pct": None,
+          "sources": [{"type": "a", "detail": "1"}, {"type": "b", "detail": "2"}]}
+    base = {"bucket": "Accelerator", "held": True, "as_of": _AS_OF, "min_return_per_week": 1.0,
+            "month_midpoint": False, "trend_template_pass": True, "regime": "Risk-On",
+            "fund_read": "ok"}
+    out = G.replay_gates(mo, {**base, "nonfinite_replaced": 1}, [])
+    rr = _step(out, "return_rate")
+    assert rr["status"] == G.ORACLE and rr["fired"] is False
+    assert rr["reason"] == "non-finite value not stored"
+    assert out["final_action"] == "OPEN"
+    recorded = ["return rate (no expected_return_pct): OPEN -> WATCH"]
+    out = G.replay_gates(mo, {**base, "nonfinite_replaced": 1}, recorded)
+    assert _step(out, "return_rate")["fired"] is True and out["gates"] == recorded
+    out = G.replay_gates(mo, base, [])
+    assert _step(out, "return_rate")["status"] == G.REPLAYED and out["final_action"] == "WATCH"
+    # A finite return is read as usual with the marker set.
+    out = G.replay_gates({**mo, "expected_return_pct": 25}, {**base, "nonfinite_replaced": 1}, [])
+    assert _step(out, "return_rate")["status"] == G.REPLAYED
+    # The harness passes the marker from the signals row.
+    inp, src = H.gate_inputs({"as_of_ts": _AS_OF}, {"provenance": {"config": {}},
+                             "decision": {"nonfinite_replaced": 2}, "prompt_role": None}, None)
+    assert inp["nonfinite_replaced"] == 2 and src["nonfinite_replaced"] == "decision.nonfinite_replaced"
+    inp, _ = H.gate_inputs({"as_of_ts": _AS_OF}, {"provenance": {"config": {}},
+                           "decision": {}, "prompt_role": None}, None)
+    assert "nonfinite_replaced" not in inp
+
+
+@pytest.mark.parametrize("paths, oracle", [
+    (["decision.model_output.expected_return_pct"], True),
+    (["decision.model_output.catalyst.date"], True),
+    (["provenance.implied_growth.x", "decision.model_output.upside_downside_ratio"], False),
+])
+def test_nonfinite_paths_narrow_the_rate_oracle(paths, oracle):
+    """With recorded paths, the rate step is oracle only when the null it
+    reads was a NaN/inf; a row with only the count keeps the wider rule."""
+    from helios3d.replay import harness as H
+    mo = {"action": "OPEN", "conviction": 8, "upside_downside_ratio": 3, "pass_to_risk": True,
+          "catalyst": {"date": (_AS_OF + timedelta(days=21)).date().isoformat()},
+          "expected_return_pct": None,
+          "sources": [{"type": "a", "detail": "1"}, {"type": "b", "detail": "2"}]}
+    base = {"bucket": "Accelerator", "held": True, "as_of": _AS_OF, "min_return_per_week": 1.0,
+            "month_midpoint": False, "trend_template_pass": True, "regime": "Risk-On",
+            "fund_read": "ok", "nonfinite_replaced": max(len(paths), 1)}
+    rr = _step(G.replay_gates(mo, {**base, "nonfinite_paths": paths}, []), "return_rate")
+    assert (rr["status"] == G.ORACLE) is oracle
+    if not oracle:
+        assert rr["status"] == G.REPLAYED and rr["fired"] is True
+    assert _step(G.replay_gates(mo, base, []), "return_rate")["status"] == G.ORACLE
+    inp, src = H.gate_inputs({"as_of_ts": _AS_OF}, {"provenance": {"config": {}},
+                             "decision": {"nonfinite_replaced": 1, "nonfinite_paths": paths},
+                             "prompt_role": None}, None)
+    assert inp["nonfinite_paths"] == paths and src["nonfinite_paths"] == "decision.nonfinite_paths"
+
+
+def test_capped_paths_fall_back_to_the_count_rule():
+    """Over 50 non-finite values log_signal keeps 50 paths; when they are
+    fewer than the count the rate path may be past the cap, so the null
+    field rule applies (oracle), not the paths."""
+    mo = {"action": "OPEN", "conviction": 8, "upside_downside_ratio": 3, "pass_to_risk": True,
+          "catalyst": {"date": (_AS_OF + timedelta(days=21)).date().isoformat()},
+          "expected_return_pct": None,
+          "sources": [{"type": "a", "detail": "1"}, {"type": "b", "detail": "2"}]}
+    paths = [f"provenance.p{i}" for i in range(50)]
+    base = {"bucket": "Accelerator", "held": True, "as_of": _AS_OF, "min_return_per_week": 1.0,
+            "month_midpoint": False, "trend_template_pass": True, "regime": "Risk-On",
+            "fund_read": "ok", "nonfinite_paths": paths}
+    rr = _step(G.replay_gates(mo, {**base, "nonfinite_replaced": 51}, []), "return_rate")
+    assert rr["status"] == G.ORACLE and rr["reason"] == "non-finite value not stored"
+    rr = _step(G.replay_gates(mo, {**base, "nonfinite_replaced": 50}, []), "return_rate")
+    assert rr["status"] == G.REPLAYED

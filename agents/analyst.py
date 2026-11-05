@@ -1613,12 +1613,16 @@ def _malformed_catalyst_watch(ticker: str, parsed: dict, gates: list, fields: li
     return "WATCH"
 
 
-def _alert_held_sell_as_watch(ticker: str, model_action: str, fields: list[str]) -> None:
+def _alert_held_sell_as_watch(ticker: str, model_action: str, fields: list[str]) -> str:
     """A held position's TRIM/EXIT lowered to WATCH by the malformed-catalyst
     rule: one Telegram per ticker and action per 24 h (system_state
     malformed_sell_alert_at_<TICKER>_<ACTION>, written only after a send
     that went out), so the model's wish to sell is not left in a log line.
-    A failed state read skips the alert this time. Never raises."""
+    A failed state read skips the alert this time. Never raises. Returns
+    the outcome for decision.malformed_sell_alert: "sent", "throttled",
+    "skipped_state_error", "send_failed" (alerts._send returned None or
+    raised) or "error" (anything else raised)."""
+    status = "error"
     try:
         import db
         from datetime import datetime as _dt, timezone as _tz
@@ -1627,7 +1631,7 @@ def _alert_held_sell_as_watch(ticker: str, model_action: str, fields: list[str])
             last = db.get_state_strict(key)
         except Exception as e:
             log.warning(f"[{ticker}] malformed-catalyst sell alert skipped: state read failed: {e}")
-            return
+            return "skipped_state_error"
         now = _dt.now(_tz.utc)
         if last:
             try:
@@ -1635,18 +1639,20 @@ def _alert_held_sell_as_watch(ticker: str, model_action: str, fields: list[str])
                 if sent.tzinfo is None:
                     sent = sent.replace(tzinfo=_tz.utc)
                 if (now - sent).total_seconds() < 24 * 3600:
-                    return
+                    return "throttled"
             except (ValueError, TypeError):
                 pass    # unreadable: send, and the write below replaces it
         import alerts
-        if alerts._send(
-            f"⚠️ <b>{ticker}: model said {model_action} on a held position</b>\n"
-            f"The verdict was held as WATCH because of malformed field(s): "
-            f"{', '.join(fields)}. The stop is unchanged."
-        ) is not None:
+        text = (f"⚠️ <b>{ticker}: model said {model_action} on a held position</b>\n"
+                f"The verdict was held as WATCH because of malformed field(s): "
+                f"{', '.join(fields)}. The stop is unchanged.")
+        status = "send_failed"
+        if alerts._send(text) is not None:
+            status = "sent"
             db.set_state(key, now.isoformat())
     except Exception as e:
         log.warning(f"[{ticker}] malformed-catalyst sell alert failed: {e}")
+    return status
 
 
 # ---------------------------------------------------------------------------
@@ -1872,7 +1878,7 @@ def _stub_recommendation(candidate: dict, reason: str) -> dict:
         "expected_downside_pct": None,
         "weeks_to_catalyst": None,
         "expected_return_per_week": None,
-        "trend_template": None,
+        "trend_template": {"status": "not_run"},
         "options_opportunity": False,
         "options_notes":   None,
         "pass_to_risk":    False,
@@ -1927,9 +1933,13 @@ def _log_failed_analysis(candidate: dict, kind: str, reason: str, prompt: str | 
         db.log_signal(ticker, "ANALYST_FAILED", None, f"No verdict ({kind}): {reason}"[:500],
                       model=None, provenance=provenance,
                       decision={"failure": failure, "downgraded_reason": None, "malformed_fields": None,
-                                "return_malformed": None})
+                                "return_malformed": None, "malformed_sell_alert": None,
+                                "held_review": candidate.get("held_review") is True})
     except Exception as e:
         log.warning(f"[{ticker}] failed-analysis record not written: {e}")
+
+
+_EVENT_TIME_KEYS = ("timestamp", "published_at", "event_time", "filing_date", "date")
 
 
 def trigger_record(path: str, event: dict | None = None) -> dict:
@@ -1939,6 +1949,14 @@ def trigger_record(path: str, event: dict | None = None) -> dict:
     rec = {"path": path, "source": e.get("source"), "type": e.get("type"),
            "title": (e.get("title") or "")[:200] or None, "url": e.get("url"),
            "published_at": str(e.get("timestamp") or e.get("published_at") or "") or None}
+    # The item's own time, from the first structured key the source carries
+    # (M266): EDGAR/arXiv timestamp, news published_at, a rating's
+    # event_time, a Form 4 filing_date, a congressional trade date.
+    rec["event_time"], rec["event_time_source"] = None, None
+    for key in _EVENT_TIME_KEYS:
+        if e.get(key):
+            rec["event_time"], rec["event_time_source"] = str(e[key]), key
+            break
     if isinstance(e.get("text"), str) and e["text"]:
         # The brief shows only the first EVENT_TEXT_CAP characters (SEF data QA).
         rec["text_len"] = len(e["text"])
@@ -2051,6 +2069,9 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
 
     action     = str(parsed.get("action", "WATCH")).upper()
     conviction = max(1, min(10, int(parsed.get("conviction", 1) or 1)))
+    # Log-only (m429): scores the model left out and a default filled in
+    # (conviction 1, a sub-score 3), so they aren't read as its own.
+    imputed_fields: list[str] = ["conviction"] if parsed.get("conviction") is None else []
     udr        = float(parsed.get("upside_downside_ratio", 0) or 0)
     # Decision record (roadmap 0e #8): the model's own verdict and full
     # output before any gate, plus each gate that changed it. signals kept
@@ -2074,16 +2095,17 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
     # the raw value.
     malformed_fields = _malformed_catalyst_fields(parsed)
     return_malformed = "expected_return_pct" in malformed_fields
+    malformed_sell_alert = None     # the alert's outcome; None when none was due
     malformed_fields = [f for f in malformed_fields if f != "expected_return_pct"]
     _normalise_catalyst(parsed)
     if malformed_fields:
         action = _malformed_catalyst_watch(ticker, parsed, gates, malformed_fields, action)
-        # held_review: a held-position review (crew._analyze_held_position),
-        # whose candidate carries no "held" so the held flag recorded for
-        # the gates stays as it was.
+        # held_review: a held-position review (crew._analyze_held_position)
+        # or a held name in the scan (analyze_batch), whose candidate carries
+        # no "held" so the held flag recorded for the gates stays as it was.
         if (candidate.get("held") is True or candidate.get("held_review") is True) \
                 and model_action in ("TRIM", "EXIT"):
-            _alert_held_sell_as_watch(ticker, model_action, malformed_fields)
+            malformed_sell_alert = _alert_held_sell_as_watch(ticker, model_action, malformed_fields)
 
     # The model doesn't reliably know what's held (ADD/HOLD on unheld MSFT
     # and AMZN, 10-15 and 10-26). An ADD on nothing is an OPEN and must pass
@@ -2107,11 +2129,17 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
         value = parsed.get(field)
         if value is None:
             value = 3
+            imputed_fields.append(field)
         return max(1, min(5, int(value)))
 
     def _optional_float(field: str) -> float | None:
         value = parsed.get(field)
         if value is None:
+            return None
+        # A bool is not a number here (float(True) is 1.0): stored as null,
+        # as the malformed-catalyst check treats it.
+        if isinstance(value, bool):
+            log.debug(f"[{ticker}] Boolean {field}: {value!r}")
             return None
         try:
             out = float(value)
@@ -2287,7 +2315,7 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
         # visibility fix. catalyst_stale is surfaced in the result for
         # thesis-drift tracking (db.compute_thesis_drift) and reporting
         # to actually force human attention instead. A malformed expected
-        # return (return_malformed; a bool would read as 1.0) counts as none:
+        # return (return_malformed) counts as none:
         # the HOLD stays HOLD, flagged stale, with no malformed gate.
         catalyst_date = (parsed.get("catalyst") or {}).get("date")
         weeks_to_catalyst = compute_weeks_to_catalyst(catalyst_date)
@@ -2325,12 +2353,19 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
     # ticker, so this inline check is still the only place Trend Template
     # runs for it.
     trend_template = None
+    # Log-only record of the check (M270): the result, or why there is none.
+    # The gate below still reads trend_template, so None still passes.
+    trend_template_record = {"status": "not_run"}
     if bucket == "Accelerator" and action in ("OPEN", "ADD"):
+        tt_status: dict = {}
         try:
             from agents.price_action import compute_trend_template
-            trend_template = compute_trend_template(ticker)
+            trend_template = compute_trend_template(ticker, status=tt_status)
         except Exception as e:
-            log.debug(f"[{ticker}] Trend Template check failed: {e}")
+            log.warning(f"[{ticker}] Trend Template check failed: {e}")
+            tt_status["status"] = "read_error"
+        trend_template_record = (trend_template if trend_template is not None
+                                 else {"status": tt_status.get("status") or "insufficient_history"})
         if trend_template is not None and not trend_template["pass"]:
             log.info(f"[{ticker}] Trend Template failed ({trend_template['reasoning']}) — downgrading to WATCH")
             gates.append(f"trend template: {action} -> WATCH")
@@ -2343,6 +2378,10 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
         # history isn't a red flag the way "no catalyst timeframe" is; it's
         # just data the gate can't evaluate yet, and Accelerator names are
         # by definition established enough that this should be rare.
+
+    # The verdict as it reaches the two conviction-7 bars below, for the c6
+    # bar shadow (agents/c6_shadow.py). Read only.
+    pre_c7 = (action, bool(parsed.get("pass_to_risk")), len(gates))   # action, pass, gate count
 
     # Moonshots need conviction >= 7 for OPEN
     if bucket == "Moonshot" and action == "OPEN" and conviction < 7:
@@ -2365,6 +2404,7 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
         gates.append(f"{regime_str} regime conviction {conviction} < 7: OPEN -> WATCH")
         action = "WATCH"
         parsed["pass_to_risk"] = False
+    c7_fired = gates[pre_c7[2]:]
 
     # Deterministic guardrail for ungrounded valuation: the prompt instructs
     # the model to cap its own conviction at 6 when fundamentals aren't
@@ -2432,6 +2472,16 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
         log.debug(f"[{ticker}] knowledge coverage record failed: {e}")
     provenance.update(_decision_inputs_record(ticker, regime_packet))
     provenance["fundamentals_read"] = fund_read
+    try:
+        from agents.c6_shadow import analyst_record as _c6_record
+        c6 = _c6_record(model_action, model_conviction, pre_c7[0], pre_c7[1], c7_fired, action,
+                        conviction, bool(parsed.get("pass_to_risk")))
+        if c6 is not None:
+            from agents.plans import brief_price
+            c6["ref_price"] = brief_price(situation_brief)   # the verdict's quote, raw
+            provenance["c6_bar"] = c6
+    except Exception as e:
+        log.warning(f"[{ticker}] c6 bar shadow record failed: {e}")
     try:
         provenance["brief_exposure"] = _brief_exposure(ticker, prompt)
         # The held flag the gates used (crew sets it from broker positions
@@ -2503,6 +2553,11 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
                 "downgraded_reason": "malformed_catalyst" if malformed_fields else None,
                 "malformed_fields": malformed_fields or None,
                 "return_malformed": return_malformed,
+                "malformed_sell_alert": malformed_sell_alert,
+                # A held-position review or a held scan name (log-only); a
+                # scan with no broker positions reads False.
+                "held_review": candidate.get("held_review") is True,
+                "imputed_fields": imputed_fields,
             },
             prompt=redact_account_figures(prompt),
         )
@@ -2526,6 +2581,7 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
         # calibration so a fundamentals-cache outage capping 7s to 6 doesn't
         # poison the conviction→outcome track record with manufactured 6s.
         "conviction_raw": conviction_raw,
+        "imputed_fields": imputed_fields,
         "thesis_strength": thesis_strength,
         "catalyst_quality": catalyst_quality,
         "valuation_risk_reward": valuation_risk_reward,
@@ -2545,7 +2601,7 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
         "weeks_to_catalyst": weeks_to_catalyst,
         "expected_return_per_week": per_week,
         "catalyst_stale": catalyst_stale,
-        "trend_template": trend_template,
+        "trend_template": trend_template_record,
         "upside_downside_ratio": udr,
         "key_risks": parsed.get("key_risks", []),
         "sources": sources,
@@ -2618,6 +2674,12 @@ def analyze_batch(
         except Exception as e:
             log.warning(f"[{ticker}] Scan brief build failed, analyzing without it: {e}")
 
+        # A held name in the scan: held_review (read only by the
+        # malformed-catalyst sell alert) on a copy, from the positions the
+        # caller already read; "held" is left alone so the gates, prompt and
+        # provenance see the candidate as before.
+        if positions and ticker in positions:
+            candidate = {**candidate, "held_review": True}
         try:
             result = analyze(candidate, situation_brief=brief, regime_packet=regime_packet,
                              trigger=trigger_record("daily_scan", {"source": "scanner"}))

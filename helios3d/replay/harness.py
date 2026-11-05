@@ -75,9 +75,9 @@ DEFAULT_OUT_DIR = REPO / "logs" / "helios3d"
 # Routing rows that end a routing attempt (crew._route_to_approval,
 # scan_guard), in the order they can occur.
 ROUTE_TERMINAL = ("ROUTE_APPROVAL_PENDING", "COOLDOWN_SKIPPED", "SELL_POSITION_UNREADABLE",
-                  "SELL_NO_POSITION", "CATALYST_BLOCKED", "EARNINGS_BLOCKED",
+                  "SELL_NO_POSITION", "CATALYST_BLOCKED", "EARNINGS_BLOCKED", "ROUTE_NO_NEW_FACT",
                   "ROUTE_RISK_INIT_FAILED", "ROUTE_NO_PRICE", "ROUTE_ZERO_SHARES",
-                  "ROUTE_CONCENTRATION_ZERO", "ROUTE_NO_BROKER")
+                  "ROUTE_CONCENTRATION_ZERO", "ROUTE_MICRO_NAME_CAP", "ROUTE_NO_BROKER", "ROUTE_ERROR")
 # Rows written on the way that do not end routing.
 ROUTE_NOTES = ("CATALYST_GATE_ERROR", "SHADOW_SWAP", "SELL_SKIPPED_CLOSED")
 ROUTE_KINDS = ROUTE_TERMINAL + ROUTE_NOTES
@@ -172,6 +172,14 @@ def gate_inputs(rec: dict, sig: dict, approval: dict | None) -> tuple[dict, dict
             inp[key], src[key] = cfg[name], "provenance.config"
         else:
             src[key] = "not recorded"
+    dec = _as_dict(sig.get("decision"))
+    nonfinite = dec.get("nonfinite_replaced")
+    if nonfinite:
+        inp["nonfinite_replaced"] = nonfinite
+        src["nonfinite_replaced"] = "decision.nonfinite_replaced"
+        if isinstance(dec.get("nonfinite_paths"), list):
+            inp["nonfinite_paths"] = dec["nonfinite_paths"]
+            src["nonfinite_paths"] = "decision.nonfinite_paths"
     be = prov.get("brief_exposure")
     if isinstance(be, dict) and "held_at_gate" in be:
         inp["held"], src["held"] = be["held_at_gate"], "provenance.brief_exposure.held_at_gate"

@@ -492,6 +492,7 @@ class TestHeldSellLoweredToWatchAlerts:
         assert "malformed_sell_alert_at_SNOW_EXIT" in state
         exposure = log_signal.call_args.kwargs["provenance"]["brief_exposure"]
         assert exposure["held_at_gate"] is None
+        assert log_signal.call_args.kwargs["decision"]["held_review"] is True
 
     def test_backfill_does_not_alert(self, caplog):
         import json
@@ -500,7 +501,7 @@ class TestHeldSellLoweredToWatchAlerts:
                    "catalyst": "earnings next month"}
         patches = _mock_analyze_deps(json.dumps(payload))
         with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], \
-             patches[6], patches[7], patches[8], \
+             patches[6], patches[7] as log_signal, patches[8], \
              patch("context_engine.assemble_brief", return_value="brief"), \
              patch("knowledge_loader.get_watchlist_entry", return_value={"role": "Compounder"}), \
              patch("db.get_state_strict", return_value=None), patch("db.set_state"), \
@@ -509,6 +510,87 @@ class TestHeldSellLoweredToWatchAlerts:
                                                  {"regime": "Neutral"}, path="backfill")
         assert result["action"] == "WATCH"
         send.assert_not_called()
+        assert log_signal.call_args.kwargs["decision"]["held_review"] is False
+
+    @pytest.mark.parametrize("held, stored, read_fails, send_id, want", [
+        (True, None, False, 7, "sent"),
+        (True, "recent", False, 7, "throttled"),
+        (True, None, True, 7, "skipped_state_error"),
+        (True, None, False, None, "send_failed"),
+        (True, None, False, RuntimeError("telegram down"), "send_failed"),
+        (False, None, False, 7, None),
+    ])
+    def test_decision_records_the_alert_outcome(self, held, stored, read_fails, send_id, want,
+                                                caplog):
+        import json
+        payload = {**json.loads(_response("EXIT", 20.0, _THREE_WEEKS_OUT, bucket="Compounder")),
+                   "catalyst": "earnings next month"}
+        state = {}
+        if stored == "recent":
+            state["malformed_sell_alert_at_SNOW_EXIT"] = datetime.now(timezone.utc).isoformat()
+        read = (patch("db.get_state_strict", side_effect=RuntimeError("db down")) if read_fails
+                else patch("db.get_state_strict", side_effect=lambda k, d=None: state.get(k, d)))
+        send = (patch("alerts._send", side_effect=send_id) if isinstance(send_id, Exception)
+                else patch("alerts._send", return_value=send_id))
+        with read, send, patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)):
+            result, log_signal, _ = _run_analyze(payload, "Compounder", caplog, held=held)
+        assert result["action"] == "WATCH"
+        assert log_signal.call_args.kwargs["decision"]["malformed_sell_alert"] == want
+
+    def test_an_error_before_the_send_is_error_not_send_failed(self, caplog):
+        import json
+        import sys
+        payload = {**json.loads(_response("EXIT", 20.0, _THREE_WEEKS_OUT, bucket="Compounder")),
+                   "catalyst": "earnings next month"}
+        with patch("db.get_state_strict", return_value=None), patch("db.set_state") as set_state, \
+             patch.dict(sys.modules, {"alerts": None}):     # import alerts raises
+            result, log_signal, _ = _run_analyze(payload, "Compounder", caplog, held=True)
+        assert result["action"] == "WATCH"
+        assert log_signal.call_args.kwargs["decision"]["malformed_sell_alert"] == "error"
+        set_state.assert_not_called()
+
+    def test_well_formed_verdict_records_no_alert(self, caplog):
+        import json
+        payload = json.loads(_response("EXIT", 20.0, _THREE_WEEKS_OUT, bucket="Compounder"))
+        _, log_signal, _ = _run_with_alert_state(payload, "Compounder", caplog, True, {})
+        assert log_signal.call_args.kwargs["decision"]["malformed_sell_alert"] is None
+
+    def test_scan_alerts_on_a_held_name_only_with_the_same_prompt(self, caplog):
+        """analyze_batch marks a held scan name held_review from the positions
+        it is given; the prompt, the recorded held flag and the decision are
+        as for an unheld one."""
+        import json
+        from agents import analyst
+        payload = {**json.loads(_response("EXIT", 20.0, _THREE_WEEKS_OUT, bucket="Compounder")),
+                   "catalyst": "earnings next month"}
+        runs = {}
+        for name, positions in (("held", {"SNOW": {"current_price": 100.0}}),
+                                ("unheld", {"NVDA": {"current_price": 100.0}})):
+            state = {}
+            patches = _mock_analyze_deps(json.dumps(payload))
+            cand = {**_CANDIDATE, "role": "Compounder"}
+            with patches[0] as call, patches[1], patches[2], patches[3], patches[4], \
+                 patches[5], patches[6], patches[7] as log_signal, patches[8], \
+                 patch("context_engine.build_scan_brief", return_value="brief"), \
+                 patch("agents.crew._get_price", return_value=100.0), \
+                 patch("db.get_state_strict", side_effect=lambda k, d=None: state.get(k, d)), \
+                 patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+                 patch("alerts._send", return_value=7) as send:
+                results = analyst.analyze_batch([cand], positions=positions)
+            assert "held_review" not in cand
+            assert results[0]["action"] == "WATCH"
+            kwargs = log_signal.call_args.kwargs
+            runs[name] = (send.call_count, call.call_args, kwargs["prompt"],
+                          kwargs["provenance"]["brief_exposure"]["held_at_gate"],
+                          {k: v for k, v in kwargs["decision"].items()
+                           if k not in ("malformed_sell_alert", "held_review", "latency_ms")},
+                          kwargs["decision"]["held_review"])
+        assert runs["held"][0] == 1 and runs["unheld"][0] == 0
+        assert runs["held"][1] == runs["unheld"][1]
+        assert runs["held"][2] == runs["unheld"][2]
+        assert runs["held"][3] is None and runs["unheld"][3] is None
+        assert runs["held"][4] == runs["unheld"][4]
+        assert runs["held"][5] is True and runs["unheld"][5] is False
 
 
 @pytest.mark.parametrize("action", ["HOLD", "OPEN"])
@@ -553,7 +635,11 @@ def test_failed_analysis_rows_carry_the_malformed_keys_as_none():
         analyst._log_failed_analysis({"ticker": "NVDA"}, "timeout", "Ollama timed out", prompt="p")
     decision = log_signal.call_args.kwargs["decision"]
     assert decision["downgraded_reason"] is None and decision["malformed_fields"] is None
-    assert decision["return_malformed"] is None
+    assert decision["return_malformed"] is None and decision["malformed_sell_alert"] is None
+    assert decision["held_review"] is False
+    with patch("db.log_signal") as log_signal:
+        analyst._log_failed_analysis({"ticker": "NVDA", "held_review": True}, "timeout", "t")
+    assert log_signal.call_args.kwargs["decision"]["held_review"] is True
     assert decision["failure"]["kind"] == "timeout"
 
 

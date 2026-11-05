@@ -21,6 +21,32 @@ before that date are pre-rewrite hashes. To find the commit today, look up the
 old full hash in `history-rewrite-2026-10-31-commit-map.txt`, which lists old
 full hash and new full hash on each line.
 
+## One change, several hashes
+
+A change built on one branch is often cherry-picked onto a deploy branch, so
+the same diff runs under a different hash from the one a log entry cites.
+`patch-id-map.csv` groups commits by `git patch-id --stable` (same diff, same
+id), one row per commit, with the full 40-character hash in `commit`.
+`in_live` = yes means the commit was an ancestor of the live checkout's HEAD
+when the map was generated. It does not say which hash was running at any
+earlier time: a later deploy can bring in either hash of a pair. The
+generation time and the full live HEAD hash used are in the sidecar
+`patch-id-map.meta.txt` (a sidecar rather than a comment line, so CSV readers
+see a plain header row). Regenerate both with `python scripts/patch_id_map.py`.
+
+Limits:
+- A cherry-pick that needed conflict resolution or was amended gets a
+  different patch id and isn't paired, so a missing row doesn't prove a
+  commit was never re-hashed.
+- A group with no "yes" is common: no hash of that change was in the live
+  history at generation time (not deployed yet, or deployed under a hash that
+  isn't paired).
+- Hashes from before the 2026-10-31 history rewrite are in no ref, so they
+  never appear here. A log entry citing one maps to its new hash through
+  `history-rewrite-2026-10-31-commit-map.txt`.
+- Squash commits on GitHub main bundle many changes and never pair with dev
+  commits; trace those through `dev-squash-map.txt`.
+
 ## "Professor"
 
 In these logs and in code comments, "professor" means an AI reviewer agent

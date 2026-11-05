@@ -45,3 +45,54 @@ def test_refuses_csv_when_setup_gates_are_on(monkeypatch, tmp_path):
         dr.main()
     assert "SETUP_GATES_ENABLED" in str(e.value)
     assert not (tmp_path / "x.csv").exists()
+
+
+def _git_repo(tmp_path):
+    import subprocess
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    run = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True)
+    run("init", "-q")
+    (repo / "f.py").write_text("x = 1\n")
+    run("add", "f.py")
+    run("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "c")
+    head = subprocess.run(["git", "-C", str(repo), "rev-parse", "--short=12", "HEAD"],
+                          capture_output=True, text=True).stdout.strip()
+    return repo, head
+
+
+def test_code_state_is_the_given_checkouts_head_and_dirty_flag(tmp_path):
+    repo, head = _git_repo(tmp_path)
+    (repo / "untracked.txt").write_text("not counted")
+    assert dr._code_state(repo) == (head, False)
+    (repo / "f.py").write_text("x = 2\n")
+    assert dr._code_state(repo) == (head, True)
+
+
+def test_code_state_defaults_to_the_scripts_own_checkout():
+    from pathlib import Path
+    assert dr.REPO == Path(dr.__file__).resolve().parent.parent
+
+
+def test_append_csv_new_file_has_code_dirty_last(tmp_path):
+    import csv
+    repo, head = _git_repo(tmp_path)
+    out = tmp_path / "t.csv"
+    dr._append_csv(str(out), [("AAA", "Accelerator", True, "ok")], "Neutral", 7, repo=repo)
+    rows = list(csv.DictReader(open(out)))
+    assert list(rows[0]) == dr.CSV_HEADER and dr.CSV_HEADER[-1] == "code_dirty"
+    assert rows[0]["code_sha"] == head and rows[0]["code_dirty"] == "False"
+
+
+def test_append_csv_adds_code_dirty_to_an_old_header_and_keeps_old_rows(tmp_path):
+    import csv
+    repo, head = _git_repo(tmp_path)
+    out = tmp_path / "t.csv"
+    old_row = "2026-10-28,AAOI,Accelerator,Neutral,7,True,ok,2026-10-28T08:59:00,5f76d445723e,yfinance_last_daily_close\r\n"
+    out.write_text(",".join(dr.CSV_HEADER[:-1]) + "\r\n" + old_row, newline="")
+    dr._append_csv(str(out), [("ZZZ", "Compounder", False, "under_one_share")], "Neutral", 7, repo=repo)
+    text = out.read_text(newline="")
+    assert text.startswith(",".join(dr.CSV_HEADER) + "\r\n" + old_row)
+    rows = list(csv.DictReader(open(out, newline="")))
+    assert rows[0]["code_sha"] == "5f76d445723e" and rows[0]["code_dirty"] is None
+    assert rows[1]["ticker"] == "ZZZ" and rows[1]["code_sha"] == head and rows[1]["code_dirty"] == "False"

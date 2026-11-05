@@ -264,6 +264,49 @@ def test_swap_simulation_does_not_log():
     assert seen == [False]
 
 
+def test_swap_precheck_sends_no_fallback_alert_and_sizes_as_before():
+    """calculate_stop is not patched and the IBKR ATR fetch fails: the swap
+    pre-check sends no ATR-fallback alert, still asks IBKR for the bars, and
+    its share count and is_halted calls match the same sizing run by hand
+    the way the pre-check ran it before (which does alert)."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    client = MagicMock()
+    client.get_account.return_value = SimpleNamespace(portfolio_value=100_000.0, cash=50_000.0,
+                                                      buying_power=50_000.0)
+    client.get_all_positions.return_value = []
+    client.get_open_position.side_effect = Exception("none")
+    real_halted = risk_manager.RiskManager.is_halted
+    halted_calls = []
+
+    def counted(self_):
+        out = real_halted(self_)
+        halted_calls.append(out)
+        return out
+    with patch("db.get_state", return_value=None), patch("db.set_state"), \
+         patch("db.get_state_strict", side_effect=lambda k, d=None: d), \
+         patch("db.get_portfolio_heat_pct", return_value={"heat_pct": 0.0}), \
+         patch("risk_manager.RiskManager.check_concentration",
+               return_value={"passed": True, "flags": []}), \
+         patch("risk_manager.SETUP_GATES_ENABLED", False), \
+         patch("risk_manager._fetch_bars_for_atr", return_value=[]) as broker_bars, \
+         patch.object(risk_manager.RiskManager, "is_halted", counted), \
+         patch.object(alerts, "_send") as send:
+        rm = risk_manager.RiskManager(client)
+        shares = rm.would_size_after_swap("NEW", 7, "Compounder", "Neutral", 100.0,
+                                          {"ticker": "OLD", "market_value": 0.0})
+        precheck_halted, halted_calls[:] = list(halted_calls), []
+        assert broker_bars.called
+        send.assert_not_called()
+        # The same sizing without the quiet flag: the pre-check before this change.
+        sim = risk_manager.RiskManager(client, start_value=rm.start_value)
+        sizing = sim.size_position("NEW", 7, "Compounder", "Neutral", 100.0, log_fallback=False)
+        before = sim.shares_after_concentration("NEW", sizing, "Compounder")
+        assert send.call_count == 1                 # the unquieted path still alerts
+    assert shares == before and shares >= 1
+    assert precheck_halted == halted_calls == [False]
+
+
 def test_marker_deleted_when_the_write_fails(env):
     env.write_ok = False
     _stop([], ticker="ZS")

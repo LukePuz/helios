@@ -337,6 +337,24 @@ ALLOW_ONE_SHARE_ABOVE_ALLOCATION = os.getenv("ALLOW_ONE_SHARE_ABOVE_ALLOCATION",
 # per-trade cash cap, which blocked every $400-600 share once most cash was
 # invested; Luke 10-29). Normal multi-share sizing keeps the 20% cap.
 ONE_SHARE_MAX_PCT_OF_CASH = float(os.getenv("ONE_SHARE_MAX_PCT_OF_CASH", "0.50"))
+# Micro tier only: a new OPEN/ADD is cut (or blocked) so the name's held value
+# plus the order stays at or under this % of equity. Never sells or trims an
+# existing position (risk_manager.RiskManager.micro_name_cap).
+MICRO_TIER_NAME_CAP_ENABLED = os.getenv("MICRO_TIER_NAME_CAP_ENABLED", "true").lower() == "true"
+MICRO_TIER_NAME_CAP_PCT = float(os.getenv("MICRO_TIER_NAME_CAP_PCT", "30.0"))
+# A new OPEN/ADD routes only when the screener marked its news item a new
+# fact (agents.crew.new_fact_gate). Sells, HOLD and WATCH are never gated.
+# Anything but "true"/"false" keeps the gate on and is alerted
+# (crew.new_fact_gate), so a typo can't switch it off.
+BUY_REQUIRES_NEW_FACT_RAW = os.getenv("BUY_REQUIRES_NEW_FACT", "true").strip().lower()
+BUY_REQUIRES_NEW_FACT = BUY_REQUIRES_NEW_FACT_RAW != "false"
+# Which buys: all_buys (every OPEN/ADD; a verdict with no news item can't
+# buy), news_only (only buys from a news/event verdict), or
+# all_but_held_review_add (all but an ADD from a held-position review).
+BUY_NEW_FACT_SCOPE = os.getenv("BUY_NEW_FACT_SCOPE", "news_only").strip().lower()
+# Where the new fact may come from: same_run (the verdict's own item), or
+# 24h / 3d (also any analysed news item on the ticker within that window).
+BUY_NEW_FACT_WINDOW = os.getenv("BUY_NEW_FACT_WINDOW", "24h").strip().lower()
 # Quiver Quant (congressional trades, gov contracts): key rejected since
 # 10-13; Luke dropped it 10-29 (D2). true turns the poller and the
 # scanner lookup back on once a key exists.
@@ -521,9 +539,10 @@ USE_BRACKET_ORDERS = _os.getenv("USE_BRACKET_ORDERS", "false").lower() == "true"
 SETUP_GATES_ENABLED = os.getenv("SETUP_GATES_ENABLED", "false").lower() == "true"
 # Watchlist ETFs (DRAM, QTUM) never have company fundamentals, so the
 # missing-fundamentals conviction cap (6) makes them unbuyable wherever the
-# floor is 7. True exempts them from that cap. Off until Luke turns it on
-# (it changes what can be bought; audit A0100-2).
-ETF_FUNDAMENTALS_CAP_EXEMPT = os.getenv("ETF_FUNDAMENTALS_CAP_EXEMPT", "false").lower() == "true"
+# floor is 7. True exempts them from that cap. On by default since
+# 2026-11-04 (it changes what can be bought; audit A0100-2); the env var
+# set to anything but "true" turns it off.
+ETF_FUNDAMENTALS_CAP_EXEMPT = os.getenv("ETF_FUNDAMENTALS_CAP_EXEMPT", "true").lower() == "true"
 
 # A held name hitting a level of its trade plan (invalidation, target,
 # catalyst passed, horizon end; tasks.watch_plan_levels) queues a review of
@@ -543,6 +562,13 @@ STALE_ENTRY_EXPIRE_ONLY = os.getenv("STALE_ENTRY_EXPIRE_ONLY", "false").lower() 
 # provenance already does. Changes which verdicts pass the gate, so it is
 # off until Luke decides (audit A1031-0253-1).
 CATALYST_MONTH_MIDPOINT_ENABLED = os.getenv("CATALYST_MONTH_MIDPOINT_ENABLED", "false").lower() == "true"
+
+# Log-only: a conviction-6 OPEN/ADD stopped only by a conviction-7 bar (the
+# regime gate, the Moonshot OPEN bar, the account-tier floor) writes one
+# activity_feed row, stage c6_bar_shadow, with the size it would have got at
+# a bar of 6 (agents/c6_shadow.py); tasks._check_c6_bar_outcomes adds its
+# forward returns. No live threshold or order changes either way.
+C6_BAR_SHADOW_ENABLED = os.getenv("C6_BAR_SHADOW_ENABLED", "true").lower() == "true"
 
 # Risk-per-trade-of-equity by LIVE setup category (Breakout/Catalyst/
 # Continuation) -- the SETUP_GATES_ENABLED equivalent of RISK_PCT_PER_TRADE

@@ -178,6 +178,7 @@ class TestConcentrationCapping:
                 "ai_infra_size_cap_pct": 0.05,  # half of the proposed 10%
             }
             mock_rm_cls.return_value.check_correlation.return_value = {"reduce_by": 0}
+            mock_rm_cls.return_value.micro_name_cap.return_value = None   # standard tier: no name cap
             crew._route_to_approval(result, {"regime": "Neutral"}, client)
 
         mock_log_approval.assert_called_once()
@@ -203,6 +204,7 @@ class TestConcentrationCapping:
                 "ai_infra_size_cap_pct": 0.0,  # already at/over the limit
             }
             mock_rm_cls.return_value.check_correlation.return_value = {"reduce_by": 0}
+            mock_rm_cls.return_value.micro_name_cap.return_value = None   # standard tier: no name cap
             crew._route_to_approval(result, {"regime": "Neutral"}, client)
 
         mock_log_approval.assert_not_called()
@@ -227,6 +229,7 @@ class TestConcentrationCapping:
             mock_rm_cls.return_value.size_position.return_value = self._base_sizing()
             mock_rm_cls.return_value.check_concentration.return_value = conc
             mock_rm_cls.return_value.check_correlation.return_value = {"reduce_by": 0}
+            mock_rm_cls.return_value.micro_name_cap.return_value = None   # standard tier: no name cap
             crew._route_to_approval(result, {"regime": "Neutral"}, MagicMock())
 
         mock_log_approval.assert_not_called()
@@ -253,6 +256,7 @@ class TestConcentrationCapping:
                 "ai_infra_size_cap_pct": None,
             }
             mock_rm_cls.return_value.check_correlation.return_value = {"reduce_by": 0}
+            mock_rm_cls.return_value.micro_name_cap.return_value = None   # standard tier: no name cap
             crew._route_to_approval(result, {"regime": "Neutral"}, client)
 
         mock_log_approval.assert_called_once()
@@ -280,6 +284,7 @@ class TestConcentrationUsesOrderWeight:
             mock_rm_cls.return_value.size_position.return_value = sizing
             mock_rm_cls.return_value.check_concentration.return_value = conc
             mock_rm_cls.return_value.check_correlation.return_value = {"reduce_by": 0}
+            mock_rm_cls.return_value.micro_name_cap.return_value = None   # standard tier: no name cap
             crew._route_to_approval(result, {"regime": "Neutral"}, MagicMock())
         return mock_rm_cls.return_value.check_concentration, mock_log_approval
 
@@ -400,6 +405,7 @@ class TestConvictionSwap:
                 "ai_infra_size_cap_pct": None,
             }
             mock_rm_cls.return_value.check_correlation.return_value = {"reduce_by": 0}
+            mock_rm_cls.return_value.micro_name_cap.return_value = None   # standard tier: no name cap
             crew._route_to_approval(result, {"regime": "Neutral"}, client)
 
         mock_sell.assert_called_once()

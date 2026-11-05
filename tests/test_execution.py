@@ -386,6 +386,7 @@ class TestStalePriceBuyGuard:
              patch("market_data.get_priced_quote", return_value=self._stale_quote()), \
              patch("market_data.is_market_hours", return_value=True), \
              patch("tasks.retry_deferred_entry") as mock_retry_task, \
+             patch("tasks.stale_quote_fallback_shadow"), \
              patch("time.sleep"), \
              patch("alerts._send") as mock_alert:
             mock_rm_cls.return_value.is_halted.return_value = False
@@ -411,6 +412,7 @@ class TestStalePriceBuyGuard:
              patch("market_data.get_priced_quote", return_value=self._stale_quote()), \
              patch("market_data.is_market_hours", return_value=True), \
              patch("tasks.retry_deferred_entry") as mock_retry_task, \
+             patch("tasks.stale_quote_fallback_shadow"), \
              patch("time.sleep"), \
              patch("alerts._send") as mock_alert:
             mock_rm_cls.return_value.is_halted.return_value = False

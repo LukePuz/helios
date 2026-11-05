@@ -420,6 +420,13 @@ def _analyze_held_position(ticker: str, client, positions: dict, regime: dict,
     brief = assemble_brief(event, positions, client, current_price=price)
 
     wl_entry = get_watchlist_entry(ticker) or {}
+    if "role" not in wl_entry:
+        # Log-only: the review still runs with the Accelerator default below.
+        log.warning(f"[{ticker}] held review role defaulted to Accelerator "
+                    f"(watchlist entry {'has no role' if wl_entry else 'missing'})")
+    elif not wl_entry["role"]:
+        # .get() returns the empty value as is, so no default applies.
+        log.warning(f"[{ticker}] held review role is empty ({wl_entry['role']!r}), passed as is")
     candidate = {
         "ticker":          ticker,
         "role":            wl_entry.get("role", "Accelerator"),
@@ -942,13 +949,88 @@ def _json_safe(value):
         return _UNENCODABLE
 
 
-def _attach_shadows(sizing: dict, ticker: str, result: dict, price: float) -> None:
+def _partial_exec_shadow(sizing: dict, bucket: str | None = None) -> dict | None:
+    """Which partial sells a position of the initial size could execute in
+    whole shares (audit 2026-11-05-0325 #5): the profit-target partial is
+    int(qty * pct), so 0 shares at small qty, and a TRIM is
+    max(1, int(qty * TRIM_FRACTION)), a full exit at 1-2 shares. Uses the
+    shares at sizing, before any later rescale. The profit fields are None
+    for a bucket profit targets skip (Compounder). Log-only."""
+    qty = int(sizing.get("shares_initial") or 0)
+    if qty <= 0:
+        return None
+    from config import PARTIAL_SELL_PCT_BY_STYLE, PROFIT_TARGET_PCT_BY_STYLE, TRIM_FRACTION
+    trim = min(qty, max(1, int(qty * TRIM_FRACTION)))
+    applies = any(bucket in t for t in PROFIT_TARGET_PCT_BY_STYLE.values())
+    profit = ({style: int(qty * pct) for style, pct in PARTIAL_SELL_PCT_BY_STYLE.items()}
+              if applies else None)
+    return {"qty": qty, "bucket": bucket, "profit_target_applies": applies,
+            "profit_partial_shares": profit,
+            "profit_partial_executable": all(n > 0 for n in profit.values()) if applies else None,
+            "trim_shares": trim, "trim_is_full_exit": trim >= qty}
+
+
+def _add_to_loser_shadow(ticker: str, result: dict, price: float, client=None) -> dict | None:
+    """Shadow check of a written rule nothing enforces: "Never add to a
+    losing position without a new fundamental catalyst" (risk_rules.md,
+    every bucket; audit 2026-11-05-0525 #4). The new-fact gate covers news
+    buys only by default, so an ADD from a review path is unchecked.
+
+    "Losing" is judged against the broker's average cost when it can be
+    read (basis "avg_cost"), else position_stops.entry_price, which every
+    bracketed BUY overwrites with its fill, so it is the last buy price
+    (basis "last_buy"; professor m538). Both are recorded. new_fact is the
+    screener's flag on the triggering news item, None off the news path;
+    what counts as a catalyst is Luke's (G58, m539). Log-only."""
+    if result.get("action") != "ADD":
+        return None
+    import db
+    last_buy = float((db.get_position_stop(ticker) or {}).get("entry_price") or 0) or None
+    avg_cost, avg_read = None, "no_client"
+    if client is not None:
+        try:
+            pos = next((p for p in client.get_all_positions() if p.symbol == ticker), None)
+            avg_cost = float(pos.avg_entry_price) if pos and pos.avg_entry_price else None
+            avg_read = "ok" if avg_cost else "not_held"
+        except Exception as e:
+            avg_read = f"error: {type(e).__name__}"
+    basis, ref = ("avg_cost", avg_cost) if avg_cost else ("last_buy", last_buy)
+    if not ref or not price:
+        return {"entry_known": bool(ref), "price_known": bool(price), "below_entry": None,
+                "avg_cost_read": avg_read}
+
+    def pct(x):
+        return round((price - x) / x * 100, 2) if x else None
+    prov = result.get("provenance")
+    trig = (prov.get("trigger") if isinstance(prov, dict) else None) or {}
+    item = trig.get("new_fact") if trig.get("path") == "event" else None
+    rec = {"entry_known": True, "basis": basis, "avg_cost_read": avg_read,
+           "pct_vs_avg_cost": pct(avg_cost),
+           "pct_vs_last_buy": pct(last_buy), "below_entry": price < ref,
+           "path": trig.get("path"), "new_fact": item if isinstance(item, bool) else None}
+    rec["breaks_rule"] = rec["below_entry"] and rec["new_fact"] is not True
+    if rec["breaks_rule"]:
+        log.warning(f"[{ticker}] rule shadow (never add to a loser without a new catalyst): "
+                    f"ADD {pct(ref):+.1f}% vs {basis}, path={rec['path']}, "
+                    f"new_fact={rec['new_fact']}; not enforced")
+    return rec
+
+
+def _attach_shadows(sizing: dict, ticker: str, result: dict, price: float, client=None) -> None:
     """Log-only fields on a sizing dict, each guaranteed JSON-safe, with
     shadow_status saying why one is missing: ok, n/a (doesn't apply),
     error (the helper raised; the dict holds the message) or unencodable."""
     stop = sizing.get("stop_loss_price")
     values = {"r_shadow": _r_shadow(result, price, stop),
               "plan_compiled": _compiled_plan(ticker, result, price, stop)}
+    try:
+        values["partial_exec"] = _partial_exec_shadow(sizing, result.get("thesis_bucket"))
+    except Exception as e:
+        values["partial_exec"] = {"error": str(e)[:200]}
+    try:
+        values["add_to_loser"] = _add_to_loser_shadow(ticker, result, price, client)
+    except Exception as e:
+        values["add_to_loser"] = {"error": str(e)[:200]}
     if "heat_shadow" in sizing:
         values["heat_shadow"] = sizing["heat_shadow"]
     status = {}
@@ -1532,7 +1614,7 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
         # Size the position — stamp the price used so execution can validate freshness
         sizing = rm.size_position(ticker, conviction, bucket, regime_str, price)
         sizing["price_at_sizing"] = price
-        _attach_shadows(sizing, ticker, result, price)
+        _attach_shadows(sizing, ticker, result, price, trading_client)
         swap_sold = None   # the holding a swap sold for this buy, if any
         if sizing.get("shares_initial", 0) <= 0:
             # 2026-08-13: if this is specifically a cash shortage (not a
@@ -1620,7 +1702,7 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
                         _wait_for_swap_cash(rm, cash_before, sell_result, ticker)
                         sizing = rm.size_position(ticker, conviction, bucket, regime_str, price)
                         sizing["price_at_sizing"] = price
-                        _attach_shadows(sizing, ticker, result, price)
+                        _attach_shadows(sizing, ticker, result, price, trading_client)
                         if sizing.get("shares_initial", 0) <= 0:
                             try:
                                 import alerts as alert_module

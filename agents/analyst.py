@@ -1957,6 +1957,18 @@ def trigger_record(path: str, event: dict | None = None) -> dict:
         if e.get(key):
             rec["event_time"], rec["event_time_source"] = str(e[key]), key
             break
+    if isinstance(e.get("rating"), dict):
+        # pt_only: a maintained or reiterated rating whose news is a price
+        # target raise or cut (audit 2026-11-05-0725 #2; G59). "Maintains"
+        # (target unchanged) and "Announces" (a first target) are recorded
+        # but not tagged (professor m544). Tag only.
+        r = e["rating"]
+        action = str(r.get("action") or "").lower()
+        pt = str(r.get("pt_action") or "").lower()
+        rec["rating"] = {"action": r.get("action"), "grade_changed": r.get("grade_changed"),
+                         "pt_action": r.get("pt_action"),
+                         "pt_only": action in ("main", "reit") and not r.get("grade_changed")
+                         and pt in ("raises", "lowers")}
     if isinstance(e.get("text"), str) and e["text"]:
         # The brief shows only the first EVENT_TEXT_CAP characters (SEF data QA).
         rec["text_len"] = len(e["text"])

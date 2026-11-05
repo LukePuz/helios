@@ -53,3 +53,32 @@ def test_preflight_compares_current_config(tmp_path, monkeypatch):
     assert rc.main([p, "--preflight"]) == 2
     monkeypatch.setattr(rc, "current_run", lambda first: dict(first))
     assert rc.main([p, "--preflight"]) == 0
+
+
+def test_a_redrawn_sample_or_logprob_change_fails(tmp_path):
+    base = dict(RUN, signal_ids=[1, 2, 3], repeat_ids=[2], logprobs=True, top_logprobs=5,
+                sample={"mode": "range", "from": "a", "to": "b", "trading_env": "live", "population": 9, "n": 3})
+    assert rc.main([_write(tmp_path, base, dict(base, run_id="r2", repeat_ids=[2]))]) == 0
+    assert rc.main([_write(tmp_path, base, dict(base, run_id="r2", signal_ids=[1, 2, 4]))]) == 2
+    assert rc.main([_write(tmp_path, base, dict(base, run_id="r2", top_logprobs=3))]) == 2
+    pop = dict(base["sample"], population=10)
+    assert rc.main([_write(tmp_path, base, dict(base, run_id="r2", sample=pop))]) == 2
+    opts = dict(base["options"], top_k=40)
+    assert rc.main([_write(tmp_path, base, dict(base, run_id="r2", options=opts))]) == 2
+
+
+def test_stored_shas_keeps_only_id_and_sha(tmp_path):
+    pair = {"kind": "pair", "signal_id": 7, "sha_stored": "abc", "arms": {"A": {"reply": "x"}}}
+    assert rc.stored_shas(_write(tmp_path, RUN, pair)) == {7: "abc"}
+
+
+def test_preflight_flags_a_rewritten_stored_prompt(tmp_path, monkeypatch, capsys):
+    import prompt_order_ab as ab
+    pair = {"kind": "pair", "signal_id": 7, "sha_stored": ab.sha12("old prompt")}
+    p = _write(tmp_path, dict(RUN, signal_ids=[7, 8]), pair)
+    monkeypatch.setattr(rc, "current_run", lambda first: dict(first))
+    monkeypatch.setattr(ab, "fetch_signals", lambda ids: {7: {"prompt": "old prompt"}})
+    assert rc.main([p, "--preflight"]) == 0
+    monkeypatch.setattr(ab, "fetch_signals", lambda ids: {7: {"prompt": "redacted prompt"}})
+    assert rc.main([p, "--preflight"]) == 2
+    assert "signal ids [7]" in capsys.readouterr().out

@@ -1564,6 +1564,16 @@ def execute_approved(
                         # shape as GAP_CONFIRMATION_* instead of giving up
                         # on the first miss.
                         from config import STALE_PRICE_MAX_RETRIES, STALE_PRICE_RETRY_MINUTES
+                        try:   # log-only: would a Yahoo quote have been fresh? (off the order path)
+                            from datetime import datetime as _dt, timezone as _tz
+                            from tasks import stale_quote_fallback_shadow
+                            # retry=False: a slow broker must not hold the order path (m545)
+                            stale_quote_fallback_shadow.apply_async(
+                                args=[ticker, approval.get("id"), price_retry_attempt,
+                                      pq.get("age_minutes"), _dt.now(_tz.utc).isoformat()],
+                                queue="ops", expires=600, retry=False)
+                        except Exception as e:
+                            log.debug(f"[{ticker}] quote fallback shadow not queued: {e}")
                         if price_retry_attempt < STALE_PRICE_MAX_RETRIES:
                             from datetime import datetime, timedelta, timezone
                             eta = datetime.now(timezone.utc) + timedelta(minutes=STALE_PRICE_RETRY_MINUTES)

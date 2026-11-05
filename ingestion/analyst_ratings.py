@@ -38,6 +38,11 @@ def _is_seen(item_id: str) -> bool:
         return False
 
 
+def _clean(value: str) -> str | None:
+    """A yfinance string cell, or None for an empty or NaN one."""
+    return None if value.strip().lower() in ("", "nan", "none") else value.strip()
+
+
 def _fetch_for_ticker(ticker: str) -> list[dict]:
     try:
         import yfinance as yf
@@ -87,6 +92,13 @@ def _fetch_for_ticker(ticker: str) -> list[dict]:
             "url":    "",
             "text":   title,
             "event_time": grade_dt.isoformat() if hasattr(grade_dt, "isoformat") else str(grade_dt),
+            # Structured fields for the verdict's trigger record (log-only,
+            # audit 2026-11-05-0725 #2); the prompt sees only title/text.
+            # A NaN cell reads as "nan" here (m544); the title above keeps
+            # its existing text, the record maps it to None.
+            "rating": {"action": _clean(action),
+                       "grade_changed": bool(_clean(from_grade)) and _clean(from_grade) != _clean(to_grade),
+                       "pt_action": _clean(pt_action)},
             "_seen_keys": [(_SOURCE, item_id)],
         })
     return results

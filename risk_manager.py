@@ -2084,7 +2084,10 @@ class RiskManager:
                     "action":        "EXIT",
                     "current_price": current,
                     "stop_price":    stop_px,
-                    "reason":        f"Stop triggered at ${stop_px:.2f} (current ${current:.2f})",
+                    "rth":           rth,
+                    "reason":        (f"Stop triggered at ${stop_px:.2f} (current ${current:.2f})" if rth else
+                                      f"Price ${current:.2f} is below the ${stop_px:.2f} stop outside "
+                                      f"regular hours"),   # tasks adds what covers it
                 })
                 continue
 

@@ -1262,7 +1262,9 @@ _NON_ANALYST_SIGNALS = ("SCREENED_OUT", "CATALYST_BLOCKED", "COOLDOWN_SKIPPED", 
                         "ROUTE_ERROR",
                         # Log-only: a screener pass, and a screen or analysis
                         # task that expired, was revoked or failed for good.
-                        "SCREENED_IN", "EVENT_LOST")
+                        "SCREENED_IN", "EVENT_LOST",
+                        # Log-only: a held name moved 5%+ today (no review).
+                        "HELD_MOVE_SHADOW")
 
 
 def get_latest_signal_for(ticker: str) -> dict | None:
@@ -1308,9 +1310,10 @@ def get_latest_signal_for(ticker: str) -> dict | None:
 # and a scan pass not routed for want of a broker (ROUTE_NO_BROKER); from
 # 11-03 also a pass not sized because RiskManager could not start
 # (ROUTE_RISK_INIT_FAILED), a routing raise (ROUTE_ERROR), a screener pass
-# (SCREENED_IN) and a lost screen or analysis task (EVENT_LOST).
+# (SCREENED_IN) and a lost screen or analysis task (EVENT_LOST); from 11-05
+# a held name that moved 5%+ in a session (HELD_MOVE_SHADOW).
 _RECORD_ONLY_SIGNALS = ("ANALYST_FAILED", "NO_VERDICT", "ROUTE_NO_BROKER", "ROUTE_RISK_INIT_FAILED",
-                        "ROUTE_ERROR", "SCREENED_IN", "EVENT_LOST")
+                        "ROUTE_ERROR", "SCREENED_IN", "EVENT_LOST", "HELD_MOVE_SHADOW")
 
 
 def get_recent_signals(limit: int = 50) -> list[dict]:

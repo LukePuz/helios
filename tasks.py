@@ -436,15 +436,24 @@ def manage_cancel_order(order_id: int, timeout: int = 30, symbol: str | None = N
 # machine's sleep window (stack down 19:00→05:00 weekdays, all weekend), so
 # beat's catch-up send on wake still executes rather than being discarded.
 app.conf.beat_schedule = {
-    # Market regime — daily at 9:30 AM ET (market open). LLM-heavy → llm
-    # lane, priority: it gates the day's sizing multiplier.
+    # Market regime — daily at 9:30 AM ET (market open). It gates the day's
+    # sizing multiplier. Price/volume only, no LLM call, so it runs on ops
+    # rather than waiting for (and holding) the single llm slot (audit
+    # 2026-11-05-0325 #11).
     "assess-regime": {
         "task":     "tasks.assess_regime_daily",
         "schedule": crontab(hour=9, minute=30, day_of_week="mon-fri"),
-        "options":  {"queue": LLM_QUEUE_HELD, "expires": 6 * 3600},
+        "options":  {"queue": "ops", "expires": 6 * 3600},
     },
     # Daily scanner — 9:35 AM ET (5 min after regime). The scan itself is
     # fast (ops); it enqueues analyze_candidates onto the llm lane.
+    # Log-only: held names that moved 5%+ close to close today (audit
+    # 2026-11-05-0525 #4). After the close so today's daily bar is final.
+    "held-move-shadow": {
+        "task":     "tasks.held_move_shadow",
+        "schedule": crontab(hour=16, minute=20, day_of_week="mon-fri"),
+        "options":  {"queue": "ops", "expires": 2 * 3600},
+    },
     "daily-scan": {
         "task":     "tasks.run_daily_scan",
         "schedule": crontab(hour=9, minute=35, day_of_week="mon-fri"),
@@ -1105,6 +1114,62 @@ def analyze_candidates(self, candidates: list, max_per_run: int = 5):
     except Exception as e:
         log.error(f"analyze_candidates failed: {e}")
         raise self.retry(exc=e, countdown=300)
+
+
+def _yf_last_minute(ticker: str, at=None) -> tuple[float | None, str | None]:
+    """The last 1-minute close Yahoo has for today that started at or before
+    `at` (all bars when None), with its bar START time (ISO), including
+    pre/post-market bars; (None, None) when there is none."""
+    import yfinance as yf
+    df = yf.Ticker(ticker).history(period="1d", interval="1m", prepost=True)
+    if df is not None and not df.empty and at is not None:
+        df = df[df.index <= at]   # a bar that arrived after the stale quote was seen doesn't count
+    if df is None or df.empty:
+        return None, None
+    return float(df["Close"].iloc[-1]), df.index[-1].isoformat()
+
+
+@app.task(name="tasks.stale_quote_fallback_shadow", ignore_result=True,
+          soft_time_limit=20, time_limit=30)
+def stale_quote_fallback_shadow(ticker: str, approval_id, attempt: int, stale_age_min,
+                                seen_at: str | None = None) -> None:
+    """Log-only (audit 2026-11-05-0725 #10/#13): when a BUY at the open finds
+    only a stale IBKR quote (HMDS "no data" for the first minutes; ANET's
+    11-04 08:33 OPEN was lost this way), record whether Yahoo had a recent
+    1-minute bar, so a fallback quote source can be judged before it is used.
+
+    yf_age_min is measured from the bar's START to seen_at (when execution
+    saw the stale quote; the task may run later), so a current bar reads
+    about 1 min old. bar_in_rth says whether that bar started between 09:30
+    and 16:00 ET: a pre-market print just before the open looks fresh but is
+    thin trade (professor m545). Runs on ops, off the order path, with time
+    limits. One activity_feed row per check; never raises."""
+    from datetime import datetime, time, timezone
+    from zoneinfo import ZoneInfo
+    import db
+    now = datetime.now(timezone.utc)
+    ref = datetime.fromisoformat(seen_at) if seen_at else now
+    try:
+        price, bar_at = _yf_last_minute(ticker, ref)
+        bar = datetime.fromisoformat(bar_at) if bar_at else None
+        age = round((ref - bar).total_seconds() / 60, 1) if bar else None
+        # 09:30-16:00 ET; an early-close day's last hours read as in RTH (known limit).
+        in_rth = (time(9, 30) <= bar.astimezone(ZoneInfo("America/New_York")).time() < time(16, 0)
+                  if bar else None)
+        err = None
+    except Exception as e:
+        price, bar_at, age, in_rth, err = None, None, None, None, type(e).__name__
+    try:
+        db.log_activity("quote_fallback_shadow", ticker,
+                        f"stale IBKR quote (check {attempt}); Yahoo 1-min bar age "
+                        f"{age if age is not None else 'n/a'} min", "neutral",
+                        {"approval_id": approval_id, "attempt": attempt,
+                         "ibkr_age_min": stale_age_min, "seen_at": seen_at, "yf_bar_at": bar_at,
+                         "yf_age_min": age, "bar_in_rth": in_rth,
+                         "yf_price_found": price is not None, "error": err,
+                         "checked_at": now.isoformat()})
+    except Exception as e:
+        log.warning(f"[{ticker}] quote fallback shadow row failed: {e}")
 
 
 @app.task(name="tasks.retry_deferred_entry", bind=True, max_retries=0)
@@ -3155,6 +3220,72 @@ def assess_regime_daily(self):
         raise self.retry(exc=e, countdown=120)
 
 
+HELD_MOVE_SHADOW_PCT = 5.0   # risk_rules.md: "Review: Weekly or after 5%+ single-session move"
+
+
+def _session_move_pct(bars: list[dict], today: str) -> float | None:
+    """Close-to-close move of the session dated `today` (ET), in percent, or
+    None when today's bar or a prior close is missing (holiday, no data)."""
+    done = [b for b in bars or [] if b.get("close")]
+    if len(done) < 2 or str(done[-1].get("time"))[:10] != today:
+        return None
+    prev, last = float(done[-2]["close"]), float(done[-1]["close"])
+    return round((last - prev) / prev * 100, 2) if prev > 0 else None
+
+
+@app.task(name="tasks.held_move_shadow")
+def held_move_shadow(today: str | None = None):
+    """Log-only (audit 2026-11-05-0525 #4): a held name that moved 5% or
+    more close to close today. risk_rules.md asks for a review after such a
+    move; nothing triggers one. Writes a HELD_MOVE_SHADOW signal row per
+    name, no alert and no review. Whether it should trigger a review is
+    Luke's (G57)."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    import db
+    import market_data
+    today = today or datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    # Held = broker positions plus position_stops rows: either alone misses a
+    # case (a holding with no stop row; a stale row for a sold name; m542).
+    broker, stops = set(), set()
+    read = {"broker": True, "stops": True}   # on every row, so a one-sided held_source is explained
+    try:
+        broker = {p.symbol for p in _get_client().get_all_positions() if float(p.qty or 0)}
+    except Exception as e:
+        read["broker"] = False
+        log.warning(f"held move shadow: broker positions unreadable ({e})")
+    try:
+        stops = {r["ticker"] for r in db.get_all_position_stops(strict=True)}
+    except Exception as e:
+        read["stops"] = False
+        log.warning(f"held move shadow: position stops unreadable ({e})")
+    no_reading = []
+    for ticker in sorted(broker | stops):
+        try:
+            move = _session_move_pct(market_data.get_bars(ticker, days=5), today)
+        except Exception as e:
+            log.debug(f"[{ticker}] held move shadow: bars read raised {type(e).__name__}")
+            move = None
+        if move is None:   # get_historical_bars returns [] on error (m543)
+            no_reading.append(ticker)
+            continue
+        if abs(move) < HELD_MOVE_SHADOW_PCT:
+            continue
+        source = "both" if ticker in broker and ticker in stops else "broker" if ticker in broker else "stops"
+        try:
+            db.log_signal(ticker, "HELD_MOVE_SHADOW", 0.0,
+                          f"held, moved {move:+.1f}% today; risk_rules.md asks for a review (not triggered)",
+                          provenance={"move_pct": move, "session": today, "held_source": source,
+                                      "sources_read": dict(read),
+                                      "threshold_pct": HELD_MOVE_SHADOW_PCT,
+                                      "rule": "risk_rules.md: review after 5%+ single-session move"})
+        except Exception as e:
+            log.warning(f"[{ticker}] held move shadow: signal log failed ({e})")
+    log.info(f"held move shadow: {len(broker | stops)} held names checked, "
+             f"{len(no_reading)} with no reading for {today}"
+             + (f": {', '.join(no_reading)}" if no_reading else ""))
+
+
 @app.task(name="tasks.assess_gics_sector_map", bind=True, max_retries=2)
 def assess_gics_sector_map(self):
     """Daily full-market GICS sector regime sweep at 9:45 AM ET — see
@@ -3738,6 +3869,29 @@ def retry_backstop_sell(self, ticker: str, alert: dict):
         log.error(f"[{ticker}] Backstop sell retry did not sell; the reason is logged above")
 
 
+def _first_offhours_stop_alert(ticker: str, alert: dict) -> bool:
+    """True when a stop alert should be sent. Outside regular hours a broker
+    stop can't fire, so the price stays below it and the 30-minute check
+    re-alerted on every run until the open (QBTS 10-13: four alerts, NVDA
+    11-05). Called only for a position a working broker stop covers: those
+    off-hours alerts go once per ticker per ET day; a state read or write
+    failure sends the alert anyway."""
+    if alert.get("rth", True):
+        return True
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    import db
+    key = f"stop_alert_offhours:{ticker}"
+    today = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    try:
+        if db.get_state_strict(key) == today:
+            return False
+        db.set_state(key, today)
+    except Exception as e:
+        log.warning(f"[{ticker}] off-hours stop alert state unavailable ({e}); alerting")
+    return True
+
+
 @app.task(name="tasks.check_trailing_stops", bind=True, max_retries=2)
 def check_trailing_stops(self):
     """Monitor open positions against their stop levels. Alert on triggers;
@@ -3804,25 +3958,50 @@ def check_trailing_stops(self):
             ticker = alert["ticker"]
             log.warning(f"STOP TRIGGERED: {ticker} — {alert['reason']}")
             backstopped = False
-            if (alert.get("action") == "EXIT"
-                    and AUTO_EXECUTE_PROTECTIVE_SELLS
-                    and open_stop_qty is not None):
-                try:
-                    held_qty = abs(float(client.get_open_position(ticker).qty))
-                except Exception:
-                    held_qty = 0.0
-                stop_qty = open_stop_qty.get(ticker, 0.0)
-                covered = held_qty > 0 and abs(stop_qty - held_qty) < max(0.01, held_qty * 0.02)
-                if held_qty > 0 and not covered:
-                    if stop_qty:
-                        log.warning(f"[{ticker}] Working stops and sells cover {stop_qty} shares but "
-                                    f"{held_qty} are actually held — treating as stale/unreliable")
-                    backstopped = _execute_backstop_sell(ticker, alert)
+            # What covers the position: "covered", "uncovered", "not_held",
+            # "unknown" (open orders or the position unreadable) or "not_checked".
+            cover, cover_note = "not_checked", ""
+            if alert.get("action") == "EXIT" and AUTO_EXECUTE_PROTECTIVE_SELLS:
+                if open_stop_qty is None:
+                    cover = "unknown"
+                else:
+                    try:
+                        held_qty = abs(float(client.get_open_position(ticker).qty))
+                    except Exception:
+                        held_qty = None
+                    stop_qty = open_stop_qty.get(ticker, 0.0)
+                    if held_qty is None:
+                        cover = "unknown"
+                    elif held_qty == 0:
+                        cover = "not_held"
+                    else:
+                        covered = abs(stop_qty - held_qty) < max(0.01, held_qty * 0.02)
+                        cover = "covered" if covered else "uncovered"
+                        cover_note = (f"the broker stop covers {stop_qty:g} shares" if covered else
+                                      f"NO working broker stop covers {held_qty:g} shares "
+                                      f"(working: {stop_qty:g})")
+                    if cover == "uncovered":
+                        if stop_qty:
+                            log.warning(f"[{ticker}] Working stops and sells cover {stop_qty} shares but "
+                                        f"{held_qty} are actually held — treating as stale/unreliable")
+                        backstopped = _execute_backstop_sell(ticker, alert)
+            reason = alert["reason"]
+            if not alert.get("rth", True) and not backstopped:
+                reason += {"covered": f"; {cover_note}, and it fires at the open",
+                           "uncovered": f"; {cover_note}; backstop sale not done (see the backstop "
+                                        f"log; an off-hours sale is retried at the open)",
+                           "not_held": "; the position is not held at the broker",
+                           "unknown": "; cover unknown (open orders or position unreadable)",
+                           }.get(cover, "; broker cover not checked")
+            # Only a covered position is quiet after its first off-hours
+            # alert; uncovered or unknown cover alerts every run (professor m541).
+            if cover == "covered" and not backstopped and not _first_offhours_stop_alert(ticker, alert):
+                continue
             alerts.send_stop_triggered(
                 ticker=ticker,
                 current_price=alert["current_price"],
                 stop_price=alert["stop_price"],
-                reason=alert["reason"] + (" — BACKSTOP SELL EXECUTED" if backstopped else ""),
+                reason=reason + (" — BACKSTOP SELL EXECUTED" if backstopped else ""),
             )
     except Exception as e:
         failed = True

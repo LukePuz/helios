@@ -366,7 +366,7 @@ The verdict, gates, provenance and redacted prompt are written to `signals` (`ag
 26. Price must be available (`:1048-1052`).
 27. `RiskManager.size_position` (section 6.3). Zero shares: if the cause is cash or heat, try a swap out of a weaker Accelerator/Moonshot holding during market hours only, then re-size (`:1055-1155`); otherwise stop with `ROUTE_ZERO_SHARES`.
 28. Concentration (`risk_manager.py:check_concentration`, `:860`), fail closed: shrinks the order to fit theme (35%), AI-infrastructure (60%) and total moonshot (10%) caps (`config.py:104-106`), or stops if no room (`agents/crew.py:1162-1195`).
-29. Correlation: a correlated holding (threshold 0.7, `risk_manager.py:982`) cuts size by 25% (`agents/crew.py:1197-1201`).
+29. Correlation: two or more held positions with return correlation r >= 0.7 (`risk_manager.py:1614`, `:1659`) cut size by 25% (`agents/crew.py:1731`). One correlated holding alone does not cut size.
 30. Approval row written to `pending_approvals` (`agents/crew.py:1208-1219`).
 31. If `AUTO_EXECUTE` is false, a Telegram Approve/Reject request is sent and the flow waits for a human (`:1227-1249`). `AUTO_EXECUTE` is true in paper, and in live only if `LIVE_TRADING_ENABLED` is also true (`config.py:64-65`).
 32. Otherwise the approval is atomically claimed and `execution.execute_approved(trigger="auto")` runs (`agents/crew.py:1253-1260`).

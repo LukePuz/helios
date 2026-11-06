@@ -259,7 +259,7 @@ def test_trigger_record_and_every_analyze_call_passes_one():
                                            "timestamp": "2026-10-29T11:02"})
     assert rec == {"path": "event", "source": "analyst_ratings", "type": "pt_raise",
                    "title": "Stifel raises MSFT", "url": "u", "published_at": "2026-10-29T11:02",
-                   "event_time": "2026-10-29T11:02", "event_time_source": "timestamp"}
+                   "event_time": "2026-10-29T11:02", "event_time_source": "timestamp", "title_tone": "pos"}
     assert "trigger" not in inspect.getsource(analyst._build_prompt)
     for mod in (analyst, crew):
         src = inspect.getsource(mod)

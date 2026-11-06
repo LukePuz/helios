@@ -1550,8 +1550,11 @@ class RiskManager:
         if ai_infra_total > MAX_AI_INFRA_PCT:
             flags.append(f"AI infrastructure exposure {ai_infra_total:.1%} exceeds {MAX_AI_INFRA_PCT:.0%} limit")
 
-        if pos_values.get(ticker, 0) > MAX_POSITION_PCT_COMPOUNDER:
-            flags.append(f"{ticker} position {pos_values[ticker]:.1%} exceeds Compounder cap {MAX_POSITION_PCT_COMPOUNDER:.0%}")
+        # The account tier's Compounder cap, the one sizing uses: the
+        # standard 12% flagged every buy on a smaller account as a breach.
+        name_flag_cap = get_active_limits(pv)["max_position_pct_compounder"]
+        if pos_values.get(ticker, 0) > name_flag_cap:
+            flags.append(f"{ticker} position {pos_values[ticker]:.1%} exceeds Compounder cap {name_flag_cap:.0%}")
 
         # Theme concentration — positions sharing the proposed ticker's sector.
         # theme_size_cap_pct mirrors ai_infra_size_cap_pct's shape below --

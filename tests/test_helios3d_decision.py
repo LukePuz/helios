@@ -717,6 +717,9 @@ def test_free_text_caps():
     {"malformed_sell_alert": None},
     {"nonfinite_paths": ["decision.model_output.expected_return_pct"]},
     {"held_review": True},
+    {"imputed_fields": ["conviction"]},
+    {"trend_template": {"pass": True, "criteria": {"above_200": True}}},
+    {"trend_template": {"status": "insufficient_history"}},
 ])
 def test_malformed_catalyst_keys_are_kept(keys):
     inputs = D.recover_inputs(_prov(), _dec(**keys))

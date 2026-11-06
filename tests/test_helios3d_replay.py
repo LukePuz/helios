@@ -141,6 +141,32 @@ def test_trend_template_is_oracle_for_accelerator_buys():
     assert tt["status"] == G.ORACLE and tt["fired"] is True
 
 
+@pytest.mark.parametrize("record, tt_pass, fired", [
+    ({"pass": False, "criteria": {}, "reasoning": "x"}, False, True),
+    ({"pass": True, "criteria": {}, "reasoning": "x"}, True, False),
+    ({"status": "insufficient_history"}, None, False),
+    ({"status": "read_error"}, None, False),
+])
+def test_trend_template_is_replayed_from_the_recorded_check(record, tt_pass, fired):
+    src = FakeSource()
+    mo = _mo("OPEN", 8, pass_to_risk=True)
+    dec, prov, _ = _decision(mo, {"bucket": "Accelerator", "trend_template_pass": tt_pass})
+    dec["trend_template"] = record
+    src.add(1, "AAA", mo, dec, prov, role="Accelerator", approval=None if fired else 9)
+    e = _entry(H.run(DAY, DAY, src), 1)
+    tt = next(s for s in e["steps"] if s["step"] == "trend_template")
+    assert tt["status"] == G.REPLAYED and tt["fired"] is fired
+    assert e["status"] == "match"
+    assert e["input_sources"]["trend_template_pass"].startswith("decision.trend_template")
+
+
+def test_trend_template_not_run_record_stays_oracle():
+    sig = {"provenance": _prov(), "prompt_role": "Accelerator",
+           "decision": {"trend_template": {"status": "not_run"}}}
+    inp, src = H.gate_inputs({"as_of_ts": T0}, sig, None)
+    assert "trend_template_pass" not in inp and src["trend_template_pass"] == "not recorded"
+
+
 def test_regime_gate_replayed_and_diff_reported():
     src = FakeSource()
     mo = _mo("OPEN", 6, pass_to_risk=True)

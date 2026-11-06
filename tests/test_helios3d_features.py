@@ -102,7 +102,7 @@ def test_get_dispatches_and_rejects_unknown_source():
 
 def test_every_source_is_registered_with_its_flag():
     expected = {"price_bars": False, "price_bars_asof": True, "fundamentals": True,
-                "regime": True, "earnings_calendar": True, "news": True,
+                "regime": True, "earnings_calendar": True, "earnings_consensus": True, "news": True,
                 "portfolio_snapshot": True, "position_stops": False}
     assert set(S.SOURCES) == set(expected)
     for source, safe in expected.items():
@@ -462,6 +462,7 @@ _SAFE_WRITERS = {
                                         ("scripts/replay_spill.py", "insert_row")}),
     "portfolio_snapshots": ("timestamp", {("db.py", "log_snapshot")}),
     "earnings_calendar_history": ("recorded_at", {("db.py", "upsert_earnings_date")}),
+    "earnings_consensus_history": ("fetched_at", {("db.py", "log_earnings_consensus")}),
 }
 _SKIP_DIRS = ("helios3d", "tests", "venv", ".venv", ".git", ".claude")
 

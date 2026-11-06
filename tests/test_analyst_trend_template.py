@@ -129,3 +129,16 @@ class TestTrendTemplateGateIntegration:
         response["pass_to_risk"] = False
         result = _run(_CANDIDATE, json.dumps(response), None)
         assert result["trend_template"] == {"status": "not_run"}
+
+
+def test_signal_decision_records_the_trend_template_and_imputed_fields():
+    """M273: the check is in the signals decision dict, not only the result."""
+    tt = {"pass": False, "criteria": {"above_200": False}, "reasoning": "below MA200"}
+    patches = _mock_analyze_deps(_response("OPEN"))
+    with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], \
+         patches[6], patch("db.log_signal") as ls, patches[8], \
+         patch("agents.price_action.compute_trend_template", return_value=tt):
+        analyze(_CANDIDATE, situation_brief="brief")
+    decision = ls.call_args.kwargs["decision"]
+    assert decision["trend_template"] == tt
+    assert decision["imputed_fields"] == []

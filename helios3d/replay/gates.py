@@ -24,7 +24,8 @@ Inputs (keys of ``inp``; a key that is ABSENT means "unknown"):
   fund_read            provenance.fundamentals_read: "ok", "missing" or
                        "read error: X"
   is_etf               ticker in knowledge_loader.get_etf_tickers()
-  trend_template_pass  compute_trend_template(ticker)["pass"]; None = the
+  trend_template_pass  compute_trend_template(ticker)["pass"] (the harness reads
+                       decision.trend_template); None = the
                        function returned None (insufficient history: passes)
   prev_verdict         db.get_latest_signal_for(ticker) before this verdict:
                        {"confidence", "timestamp"} or None
@@ -500,7 +501,8 @@ def replay_gates(model_output: dict, inp: dict, recorded_gates=()) -> dict:
                 parsed["pass_to_risk"] = False
             step("trend_template", ORACLE, text is not None,
                  "bucket not recorded" if not bucket_known else
-                 "compute_trend_template needs point-in-time price bars; its result is not recorded")
+                 "compute_trend_template needs point-in-time price bars; its result is not "
+                 "recorded (decision.trend_template)")
     else:
         step("trend_template", NOT_APPLICABLE)
 

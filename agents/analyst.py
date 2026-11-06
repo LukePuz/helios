@@ -204,6 +204,33 @@ def _venv_record() -> dict:
         return {"venv_sha": None, "venv_error": type(e).__name__}
 
 
+# Installed versions of the libraries a verdict's inputs and routing go
+# through (m4): key -> distribution names tried in order (psycopg2 is often
+# installed as psycopg2-binary). Read once per process.
+_LIB_DISTS = {"ib_async": ("ib_async",), "ib_insync": ("ib_insync",), "yfinance": ("yfinance",),
+              "celery": ("celery",), "kombu": ("kombu",),
+              "psycopg2": ("psycopg2", "psycopg2-binary")}
+_LIB_VERSIONS: dict = {}
+
+
+def _lib_versions() -> dict:
+    """{key: installed version or None} for _LIB_DISTS, from package metadata,
+    cached. Never raises."""
+    if not _LIB_VERSIONS:
+        from importlib import metadata
+        out = {}
+        for key, dists in _LIB_DISTS.items():
+            out[key] = None
+            for dist in dists:
+                try:
+                    out[key] = metadata.version(dist)
+                    break
+                except Exception:
+                    continue
+        _LIB_VERSIONS.update(out)
+    return dict(_LIB_VERSIONS)
+
+
 def boot_record(service: str) -> dict:
     """What a process started with (M181): commit, dirty flag, service, pid,
     process start time, plus hashes of inputs code_sha can't see (m248): the
@@ -812,9 +839,10 @@ def shadow_versions() -> dict:
     (professor m268). Never raises."""
     try:
         return {"code_sha": _CODE_SHA.get("code_sha"),
-                "env_sha": _config_env_record().get("env_sha")}
+                "env_sha": _config_env_record().get("env_sha"),
+                "lib_versions": _lib_versions()}
     except Exception:
-        return {"code_sha": None, "env_sha": None}
+        return {"code_sha": None, "env_sha": None, "lib_versions": None}
 
 
 def _treatment_config() -> dict:
@@ -928,6 +956,8 @@ def _provenance(prompt: str) -> dict:
     return {**_PROVENANCE_STATIC, **_ollama_identity(), **_code_mixed_check(),
             # Every env-overridable config.py setting, hashed (M182).
             "config_env": _config_env_record(),
+            # Installed library versions (m4).
+            "lib_versions": _lib_versions(),
             # Which process, and when it read code_sha (joins to its boot row).
             "process": {"pid": os.getpid(), "code_read_pid": _BOOT["pid"],
                         "code_read_at": _BOOT["code_read_at"]},
@@ -1949,6 +1979,16 @@ def trigger_record(path: str, event: dict | None = None) -> dict:
     rec = {"path": path, "source": e.get("source"), "type": e.get("type"),
            "title": (e.get("title") or "")[:200] or None, "url": e.get("url"),
            "published_at": str(e.get("timestamp") or e.get("published_at") or "") or None}
+    # The trigger headline's tone from the screener's keyword lists (not a
+    # model), so a buy on a negative headline can be counted (audit 11-05
+    # 17:32 #3). Tag only; the gate ignores it.
+    rec["title_tone"] = None
+    if e.get("title"):
+        try:
+            from agents.screener import title_tone
+            rec["title_tone"] = title_tone(e["title"])
+        except Exception:
+            pass
     # The item's own time, from the first structured key the source carries
     # (M266): EDGAR/arXiv timestamp, news published_at, a rating's
     # event_time, a Form 4 filing_date, a congressional trade date.
@@ -2570,6 +2610,9 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
                 # scan with no broker positions reads False.
                 "held_review": candidate.get("held_review") is True,
                 "imputed_fields": imputed_fields,
+                # The Trend Template check (M273): its result, or why there
+                # is none; the replay harness reads it.
+                "trend_template": trend_template_record,
             },
             prompt=redact_account_figures(prompt),
         )

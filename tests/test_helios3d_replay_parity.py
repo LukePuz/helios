@@ -332,6 +332,13 @@ def _assert_same(case):
               "final_conviction", "final_pass_to_risk", "gates"):
         assert got[k] == want[k], (k, case, got[k], want[k])
     assert all(s["status"] != G.ORACLE for s in got["steps"])
+    # The recorded Trend Template check gives the harness the input live used.
+    from helios3d.replay import harness as H
+    inp, _ = H.gate_inputs({}, {"provenance": {}, "decision": want}, None)
+    if want["trend_template"] != {"status": "not_run"}:
+        assert inp["trend_template_pass"] == case["trend"], (case, want["trend_template"])
+    else:
+        assert "trend_template_pass" not in inp
 
 
 _RNG = random.Random(20261103)

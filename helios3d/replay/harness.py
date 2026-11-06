@@ -20,8 +20,11 @@ STEPS
   provenance.config; a switch not recorded leaves the step that needs it
   oracle (SETUP_GATES_ENABLED not recorded leaves the bucket unknown). A step whose input is missing takes its outcome from
   the recorded gate list and is reported as "oracle", not "replayed".
-  Trend Template is always oracle: compute_trend_template read price bars
-  that public.price_history rewrites in place, and its result is not stored.
+  Trend Template is replayed from the recorded check (decision.trend_template:
+  its "pass", or an insufficient_history/read_error status, which the gate
+  passes); it is oracle on rows without it (or with status not_run), since
+  compute_trend_template read price bars that public.price_history rewrites
+  in place.
 - route: whether the verdict goes to routing (crew routes iff pass_to_risk)
   is replayed. Which branch routing took is not_replayable: it read live
   state (active approvals, rebuy cooldown, catalyst and earnings calendars,
@@ -180,6 +183,16 @@ def gate_inputs(rec: dict, sig: dict, approval: dict | None) -> tuple[dict, dict
         if isinstance(dec.get("nonfinite_paths"), list):
             inp["nonfinite_paths"] = dec["nonfinite_paths"]
             src["nonfinite_paths"] = "decision.nonfinite_paths"
+    # The recorded check: a "pass", or a None result (the gate passes it).
+    tt = dec.get("trend_template")
+    if isinstance(tt, dict) and isinstance(tt.get("pass"), bool):
+        inp["trend_template_pass"] = tt["pass"]
+        src["trend_template_pass"] = "decision.trend_template.pass"
+    elif isinstance(tt, dict) and tt.get("status") in ("insufficient_history", "read_error"):
+        inp["trend_template_pass"] = None
+        src["trend_template_pass"] = f"decision.trend_template.status ({tt['status']})"
+    else:
+        src["trend_template_pass"] = "not recorded"
     be = prov.get("brief_exposure")
     if isinstance(be, dict) and "held_at_gate" in be:
         inp["held"], src["held"] = be["held_at_gate"], "provenance.brief_exposure.held_at_gate"

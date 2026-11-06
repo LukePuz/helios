@@ -411,3 +411,18 @@ def test_concentration_read_error_has_pure_equivalent(live):
     got_live = rm.check_concentration("NVDA", 0.1, bucket="Compounder")
     got_pure = limits.concentration("NVDA", 0.1, "Compounder", {}, 2400.0, WATCHLIST)
     assert got_live["passed"] == got_pure["passed"]
+
+
+def test_single_position_flag_uses_the_tier_cap(live, monkeypatch):
+    import knowledge_loader
+    monkeypatch.setattr(knowledge_loader, "load_watchlist", lambda: WATCHLIST)
+    # Micro tier: 16% of a small account is under the tier's Compounder cap.
+    rm = live(2400.0, 2400.0, [])
+    got = rm.check_concentration("COST", 0.16, bucket="Compounder")
+    assert not any("exceeds Compounder cap" in f for f in got["flags"])
+    assert "single_position" not in limits.concentration("COST", 0.16, "Compounder", {}, 2400.0,
+                                                         WATCHLIST)["breaches"]
+    # Standard tier keeps the 12% cap.
+    rm = live(100_000.0, 100_000.0, [])
+    got = rm.check_concentration("COST", 0.16, bucket="Compounder")
+    assert any("exceeds Compounder cap 12%" in f for f in got["flags"])

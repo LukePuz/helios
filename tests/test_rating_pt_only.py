@@ -50,3 +50,10 @@ def test_nan_cells_map_to_none():
         (ev,) = ar._fetch_for_ticker("ANET")
     assert ev["rating"] == {"action": "main", "grade_changed": False, "pt_action": None}
     assert analyst.trigger_record("event", ev)["rating"]["pt_only"] is False
+
+
+def test_trigger_record_tags_the_headline_tone():
+    from agents.analyst import trigger_record
+    assert trigger_record("event", {"title": "AMD Tumbles 13% on AI Regulation Fears"})["title_tone"] == "neg"
+    assert trigger_record("event", {"title": "Nvidia beats estimates, raises guidance"})["title_tone"] == "pos"
+    assert trigger_record("daily_scan", {"source": "scanner"})["title_tone"] is None

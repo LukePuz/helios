@@ -138,7 +138,8 @@ LLM_EVENT_EXPIRES_SECONDS = 4 * 3600
 # sets for it) — if so, call the broker directly; if not, dispatch a task to
 # the "orders" queue and wait for the result. The direct-call branch also
 # means celery_orders_worker's own tasks never call back into themselves.
-from celery.signals import beat_init, task_failure, task_revoked, worker_init
+from celery.signals import (beat_init, task_failure, task_postrun, task_prerun, task_revoked,
+                            worker_init, worker_ready)
 
 
 def _boot_service_name(sender) -> str:
@@ -729,6 +730,14 @@ app.conf.beat_schedule = {
         "schedule": crontab(hour=17, minute=15, day_of_week="mon-fri"),
         "options":  {"queue": INGESTION_QUEUE, "expires": 2 * 3600},
     },
+    # Earnings consensus snapshot (log-only, research) — 5:30 PM ET, after
+    # the close and inside the awake window; expires before the 19:00
+    # stack-down.
+    "refresh-earnings-consensus": {
+        "task":     "tasks.refresh_earnings_consensus",
+        "schedule": crontab(hour=17, minute=30, day_of_week="mon-fri"),
+        "options":  {"queue": INGESTION_QUEUE, "expires": 90 * 60},
+    },
     # S&P 500 universe price history — weekly, Saturday 9:00 AM. The stack
     # is down all weekend, so it actually runs via the Monday 05:00 catch-up
     # (~44h later), which is fine —
@@ -947,9 +956,11 @@ def _dispatch_event(event: dict, seen_source: str | None = None) -> None:
 _EVENT_TASKS = ("tasks.screen_event", "tasks.deep_analyze_event")
 
 
-def _log_event_lost(task_name: str, reason: str, args, error_class: str | None = None) -> None:
+def _log_event_lost(task_name: str, reason: str, args, error_class: str | None = None,
+                    started_at: float | None = None) -> bool:
     """Log-only EVENT_LOST row: the task, why, and the event's identifiers
-    from the task args. Never raises."""
+    from the task args. Never raises. False if the row could not be handed
+    to db.log_signal (a spill or degraded row there still counts)."""
     try:
         import db
         from agents.crew import event_item_fields
@@ -959,10 +970,15 @@ def _log_event_lost(task_name: str, reason: str, args, error_class: str | None =
         decision = {"task": task_name, "reason": reason, **event_item_fields(event)}
         if error_class:
             decision["error_class"] = error_class
+        if started_at is not None:
+            from datetime import datetime, timezone
+            decision["started_at"] = datetime.fromtimestamp(started_at, timezone.utc).isoformat()
         log.error(f"[{ticker}] {task_name} lost the event ({reason}): {decision.get('title')}")
         db.log_signal(ticker, "EVENT_LOST", 0.0, f"{task_name}: {reason}", decision=decision)
+        return True
     except Exception as e:
         log.warning(f"EVENT_LOST log failed for {task_name}: {e}")
+        return False
 
 
 def _event_task_failed(self, exc, task_id, args, kwargs, einfo):
@@ -988,6 +1004,7 @@ def _on_event_task_killed(sender=None, task_id=None, exception=None, args=None, 
         reason = "worker_lost"
     else:
         return
+    _clear_event_running(task_id)
     _log_event_lost(sender.name, reason, args, type(exception).__name__)
 
 
@@ -998,7 +1015,85 @@ def _on_event_task_revoked(sender=None, request=None, terminated=None, signum=No
     name = getattr(sender, "name", None) or getattr(request, "task_name", None)
     if name not in _EVENT_TASKS:
         return
+    _clear_event_running(getattr(request, "id", None))
     _log_event_lost(name, "expired" if expired else "revoked", getattr(request, "args", None))
+
+
+# A screen or analysis task running when its worker is SIGKILLed (the stop's
+# grace ran out: process_manager._finish_stop, or systemd's TimeoutStopSec)
+# leaves nothing: the message was acked when the pool accepted it (no
+# acks_late), so it is not redelivered, and no signal runs. So each running
+# task keeps a Redis marker, cleared when it ends, by any of the writers
+# above. The worker's next boot turns a marker left by an earlier process of
+# the same worker name into EVENT_LOST "worker_shutdown". Messages that were
+# only reserved go back to the queue on a warm stop, or after the broker's
+# visibility_timeout on a kill, and then expire through the revoked handler.
+_EVENT_RUNNING_KEY = "helios:event_running:{}"
+_EVENT_RUNNING_TTL_S = 7 * 24 * 3600
+_PROCESS_STARTED = __import__("time").time()   # set before the pool forks
+
+
+def _clear_event_running(task_id) -> None:
+    if not task_id:
+        return
+    try:
+        stop_lock._redis().delete(_EVENT_RUNNING_KEY.format(task_id))
+    except Exception as e:
+        log.warning(f"event running marker not cleared for {task_id}: {e}")
+
+
+@task_prerun.connect
+def _on_event_task_start(sender=None, task_id=None, args=None, **_):
+    if getattr(sender, "name", None) not in _EVENT_TASKS or not task_id:
+        return
+    request = getattr(sender, "request", None)
+    hostname = getattr(request, "hostname", None)
+    if not hostname or getattr(request, "is_eager", False):
+        return
+    args = list(args or [])
+    event = args[0] if args and isinstance(args[0], dict) else {}
+    keep = ("ticker", "source", "title", "url", "id", "form", "type")
+    import time
+    marker = {"task": sender.name, "hostname": hostname, "started_at": time.time(),
+              "event": {k: event[k] for k in keep if k in event}}
+    try:
+        stop_lock._redis().set(_EVENT_RUNNING_KEY.format(task_id), json.dumps(marker, default=str),
+                               ex=_EVENT_RUNNING_TTL_S)
+    except Exception as e:
+        log.warning(f"event running marker not written for {task_id}: {e}")
+
+
+@task_postrun.connect
+def _on_event_task_end(sender=None, task_id=None, **_):
+    if getattr(sender, "name", None) in _EVENT_TASKS:
+        _clear_event_running(task_id)
+
+
+@worker_ready.connect
+def _log_events_lost_at_shutdown(sender=None, **_):
+    """At worker boot: an EVENT_LOST row for each task an earlier process
+    of this worker name left running. Never raises."""
+    hostname = getattr(sender, "hostname", None)
+    if not hostname:
+        return
+    try:
+        r = stop_lock._redis()
+        for key in r.scan_iter(_EVENT_RUNNING_KEY.format("*"), count=100):
+            try:
+                raw = r.get(key)
+                marker = json.loads(raw) if raw else None
+                if not isinstance(marker, dict) or marker.get("hostname") != hostname:
+                    continue
+                started = float(marker.get("started_at") or 0)
+                if started >= _PROCESS_STARTED:
+                    continue                        # this process's own task
+                if _log_event_lost(str(marker.get("task")), "worker_shutdown",
+                                   [marker.get("event") or {}], started_at=started or None):
+                    r.delete(key)                   # else the next boot tries again (TTL bounds it)
+            except Exception as e:
+                log.warning(f"event running marker {key!r} not handled: {e}")
+    except Exception as e:
+        log.warning(f"event running markers not read: {e}")
 
 
 @app.task(name="tasks.screen_event", bind=True, max_retries=1, on_failure=_event_task_failed)
@@ -5591,6 +5686,7 @@ def watch_plan_levels():
         import db
         import market_data
         import stop_lock
+        from agents.analyst import shadow_versions
         from agents.plans import level_hits
         if not market_data.is_market_hours():
             return 0
@@ -5620,7 +5716,7 @@ def watch_plan_levels():
                               + ("review queued" if queued else "would re-review"),
                               provenance={"plan_id": plan["id"], "kind": kind, "level": level,
                                           "price": price, "plan_source": plan.get("source"),
-                                          "review_queued": queued})
+                                          "review_queued": queued, **shadow_versions()})
                 if queued:
                     review_plan_level_hit.apply_async(
                         args=[plan["ticker"], kind, str(level), price],
@@ -5711,6 +5807,31 @@ def refresh_earnings_calendar(self):
     except Exception as e:
         log.error(f"refresh_earnings_calendar failed: {e}")
         raise self.retry(exc=e, countdown=300)
+
+
+_EARNINGS_CONSENSUS_SOFT_LIMIT_S = 20 * 60
+# The loop stops fetching this long before the soft limit, so the run ends
+# with a row per ticker and a heartbeat instead of at the limit.
+_EARNINGS_CONSENSUS_DEADLINE_MARGIN_S = 2 * 60
+
+
+@app.task(name="tasks.refresh_earnings_consensus", bind=True, max_retries=0,
+          soft_time_limit=_EARNINGS_CONSENSUS_SOFT_LIMIT_S, time_limit=25 * 60)
+def refresh_earnings_consensus(self):
+    """Append today's earnings consensus and surprise history per watchlist
+    ticker (ingestion/earnings_consensus.py). Log-only: nothing the analyst
+    sees, no gate and no routing reads it. Not retried: a missed day is a
+    gap in the series, and a retry can't fill it with that day's values.
+    At the soft time limit, SoftTimeLimitExceeded reaches the except below
+    and records the failed heartbeat."""
+    try:
+        from ingestion.earnings_consensus import refresh_all_earnings_consensus
+        counts = refresh_all_earnings_consensus(
+            deadline_s=_EARNINGS_CONSENSUS_SOFT_LIMIT_S - _EARNINGS_CONSENSUS_DEADLINE_MARGIN_S)
+        _heartbeat_ok("earnings_consensus", counts.get("written", 0))
+    except Exception as e:
+        log.warning(f"refresh_earnings_consensus failed: {type(e).__name__}: {e}")
+        _heartbeat_fail("earnings_consensus", f"{type(e).__name__}: {e}")
 
 
 @app.task(name="tasks.refresh_macro_calendar", bind=True, max_retries=2)

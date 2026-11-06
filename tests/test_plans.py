@@ -180,6 +180,9 @@ def test_watcher_logs_once_per_plan_and_kind():
         assert tasks.watch_plan_levels() == 0          # same plan and kind today: not again
     assert log_signal.call_args.args[1] == "PLAN_LEVEL_HIT"
     assert not client.called          # no IBKR connection from the ingestion worker
+    # The row names its own code and config version (SEF run 100).
+    prov = log_signal.call_args.kwargs["provenance"]
+    assert "code_sha" in prov and "env_sha" in prov
 
 
 def test_watcher_says_when_price_checks_were_skipped(caplog):

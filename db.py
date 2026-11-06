@@ -837,6 +837,18 @@ _MIGRATIONS: list[tuple[int, str]] = [
     # trade rows written before (or without) their orders row. No FOREIGN
     # KEY: a constraint failure must never lose a trade row.
     (78, "ALTER TABLE trades ADD COLUMN IF NOT EXISTS order_row_id INTEGER;"),
+    # Earnings consensus and surprise history per watchlist ticker, one row
+    # per ticker per fetch (ingestion/earnings_consensus.py). Append-only;
+    # fetched_at is the insert time. Log-only: nothing in the analyst's
+    # brief, gates or routing reads it. Empty before 11-03.
+    (79, "CREATE TABLE IF NOT EXISTS earnings_consensus_history ("
+         "id SERIAL PRIMARY KEY, ticker VARCHAR(10) NOT NULL, "
+         "fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), source VARCHAR(20) NOT NULL, "
+         "status VARCHAR(10) NOT NULL, error_class VARCHAR(60), parts JSONB, "
+         "next_earnings_date DATE, next_earnings_is_estimate BOOLEAN, "
+         "eps_estimate JSONB, revenue_estimate JSONB, eps_history JSONB); "
+         "CREATE INDEX IF NOT EXISTS idx_earnings_consensus_history_ticker_fetched "
+         "ON earnings_consensus_history (ticker, fetched_at DESC);"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -3415,6 +3427,41 @@ def get_fundamentals_history(ticker: str, limit: int = 400) -> list[dict]:
         return []
     finally:
         _put_conn(conn)
+
+
+def log_earnings_consensus(ticker: str, rec: dict, errors: list | None = None) -> bool:
+    """Append one earnings consensus snapshot (migration 79). Insert only:
+    a row is never updated, and the insert time is its knowledge time.
+    NaN/inf in the JSON parts become null. Never raises: returns False on
+    failure (a connect error included), logged at DEBUG with the error text
+    appended to `errors`, so the run warns once rather than per ticker."""
+    def js(v):
+        return psycopg2.extras.Json(_finite_json(v)) if v is not None else None
+    conn = None
+    try:
+        conn = _connect_with_retry("log_earnings_consensus")
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO earnings_consensus_history (ticker, source, status, error_class, "
+                "parts, next_earnings_date, next_earnings_is_estimate, eps_estimate, "
+                "revenue_estimate, eps_history) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (ticker, rec.get("source"), rec.get("status"), rec.get("error_class"),
+                 js(rec.get("parts")), rec.get("next_earnings_date"),
+                 rec.get("next_earnings_is_estimate"), js(rec.get("eps_estimate")),
+                 js(rec.get("revenue_estimate")), js(rec.get("eps_history"))),
+            )
+        conn.commit()
+        return True
+    except Exception as e:
+        if conn is not None:
+            _rollback_quietly(conn)
+        logging.debug(f"log_earnings_consensus({ticker}) failed: {e}")
+        if errors is not None:
+            errors.append(f"{type(e).__name__}: {e}")
+        return False
+    finally:
+        if conn is not None:
+            _put_conn(conn)
 
 
 def get_fundamentals(ticker: str) -> dict | None:

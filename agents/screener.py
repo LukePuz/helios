@@ -38,6 +38,8 @@ SCREENER_MODEL = os.getenv("SCREENER_MODEL", "qwen2.5:7b")
 
 from config import SYMBOLS
 
+SCREENER_CONTENT_CAP = 500   # characters of event text the screener prompt includes
+
 _SCREENER_PROMPT = """\
 You are a financial analyst screening events for a trading system that holds \
 tech, AI, semiconductor, and quantum computing stocks. Every event you mark \
@@ -287,6 +289,63 @@ def title_tone(title: str) -> str:
     """'pos', 'neg', 'mixed' (both word lists hit) or 'neutral'."""
     pos, neg = bool(_TONE_POS.search(title or "")), bool(_TONE_NEG.search(title or ""))
     return "mixed" if pos and neg else "pos" if pos else "neg" if neg else "neutral"
+
+
+# Opinion/listicle headline patterns, log-only (opinion_shadow in provenance):
+# measures how often the 7B passes pieces its prompt calls not relevant.
+# Separate from _keyword_fallback's low_signal_keywords, which stay as they are.
+# First match in this order wins.
+_OPINION_PATTERNS = [
+    ("is_x_a_buy", re.compile(
+        r"(?:^|[:?!.\-–—|]\s*)is\s+(?:[\w.&'’-]+\s+){0,5}?an?\s+"
+        r"(?:(?:good|great|smart|strong|top)\s+)?(?:buy|sell|investment)\b", re.I)),
+    ("should_you_buy", re.compile(
+        r"\bshould\s+(?:you|investors|i)\s+(?:buy|sell|own|hold|invest)\b", re.I)),
+    ("stocks_to_buy", re.compile(
+        r"\bstocks?\s+to\s+(?:buy|watch|own|sell|avoid|consider)\b", re.I)),
+    ("best_stocks", re.compile(r"\bbest\s+(?:[\w-]+\s+){0,2}?stocks?\b", re.I)),
+    ("buy_the_dip", re.compile(r"\bbuy(?:ing)?\s+the\s+dip\b", re.I)),
+    ("too_late_to_buy", re.compile(r"\btoo\s+late\s+to\s+buy\b", re.I)),
+    ("time_to_buy", re.compile(r"\bis\s+(?:it|now)\s+(?:the\s+)?(?:right\s+)?time\s+to\s+buy\b", re.I)),
+    ("prediction", re.compile(r"\bprediction\s*:", re.I)),
+    ("could_soar", re.compile(
+        r"\bcould\s+(?:\w+\s+){0,2}?(?:soar|double|triple|skyrocket|10x)\b", re.I)),
+    ("heres_why", re.compile(r"\bhere(?:['’]s|\s+is)\s+why\b", re.I)),
+    ("what_investors_should_know", re.compile(
+        r"\bwhat\s+investors\s+(?:should|need\s+to)\s+know\b", re.I)),
+    ("im_buying", re.compile(r"\bi(?:['’]m|\s+am)\s+buying\b|\bi\s+just\s+bought\b", re.I)),
+    ("millionaire_maker", re.compile(r"\bmillionaire[-\s]+makers?\b", re.I)),
+    ("forever_stock", re.compile(r"\bforever\s+stocks?\b", re.I)),
+    # "X Is Betting Big on AI: Is Its Growth ..." (2026-11-03).
+    ("colon_question", re.compile(
+        r":\s+(?:is|are|can|could|should|will|does)\s+(?:it|its|this|now)\b", re.I)),
+]
+
+
+def _opinion_patterns_sha(patterns) -> str:
+    """First 12 hex of sha256 over the ordered (name, pattern, flags) list, so
+    opinion_shadow rows from different pattern lists can be told apart."""
+    import hashlib
+    spec = json.dumps([[name, pat.pattern, int(pat.flags)] for name, pat in patterns])
+    return hashlib.sha256(spec.encode()).hexdigest()[:12]
+
+
+try:
+    _OPINION_PATTERNS_SHA = _opinion_patterns_sha(_OPINION_PATTERNS)
+except Exception:
+    _OPINION_PATTERNS_SHA = None
+
+
+def _opinion_headlines(title) -> list[str]:
+    """Names of every _OPINION_PATTERNS entry the title matches, in list order."""
+    t = title or ""
+    return [name for name, pat in _OPINION_PATTERNS if pat.search(t)]
+
+
+def _opinion_headline(title) -> str | None:
+    """Name of the first _OPINION_PATTERNS entry the title matches, or None."""
+    names = _opinion_headlines(title)
+    return names[0] if names else None
 
 
 _HELD_OVERRIDE_COOLDOWN_S = 4 * 3600
@@ -554,13 +613,14 @@ def screen(event: dict) -> dict:
         tier=tier,
         held="yes" if held else "no",
         title=title,
-        content=event.get("text", "")[:500],
+        content=(event.get("text") or "")[:SCREENER_CONTENT_CAP],
     )
 
     raw = _call_ollama(prompt)
 
     fallback_reason = None
     urgency_missing = False
+    reply_keys = None   # the 7B reply's own keys, before any defaults (professor m569)
     if raw is None:
         log.warning("Ollama unavailable — using keyword fallback for screening.")
         result = _keyword_fallback(event, tier=tier)
@@ -571,6 +631,8 @@ def screen(event: dict) -> dict:
             json_match = re.search(r"\{.*\}", raw, re.DOTALL)
             if json_match:
                 result = json.loads(json_match.group())
+                if isinstance(result, dict):
+                    reply_keys = sorted(str(k) for k in result)
                 result["model_used"] = SCREENER_MODEL
             else:
                 # The fallback judged it, not the 7B: model_used says so.
@@ -606,6 +668,18 @@ def screen(event: dict) -> dict:
     _held_negative_override(result, ticker, source, title, held)
     held_negative_shadow = _would_pass_held_negative(result, event, source, title, held)
     _log_would_bypass_post_print(result, event, ticker, source, title, held)   # log-only
+    # Log-only: would a deterministic opinion-headline check have dropped
+    # what the screener passed? Changes nothing in result.
+    try:
+        _ops = _opinion_headlines(title)
+        _op = _ops[0] if _ops else None
+        opinion_shadow = {"match": _op, "matches": _ops,
+                          "would_drop": result.get("relevant") is True and _op is not None,
+                          "patterns_sha": _OPINION_PATTERNS_SHA, "error": None}
+    except Exception as e:
+        log.debug(f"[{ticker}] opinion_shadow failed: {e}")
+        opinion_shadow = {"match": None, "matches": [], "would_drop": False,
+                          "patterns_sha": _OPINION_PATTERNS_SHA, "error": type(e).__name__}
 
     # Provenance for the SCREENED_OUT signal row (SEF run 7, 2026-10-28):
     # those rows had no model or code version, so screener rejections couldn't
@@ -628,6 +702,11 @@ def screen(event: dict) -> dict:
             "new_fact": result.get("new_fact"),
             "override": result.get("override"),
             "would_pass_held_negative": held_negative_shadow,
+            # How much of the event text the 7B saw (audit 2026-11-05-0725 #10;
+            # G54). Log-only.
+            "content_len": len(event.get("text") or ""),
+            "content_cut": len(event.get("text") or "") > SCREENER_CONTENT_CAP,
+            "opinion_shadow": opinion_shadow,
         }
         if fallback_reason:
             result["provenance"]["fallback_reason"] = fallback_reason
@@ -635,6 +714,14 @@ def screen(event: dict) -> dict:
             result["provenance"]["urgency_missing"] = True
         if relevant_invalid:
             result["provenance"]["relevant_invalid"] = True
+        if reply_keys is not None:
+            # Record-only: whether the 7B left "reason" out, null or blank.
+            rv = result.get("reason")
+            result["provenance"]["reply_keys"] = reply_keys
+            result["provenance"]["reason_missing"] = (
+                "absent" if "reason" not in reply_keys else
+                "null" if rv is None else
+                "blank" if not str(rv).strip() else None)
     except Exception as e:
         log.warning(f"screener provenance failed: {e}")
 
@@ -648,9 +735,11 @@ def screen(event: dict) -> dict:
 
     try:
         from feed import emit
-        reason = result.get("reason", "")[:100]
+        # A null reason from the model used to raise on the slice, and the
+        # except below dropped the feed row with no trace (49 on 11-05).
+        reason = str(result.get("reason") or "")[:100]
         if result.get("relevant"):
-            urgency = result.get("urgency", "low")
+            urgency = result.get("urgency") or "low"
             sentiment = "alert" if urgency == "immediate" else "neutral"
             emit("screener", ticker,
                  f"Relevant ({urgency}) — {reason}",

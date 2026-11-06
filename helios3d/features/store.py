@@ -23,6 +23,7 @@ fundamentals        public.fundamentals_history.recorded_at          True
 regime              public.market_regime_log.timestamp, or the       True
                     spill-replay time for replayed rows
 earnings_calendar   public.earnings_calendar_history.recorded_at     True
+earnings_consensus  public.earnings_consensus_history.fetched_at    True
 news                public.news_log.published_at (the insert time;   True
                     see NEWS_REASON)
 portfolio_snapshot  public.portfolio_snapshots.timestamp             True
@@ -295,6 +296,26 @@ def earnings_calendar(ticker: str, as_of: datetime, limit: int = 20, conn=None) 
          "(upsert_earnings_date(replace_future=True)); no row means unknown, not no earnings"))
 
 
+def earnings_consensus(ticker: str, as_of: datetime, limit: int = 1, conn=None) -> FeatureResult:
+    """The latest ``limit`` earnings_consensus_history rows (consensus EPS and
+    revenue estimates, EPS surprise history) fetched by as_of, newest first.
+    A caller-supplied ``conn`` has its open transaction rolled back (read_only())."""
+    as_of = _aware(as_of)
+    limit = max(int(limit), 0)
+    t = ticker.strip().upper()
+    rows = _query(conn,
+                  "SELECT * FROM public.earnings_consensus_history WHERE ticker = %s AND fetched_at <= %s "
+                  "ORDER BY fetched_at DESC, id DESC LIMIT %s", (t, as_of, limit))
+    kept, refused = _refuse_after(rows, lambda r: _ts(r.get("fetched_at")), as_of)
+    return FeatureResult(
+        "earnings_consensus", t, as_of, kept, "public.earnings_consensus_history.fetched_at", True,
+        "append-only; fetched_at is the insert time (DEFAULT NOW(), never set by the writer)",
+        refused,
+        ("table exists since db migration 79 (2026-11-03); nothing before that",
+         "status/parts say which parts yfinance returned; ETFs are not fetched (status no_data)",
+         "eps_history.surprisePercent is Yahoo's raw value, unit not converted"))
+
+
 def news(ticker: str, as_of: datetime, limit: int = 50, since: datetime | None = None,
          conn=None) -> FeatureResult:
     """news_log headlines logged by as_of (and at or after ``since`` when
@@ -372,6 +393,7 @@ SOURCES: dict[str, Callable[..., FeatureResult]] = {
     "fundamentals": fundamentals,
     "regime": regime,
     "earnings_calendar": earnings_calendar,
+    "earnings_consensus": earnings_consensus,
     "news": news,
     "portfolio_snapshot": portfolio_snapshot,
     "position_stops": position_stops,

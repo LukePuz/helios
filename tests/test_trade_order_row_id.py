@@ -28,7 +28,7 @@ def _sqls(cur):
 def test_migration_78_adds_the_column_once():
     versions = [v for v, _ in db._MIGRATIONS]
     assert len(versions) == len(set(versions))
-    assert versions == sorted(versions) and versions[-1] == 78
+    assert versions == sorted(versions) and 78 in versions
     sql = dict(db._MIGRATIONS)[78]
     assert sql == "ALTER TABLE trades ADD COLUMN IF NOT EXISTS order_row_id INTEGER;"
     assert sum("order_row_id" in s for _, s in db._MIGRATIONS) == 1

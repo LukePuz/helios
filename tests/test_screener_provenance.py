@@ -75,3 +75,43 @@ def test_recap_headline_does_not_use_up_a_rating_changes_override():
     r = _screen("Why Is ServiceNow Stock Falling Today?", source="news")
     assert r["relevant"] and r["provenance"]["override"] == "held_negative_or_rating"
     assert _screen("BTIG main NOW: Buy, price target lowers to $180")["relevant"]
+
+
+def test_provenance_records_how_much_text_the_screener_saw():
+    from agents import screener
+    reply = '{"relevant": false, "urgency": "low", "reason": "noise"}'
+    for text, cut in (("x" * 1200, True), ("short", False), ("", False)):
+        with patch("agents.screener._call_ollama", return_value=reply) as call, patch("feed.emit"):
+            r = screener.screen({"ticker": "NVDA", "source": "edgar", "title": "8-K", "text": text})
+        assert r["provenance"]["content_len"] == len(text) and r["provenance"]["content_cut"] is cut
+        assert ("x" * (screener.SCREENER_CONTENT_CAP + 1)) not in call.call_args.args[0]
+
+
+def test_none_text_screens_as_empty():
+    with patch("agents.screener._call_ollama", return_value='{"relevant": false, "urgency": "low", "reason": "x"}'), \
+         patch("feed.emit"):
+        r = screener.screen({"ticker": "NVDA", "source": "news", "title": "t", "text": None})
+    assert r["provenance"]["content_len"] == 0 and r["provenance"]["content_cut"] is False
+
+
+def test_null_reason_still_emits_the_feed_row():
+    for reply, want in (('{"relevant": false, "urgency": "low", "reason": null}', "Filtered out — "),
+                        ('{"relevant": true, "urgency": null, "reason": null}', "Relevant (")):
+        with patch("agents.screener._call_ollama", return_value=reply), patch("feed.emit") as emit:
+            screener.screen({"ticker": "NVDA", "source": "news", "title": "t", "text": "x"})
+        assert any(c.args[2].startswith(want) for c in emit.call_args_list), (reply, emit.call_args_list)
+
+
+def test_provenance_records_the_reply_keys_and_a_missing_reason():
+    cases = (('{"relevant": false, "urgency": "eod", "reason": null, "new_fact": false}', "null"),
+             ('{"relevant": false, "urgency": "eod", "new_fact": false}', "absent"),
+             ('{"relevant": false, "urgency": "eod", "reason": "  ", "new_fact": false}', "blank"),
+             ('{"relevant": false, "urgency": "eod", "reason": "noise", "new_fact": false}', None))
+    for reply, want in cases:
+        with patch("agents.screener._call_ollama", return_value=reply), patch("feed.emit"):
+            r = screener.screen({"ticker": "NVDA", "source": "news", "title": "t", "text": "x"})
+        assert r["provenance"]["reason_missing"] == want, reply
+        assert "model_used" not in r["provenance"]["reply_keys"] and "relevant" in r["provenance"]["reply_keys"]
+    with patch("agents.screener._call_ollama", return_value=None), patch("feed.emit"):
+        r = screener.screen({"ticker": "NVDA", "source": "news", "title": "t", "text": "x"})
+    assert "reply_keys" not in r["provenance"] and "reason_missing" not in r["provenance"]

@@ -443,7 +443,7 @@ def concentration(ticker: str, proposed_size_pct: float, bucket: str | None,
         ai_cap = max(0.0, _cfg.MAX_AI_INFRA_PCT - (ai_total - proposed_size_pct))
     if ai_total > _cfg.MAX_AI_INFRA_PCT:
         breaches.append("ai_infra")
-    if weights.get(ticker, 0) > _cfg.MAX_POSITION_PCT_COMPOUNDER:
+    if weights.get(ticker, 0) > active_limits(pv)["max_position_pct_compounder"]:
         breaches.append("single_position")
 
     theme_cap = None

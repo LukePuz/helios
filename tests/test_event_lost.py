@@ -151,3 +151,143 @@ def test_task_failure_signal_leaves_ordinary_exceptions_to_on_failure():
         tasks._on_event_task_killed(sender=tasks.poll_news, task_id="t",
                                     exception=WorkerLostError("x"), args=[])
     log_signal.assert_not_called()
+
+
+# ── worker killed at stop ─────────────────────────────────────────────────────
+# A running task's message was acked when the pool accepted it, and a SIGKILL
+# after the stop's grace runs no handler, so the worker's next boot logs it
+# from the marker the task left.
+
+def _start(task, task_id, hostname="screen@box"):
+    task.push_request(id=task_id, hostname=hostname, is_eager=False)
+    try:
+        tasks._on_event_task_start(sender=task, task_id=task_id,
+                                   args=[dict(_EVENT), {"relevant": True}])
+    finally:
+        task.pop_request()
+
+
+def _boot(hostname="screen@box"):
+    tasks._log_events_lost_at_shutdown(sender=SimpleNamespace(hostname=hostname))
+
+
+def _rebooted(monkeypatch):
+    monkeypatch.setattr(tasks, "_PROCESS_STARTED", tasks._PROCESS_STARTED + 10**6)
+
+
+def _running_keys():
+    import stop_lock
+    return [k for k in stop_lock._redis().store if k.startswith("helios:event_running:")]
+
+
+def test_acks_early_so_a_killed_running_task_is_not_redelivered():
+    for task in (tasks.screen_event, tasks.deep_analyze_event):
+        assert not task.acks_late
+    assert not tasks.app.conf.task_acks_late
+
+
+@pytest.mark.parametrize("task", [tasks.screen_event, tasks.deep_analyze_event])
+def test_task_running_at_a_kill_is_logged_at_the_next_boot(task, monkeypatch):
+    import stop_lock
+    _start(task, "t1")
+    (key,) = _running_keys()
+    assert "body text" not in stop_lock._redis().store[key]   # identifiers only
+    _rebooted(monkeypatch)
+    with patch("db.log_signal") as log_signal:
+        _boot()
+        _boot()                                                # logged once
+    (row,) = _rows(log_signal, "EVENT_LOST")
+    assert row.args[0] == "NVDA"
+    d = row.kwargs["decision"]
+    assert d["task"] == task.name and d["reason"] == "worker_shutdown"
+    assert d["title"] == _EVENT["title"] and d["url"] == _EVENT["url"]
+    assert d["started_at"] and "error_class" not in d
+    assert not _running_keys()
+
+
+def test_marker_kept_when_the_row_was_not_written(monkeypatch):
+    _start(tasks.screen_event, "t1")
+    _rebooted(monkeypatch)
+    with patch("db.log_signal", side_effect=RuntimeError("db down")):
+        _boot()
+    assert len(_running_keys()) == 1                           # the next boot tries again
+    with patch("db.log_signal") as log_signal:
+        _boot()
+    assert len(_rows(log_signal, "EVENT_LOST")) == 1 and not _running_keys()
+
+
+def test_log_event_lost_reports_whether_the_row_was_handed_over():
+    with patch("db.log_signal"):
+        assert tasks._log_event_lost("tasks.screen_event", "expired", [dict(_EVENT)]) is True
+    with patch("db.log_signal", side_effect=RuntimeError("db down")):
+        assert tasks._log_event_lost("tasks.screen_event", "expired", [dict(_EVENT)]) is False
+
+
+def test_boot_skips_other_workers_and_its_own_tasks():
+    _start(tasks.deep_analyze_event, "llm-task", hostname="llm@box")
+    _start(tasks.screen_event, "own-task")                     # started by this process
+    with patch("db.log_signal") as log_signal:
+        _boot()
+    log_signal.assert_not_called()
+    assert len(_running_keys()) == 2
+
+
+def test_finished_task_clears_its_marker(monkeypatch):
+    _start(tasks.screen_event, "t1")
+    tasks._on_event_task_end(sender=tasks.screen_event, task_id="t1")
+    _rebooted(monkeypatch)
+    with patch("db.log_signal") as log_signal:
+        _boot()
+    log_signal.assert_not_called()
+
+
+@pytest.mark.parametrize("kill", ["worker_lost", "revoked"])
+def test_one_row_when_another_writer_logged_it(kill, monkeypatch):
+    from billiard.exceptions import WorkerLostError
+    _start(tasks.screen_event, "t1")
+    with patch("db.log_signal") as log_signal:
+        if kill == "worker_lost":
+            tasks._on_event_task_killed(sender=tasks.screen_event, task_id="t1",
+                                        exception=WorkerLostError("x"), args=[dict(_EVENT)])
+        else:
+            request = SimpleNamespace(id="t1", args=[dict(_EVENT)],
+                                      task_name=tasks.screen_event.name)
+            tasks._on_event_task_revoked(sender=tasks.screen_event, request=request,
+                                         terminated=True, expired=False)
+        _rebooted(monkeypatch)
+        _boot()
+    assert len(_rows(log_signal, "EVENT_LOST")) == 1
+
+
+def test_marker_set_and_cleared_through_the_worker_trace():
+    from celery.app.trace import trace_task
+    seen = []
+    task = tasks.screen_event
+    with patch.object(task.backend, "store_result"), patch.object(task.backend, "mark_as_done"), \
+         patch("agents.crew.screen_event_only",
+               side_effect=lambda e: seen.append(_running_keys()) or {"relevant": False}):
+        trace_task(task, "tid", [dict(_EVENT)], {}, app=tasks.app, eager=False,
+                   request={"id": "tid", "hostname": "screen@box", "is_eager": False})
+    assert seen == [["helios:event_running:tid"]] and not _running_keys()
+
+
+def test_eager_and_other_tasks_leave_no_marker():
+    with patch("agents.crew.screen_event_only", return_value={"relevant": False}):
+        tasks.screen_event.apply(args=[dict(_EVENT)])
+    tasks.poll_news.push_request(id="p", hostname="ingestion@box", is_eager=False)
+    try:
+        tasks._on_event_task_start(sender=tasks.poll_news, task_id="p", args=[])
+    finally:
+        tasks.poll_news.pop_request()
+    assert not _running_keys()
+
+
+def test_marker_handlers_never_raise(monkeypatch):
+    import stop_lock
+
+    def down():
+        raise ConnectionError("redis down")
+    monkeypatch.setattr(stop_lock, "_redis", down)
+    _start(tasks.screen_event, "t1")
+    tasks._on_event_task_end(sender=tasks.screen_event, task_id="t1")
+    _boot()

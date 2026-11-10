@@ -132,6 +132,10 @@ _SOURCE = "edgar"
 # Only process filings published within this window — prevents old annual
 # reports and quarterly filings from flooding the pipeline on every restart.
 _MAX_AGE_HOURS = 48
+# Log-only (audit 11-06 17:34 #4): unseen filings older than _MAX_AGE_HOURS
+# but within this many more hours, i.e. accepted while the stack was down
+# (Friday evening to the Monday 05:00 boot is 58 h). Counted, not dispatched.
+_AGED_OUT_LOOKBACK_HOURS = 72
 
 
 _SEEN_THIS_PASS: set[str] | None = None   # loaded once per poll_once pass
@@ -563,6 +567,29 @@ def _fetch_submissions(ticker: str, cik: str, label: str = "EDGAR") -> tuple | N
     return data, tz
 
 
+_AGED_OUT_THIS_PASS: list[tuple[str, str]] = []   # (accession, "TICKER FORM ACCEPTED")
+_AGED_OUT_WARNED: set[str] = set()   # accessions already logged by this process
+
+
+def _note_aged_out(ticker: str, data: dict, tz) -> None:
+    """Log-only: filings the age filter drops that were never seen, accepted
+    within _AGED_OUT_LOOKBACK_HOURS before the cutoff, added to
+    _AGED_OUT_THIS_PASS as (accession, "TICKER FORM ACCEPTED"). A filing is
+    marked seen only once dispatched, so this also counts a failed dispatch
+    that aged out. Nothing is dispatched or marked seen, so a later change
+    to the cutoff still finds them. Never raises."""
+    try:
+        kept = {r["accession"] for r in _parse_submissions(data, tz=tz)}
+        wider = _parse_submissions(data, tz=tz, max_age_hours=_MAX_AGE_HOURS + _AGED_OUT_LOOKBACK_HOURS)
+        for r in wider:
+            if r["accession"] in kept or r["accepted_at"] is None or _is_seen(_seen_key(r["accession"])):
+                continue
+            _AGED_OUT_THIS_PASS.append((r["accession"],
+                f"{ticker} {r['actual_form']} {r['accepted_at'].astimezone(_ET).isoformat(timespec='minutes')}"))
+    except Exception as e:
+        log.debug(f"EDGAR: aged-out count failed for {ticker}: {e}")
+
+
 def _get_recent_filings(ticker: str, cik: str) -> list[dict] | None:
     """New filings for a ticker, every form in FILING_FORMS, from one
     submissions request. None when the request failed, so the pass can tell
@@ -571,6 +598,7 @@ def _get_recent_filings(ticker: str, cik: str) -> list[dict] | None:
     if fetched is None:
         return None
     data, tz = fetched
+    _note_aged_out(ticker, data, tz)
     filings = []
     for row in _parse_submissions(data, tz=tz):
         filing_id = _seen_key(row["accession"])
@@ -588,6 +616,9 @@ def _get_recent_filings(ticker: str, cik: str) -> list[dict] | None:
             "ticker":    ticker,
             "cik":       cik,
             "form":      form,
+            # The filing's own form: form is the FILING_FORMS prefix it
+            # matched, so a 424B5 or 425 reads "4" (audit 2026-11-07 03:08 #1).
+            "actual_form": row["actual_form"],
             # Without a source the screener logged "?", the brief said
             # "Triggering Event: UNKNOWN" and memory filed it as news.
             "source":    "sec_form4" if form == "4" else "sec_filing",
@@ -740,6 +771,7 @@ def _poll_all(on_filing=None) -> list[dict]:
     consecutive = 0
     polled = 0
     LAST_PASS.clear()
+    _AGED_OUT_THIS_PASS.clear()
     for n in range(total):
         ticker, cik = tickers[(start + n) % total]
         if consecutive >= _ABORT_AFTER_CONSECUTIVE_FAILS:
@@ -783,6 +815,16 @@ def _poll_all(on_filing=None) -> list[dict]:
                 except Exception as e:
                     log.error(f"EDGAR: dispatch failed for {ticker} {filing.get('form')}: {e}")
     stats["skipped"] = total - polled
+    stats["aged_out_unseen"] = len(_AGED_OUT_THIS_PASS)
+    # Each filing is named once per process, up to 20 a pass (the rest are
+    # named on later passes); the count is kept every pass.
+    fresh = [(acc, label) for acc, label in _AGED_OUT_THIS_PASS if acc not in _AGED_OUT_WARNED]
+    named = fresh[:20]
+    _AGED_OUT_WARNED.update(acc for acc, _ in named)
+    if fresh:
+        log.warning(f"EDGAR: {len(fresh)} new unseen filing(s) older than "
+                    f"{_MAX_AGE_HOURS}h skipped by the age filter (log-only; "
+                    f"{len(_AGED_OUT_THIS_PASS)} this pass): " + "; ".join(label for _, label in named))
     if stats["aborted"]:
         log.warning(f"EDGAR: pass stopped early ({stats['aborted']}), "
                     f"{stats['skipped']} ticker(s) not polled")

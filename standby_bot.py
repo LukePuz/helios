@@ -87,7 +87,12 @@ def _handle_message(update: dict) -> None:
 
     if not chat_id or not text:
         return
-    if tb._ALLOWED_USER_IDS and user_id not in tb._ALLOWED_USER_IDS:
+    # Fails closed like telegram_bot's mention and callback paths: an empty
+    # allowlist let anyone wake the full stack (audit 11-06 19:37 #7c).
+    if not tb._ALLOWED_USER_IDS:
+        log.error("[standby] Message rejected: TELEGRAM_ALLOWED_USER_IDS is not set")
+        return
+    if user_id not in tb._ALLOWED_USER_IDS:
         log.warning(f"[standby] Blocked message from unauthorized user_id={user_id} ({display})")
         return
 

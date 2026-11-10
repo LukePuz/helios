@@ -89,13 +89,15 @@ import sys
 import uuid
 from datetime import date, datetime, timedelta, timezone
 
+from helios3d.record.verdict_rows import DECISION_KEEP_KINDS, DECISION_RULE
+
 # Fixed namespace for decision ids; never change it (ids would all move).
 DECISION_NAMESPACE = uuid.UUID("5b1e7c9a-3d2f-4e1b-9a6c-0d4f2e8b7a31")
 RECORD_VERSION = 1
 DEFAULT_RELINK_DAYS = 14
 PAGE_SIZE = 500
 # Rows recorded although db._NON_ANALYST_SIGNALS lists them.
-_KEEP_NON_ANALYST = ("ANALYST_FAILED",)
+_KEEP_NON_ANALYST = DECISION_KEEP_KINDS
 
 # provenance keys copied into inputs.
 _PROV_KEYS = ("trigger", "regime_used", "implied_growth", "fundamentals_read", "brief_exposure",
@@ -113,7 +115,7 @@ _DECISION_KEYS = ("model_action", "model_conviction", "model_pass_to_risk", "fin
                   "pending_entry", "udr_check", "udr_structural", "event_burst",
                   "nonfinite_replaced", "nonfinite_paths", "failure", "downgraded_reason", "malformed_fields",
                   "return_malformed", "malformed_sell_alert",
-                  "held_review", "imputed_fields", "trend_template")
+                  "held_review", "imputed_fields", "trend_template", "parse_mode")
 # Scalar fields of decision.model_output kept as inputs.model_scores.
 _MODEL_SCORE_KEYS = ("action", "conviction", "thesis_strength", "catalyst_quality",
                      "valuation_risk_reward", "data_completeness", "thesis_bucket",
@@ -565,7 +567,7 @@ SIGNALS_SQL = (
     "(prompt IS NOT NULL) AS prompt_stored, "
     "(trading_env IS NULL AND COALESCE(reasoning, '') LIKE %s) AS degraded "
     "FROM public.signals "
-    "WHERE (signal NOT IN %s OR signal IN %s) AND symbol IS NOT NULL AND timestamp IS NOT NULL "
+    "WHERE " + DECISION_RULE +  # verdict_rows.DECISION_RULE
     "AND id > %s AND (id > %s OR timestamp >= %s) "
     "ORDER BY id LIMIT %s"
 )

@@ -163,7 +163,7 @@ def test_window_own_item_needs_no_lookup():
 def test_db_lookup_query_shape():
     import db
     cur = MagicMock()
-    cur.fetchall.return_value = [(9, "2026-11-03", "deal", "u")]
+    cur.fetchall.return_value = [(9, "2026-11-03", "deal", "u", "neg")]
     conn = MagicMock()
     conn.cursor.return_value.__enter__.return_value = cur
     with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
@@ -172,7 +172,9 @@ def test_db_lookup_query_shape():
     assert "provenance->'trigger'->>'new_fact' = 'true'" in sql
     assert "provenance->'trigger'->>'path' = 'event'" in sql
     assert params[0] == "NVDA" and params[-1] == 24
-    assert out == [{"signal_id": 9, "timestamp": "2026-11-03", "title": "deal", "url": "u"}]
+    assert "provenance->'trigger'->>'title_tone'" in sql
+    assert out == [{"signal_id": 9, "timestamp": "2026-11-03", "title": "deal", "url": "u",
+                    "title_tone": "neg"}]
     with patch("db._get_conn", side_effect=RuntimeError("down")):
         assert db.recent_new_fact_items("NVDA", 24) is None
     conn.cursor.side_effect = RuntimeError("down")
@@ -551,3 +553,35 @@ def test_trigger_carries_the_screener_digest_and_template_sha():
     assert t["new_fact"] is True
     assert (t["screener_model_digest"], t["screener_prompt_template_sha"]) == \
         ("abc123def456", "0123456789ab")
+
+
+# ── tone of the licensing fact (log-only, audit 2026-11-09 16:53 #3) ─────────
+def test_negative_triggering_fact_is_flagged_but_still_passes():
+    out, _ = _gate("ADD", {"path": "event", "new_fact": True, "title_tone": "neg"})
+    assert out["passed"] is True
+    assert out["licensing_tones"] == ["neg"] and out["new_fact_tone_mismatch"] is True
+
+
+def test_positive_triggering_fact_is_not_a_mismatch():
+    out, _ = _gate("OPEN", {"path": "event", "new_fact": True, "title_tone": "pos"})
+    assert out["passed"] is True and out["new_fact_tone_mismatch"] is False
+
+
+def test_window_items_all_negative_is_a_mismatch():
+    items = [dict(ITEM[0], title_tone="neg"), dict(ITEM[0], signal_id=8, title_tone=None)]
+    out, _ = _gate("ADD", EVENT_OLD, scope="news_only", window="24h", items=items)
+    assert out["passed"] is True
+    assert out["licensing_tones"] == ["neg", None] and out["new_fact_tone_mismatch"] is True
+
+
+def test_window_items_with_one_positive_is_not_a_mismatch():
+    items = [dict(ITEM[0], title_tone="neg"), dict(ITEM[0], signal_id=8, title_tone="pos")]
+    out, _ = _gate("ADD", EVENT_OLD, scope="news_only", window="24h", items=items)
+    assert out["new_fact_tone_mismatch"] is False
+
+
+def test_unknown_tone_records_none_and_blocks_nothing():
+    out, _ = _gate("ADD", EVENT_NEW)
+    assert out["passed"] is True and out["new_fact_tone_mismatch"] is None
+    blocked, _ = _gate("ADD", EVENT_OLD)
+    assert blocked["passed"] is False and "new_fact_tone_mismatch" not in blocked

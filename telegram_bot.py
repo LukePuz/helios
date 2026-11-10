@@ -242,9 +242,13 @@ def _handle_callback(update: dict) -> None:
             _answer_callback(cq_id, "Processing order...")
 
             success = _execute_approved_order(approval)
-            from execution import approval_outcome
+            from execution import approval_outcome, outcome_deferred
             status, reason = approval_outcome(success)   # a fill left to reconcile: APPROVED
             db.update_approval_status(approval_id, status, reason=reason)
+            # Deferred to a scheduled retry (market closed, stale price, gap
+            # check): stays FAILED so retry_deferred_entry can claim it, and
+            # execution already sent the deferral alert; not a failure.
+            deferred = not success and status == "FAILED" and outcome_deferred(reason)
             try:
                 from feed import emit as _fe
                 if success:
@@ -252,6 +256,8 @@ def _handle_callback(update: dict) -> None:
                 elif status == "APPROVED":   # filled; reconcile records it
                     _fe("execution", ticker, f"Order filled: {action} {ticker} — recorded by "
                                              f"reconcile", "alert")
+                elif deferred:
+                    _fe("execution", ticker, f"Order deferred: {action} {ticker} — {reason}", "info")
                 else:
                     _fe("execution", ticker, f"Order FAILED: {action} {ticker} — check logs", "alert")
             except Exception:
@@ -261,6 +267,7 @@ def _handle_callback(update: dict) -> None:
             if msg_id:
                 icon = ("✅ APPROVED" if success else
                         "✅ APPROVED (filled; recorded by reconcile)" if status == "APPROVED" else
+                        "⏸️ APPROVED (deferred; retry scheduled)" if deferred else
                         "⚠️ APPROVAL FAILED")
                 _edit_message(
                     msg_id,

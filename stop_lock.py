@@ -58,11 +58,71 @@ def assert_held(ticker: str) -> None:
         raise LockLost(ticker)
 
 
+# Per process: ticker -> monotonic time of its last stop_lock_skipped row,
+# so a long Redis outage writes about one row per ticker per minute.
+_SKIP_LOGGED: dict = {}
+_SKIP_SUPPRESSED: dict = {}          # ticker -> skips not written since its last row
+_SKIP_ROW_EVERY_S = 60
+
+
+def _record_lock_skip(ticker: str, error: Exception) -> None:
+    """One activity row (stage stop_lock_skipped) when a stop change runs
+    unlocked, so Redis outage windows can be measured (audit 2026-11-07
+    13:07 #9, professor). Queued to the process's one activity writer: the
+    stop change must never wait on the DB. Log-only; never raises."""
+    import time
+    try:
+        now = time.monotonic()
+        if now - _SKIP_LOGGED.get(ticker, -_SKIP_ROW_EVERY_S) < _SKIP_ROW_EVERY_S:
+            _SKIP_SUPPRESSED[ticker] = _SKIP_SUPPRESSED.get(ticker, 0) + 1
+            return
+        _SKIP_LOGGED[ticker] = now
+        extra = {"error_type": type(error).__name__, "error": str(error)[:200], "pid": os.getpid(),
+                 "skipped_since_last": _SKIP_SUPPRESSED.pop(ticker, 0)}
+
+        import db
+        db.log_activity_queued("stop_lock_skipped", ticker,
+                               f"stop lock unavailable, change ran unlocked ({extra['error_type']})",
+                               "neutral", {**extra, "env": db.TRADING_ENV})
+    except Exception:
+        pass
+
+
+def _flush_skip_carry(ticker: str) -> None:
+    """On the first locked change after an outage, one closing row (stage
+    stop_lock_skipped, recovered=True) with the skips suppressed since the
+    ticker's last row, so they count toward that outage (SEF 153j). Written
+    after any skip, so every outage has an end (professor m623). No-op when
+    the ticker had no skip. Queued to the activity writer; never raises."""
+    try:
+        n = _SKIP_SUPPRESSED.pop(ticker, 0)
+        had_skip = _SKIP_LOGGED.pop(ticker, None) is not None
+        if not n and not had_skip:
+            return
+        extra = {"recovered": True, "skipped_since_last": n, "pid": os.getpid()}
+
+        import db
+        db.log_activity_queued("stop_lock_skipped", ticker,
+                               f"stop lock back; {n} unlocked change(s) since the last row",
+                               "neutral", {**extra, "env": db.TRADING_ENV})
+    except Exception:
+        pass
+
+
+_REDIS_SOCKET_TIMEOUT_S = 5.0
+
+
 def _redis():
     global _client
     if _client is None:
         import redis
-        _client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+        # A hung Redis must not hang a stop change forever (audit 2026-11-08
+        # 15:08 #8). Each call is a short SET/Lua script (the blocking wait is
+        # a client-side sleep loop), so 5 s only trips on a stuck server; the
+        # timeout then takes the fail-open path in ticker_lock.
+        _client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+                                       socket_timeout=_REDIS_SOCKET_TIMEOUT_S,
+                                       socket_connect_timeout=_REDIS_SOCKET_TIMEOUT_S)
     return _client
 
 
@@ -87,10 +147,17 @@ def ticker_lock(ticker: str, wait: float | None = None):
                              thread_local=False)
         acquired = lock.acquire()
     except Exception as e:
+        # Fails open on purpose: Redis is also the Celery broker, so while it
+        # is down few task runners can race on a ticker, and blocking a stop
+        # move would leave a position less protected than an unlocked change
+        # (professor, audit 2026-11-07 13:07 #9). Each skip is recorded.
         log.warning(f"[{ticker}] stop lock unavailable, continuing unlocked: {e}")
+        _record_lock_skip(ticker, e)
         lock, acquired = None, True
     if not acquired:
         raise TickerBusy(ticker)
+    if lock is not None and ticker in _SKIP_LOGGED:
+        _flush_skip_carry(ticker)
 
     held[ticker] = 1
     done = threading.Event()

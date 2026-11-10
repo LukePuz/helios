@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os
 import threading
 import time as _time
@@ -303,6 +304,10 @@ def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
                 # Keep idle connections alive through the pooler and notice
                 # dead ones in about a minute.
                 keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3,
+                # A connect that hangs (DNS, pooler) fails in 10 s instead of
+                # waiting on the OS TCP timeout; the direct connections use 5 s
+                # (audit 2026-11-07 05:07 #5).
+                connect_timeout=10,
             )
             logging.info(f"DB connection pool created (maxconn={maxconn}).")
             _last_pool_health_check = _time.monotonic()
@@ -849,6 +854,63 @@ _MIGRATIONS: list[tuple[int, str]] = [
          "eps_estimate JSONB, revenue_estimate JSONB, eps_history JSONB); "
          "CREATE INDEX IF NOT EXISTS idx_earnings_consensus_history_ticker_fetched "
          "ON earnings_consensus_history (ticker, fetched_at DESC);"),
+    # Where filled_at came from (ibkr._fill_time_and_source): "receipt" (a
+    # live Fill's own time) or "execution" (execution.time, relabelled as
+    # UTC when it read as future). Written with filled_at, kept when a write
+    # has no fill time. Log-only. NULL before 11-06 and when filled_at is.
+    (80, "ALTER TABLE orders ADD COLUMN IF NOT EXISTS filled_at_source VARCHAR(20);"),
+    # exit_fill_at's source, the same labels as orders.filled_at_source:
+    # trade_outcomes has no link to its SELL order row, so it can't be
+    # joined. NULL when exit_fill_at is, and before 11-06. Log-only.
+    (81, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS exit_fill_at_source VARCHAR(20);"),
+    # A shadow plan's named levels from agents.plans.compile_plan (structural
+    # stop, first and second target, add trigger) and where they came from
+    # ("ladder" or "analyst_only"), written with NEW_PLAN/REVISE plans. Record
+    # only: nothing reads them for trading. NULL for held_seed plans, when the
+    # compile failed, and before 11-04.
+    (82, "ALTER TABLE trade_plans ADD COLUMN IF NOT EXISTS structural_stop DECIMAL, "
+         "ADD COLUMN IF NOT EXISTS t1 DECIMAL, ADD COLUMN IF NOT EXISTS t2 DECIMAL, "
+         "ADD COLUMN IF NOT EXISTS add_trigger DECIMAL, "
+         "ADD COLUMN IF NOT EXISTS levels_source VARCHAR(20);"),
+    # Which peer pool the comps fair value used (agents.valuation.
+    # compute_comps_fair_value): "industry" (the broad industry pool) or
+    # "watchlist_fallback" (watchlist-only sector peers), and how many values
+    # its median was taken over. NULL when comps gave no value, and before
+    # 11-04. Log-only.
+    (83, "ALTER TABLE trade_ladder ADD COLUMN IF NOT EXISTS comps_peer_source VARCHAR(20), "
+         "ADD COLUMN IF NOT EXISTS comps_peer_count INTEGER;"),
+    # Per level, where a shadow plan's migration-82 levels came from
+    # (agents.plans.compile_plan's level_sources: {"structural_stop", "t1",
+    # "t2", "add_trigger"} -> "ladder_support", "analyst_invalidation",
+    # "ladder_resistance", "analyst_target", "fair_value" or "none"), and the
+    # computed_at of the trade_ladder row they were compiled from. Record
+    # only. NULL when level_sources/levels_source is (ladder_computed_at also
+    # when there was no ladder row), and before 11-04.
+    (84, "ALTER TABLE trade_plans ADD COLUMN IF NOT EXISTS level_sources JSONB, "
+         "ADD COLUMN IF NOT EXISTS ladder_computed_at TIMESTAMPTZ;"),
+    # How position_stops.entry_price was set by its last write (professor
+    # m590): "fill" or "quote" (the order's fill price, or the quote when
+    # the fill price was missing), "broker_avg" (the broker's average cost:
+    # a non-bracket ADD, or an adopted position). Provenance of an existing
+    # field. NULL for rows last written before this migration.
+    (85, "ALTER TABLE position_stops ADD COLUMN IF NOT EXISTS entry_price_source VARCHAR(20);"),
+    # The verdict's imputed_fields (scores a default filled in: conviction 1,
+    # a sub-score 3), so a stored 3 can be told from one the model gave
+    # (professor 65f). Record only. NULL for rows written before this
+    # migration; [] when nothing was imputed.
+    (86, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS imputed_fields JSONB;"),
+    # When the exit SPY price (exit_benchmark_price) was fetched: at booking,
+    # which can be minutes after the fill (audit 2026-11-07 13:07 #3). Record
+    # only; which time the alpha should use is an open question. NULL before
+    # this migration, or when the fetch failed.
+    (87, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS exit_benchmark_at TIMESTAMPTZ;"),
+    # Why exit_benchmark_at/price are what they are (professor m624): "ok"
+    # (a price was fetched), "no_price" (the fetch returned none) or
+    # "fetch_failed" (it raised). Written with exit_benchmark_at after the
+    # close commits, so NULL means a row closed before this migration or a
+    # failed stamp (logged). The quote's own time isn't available from
+    # fast_info; exit_benchmark_at is the fetch time.
+    (88, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS exit_benchmark_status VARCHAR(16);"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -857,6 +919,9 @@ CREATE TABLE IF NOT EXISTS schema_version (
     applied_at  TIMESTAMPTZ DEFAULT NOW()
 );
 """
+
+
+_MIGRATION_LOCK_TIMEOUT = "30s"
 
 
 def init_db() -> None:
@@ -876,6 +941,11 @@ def init_db() -> None:
             if version in applied:
                 continue
             with conn.cursor() as cur:
+                # An ALTER waits for ACCESS EXCLUSIVE; with no lock timeout a
+                # session holding a lock on the table hangs boot and queues
+                # every query on that table behind it (audit 2026-11-08 23:22
+                # #1). Fail the boot with a clear error instead.
+                cur.execute(f"SET LOCAL lock_timeout = '{_MIGRATION_LOCK_TIMEOUT}'")
                 cur.execute(sql)
                 cur.execute("INSERT INTO schema_version (version) VALUES (%s)", (version,))
             conn.commit()
@@ -1250,9 +1320,15 @@ def get_chat_history(user_id: str, limit: int = 12, max_age_hours: float = 4) ->
         _put_conn(conn)
 
 
+# decision key set on every row whose provenance is a copy of its verdict's
+# (agents.crew._route_row_fields: the routing-exit rows). Readers that count
+# provenance skip these rows so one verdict's provenance counts once.
+_VERDICT_COPY_KEY = "route_exit"
+
+
 # Signal types crew.py logs for routing decisions, not analyst verdicts.
 _NON_ANALYST_SIGNALS = ("SCREENED_OUT", "CATALYST_BLOCKED", "COOLDOWN_SKIPPED", "SELL_NO_POSITION",
-                        "SELL_POSITION_UNREADABLE",
+                        "SELL_POSITION_UNREADABLE", "ROUTE_GUARD_UNREADABLE",
                         "EARNINGS_BLOCKED", "ROUTE_APPROVAL_PENDING", "ROUTE_NO_PRICE",
                         "ROUTE_ZERO_SHARES", "ROUTE_CONCENTRATION_ZERO", "ROUTE_NO_BROKER", "NO_VERDICT",
                         # Written at 0.0: read as a verdict it made a healthy
@@ -1275,11 +1351,17 @@ _NON_ANALYST_SIGNALS = ("SCREENED_OUT", "CATALYST_BLOCKED", "COOLDOWN_SKIPPED", 
                         # Log-only: a screener pass, and a screen or analysis
                         # task that expired, was revoked or failed for good.
                         "SCREENED_IN", "EVENT_LOST",
+                        # Log-only: a held-position review skipped because
+                        # broker positions could not be read.
+                        "REVIEW_SKIPPED",
                         # Log-only: a held name moved 5%+ today (no review).
-                        "HELD_MOVE_SHADOW")
+                        "HELD_MOVE_SHADOW",
+                        # Drop watch row (tasks.dip_watch); a review it queues
+                        # writes its own verdict row.
+                        "DIP_WATCH_SHADOW")
 
 
-def get_latest_signal_for(ticker: str) -> dict | None:
+def get_latest_signal_for(ticker: str, with_trigger: bool = False) -> dict | None:
     """Most recent analysis result for a ticker, regardless of verdict —
     every call to agents.analyst.analyze() logs here (see analyst.py's
     db.log_signal call), including routine HOLDs on positions already
@@ -1293,12 +1375,15 @@ def get_latest_signal_for(ticker: str) -> dict | None:
     Skips the routing rows crew.py writes to the same table (SCREENED_OUT and
     CATALYST_BLOCKED at 0.0, COOLDOWN_SKIPPED, SELL_NO_POSITION). Before
     2026-10-27 one screened-out headline made a healthy holding read as
-    conviction 0, which passes the swap test."""
+    conviction 0, which passes the swap test.
+    with_trigger: also return the row's id and its provenance trigger record
+    (for the low-conviction sell's confirmation record, audit 11-06 23:24 #4)."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT signal, confidence, timestamp FROM signals "
+                "SELECT signal, confidence, timestamp"
+                + (", id, provenance->'trigger'" if with_trigger else "") + " FROM signals "
                 "WHERE symbol=%s AND signal NOT IN %s "
                 # Paper verdicts must not drive live decisions (professor M35).
                 # NULL = rows from before migration 51.
@@ -1309,7 +1394,10 @@ def get_latest_signal_for(ticker: str) -> dict | None:
             row = cur.fetchone()
             if not row:
                 return None
-            return {"signal": row[0], "confidence": float(row[1] or 0), "timestamp": row[2]}
+            out = {"signal": row[0], "confidence": float(row[1] or 0), "timestamp": row[2]}
+            if with_trigger:
+                out.update(id=row[3], trigger=row[4] if isinstance(row[4], dict) else None)
+            return out
     except Exception as e:
         logging.error(f"get_latest_signal_for({ticker}) failed: {e}")
         return None
@@ -1322,10 +1410,13 @@ def get_latest_signal_for(ticker: str) -> dict | None:
 # and a scan pass not routed for want of a broker (ROUTE_NO_BROKER); from
 # 11-03 also a pass not sized because RiskManager could not start
 # (ROUTE_RISK_INIT_FAILED), a routing raise (ROUTE_ERROR), a screener pass
-# (SCREENED_IN) and a lost screen or analysis task (EVENT_LOST); from 11-05
-# a held name that moved 5%+ in a session (HELD_MOVE_SHADOW).
+# (SCREENED_IN) and a lost screen or analysis task (EVENT_LOST); from 11-04
+# also a held-position review skipped for want of broker positions
+# (REVIEW_SKIPPED); from 11-05 a held name that moved 5%+ in a session
+# (HELD_MOVE_SHADOW).
 _RECORD_ONLY_SIGNALS = ("ANALYST_FAILED", "NO_VERDICT", "ROUTE_NO_BROKER", "ROUTE_RISK_INIT_FAILED",
-                        "ROUTE_ERROR", "SCREENED_IN", "EVENT_LOST", "HELD_MOVE_SHADOW")
+                        "ROUTE_ERROR", "SCREENED_IN", "EVENT_LOST", "REVIEW_SKIPPED", "HELD_MOVE_SHADOW",
+                        "DIP_WATCH_SHADOW")
 
 
 def get_recent_signals(limit: int = 50) -> list[dict]:
@@ -1451,6 +1542,26 @@ def log_regime(
         _put_conn(conn)
 
 
+def get_latest_sector_regime(sector_etf: str) -> dict | None:
+    """Newest sector-regime row for one sector ETF (the GICS sweep, its
+    fallback, or the thesis-sector rows), or None. Record-only reader for an
+    entry's provenance (audit 11-07 01:08 #5); raises on a DB error."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT regime, score, regime_type, timestamp FROM market_regime_log "
+                "WHERE sector_etf=%s AND regime_type IN ('gics_sector','gics_sector_fallback','sector') "
+                "ORDER BY timestamp DESC LIMIT 1", (sector_etf,))
+            row = cur.fetchone()
+        if not row:
+            return None
+        return {"label": row[0], "score": float(row[1]) if row[1] is not None else None,
+                "regime_type": row[2], "at": row[3].isoformat() if hasattr(row[3], "isoformat") else row[3]}
+    finally:
+        _put_conn(conn)
+
+
 def get_latest_regime() -> dict | None:
     """Newest regime row. Sector rows share the table, so with
     REGIME_OVERALL_ONLY set only overall-market rows (or legacy NULL ones)
@@ -1492,8 +1603,10 @@ def get_latest_regime() -> dict | None:
 # Pending approvals
 # ---------------------------------------------------------------------------
 
-def has_active_approval(ticker: str) -> bool:
-    """Return True if this ticker already has a PENDING or PROCESSING approval."""
+def has_active_approval(ticker: str, strict: bool = False) -> bool:
+    """Return True if this ticker already has a PENDING or PROCESSING approval.
+    strict: raise on a DB error instead of reading it as "none", so a buy
+    can fail closed (audit 11-06 21:36 #8)."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
@@ -1505,12 +1618,14 @@ def has_active_approval(ticker: str) -> bool:
             return cur.fetchone() is not None
     except Exception as e:
         logging.error(f"has_active_approval failed: {e}")
+        if strict:
+            raise
         return False
     finally:
         _put_conn(conn)
 
 
-def get_last_executed_approval(ticker: str, hours: int) -> dict | None:
+def get_last_executed_approval(ticker: str, hours: int, strict: bool = False) -> dict | None:
     """Most recent decided OPEN/ADD for this ticker within the lookback
     window, or None. Used to cool down repeat buys — auto-execute completes
     a decision within seconds, so has_active_approval's PENDING/PROCESSING
@@ -1530,7 +1645,9 @@ def get_last_executed_approval(ticker: str, hours: int) -> dict | None:
     too, so the first analysis's deferral alone is enough to cool down a
     same-or-lower-conviction duplicate. EXPIRED/REJECTED are deliberately
     excluded -- a stale-and-discarded or human-vetoed recommendation
-    shouldn't suppress a fresh, independent read on the same ticker."""
+    shouldn't suppress a fresh, independent read on the same ticker.
+    strict: raise on a DB error instead of returning None (audit 11-06
+    21:36 #8)."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
@@ -1548,6 +1665,8 @@ def get_last_executed_approval(ticker: str, hours: int) -> dict | None:
             return {"conviction": row[0], "decided_at": row[1]}
     except Exception as e:
         logging.error(f"get_last_executed_approval failed: {e}")
+        if strict:
+            raise
         return None
     finally:
         _put_conn(conn)
@@ -1780,7 +1899,8 @@ def log_boot_activity(message: str, extra: dict) -> bool:
     still show in the record (professor M181). Opens and closes its own
     connection instead of using the pool: it runs in a Celery parent before
     the worker pool forks, and a pool created there would be shared by the
-    children. Never raises; returns whether the row was written."""
+    children. A failed write is spilled. Never raises; returns whether the
+    row was written."""
     conn = None
     try:
         conn = psycopg2.connect(
@@ -1801,6 +1921,11 @@ def log_boot_activity(message: str, extra: dict) -> bool:
         return True
     except Exception as e:
         logging.warning(f"log_boot_activity failed: {e}")
+        # Spilled like log_activity_direct, so scripts/replay_spill.py can
+        # write a boot row the DB missed (professor m614).
+        _spill("log_activity", {"stage": "boot", "ticker": "", "message": message,
+                                "sentiment": "neutral", "extra": {**extra, "env": TRADING_ENV}},
+               str(e))
         return False
     finally:
         if conn is not None:
@@ -1808,6 +1933,108 @@ def log_boot_activity(message: str, extra: dict) -> bool:
                 conn.close()
             except Exception:
                 pass
+
+
+# One writer thread per process for log-only rows written from paths that
+# must not wait on the DB (lost tasks, unlocked stop changes): a burst then
+# opens one session at a time instead of one per row (professor 66m, the
+# EMAXCONNSESSION class). Same pattern as ibkr's commission writer.
+_ACTIVITY_QUEUE = None
+_ACTIVITY_WRITER = None      # (pid, thread)
+_ACTIVITY_START_LOCK = None  # set on first use (a lock made at import isn't fork-safe)
+# Bounded, so a long DB outage can't grow memory without limit; a row that
+# doesn't fit is spilled like a failed write (professor m620).
+_ACTIVITY_QUEUE_MAX = 1000
+_ACTIVITY_DRAIN_S = 5.0      # at exit: how long to let the writer catch up
+
+
+def _activity_writer(q) -> None:
+    while True:
+        args = q.get()
+        try:
+            log_activity_direct(*args)
+        except Exception as e:
+            logging.debug(f"queued activity row failed ({args[0]}): {e}")
+        finally:
+            q.task_done()
+
+
+def _activity_spill(args, error: str) -> None:
+    stage, ticker, message, sentiment, extra = args
+    _spill("log_activity", {"stage": stage, "ticker": ticker, "message": message,
+                            "sentiment": sentiment, "extra": extra}, error)
+
+
+def _drain_activity_queue(q, pid: int) -> None:
+    """atexit: give the writer up to _ACTIVITY_DRAIN_S to write what is
+    queued, then spill what is left, so queued rows aren't lost at a normal
+    exit (professor m620). A hard kill or os._exit skips this. Never
+    raises."""
+    import queue
+    import time
+    try:
+        if pid != os.getpid():
+            return
+        end = time.monotonic() + _ACTIVITY_DRAIN_S
+        while q.unfinished_tasks and time.monotonic() < end:
+            time.sleep(0.05)
+        while True:
+            try:
+                args = q.get_nowait()
+            except queue.Empty:
+                break
+            _activity_spill(args, "activity queue not drained at exit")
+            q.task_done()
+    except Exception as e:
+        logging.debug(f"activity queue drain failed: {e}")
+
+
+def drain_activity_queue_now() -> None:
+    """The atexit drain, run on demand: Celery's prefork children leave
+    through os._exit, which skips atexit, so tasks.py calls this from
+    worker_process_shutdown (audit 2026-11-08 15:08 #6). Only this
+    process's own queue. Never raises."""
+    try:
+        w = _ACTIVITY_WRITER
+        if _ACTIVITY_QUEUE is not None and w is not None and w[0] == os.getpid():
+            _drain_activity_queue(_ACTIVITY_QUEUE, os.getpid())
+    except Exception as e:
+        logging.debug(f"activity queue drain failed: {e}")
+
+
+def log_activity_queued(stage: str, ticker: str, message: str, sentiment: str = "neutral",
+                        extra: dict | None = None) -> None:
+    """Queues one log_activity_direct row for this process's writer thread,
+    starting it when there is none, when it died, or in a forked child.
+    extra gains queued_at (UTC, at enqueue): the row's own timestamp is the
+    write time, which a slow DB can push minutes later (professor 66n).
+    Returns at once; never raises."""
+    global _ACTIVITY_QUEUE, _ACTIVITY_WRITER, _ACTIVITY_START_LOCK
+    try:
+        import queue
+        import threading
+        from datetime import datetime, timezone as _utc
+        extra = {**(extra or {}), "queued_at": datetime.now(_utc.utc).isoformat()}
+        if _ACTIVITY_START_LOCK is None or _ACTIVITY_START_LOCK[0] != os.getpid():
+            _ACTIVITY_START_LOCK = (os.getpid(), threading.Lock())
+        with _ACTIVITY_START_LOCK[1]:
+            w = _ACTIVITY_WRITER
+            if _ACTIVITY_QUEUE is None or w is None or w[0] != os.getpid() or not w[1].is_alive():
+                import atexit
+                _ACTIVITY_QUEUE = queue.Queue(maxsize=_ACTIVITY_QUEUE_MAX)
+                t = threading.Thread(target=_activity_writer, args=(_ACTIVITY_QUEUE,),
+                                     name="activity-writer", daemon=True)
+                t.start()
+                _ACTIVITY_WRITER = (os.getpid(), t)
+                atexit.register(_drain_activity_queue, _ACTIVITY_QUEUE, os.getpid())
+            q = _ACTIVITY_QUEUE
+        args = (stage, ticker, message, sentiment, extra)
+        try:
+            q.put_nowait(args)
+        except queue.Full:
+            _activity_spill(args, "activity queue full")
+    except Exception as e:
+        logging.debug(f"log_activity_queued failed ({stage}): {e}")
 
 
 def log_activity_direct(stage: str, ticker: str, message: str, sentiment: str = "neutral",
@@ -1845,6 +2072,114 @@ def log_activity_direct(stage: str, ticker: str, message: str, sentiment: str = 
                 conn.close()
             except Exception:
                 pass
+
+
+def get_canary_counts(since) -> dict | None:
+    """For the post-boot canary: since `since`, this env's screens
+    (SCREENED_IN/OUT), analyst verdict rows (signals not in
+    _NON_ANALYST_SIGNALS, not SCREENED_IN, not degraded, not a route_exit
+    routing copy; ANALYST_FAILED is counted apart) and the boot
+    rows' code_sha values. None on a failed read."""
+    conn = None
+    try:
+        conn = _get_conn()
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = 15000")
+            cur.execute(
+                "SELECT COUNT(*) FILTER (WHERE signal IN ('SCREENED_IN', 'SCREENED_OUT')), "
+                "COUNT(*) FILTER (WHERE signal NOT IN %s AND signal <> 'SCREENED_IN' "
+                "AND COALESCE(reasoning, '') NOT LIKE %s "
+                "AND NOT (COALESCE(decision, '{}'::jsonb) ? %s)), "
+                "COUNT(*) FILTER (WHERE signal = 'ANALYST_FAILED') "
+                "FROM signals WHERE trading_env=%s AND timestamp >= %s",
+                (_NON_ANALYST_SIGNALS, DEGRADED_SIGNAL_PREFIX + '%', _VERDICT_COPY_KEY, TRADING_ENV, since))
+            screens, verdicts, failed = cur.fetchone()
+            cur.execute(
+                "SELECT extra_json->>'service', extra_json->>'code_sha' FROM activity_feed "
+                "WHERE stage='boot' AND ts >= %s AND (extra_json->>'env' = %s OR extra_json->>'env' IS NULL)",
+                (since, TRADING_ENV))
+            boots = [{"service": s, "code_sha": c} for s, c in cur.fetchall()]
+        return {"screens": int(screens or 0), "verdicts": int(verdicts or 0),
+                "analyst_failed": int(failed or 0), "boots": boots}
+    except Exception as e:
+        logging.error(f"get_canary_counts failed: {e}")
+        return None
+    finally:
+        if conn is not None:
+            _put_conn(conn)
+
+
+def get_ledger_trades() -> list[dict] | None:
+    """Every trades row of this env, oldest first: {symbol, side, quantity,
+    timestamp}. For the ledger reconcile. None on a failed read."""
+    conn = None
+    try:
+        conn = _get_conn()
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = 15000")
+            cur.execute("SELECT symbol, side, quantity, timestamp FROM trades WHERE trading_env=%s "
+                        "ORDER BY timestamp, id", (TRADING_ENV,))
+            return [{"symbol": s, "side": (side or "").upper(), "quantity": float(q or 0), "timestamp": ts}
+                    for s, side, q, ts in cur.fetchall()]
+    except Exception as e:
+        logging.error(f"get_ledger_trades failed: {e}")
+        return None
+    finally:
+        if conn is not None:
+            _put_conn(conn)
+
+
+def get_seen_item_counts(start, end) -> list[dict] | None:
+    """New ingested items per source per ET day in [start, end), from
+    seen_items.first_seen: [{source, day (date), n}]. seen_items has no
+    trading_env (shared across envs) and is pruned at 90 days. None on a
+    failed read."""
+    conn = None
+    try:
+        conn = _get_conn()
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = 15000")
+            cur.execute(
+                "SELECT source, (first_seen AT TIME ZONE 'America/New_York')::date, COUNT(*) "
+                "FROM seen_items WHERE first_seen >= %s AND first_seen < %s GROUP BY 1, 2",
+                (start, end))
+            return [{"source": s, "day": d, "n": int(n)} for s, d, n in cur.fetchall()]
+    except Exception as e:
+        logging.error(f"get_seen_item_counts failed: {e}")
+        return None
+    finally:
+        if conn is not None:
+            _put_conn(conn)
+
+
+def get_screen_funnel(start, end) -> list[dict] | None:
+    """SCREENED_IN and SCREENED_OUT signal counts in [start, end), grouped
+    by signal and the screen's provenance source, tier, held, model,
+    prompt_template_sha and override (None where a row predates the key).
+    None on a failed read."""
+    conn = None
+    try:
+        conn = _get_conn()
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = 15000")
+            cur.execute(
+                "SELECT signal, provenance->>'source', provenance->>'tier', provenance->>'held', "
+                "provenance->>'model', provenance->>'prompt_template_sha', provenance->>'override', "
+                "COUNT(*) FROM signals "
+                "WHERE signal IN ('SCREENED_IN', 'SCREENED_OUT') AND trading_env=%s "
+                "AND timestamp >= %s AND timestamp < %s GROUP BY 1, 2, 3, 4, 5, 6, 7",
+                (TRADING_ENV, start, end),
+            )
+            return [{"signal": sig, "source": src, "tier": tier,
+                     "held": None if held is None else held == "true",
+                     "model": model, "prompt_template_sha": sha, "override": override, "n": int(n)}
+                    for sig, src, tier, held, model, sha, override, n in cur.fetchall()]
+    except Exception as e:
+        logging.error(f"get_screen_funnel failed: {e}")
+        return None
+    finally:
+        if conn is not None:
+            _put_conn(conn)
 
 
 def get_activity_shadow_keys(stage: str) -> set[str] | None:
@@ -2003,6 +2338,77 @@ def claim_deferred_entry_for_retry(approval_id: int) -> bool:
         conn.rollback()
         logging.error(f"claim_deferred_entry_for_retry failed: {e}")
         return False
+    finally:
+        _put_conn(conn)
+
+
+DEFERRED_REASON_PREFIX = "deferred:"
+
+
+def get_deferred_entries(lookback_days: int = 5) -> list[dict]:
+    """FAILED approvals in this TRADING_ENV whose status_reason starts with
+    "deferred:" (a retry_deferred_entry was scheduled for them), last updated
+    within `lookback_days`; swept rows excluded. Read only: the stuck-retry
+    check alerts on these and never changes them. [] on error."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, ticker, action, status_reason, COALESCE(decided_at, timestamp) "
+                "FROM pending_approvals "
+                "WHERE status='FAILED' AND trading_env=%s AND status_reason LIKE %s "
+                "AND status_reason NOT LIKE %s "
+                "AND COALESCE(decided_at, timestamp) > NOW() - make_interval(days => %s) "
+                "ORDER BY id",
+                (TRADING_ENV, f"{DEFERRED_REASON_PREFIX}%", f"%{SWEPT_REASON_MARK}%", lookback_days),
+            )
+            rows = cur.fetchall()
+        conn.commit()
+        return [{"id": r[0], "ticker": r[1], "action": r[2], "status_reason": r[3], "updated_at": r[4]}
+                for r in rows]
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"get_deferred_entries failed: {e}")
+        return []
+    finally:
+        _put_conn(conn)
+
+
+def get_inflight_buy_approvals(exclude_ticker: str = "") -> list[dict] | None:
+    """OPEN/ADD approvals not yet filled in this TRADING_ENV: PENDING or
+    PROCESSING from the last day, and deferred entries (FAILED with a
+    "deferred:" reason, not swept) from the last 5 days, other than
+    exclude_ticker. Each {id, ticker, action, status, pct}: pct is the larger
+    of the sized target and order weight (fractions). Read only, for the
+    log-only in-flight concentration shadow. None on a query error; a pool
+    error raises (the caller marks the shadow errored)."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, ticker, action, status, risk_json->>'position_size_pct', "
+                "risk_json->>'order_pct' FROM pending_approvals "
+                "WHERE trading_env=%s AND action IN ('OPEN','ADD') AND ticker <> %s AND ("
+                " (status IN ('PENDING','PROCESSING') AND timestamp > NOW() - INTERVAL '1 day')"
+                " OR (status='FAILED' AND status_reason LIKE %s AND status_reason NOT LIKE %s"
+                "     AND COALESCE(decided_at, timestamp) > NOW() - INTERVAL '5 days')) "
+                "ORDER BY id",
+                (TRADING_ENV, exclude_ticker, f"{DEFERRED_REASON_PREFIX}%", f"%{SWEPT_REASON_MARK}%"),
+            )
+            rows = cur.fetchall()
+        conn.commit()
+
+        def f(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return 0.0
+        return [{"id": r[0], "ticker": r[1], "action": r[2], "status": r[3],
+                 "pct": max(f(r[4]), f(r[5]))} for r in rows]
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"get_inflight_buy_approvals failed: {e}")
+        return None
     finally:
         _put_conn(conn)
 
@@ -2180,20 +2586,23 @@ def upsert_position_stop(
     bucket: str,
     conviction: int,
     trail_distance_pct: float | None = None,
+    entry_price_source: str | None = None,
 ) -> bool:
     """True once the row is committed, False when the write failed (logged).
-    Getting a connection can still raise (pool exhausted, DB down)."""
-    conn = _get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
+    Getting a connection can still raise (pool exhausted, DB down).
+    entry_price_source: how entry_price was set (migration 85), written in
+    the same statement so the two commit together (professor 59d); None
+    (a caller that doesn't say) clears it. Before migration 85 is applied
+    the row is written without it."""
+    src_col, src_val, src_set = ", entry_price_source", ",%s", \
+        "\n                    entry_price_source = EXCLUDED.entry_price_source,"
+    sql = """
                 INSERT INTO position_stops
                     (ticker, trading_env, entry_price, stop_price, stop_method, thesis_bucket,
-                     conviction, trail_distance_pct, updated_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                     conviction, trail_distance_pct, updated_at{col})
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW(){val})
                 ON CONFLICT (ticker, trading_env) DO UPDATE SET
-                    entry_price       = EXCLUDED.entry_price,
+                    entry_price       = EXCLUDED.entry_price,{set}
                     stop_price        = EXCLUDED.stop_price,
                     stop_method       = EXCLUDED.stop_method,
                     thesis_bucket     = EXCLUDED.thesis_bucket,
@@ -2209,9 +2618,21 @@ def upsert_position_stop(
                     trail_percent     = NULL,
                     profit_target_taken = FALSE,
                     updated_at        = NOW()
-                """,
-                (ticker, TRADING_ENV, entry_price, stop_price, stop_method, bucket, conviction, trail_distance_pct),
-            )
+                """
+    vals = (ticker, TRADING_ENV, entry_price, stop_price, stop_method, bucket, conviction, trail_distance_pct)
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SAVEPOINT stop_entry_source")
+            try:
+                cur.execute(sql.format(col=src_col, val=src_val, set=src_set), vals + (entry_price_source,))
+            except psycopg2.errors.UndefinedColumn:
+                # Migration 85 not applied yet (it runs in init_db at stack start).
+                cur.execute("ROLLBACK TO SAVEPOINT stop_entry_source")
+                logging.warning(f"{ticker}: stop record stored without entry_price_source "
+                                f"(migration 85 pending)")
+                cur.execute(sql.format(col="", val="", set=""), vals)
+            cur.execute("RELEASE SAVEPOINT stop_entry_source")
         conn.commit()
         return True
     except Exception as e:
@@ -2222,11 +2643,29 @@ def upsert_position_stop(
         _put_conn(conn)
 
 
+def get_entry_price_sources() -> dict:
+    """{ticker: entry_price_source} for this environment's stop records, for
+    the daily snapshot (record only). Raises on a DB error or before
+    migration 85; the caller treats that as unknown."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT ticker, entry_price_source FROM position_stops WHERE trading_env=%s",
+                        (TRADING_ENV,))
+            return {r[0]: r[1] for r in cur.fetchall()}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        _put_conn(conn)
+
+
 def update_trailing_stop(ticker: str, new_stop: float, trailing_high: float,
-                         native_trail: bool = True) -> None:
+                         native_trail: bool = True, strict: bool = False) -> None:
     """native_trail=False for a fixed STP moved up by code (fallback, ladder
     ratchet): the flag then says the broker holds no TRAIL, so nothing treats
-    the recorded stop as a live trail (professor run 7, M-1)."""
+    the recorded stop as a live trail (professor run 7, M-1). strict: re-raise
+    a failed write, for callers that report it."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
@@ -2239,6 +2678,8 @@ def update_trailing_stop(ticker: str, new_stop: float, trailing_high: float,
     except Exception as e:
         conn.rollback()
         logging.error(f"update_trailing_stop failed: {e}")
+        if strict:
+            raise
     finally:
         _put_conn(conn)
 
@@ -2279,32 +2720,58 @@ def clear_trailing_active(ticker: str) -> None:
         _put_conn(conn)
 
 
+# Migrations 82 and 84: compile_plan's named levels, each level's source and
+# the ladder's computed_at. Before they are applied, plans are written and
+# read without them (the read fills None).
+_PLAN_LEVEL_COLS = ("structural_stop", "t1", "t2", "add_trigger", "levels_source",
+                    "level_sources", "ladder_computed_at")
 _PLAN_COLS = ("id", "ticker", "status", "source", "created_at", "bucket", "conviction",
               "entry_price", "invalidation_price", "target_price", "catalyst_event",
               "catalyst_date", "horizon_end", "thesis", "primary_risk", "revision",
-              "verdicts_seen", "last_seen_at", "last_relation")
+              "verdicts_seen", "last_seen_at", "last_relation") + _PLAN_LEVEL_COLS
+_PLAN_PRICE_COLS = ("entry_price", "invalidation_price", "target_price",
+                    "structural_stop", "t1", "t2", "add_trigger")
+
+
+def _plan_level_column_missing(e: Exception) -> bool:
+    """True when e is a missing migration-82/84 column (warned once per column)."""
+    return any(_is_missing_column(e, c) for c in _PLAN_LEVEL_COLS)
+
+
+def _select_plans(conn, where_sql: str, params: tuple) -> list[dict]:
+    """trade_plans rows as dicts with every _PLAN_COLS key, prices as floats.
+    With migration 82 or 84 pending, the level columns read as None."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT {', '.join(_PLAN_COLS)} FROM trade_plans {where_sql}", params)
+            rows = [dict(zip(_PLAN_COLS, r)) for r in cur.fetchall()]
+    except Exception as e:
+        if not _plan_level_column_missing(e):
+            raise
+        conn.rollback()
+        base = tuple(c for c in _PLAN_COLS if c not in _PLAN_LEVEL_COLS)
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT {', '.join(base)} FROM trade_plans {where_sql}", params)
+            rows = [{**dict.fromkeys(_PLAN_LEVEL_COLS), **dict(zip(base, r))}
+                    for r in cur.fetchall()]
+    for plan in rows:
+        for k in _PLAN_PRICE_COLS:
+            if plan[k] is not None:
+                plan[k] = float(plan[k])
+    return rows
 
 
 def get_active_plans() -> list[dict]:
     """Every active shadow trade plan in this environment (level watcher)."""
     conn = _get_conn()
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"SELECT {', '.join(_PLAN_COLS)} FROM trade_plans "
-                "WHERE trading_env=%s AND status='active' ORDER BY ticker, id DESC",
-                (TRADING_ENV,),
-            )
-            rows = cur.fetchall()
+        rows = _select_plans(conn, "WHERE trading_env=%s AND status='active' ORDER BY ticker, id DESC",
+                             (TRADING_ENV,))
         out, seen = [], set()
-        for row in rows:
-            plan = dict(zip(_PLAN_COLS, row))
+        for plan in rows:
             if plan["ticker"] in seen:
                 continue            # newest active plan per ticker, as get_active_plan
             seen.add(plan["ticker"])
-            for k in ("entry_price", "invalidation_price", "target_price"):
-                if plan[k] is not None:
-                    plan[k] = float(plan[k])
             out.append(plan)
         return out
     except Exception as e:
@@ -2318,20 +2785,9 @@ def get_active_plan(ticker: str) -> dict | None:
     """The ticker's active shadow trade plan (migration 63), or None."""
     conn = _get_conn()
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"SELECT {', '.join(_PLAN_COLS)} FROM trade_plans "
-                "WHERE ticker=%s AND trading_env=%s AND status='active' ORDER BY id DESC LIMIT 1",
-                (ticker, TRADING_ENV),
-            )
-            row = cur.fetchone()
-        if not row:
-            return None
-        plan = dict(zip(_PLAN_COLS, row))
-        for k in ("entry_price", "invalidation_price", "target_price"):
-            if plan[k] is not None:
-                plan[k] = float(plan[k])
-        return plan
+        rows = _select_plans(conn, "WHERE ticker=%s AND trading_env=%s AND status='active' "
+                                   "ORDER BY id DESC LIMIT 1", (ticker, TRADING_ENV))
+        return rows[0] if rows else None
     except Exception as e:
         logging.error(f"get_active_plan failed: {e}")
         return None
@@ -2340,10 +2796,23 @@ def get_active_plan(ticker: str) -> dict | None:
 
 
 def insert_plan(plan: dict) -> int | None:
-    """Insert a shadow plan; with replaces_id, close that plan as superseded."""
+    """Insert a shadow plan; with replaces_id, close that plan as superseded.
+    The migration-82/84 level columns are written when the plan has any; with
+    either migration pending, the plan is written without them."""
     cols = ("ticker", "source", "bucket", "conviction", "entry_price", "invalidation_price",
             "target_price", "catalyst_event", "catalyst_date", "horizon_end", "thesis",
             "primary_risk", "revision", "replaces_id")
+
+    def insert(cur, cols):
+        cur.execute(
+            f"INSERT INTO trade_plans (trading_env, {', '.join(cols)}) "
+            f"VALUES (%s, {', '.join(['%s'] * len(cols))}) RETURNING id",
+            (TRADING_ENV, *[psycopg2.extras.Json(_finite_json(plan[c]))
+                            if c == "level_sources" and plan.get(c) is not None
+                            else plan.get(c) for c in cols]),
+        )
+        return cur.fetchone()[0]
+
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
@@ -2351,12 +2820,17 @@ def insert_plan(plan: dict) -> int | None:
                 cur.execute("UPDATE trade_plans SET status='superseded', closed_at=NOW(), "
                             "close_reason='revised' WHERE id=%s AND status='active'",
                             (plan["replaces_id"],))
-            cur.execute(
-                f"INSERT INTO trade_plans (trading_env, {', '.join(cols)}) "
-                f"VALUES (%s, {', '.join(['%s'] * len(cols))}) RETURNING id",
-                (TRADING_ENV, *[plan.get(c) for c in cols]),
-            )
-            new_id = cur.fetchone()[0]
+            if any(plan.get(c) is not None for c in _PLAN_LEVEL_COLS):
+                cur.execute("SAVEPOINT plan_levels")
+                try:
+                    new_id = insert(cur, cols + _PLAN_LEVEL_COLS)
+                except Exception as e:
+                    if not _plan_level_column_missing(e):
+                        raise
+                    cur.execute("ROLLBACK TO SAVEPOINT plan_levels")   # keeps the supersede
+                    new_id = insert(cur, cols)
+            else:
+                new_id = insert(cur, cols)
         conn.commit()
         return new_id
     except Exception as e:
@@ -2383,6 +2857,54 @@ def touch_plan(plan_id: int, relation: str, close_reason: str | None = None) -> 
     except Exception as e:
         conn.rollback()
         logging.error(f"touch_plan failed: {e}")
+    finally:
+        _put_conn(conn)
+
+
+def outcome_closed_since(ticker: str, since, entered_since=None) -> dict | None:
+    """The newest trade_outcomes row on the ticker (this environment) that
+    was entered at or after `entered_since` (default `since`; less 5 minutes
+    for clock skew) and exited after `since`, by the exit fill time where
+    known, else exit_date, as {"id", "exit_date"}, or None. An older position
+    closed late by reconcile doesn't count (professor m480); a revised plan
+    passes its first version's created_at as `entered_since`, since its trade
+    was entered before the revision (M282). Raises on a DB error, so a caller
+    can tell "none closed" from "unknown"."""
+    if entered_since is None:
+        entered_since = since
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, exit_date FROM trade_outcomes WHERE ticker=%s AND trading_env=%s "
+                "AND exit_date IS NOT NULL AND COALESCE(exit_fill_at, exit_date) > %s "
+                "AND entry_date >= %s - INTERVAL '5 minutes' ORDER BY exit_date DESC LIMIT 1",
+                (ticker, TRADING_ENV, since, entered_since),
+            )
+            row = cur.fetchone()
+        return {"id": row[0], "exit_date": row[1]} if row else None
+    finally:
+        _put_conn(conn)
+
+
+def plan_root_created_at(plan_id: int):
+    """created_at of the first plan in a revision chain (following
+    replaces_id back from plan_id). A missing row stops the walk, giving the
+    oldest row reached; None only when plan_id itself is missing. Raises on
+    a DB error."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "WITH RECURSIVE chain(id, replaces_id, created_at, depth) AS ("
+                " SELECT id, replaces_id, created_at, 0 FROM trade_plans WHERE id=%s"
+                " UNION ALL SELECT p.id, p.replaces_id, p.created_at, c.depth + 1"
+                " FROM trade_plans p JOIN chain c ON p.id = c.replaces_id WHERE c.depth < 100)"
+                " SELECT created_at FROM chain ORDER BY depth DESC LIMIT 1",
+                (plan_id,),
+            )
+            row = cur.fetchone()
+        return row[0] if row else None
     finally:
         _put_conn(conn)
 
@@ -2456,6 +2978,30 @@ def get_recent_verdicts(ticker: str, hours: int = 72, limit: int = 20,
         _put_conn(conn)
 
 
+def get_recent_verdict_levels(ticker: str, hours: int = 24, limit: int = 100) -> list[dict]:
+    """The model's stated levels on ticker's verdicts in the last `hours`,
+    filtered like get_recent_verdicts, newest first: [{timestamp,
+    expected_return_pct, expected_downside_pct, catalyst_date}] (raw model
+    values, unparsed). Raises on a DB error; the caller records it."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT timestamp, decision->'model_output'->>'expected_return_pct', "
+                "decision->'model_output'->>'expected_downside_pct', "
+                "decision->'model_output'->'catalyst'->>'date' FROM signals "
+                "WHERE symbol=%s AND signal NOT IN %s "
+                "AND (trading_env=%s OR (trading_env IS NULL AND COALESCE(reasoning, '') NOT LIKE %s)) "
+                "AND timestamp > NOW() - make_interval(hours => %s) "
+                "ORDER BY timestamp DESC LIMIT %s",
+                (ticker, _NON_ANALYST_SIGNALS, TRADING_ENV, DEGRADED_SIGNAL_PREFIX + '%', hours, limit),
+            )
+            return [{"timestamp": ts, "expected_return_pct": r, "expected_downside_pct": d,
+                     "catalyst_date": c} for ts, r, d, c in cur.fetchall()]
+    finally:
+        _put_conn(conn)
+
+
 def get_latest_verdicts(days: int | None = None, tickers: list[str] | None = None) -> dict | None:
     """The most recent analyst verdict per ticker (this env; legacy NULL-env
     rows count, degraded ones don't, as in get_recent_verdicts), limited to
@@ -2501,11 +3047,11 @@ def get_latest_verdicts(days: int | None = None, tickers: list[str] | None = Non
             _put_conn(conn)
 
 
-def get_position_context(ticker: str) -> dict:
+def get_position_context(ticker: str, strict: bool = False) -> dict:
     """Thesis and recent verdicts for a held ticker, for the brief's POSITION
     CONTEXT block: {original_thesis, latest_thesis, thesis_updated_at,
     profit_target_taken, recent_verdicts: [{timestamp, signal, conviction}]}.
-    Empty dict on error."""
+    Empty dict on error, or raises with strict."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
@@ -2531,6 +3077,38 @@ def get_position_context(ticker: str) -> dict:
     except Exception as e:
         conn.rollback()
         logging.error(f"get_position_context failed: {e}")
+        if strict:
+            raise
+        return {}
+    finally:
+        _put_conn(conn)
+
+
+def get_verdict_day_summary(ticker: str, since) -> dict:
+    """Analyst verdicts on ticker since `since` (a UTC datetime), with the
+    same filters as get_position_context: {n, by_signal: {signal: count},
+    last: {timestamp, signal, conviction} or None}. For the daily digest;
+    {} on error."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT timestamp, signal, confidence FROM signals "
+                "WHERE symbol=%s AND timestamp >= %s AND signal NOT IN %s "
+                "AND (trading_env=%s OR (trading_env IS NULL AND COALESCE(reasoning, '') NOT LIKE %s)) "
+                "ORDER BY timestamp DESC",
+                (ticker, since, _NON_ANALYST_SIGNALS, TRADING_ENV, DEGRADED_SIGNAL_PREFIX + '%'),
+            )
+            rows = cur.fetchall()
+        by_signal: dict = {}
+        for r in rows:
+            by_signal[r[1]] = by_signal.get(r[1], 0) + 1
+        last = ({"timestamp": rows[0][0], "signal": rows[0][1],
+                 "conviction": round(float(rows[0][2] or 0) * 10)} if rows else None)
+        return {"n": len(rows), "by_signal": by_signal, "last": last}
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"get_verdict_day_summary failed: {e}")
         return {}
     finally:
         _put_conn(conn)
@@ -2634,77 +3212,55 @@ def set_setup_category(ticker: str, setup_category: str, valuation_tier: str | N
 # valuation fields are computed.
 # ---------------------------------------------------------------------------
 
+# Every trade_ladder column the upsert writes besides ticker and computed_at.
+_LADDER_COLS = (
+    "current_price", "atr", "trend_stage",
+    "base_detected", "base_ceiling", "base_floor", "base_contractions", "base_volume_dryup",
+    "gap_catalyst_active", "gap_day_high", "gap_day_low",
+    "peer_implied_fair_value", "street_consensus_target", "fair_value_blended",
+    "valuation_pct_of_fair", "valuation_tier", "valuation_outlier", "rungs",
+    "dcf_fair_value", "comps_fair_value", "rule40_fair_value", "peg_fair_value",
+    "valuation_methods_used", "valuation_confidence", "street_target_low", "street_target_high",
+    "implied_growth_rate", "growth_gap_vs_actual", "growth_assumption_flag",
+    "residual_income_fair_value", "justified_multiple_fair_value",
+)
+# Migration 83: which peer pool comps used. Before it is applied, the ladder
+# is written without these (reads use SELECT *, so the keys are just absent).
+_LADDER_COMPS_PEER_COLS = ("comps_peer_source", "comps_peer_count")
+
+
+def _ladder_value(ladder: dict, col: str):
+    if col in ("rungs", "valuation_methods_used"):
+        return psycopg2.extras.Json(_finite_json(ladder.get(col, [])))
+    if col == "valuation_outlier":
+        return ladder.get(col, False)
+    return ladder.get(col)
+
+
+def _upsert_ladder_row(conn, ticker: str, ladder: dict, cols: tuple) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            f"INSERT INTO trade_ladder (ticker, computed_at, {', '.join(cols)}) "
+            f"VALUES (%s, NOW(), {', '.join(['%s'] * len(cols))}) "
+            f"ON CONFLICT (ticker) DO UPDATE SET computed_at = NOW(), "
+            + ", ".join(f"{c} = EXCLUDED.{c}" for c in cols),
+            (ticker, *[_ladder_value(ladder, c) for c in cols]),
+        )
+
+
 def upsert_trade_ladder(ticker: str, ladder: dict) -> None:
+    """Upserts the ticker's ladder row. The migration-83 comps peer columns
+    are always written, so a stale value is cleared when comps gives none;
+    with that migration pending, the row is written without them."""
     conn = _get_conn()
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO trade_ladder (
-                    ticker, computed_at, current_price, atr, trend_stage,
-                    base_detected, base_ceiling, base_floor, base_contractions, base_volume_dryup,
-                    gap_catalyst_active, gap_day_high, gap_day_low,
-                    peer_implied_fair_value, street_consensus_target, fair_value_blended,
-                    valuation_pct_of_fair, valuation_tier, valuation_outlier, rungs,
-                    dcf_fair_value, comps_fair_value, rule40_fair_value, peg_fair_value,
-                    valuation_methods_used, valuation_confidence, street_target_low, street_target_high,
-                    implied_growth_rate, growth_gap_vs_actual, growth_assumption_flag,
-                    residual_income_fair_value, justified_multiple_fair_value
-                ) VALUES (%s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                          %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (ticker) DO UPDATE SET
-                    computed_at = NOW(),
-                    current_price = EXCLUDED.current_price,
-                    atr = EXCLUDED.atr,
-                    trend_stage = EXCLUDED.trend_stage,
-                    base_detected = EXCLUDED.base_detected,
-                    base_ceiling = EXCLUDED.base_ceiling,
-                    base_floor = EXCLUDED.base_floor,
-                    base_contractions = EXCLUDED.base_contractions,
-                    base_volume_dryup = EXCLUDED.base_volume_dryup,
-                    gap_catalyst_active = EXCLUDED.gap_catalyst_active,
-                    gap_day_high = EXCLUDED.gap_day_high,
-                    gap_day_low = EXCLUDED.gap_day_low,
-                    peer_implied_fair_value = EXCLUDED.peer_implied_fair_value,
-                    street_consensus_target = EXCLUDED.street_consensus_target,
-                    fair_value_blended = EXCLUDED.fair_value_blended,
-                    valuation_pct_of_fair = EXCLUDED.valuation_pct_of_fair,
-                    valuation_tier = EXCLUDED.valuation_tier,
-                    valuation_outlier = EXCLUDED.valuation_outlier,
-                    rungs = EXCLUDED.rungs,
-                    dcf_fair_value = EXCLUDED.dcf_fair_value,
-                    comps_fair_value = EXCLUDED.comps_fair_value,
-                    rule40_fair_value = EXCLUDED.rule40_fair_value,
-                    peg_fair_value = EXCLUDED.peg_fair_value,
-                    valuation_methods_used = EXCLUDED.valuation_methods_used,
-                    valuation_confidence = EXCLUDED.valuation_confidence,
-                    street_target_low = EXCLUDED.street_target_low,
-                    street_target_high = EXCLUDED.street_target_high,
-                    implied_growth_rate = EXCLUDED.implied_growth_rate,
-                    growth_gap_vs_actual = EXCLUDED.growth_gap_vs_actual,
-                    growth_assumption_flag = EXCLUDED.growth_assumption_flag,
-                    residual_income_fair_value = EXCLUDED.residual_income_fair_value,
-                    justified_multiple_fair_value = EXCLUDED.justified_multiple_fair_value
-                """,
-                (
-                    ticker, ladder.get("current_price"), ladder.get("atr"), ladder.get("trend_stage"),
-                    ladder.get("base_detected"), ladder.get("base_ceiling"), ladder.get("base_floor"),
-                    ladder.get("base_contractions"), ladder.get("base_volume_dryup"),
-                    ladder.get("gap_catalyst_active"), ladder.get("gap_day_high"), ladder.get("gap_day_low"),
-                    ladder.get("peer_implied_fair_value"), ladder.get("street_consensus_target"),
-                    ladder.get("fair_value_blended"), ladder.get("valuation_pct_of_fair"),
-                    ladder.get("valuation_tier"), ladder.get("valuation_outlier", False),
-                    psycopg2.extras.Json(_finite_json(ladder.get("rungs", []))),
-                    ladder.get("dcf_fair_value"), ladder.get("comps_fair_value"),
-                    ladder.get("rule40_fair_value"), ladder.get("peg_fair_value"),
-                    psycopg2.extras.Json(_finite_json(ladder.get("valuation_methods_used", []))),
-                    ladder.get("valuation_confidence"),
-                    ladder.get("street_target_low"), ladder.get("street_target_high"),
-                    ladder.get("implied_growth_rate"), ladder.get("growth_gap_vs_actual"),
-                    ladder.get("growth_assumption_flag"),
-                    ladder.get("residual_income_fair_value"), ladder.get("justified_multiple_fair_value"),
-                ),
-            )
+        try:
+            _upsert_ladder_row(conn, ticker, ladder, _LADDER_COLS + _LADDER_COMPS_PEER_COLS)
+        except Exception as e:
+            if not any(_is_missing_column(e, c) for c in _LADDER_COMPS_PEER_COLS):
+                raise
+            conn.rollback()
+            _upsert_ladder_row(conn, ticker, ladder, _LADDER_COLS)
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -2822,7 +3378,7 @@ def update_latest_thesis(ticker: str, thesis: dict) -> None:
         _put_conn(conn)
 
 
-def get_thesis(ticker: str) -> dict | None:
+def get_thesis(ticker: str, strict: bool = False) -> dict | None:
     """Returns {"original": {...}, "latest": {...}, "updated_at": ...}, or
     None only if NEITHER exists yet. Found 2026-09-13 wiring
     review_held_position's latest_thesis capture: a scheduled review can
@@ -2832,7 +3388,8 @@ def get_thesis(ticker: str) -> dict | None:
     real, successfully-captured latest_thesis as if nothing were there at
     all. Callers should treat a None "original" as "no baseline to diff
     against" (db.compute_thesis_drift already can't run without one),
-    not as the whole thesis being absent."""
+    not as the whole thesis being absent. strict: raise on a DB error
+    instead of returning None."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
@@ -2847,6 +3404,8 @@ def get_thesis(ticker: str) -> dict | None:
         return {"original": row[0], "latest": row[1], "updated_at": row[2]}
     except Exception as e:
         logging.error(f"[{ticker}] get_thesis failed: {e}")
+        if strict:
+            raise
         return None
     finally:
         _put_conn(conn)
@@ -2911,6 +3470,34 @@ def compute_no_near_term_catalyst(catalyst: dict | None, weeks_to_catalyst: floa
         return True
     event = ((catalyst or {}).get("event") or "").lower()
     return any(kw in event for kw in _MACRO_CATALYST_KEYWORDS)
+
+
+def catalyst_horizon_any(catalyst: dict | None) -> dict:
+    """Log-only (audit 11-06 11:34 #4): the thesis snapshot's
+    weeks_to_catalyst comes from the rate gate, which runs only for
+    Accelerator/Moonshot, so every Compounder snapshot reads None and
+    no_near_term_catalyst True by construction. This computes both for any
+    bucket, from the catalyst's own date, beside the unchanged fields.
+    days_to_catalyst_raw_any is the unfloored ET day count, read as
+    decision.catalyst_check reads it ("YYYY-MM" as the 15th), so the
+    snapshot needs no join to signals (SEF 139b). Never raises."""
+    out = {"weeks_to_catalyst_any": None, "no_near_term_catalyst_any": None,
+           "days_to_catalyst_raw_any": None}
+    try:
+        from agents.analyst import compute_weeks_to_catalyst
+        w = compute_weeks_to_catalyst((catalyst or {}).get("date"))
+        out["weeks_to_catalyst_any"] = w
+        out["no_near_term_catalyst_any"] = compute_no_near_term_catalyst(catalyst, w)
+    except Exception:
+        pass
+    try:
+        from agents.catalyst_time import parse_catalyst_date, today_et
+        d = parse_catalyst_date((catalyst or {}).get("date"))
+        if d is not None:
+            out["days_to_catalyst_raw_any"] = (d - today_et()).days
+    except Exception:
+        pass
+    return out
 
 
 def compute_thesis_drift(original: dict, latest: dict) -> dict:
@@ -4062,19 +4649,27 @@ def get_stale_trade_pending_orders(min_age_minutes: int = 10) -> list[dict]:
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, ticker, side, qty, broker_order_id, decision_price, approval_id, "
-                "intent, stop_price, created_at, filled_qty, fill_price, perm_id, filled_at, status, "
-                "reconcile_note "
-                "FROM orders WHERE status IN ('filled', 'partial') AND reconcile_note IN (%s, %s) "
-                "AND trading_env=%s AND created_at < NOW() - make_interval(mins => %s) "
-                "ORDER BY created_at",
-                (TRADE_PENDING_NOTE, TRADE_PENDING_STOP_DONE_NOTE, TRADING_ENV, min_age_minutes),
-            )
+            def select(with_source: bool):
+                cur.execute(
+                    "SELECT id, ticker, side, qty, broker_order_id, decision_price, approval_id, "
+                    "intent, stop_price, created_at, filled_qty, fill_price, perm_id, filled_at, status, "
+                    + ("reconcile_note, filled_at_source " if with_source else "reconcile_note ")
+                    + "FROM orders WHERE status IN ('filled', 'partial') AND reconcile_note IN (%s, %s) "
+                    "AND trading_env=%s AND created_at < NOW() - make_interval(mins => %s) "
+                    "ORDER BY created_at",
+                    (TRADE_PENDING_NOTE, TRADE_PENDING_STOP_DONE_NOTE, TRADING_ENV, min_age_minutes),
+                )
+            try:
+                select(True)
+            except Exception as e:
+                if not _is_missing_column(e, "filled_at_source"):
+                    raise
+                conn.rollback()
+                select(False)
             rows = cur.fetchall()
         keys = ("id", "ticker", "side", "qty", "broker_order_id", "decision_price", "approval_id",
                 "intent", "stop_price", "created_at", "filled_qty", "fill_price", "perm_id",
-                "filled_at", "status", "reconcile_note")
+                "filled_at", "status", "reconcile_note", "filled_at_source")
         out = []
         for r in rows:
             d = dict(zip(keys, r))
@@ -4233,34 +4828,53 @@ def mark_order_cancelled(order_id: int, expect_filled_qty: float) -> bool:
         _put_conn(conn)
 
 
+_missing_column_warned: set = set()
+
+
+def _is_missing_column(e: Exception, column: str) -> bool:
+    """True when e is Postgres's UndefinedColumn for column (its migration
+    not applied yet), warning once per process per column."""
+    if not isinstance(e, psycopg2.errors.UndefinedColumn) or column not in str(e):
+        return False
+    if column not in _missing_column_warned:
+        _missing_column_warned.add(column)
+        logging.warning(f"column {column} is missing (migration pending); "
+                        f"rows are written and read without it")
+    return True
+
+
 def update_order_fill(order_id: int, fill_price: float, filled_qty: float, status: str,
-                      expect_filled_qty: float | None = None, filled_at=None) -> bool:
+                      expect_filled_qty: float | None = None, filled_at=None,
+                      filled_at_source: str | None = None) -> bool:
     """Records the fill and computes slippage_pct vs decision_price if one was logged.
     Returns False if the write failed (reconcile relies on it, professor M51).
     With expect_filled_qty, the update applies only while the row is still
     unconfirmed/partial with that filled_qty, and returns False if another
     run got there first (audit 22:53, A2253-5)."""
     n = _write_order_fill(order_id, fill_price, filled_qty, status,
-                          expect_filled_qty=expect_filled_qty, filled_at=filled_at)
+                          expect_filled_qty=expect_filled_qty, filled_at=filled_at,
+                          filled_at_source=filled_at_source)
     if n is None:
         return False
     return expect_filled_qty is None or n > 0
 
 
 def mark_submitted_order_fill(order_id: int, fill_price: float, filled_qty: float, status: str,
-                              filled_at=None) -> int | None:
+                              filled_at=None, filled_at_source: str | None = None) -> int | None:
     """update_order_fill for a row written before the fill wait, applied only
     while it is still 'submitted'. Returns the rows updated: 0 means the row
     has moved on (reconcile adopted it from its fill wait and may have booked
     the fill), None means the write failed."""
     return _write_order_fill(order_id, fill_price, filled_qty, status,
-                             filled_at=filled_at, only_if_submitted=True,
+                             filled_at=filled_at, filled_at_source=filled_at_source,
+                             only_if_submitted=True,
                              note=TRADE_PENDING_NOTE)
 
 
 def _write_order_fill(order_id: int, fill_price: float, filled_qty: float, status: str,
                       expect_filled_qty: float | None = None, filled_at=None,
-                      only_if_submitted: bool = False, note: str | None = None) -> int | None:
+                      only_if_submitted: bool = False, note: str | None = None,
+                      filled_at_source: str | None = None) -> int | None:
     """The fill UPDATE behind update_order_fill and mark_submitted_order_fill.
     Rows updated, or None on error. Never raises."""
     conn = None
@@ -4280,17 +4894,32 @@ def _write_order_fill(order_id: int, fill_price: float, filled_qty: float, statu
                 note_sql, note_arg = "reconcile_note=NULLIF(reconcile_note, %s)", AWAITING_FILL_NOTE
             else:   # replaces the note in the same write (TRADE_PENDING_NOTE at the mark)
                 note_sql, note_arg = "reconcile_note=%s", note
-            sql = ("UPDATE orders SET fill_price=%s, filled_qty=%s, status=%s, slippage_pct=%s, "
-                   f"filled_at=COALESCE(%s, filled_at), {note_sql}, "
-                   "updated_at=NOW() WHERE id=%s")
-            params = [fill_price, filled_qty, status, slippage_pct, filled_at, note_arg, order_id]
-            if expect_filled_qty is not None:
-                sql += (" AND status IN ('unconfirmed', 'partial') "
-                        "AND ABS(COALESCE(filled_qty, 0) - %s) < 0.0001")
-                params.append(expect_filled_qty)
-            if only_if_submitted:
-                sql += " AND status='submitted'"
-            cur.execute(sql, params)
+            def statement(with_source: bool):
+                # The source moves only with a new filled_at, so the two agree.
+                src_sql = ("filled_at_source=CASE WHEN %s IS NULL THEN filled_at_source "
+                           "ELSE %s END, " if with_source else "")
+                sql = ("UPDATE orders SET fill_price=%s, filled_qty=%s, status=%s, slippage_pct=%s, "
+                       f"filled_at=COALESCE(%s, filled_at), {src_sql}"
+                       f"{note_sql}, updated_at=NOW() WHERE id=%s")
+                params = ([fill_price, filled_qty, status, slippage_pct, filled_at]
+                          + ([filled_at, filled_at_source] if with_source else [])
+                          + [note_arg, order_id])
+                if expect_filled_qty is not None:
+                    sql += (" AND status IN ('unconfirmed', 'partial') "
+                            "AND ABS(COALESCE(filled_qty, 0) - %s) < 0.0001")
+                    params.append(expect_filled_qty)
+                if only_if_submitted:
+                    sql += " AND status='submitted'"
+                return sql, params
+
+            try:
+                cur.execute(*statement(True))
+            except Exception as e:
+                if not _is_missing_column(e, "filled_at_source"):
+                    raise
+                # Migration 80 pending: the fill itself must still land.
+                conn.rollback()
+                cur.execute(*statement(False))
             updated = cur.rowcount
         conn.commit()
         return updated
@@ -4389,19 +5018,28 @@ def get_unconfirmed_orders(max_age_hours: int = 24) -> list[dict]:
 
 
 def get_order_fill_state(order_id: int) -> dict | None:
-    """status, fill_price, filled_qty, broker_order_id, created_at and filled_at of one
-    orders row (professor M124), or None if there is no such row. Raises on error."""
+    """status, fill_price, filled_qty, broker_order_id, created_at, filled_at and
+    filled_at_source of one orders row (professor M124), or None if there is no
+    such row. Raises on error."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT status, fill_price, filled_qty, broker_order_id, created_at, filled_at "
-                        "FROM orders WHERE id=%s AND trading_env=%s", (order_id, TRADING_ENV))
+            sql = ("SELECT status, fill_price, filled_qty, broker_order_id, created_at, filled_at, "
+                   "filled_at_source FROM orders WHERE id=%s AND trading_env=%s")
+            try:
+                cur.execute(sql, (order_id, TRADING_ENV))
+            except Exception as e:
+                if not _is_missing_column(e, "filled_at_source"):
+                    raise
+                conn.rollback()
+                cur.execute(sql.replace(", filled_at_source", ""), (order_id, TRADING_ENV))
             r = cur.fetchone()
         if not r:
             return None
         return {"status": r[0], "fill_price": float(r[1]) if r[1] is not None else None,
                 "filled_qty": float(r[2]) if r[2] is not None else 0.0, "broker_order_id": r[3],
-                "created_at": r[4], "filled_at": r[5]}
+                "created_at": r[4], "filled_at": r[5],
+                "filled_at_source": r[6] if len(r) > 6 else None}
     except Exception as e:
         logging.error(f"get_order_fill_state failed: {e}")
         raise
@@ -4654,6 +5292,7 @@ def log_trade_outcome(
     entry_benchmark_price: float | None = None,
     planned_risk_per_share: float | None = None,
     fill_risk_per_share: float | None = None,
+    imputed_fields: list | None = None,
 ) -> bool:
     """True once the approval has an outcome row (written now or already
     there); False when the write failed, so a caller can retry (M125).
@@ -4693,9 +5332,9 @@ def log_trade_outcome(
                 " catalyst_event, catalyst_date, catalyst_is_priced_in, "
                 " expected_return_pct, expected_downside_pct, thesis_summary, "
                 " sources_json, source_count, weeks_to_catalyst, expected_return_per_week, entry_date, "
-                " planned_risk_per_share, fill_risk_per_share) "
+                " planned_risk_per_share, fill_risk_per_share, imputed_fields) "
                 "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
-                "COALESCE(%s::timestamptz, NOW()),%s,%s)",
+                "COALESCE(%s::timestamptz, NOW()),%s,%s,%s)",
                 (approval_id, TRADING_ENV, ticker, action, conviction, bucket, entry_price,
                  entry_benchmark_price, thesis_strength, catalyst_quality,
                  valuation_risk_reward, data_completeness, chase_risk,
@@ -4704,7 +5343,8 @@ def log_trade_outcome(
                  expected_return_pct, expected_downside_pct, thesis_summary,
                  psycopg2.extras.Json(_finite_json(sources)) if sources is not None else None, source_count,
                  weeks_to_catalyst, expected_return_per_week, entry_date,
-                 planned_risk_per_share, fill_risk_per_share),
+                 planned_risk_per_share, fill_risk_per_share,
+                 psycopg2.extras.Json(list(imputed_fields)) if imputed_fields is not None else None),
             )
         conn.commit()
         return True
@@ -4849,9 +5489,26 @@ def compute_outcome_metrics(
     }
 
 
+def _stamp_exit_benchmark_at(conn, ids: list, at, status: str | None = None) -> None:
+    """After the close commits: when the exit SPY price was fetched, and the
+    fetch's status (migration 88), on the rows just closed. Its own
+    transaction, so a failure (a migration not applied, a lost connection)
+    can't touch the close. Log-only; never raises."""
+    if not ids or (at is None and status is None):
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE trade_outcomes SET exit_benchmark_at=%s, exit_benchmark_status=%s "
+                        "WHERE id = ANY(%s)", (at, status, list(ids)))
+        conn.commit()
+    except Exception as e:
+        _rollback_quietly(conn)
+        logging.debug(f"exit_benchmark_at stamp failed: {e}")
+
+
 def close_trade_outcome(ticker: str, exit_price: float, exit_date=None,
                         exit_source: str | None = None, exit_price_source: str | None = None,
-                        exit_fill_at=None) -> bool:
+                        exit_fill_at=None, exit_fill_at_source: str | None = None) -> bool:
     """
     Closes every still-open (exit_date IS NULL) trade_outcomes row for this
     ticker: computes outcome_pct, was_correct, and alpha vs. SPY over each
@@ -4876,62 +5533,140 @@ def close_trade_outcome(ticker: str, exit_price: float, exit_date=None,
 
     exit_date = exit_date or datetime.now(_tz.utc)
 
+    # Every open row for the ticker: the position is gone, so an OPEN
+    # followed by ADDs must close all of its rows, not just the newest
+    # (professor C5, 2026-10-28). Rows flagged orphaned belong to an earlier
+    # position that closed unrecorded; this exit's price isn't theirs
+    # (professor M120).
+    open_sql = ("SELECT id, entry_price, entry_benchmark_price FROM trade_outcomes "
+                "WHERE ticker=%s AND trading_env=%s AND exit_date IS NULL AND orphaned_at IS NULL "
+                "ORDER BY entry_date DESC")
+
+    # An unlocked look first, so the SPY fetch below (up to ~30 s when
+    # Yahoo hangs) runs with no row lock or pooled connection held.
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
-            # Every open row for the ticker: the position is gone, so an
-            # OPEN followed by ADDs must close all of its rows, not just the
-            # newest (professor C5, 2026-10-28). Rows flagged orphaned belong
-            # to an earlier position that closed unrecorded; this exit's
-            # price isn't theirs (professor M120).
-            cur.execute(
-                "SELECT id, entry_price, entry_benchmark_price FROM trade_outcomes "
-                "WHERE ticker=%s AND trading_env=%s AND exit_date IS NULL AND orphaned_at IS NULL "
-                "ORDER BY entry_date DESC",
-                (ticker, TRADING_ENV),
-            )
-            open_rows = cur.fetchall()
+            cur.execute(open_sql, (ticker, TRADING_ENV))
+            any_open = bool(cur.fetchall())
+    except Exception as e:
+        logging.error(f"close_trade_outcome failed: {e}")
+        return False
+    finally:
+        _put_conn(conn)
+    if not any_open:
+        logging.warning(f"close_trade_outcome: no open outcome row for {ticker}")
+        return False
+
+    # One SPY price for every row; it doesn't depend on a row's entry date.
+    exit_benchmark_price = exit_benchmark_at = None
+    exit_benchmark_status = "no_price"
+    try:
+        import yfinance as yf
+        spy_price = yf.Ticker("SPY").fast_info.last_price
+        # A NaN quote is truthy: it would be stored as "ok" and make the
+        # alpha NaN (SEF 155h, professor 67f).
+        if spy_price and math.isfinite(float(spy_price)) and float(spy_price) > 0:
+            exit_benchmark_price = float(spy_price)
+            exit_benchmark_at = datetime.now(_tz.utc)
+            exit_benchmark_status = "ok"
+    except Exception as e:
+        exit_benchmark_status = "fetch_failed"
+        logging.debug(f"close_trade_outcome: SPY exit price fetch failed: {e}")
+    closed_ids: list = []
+
+    # the source goes with the time: none without one
+    source = exit_fill_at_source if exit_fill_at is not None else None
+
+    def write(conn) -> bool:
+        """Locks, re-reads and closes the open rows in one transaction."""
+        closed_ids.clear()   # a retried attempt stamps only the rows it closed (professor 66p)
+        with conn.cursor() as cur:
+            # FOR UPDATE holds the rows until the commit, so a concurrent
+            # close of the same ticker waits, then finds them closed and
+            # skips them. The rows are re-read here; the write uses these.
+            def lock_open_rows():
+                cur.execute(open_sql + " FOR UPDATE", (ticker, TRADING_ENV))
+                return cur.fetchall()
+
+            open_rows = lock_open_rows()
             if not open_rows:
-                logging.warning(f"close_trade_outcome: no open outcome row for {ticker}")
+                conn.rollback()
+                logging.warning(f"close_trade_outcome: {ticker}'s open rows were closed by another call")
                 return False
 
-            exit_benchmark_price = None
+            outcome_pct = alpha_pct = None
+
+            def run(rows, with_source: bool) -> int:
+                nonlocal outcome_pct, alpha_pct
+                closed = 0
+                for outcome_id, entry_price, entry_benchmark_price in rows:
+                    entry_price = float(entry_price)
+                    entry_benchmark_price = float(entry_benchmark_price) if entry_benchmark_price else None
+                    metrics = compute_outcome_metrics(
+                        entry_price, exit_price, entry_benchmark_price, exit_benchmark_price
+                    )
+                    outcome_pct = metrics["outcome_pct"]
+                    alpha_pct   = metrics["alpha_pct"]
+                    vals = (exit_price, exit_date, outcome_pct, metrics["was_correct"],
+                            exit_benchmark_price, metrics["benchmark_return_pct"], alpha_pct,
+                            exit_source, exit_price_source, exit_fill_at)
+                    # exit_date IS NULL: a row another close got to first is
+                    # left as that close wrote it
+                    cur.execute(
+                        "UPDATE trade_outcomes SET exit_price=%s, exit_date=%s, outcome_pct=%s, "
+                        "was_correct=%s, exit_benchmark_price=%s, benchmark_return_pct=%s, "
+                        "alpha_pct=%s, exit_source=%s, exit_price_source=%s, exit_fill_at=%s"
+                        + (", exit_fill_at_source=%s" if with_source else "")
+                        + " WHERE id=%s AND exit_date IS NULL",
+                        vals + ((source,) if with_source else ()) + (outcome_id,),
+                    )
+                    closed += cur.rowcount
+                    if cur.rowcount:
+                        closed_ids.append(outcome_id)
+                return closed
+
             try:
-                import yfinance as yf
-                spy_price = yf.Ticker("SPY").fast_info.last_price
-                if spy_price:
-                    exit_benchmark_price = float(spy_price)
+                closed = run(open_rows, True)
             except Exception as e:
-                logging.debug(f"close_trade_outcome: SPY exit price fetch failed: {e}")
-
-            for outcome_id, entry_price, entry_benchmark_price in open_rows:
-                entry_price = float(entry_price)
-                entry_benchmark_price = float(entry_benchmark_price) if entry_benchmark_price else None
-                metrics = compute_outcome_metrics(
-                    entry_price, exit_price, entry_benchmark_price, exit_benchmark_price
-                )
-                outcome_pct          = metrics["outcome_pct"]
-                was_correct          = metrics["was_correct"]
-                benchmark_return_pct = metrics["benchmark_return_pct"]
-                alpha_pct            = metrics["alpha_pct"]
-
-                cur.execute(
-                    "UPDATE trade_outcomes SET exit_price=%s, exit_date=%s, outcome_pct=%s, "
-                    "was_correct=%s, exit_benchmark_price=%s, benchmark_return_pct=%s, alpha_pct=%s, "
-                    "exit_source=%s, exit_price_source=%s, exit_fill_at=%s WHERE id=%s",
-                    (exit_price, exit_date, outcome_pct, was_correct, exit_benchmark_price,
-                     benchmark_return_pct, alpha_pct, exit_source, exit_price_source, exit_fill_at,
-                     outcome_id),
-                )
+                if not _is_missing_column(e, "exit_fill_at_source"):
+                    raise
+                # Migration 81 pending: the rollback released the locks, so
+                # the rows are locked again and every one closed without it.
+                conn.rollback()
+                closed_ids.clear()
+                closed = run(lock_open_rows(), False)
+            if not closed:
+                conn.rollback()
+                logging.warning(f"close_trade_outcome: {ticker}'s open rows were closed by another call")
+                return False
         conn.commit()
+        _stamp_exit_benchmark_at(conn, closed_ids, exit_benchmark_at, exit_benchmark_status)
         logging.info(
             f"[{ticker}] Outcome closed: {outcome_pct:+.1%} "
             f"(alpha vs SPY: {alpha_pct:+.1%})" if outcome_pct is not None and alpha_pct is not None
             else f"[{ticker}] Outcome closed: outcome_pct={outcome_pct}"
         )
         return True
+
+    conn = _get_conn()
+    try:
+        try:
+            return write(conn)
+        except (psycopg2.errors.DeadlockDetected, psycopg2.errors.SerializationFailure) as e:
+            # Lost a lock race (the orphan sweep's multi-row UPDATE): left
+            # open, a later sweep could orphan the rows and lose this exit
+            # price. One retry re-locks and recomputes, reusing the SPY price.
+            _rollback_quietly(conn)
+            logging.warning(f"close_trade_outcome: {ticker} write lost a lock race ({e}); retrying once")
+            try:
+                return write(conn)
+            except (psycopg2.errors.DeadlockDetected, psycopg2.errors.SerializationFailure) as e2:
+                _rollback_quietly(conn)
+                logging.error(f"close_trade_outcome: {ticker} not closed: lost a lock race twice ({e2})")
+                return False
     except Exception as e:
-        conn.rollback()
+        _rollback_quietly(conn)
         logging.error(f"close_trade_outcome failed: {e}")
         return False
     finally:
@@ -4949,11 +5684,40 @@ _NOT_TEST_ARTIFACT = (
 )
 
 
-def get_conviction_calibration() -> list[dict]:
+def track_record_since() -> str | None:
+    """config.TRACK_RECORD_SINCE as an ISO date, or None (no bound) when unset
+    or not YYYY-MM-DD. Read here, not in analyst._build_track_record_text, so
+    the prompt template's hash is unchanged; the setting is recorded in the
+    analyst's treatment config (professor C35). The date is an ET calendar
+    date: the queries compare entry_date with its midnight in America/New_York."""
+    try:
+        import re
+        from datetime import date
+        import config
+        s = (getattr(config, "TRACK_RECORD_SINCE", "") or "").strip()
+        if not s:
+            return None
+        try:
+            # fromisoformat alone also takes 20270101; the regex keeps the dashed form.
+            ok = bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", s)) and bool(date.fromisoformat(s))
+        except ValueError:
+            ok = False
+        if not ok:
+            logging.warning(f"TRACK_RECORD_SINCE={s!r} is not a YYYY-MM-DD date; track record left unbounded")
+            return None
+        return s
+    except Exception:
+        return None
+
+
+def get_conviction_calibration(since: str | None = None) -> list[dict]:
     """
     Realized win-rate and average alpha grouped by the conviction the analyst
-    stated at entry. Used to show the model its own track record.
+    stated at entry. Used to show the model its own track record (and in the
+    weekly review). Only trades entered on or after `since`, which defaults
+    to TRACK_RECORD_SINCE; unset, all closed trades, as before (C35).
     """
+    since = since or track_record_since()
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
@@ -4963,8 +5727,9 @@ def get_conviction_calibration() -> list[dict]:
                 "  AVG(outcome_pct) AS avg_pct, AVG(alpha_pct) AS avg_alpha "
                 "FROM trade_outcomes "
                 f"WHERE outcome_pct IS NOT NULL AND trading_env=%s AND {_NOT_TEST_ARTIFACT} "
+                + ("AND entry_date >= (%s::timestamp AT TIME ZONE 'America/New_York') " if since else "") +
                 "GROUP BY conviction ORDER BY conviction DESC",
-                (TRADING_ENV,),
+                (TRADING_ENV,) + ((since,) if since else ()),
             )
             rows = cur.fetchall()
         return [
@@ -4983,13 +5748,54 @@ def get_conviction_calibration() -> list[dict]:
         _put_conn(conn)
 
 
+def get_conviction_calibration_by_position(since: str | None = None) -> list[dict]:
+    """Record-only (audit 11-06 23:24 #8): get_conviction_calibration counts
+    each OPEN/ADD tranche as a closed trade, unweighted, and an ADD's row
+    carries the ADD's conviction. Here the tranches closed at the same exit
+    (ticker, exit_date) are one position, scored by its earliest leg (the
+    entry's conviction and outcome); legs counts the tranches. A row with no
+    exit_date counts alone. Legs closed by separate writes (different
+    exit_date) count as separate positions. The since bound applies to each
+    position's first leg (m607). Raises on a DB error (the caller records
+    it)."""
+    since = since or track_record_since()
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                # A row with no exit_date (an orphaned outcome) is its own
+                # position, not merged with the ticker's other ones (62v).
+                "WITH legs AS (SELECT ticker, COALESCE(exit_date::text, 'row:' || id::text) AS pos_key, "
+                "  entry_date, conviction, outcome_pct, alpha_pct, was_correct FROM trade_outcomes "
+                f"  WHERE outcome_pct IS NOT NULL AND trading_env=%s AND {_NOT_TEST_ARTIFACT} "
+                "), pos AS (SELECT DISTINCT ON (ticker, pos_key) conviction, outcome_pct, alpha_pct, "
+                "  was_correct, entry_date, COUNT(*) OVER (PARTITION BY ticker, pos_key) AS legs "
+                "  FROM legs ORDER BY ticker, pos_key, entry_date ASC) "
+                "SELECT conviction, COUNT(*), COUNT(*) FILTER (WHERE was_correct = TRUE), "
+                "  AVG(outcome_pct), AVG(alpha_pct), SUM(legs) FROM pos "
+                # The bound is on the position's first leg, so a position
+                # opened before it isn't scored by a later ADD (m607).
+                + ("WHERE entry_date >= (%s::timestamp AT TIME ZONE 'America/New_York') " if since else "") +
+                "GROUP BY conviction ORDER BY conviction DESC",
+                (TRADING_ENV,) + ((since,) if since else ()),
+            )
+            rows = cur.fetchall()
+        return [{"conviction": r[0], "positions": r[1], "wins": r[2],
+                 "win_rate": round(r[2] / r[1], 3) if r[1] else None,
+                 "avg_outcome_pct": round(float(r[3]), 4) if r[3] is not None else None,
+                 "avg_alpha_pct": round(float(r[4]), 4) if r[4] is not None else None,
+                 "legs": int(r[5] or 0)} for r in rows]
+    finally:
+        _put_conn(conn)
+
+
 _SUBSCORE_COLUMNS = (
     "thesis_strength", "catalyst_quality", "valuation_risk_reward", "data_completeness",
     "chase_risk", "price_action",
 )
 
 
-def get_subscore_calibration(dimension: str) -> list[dict]:
+def get_subscore_calibration(dimension: str, since: str | None = None) -> list[dict]:
     """
     Same shape as get_conviction_calibration, but grouped by one of the four
     1-5 sub-scores (see agents/analyst.py) instead of the blended 1-10
@@ -5000,6 +5806,7 @@ def get_subscore_calibration(dimension: str) -> list[dict]:
     """
     if dimension not in _SUBSCORE_COLUMNS:
         raise ValueError(f"Unknown sub-score dimension: {dimension}")
+    since = since or track_record_since()     # TRACK_RECORD_SINCE (C35)
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
@@ -5017,8 +5824,9 @@ def get_subscore_calibration(dimension: str) -> list[dict]:
                 f"FROM trade_outcomes "
                 f"WHERE outcome_pct IS NOT NULL AND {dimension} IS NOT NULL AND trading_env=%s "
                 f"AND {_NOT_TEST_ARTIFACT} "
+                + ("AND entry_date >= (%s::timestamp AT TIME ZONE 'America/New_York') " if since else "") +
                 f"GROUP BY {dimension} ORDER BY {dimension} DESC",
-                (TRADING_ENV,),
+                (TRADING_ENV,) + ((since,) if since else ()),
             )
             rows = cur.fetchall()
         return [
@@ -5454,7 +6262,12 @@ def flag_orphan_outcomes(held: set[str]) -> tuple[int, int]:
     known (professor M111). Also skips a ticker with one of our SELLs from
     the last 24 h still unconfirmed or partial: reconcile closes that exit
     from the order's fill, and a flag first would make it skip the row
-    (professor m110)."""
+    (professor m110). And skips a ticker with a SELL filled or submitted in
+    the last 30 minutes, or still trade_pending (24 h): every selling path
+    deletes the stop record before close_trade_outcome writes (its SPY fetch
+    alone can take ~30 s, a queued close waits on 5-minute reconcile runs,
+    trade_pending recovery waits 10), and a flag in that gap would make the
+    close skip the row and lose the real exit price."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
@@ -5468,9 +6281,11 @@ def flag_orphan_outcomes(held: set[str]) -> tuple[int, int]:
                 "AND ps.trading_env = trade_outcomes.trading_env) AND NOT EXISTS ("
                 "SELECT 1 FROM orders o WHERE UPPER(o.ticker) = UPPER(trade_outcomes.ticker) "
                 "AND o.trading_env = trade_outcomes.trading_env AND o.side = 'SELL' "
-                "AND o.status IN ('unconfirmed', 'partial') AND o.broker_order_id IS NOT NULL "
-                "AND o.created_at > NOW() - INTERVAL '24 hours')",
-                (TRADING_ENV, held_list),
+                "AND ((o.status IN ('unconfirmed', 'partial') AND o.broker_order_id IS NOT NULL "
+                "AND o.created_at > NOW() - INTERVAL '24 hours') "
+                "OR (o.status IN ('filled', 'submitted') AND o.updated_at > NOW() - INTERVAL '30 minutes') "
+                "OR (o.reconcile_note = %s AND o.created_at > NOW() - INTERVAL '24 hours')))",
+                (TRADING_ENV, held_list, TRADE_PENDING_NOTE),
             )
             newly = cur.rowcount
             cur.execute(
@@ -5515,7 +6330,8 @@ def recent_event_verdicts(ticker: str, minutes: int = 15) -> list[dict]:
 def recent_new_fact_items(ticker: str, hours: int) -> list[dict] | None:
     """News items on the ticker (this env) the screener marked new_fact true
     and that reached the analyst in the last `hours`, newest first, from the
-    verdict rows' provenance.trigger: [{signal_id, timestamp, title, url}].
+    verdict rows' provenance.trigger: [{signal_id, timestamp, title, url,
+    title_tone}] (title_tone None on rows from before it was recorded).
     None when the read failed (the buy gate then counts no item)."""
     try:
         conn = _get_conn()
@@ -5525,7 +6341,8 @@ def recent_new_fact_items(ticker: str, hours: int) -> list[dict] | None:
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, timestamp, provenance->'trigger'->>'title', provenance->'trigger'->>'url' "
+                "SELECT id, timestamp, provenance->'trigger'->>'title', provenance->'trigger'->>'url', "
+                "provenance->'trigger'->>'title_tone' "
                 "FROM signals WHERE symbol=%s AND trading_env=%s "
                 "AND (signal NOT IN %s OR signal = 'ANALYST_FAILED') "
                 "AND provenance->'trigger'->>'path' = 'event' "
@@ -5535,7 +6352,7 @@ def recent_new_fact_items(ticker: str, hours: int) -> list[dict] | None:
                 (ticker, TRADING_ENV, _NON_ANALYST_SIGNALS, int(hours)),
             )
             return [{"signal_id": i, "timestamp": str(ts), "title": (t or "")[:200] or None,
-                     "url": u} for i, ts, t, u in cur.fetchall()]
+                     "url": u, "title_tone": tone} for i, ts, t, u, tone in cur.fetchall()]
     except Exception as e:
         logging.error(f"recent_new_fact_items({ticker}) failed: {e}")
         return None
@@ -5587,6 +6404,43 @@ def last_sell_trade(ticker: str, days: int = 14) -> dict | None:
         return None
     finally:
         _put_conn(conn)
+
+
+def sell_trades_since(ticker: str, since, until=None) -> dict | None:
+    """SELL trades on the ticker recorded after `since` and, when given, at or
+    before `until` (tz-aware datetimes; `until` keeps this read from seeing
+    later sales, though a caller's other reads may be current state):
+    {"n", "last_trade_id", "last_recorded_at", "last_reason"},
+    or None when there are none. TRIMs count too; the reason text tells them
+    apart. Times are trades.timestamp, when the row was written, not the fill
+    (a reconciled stop fill is written up to a cycle late) (professor m580).
+    Raises on a DB error, so a caller can tell "no sale" from "couldn't
+    check" (professor m578)."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            sql = ("SELECT COUNT(*) OVER (), id, timestamp, reason FROM trades "
+                   "WHERE symbol=%s AND side='SELL' AND trading_env=%s AND timestamp > %s")
+            args = [ticker, TRADING_ENV, since]
+            if until is not None:
+                sql += " AND timestamp <= %s"
+                args.append(until)
+            cur.execute(sql + " ORDER BY timestamp DESC, id DESC LIMIT 1", tuple(args))
+            row = cur.fetchone()
+            if row is None:
+                return None
+            # An ISO string: this goes into the verdict provenance, which
+            # is written with plain json.dumps.
+            return {"n": int(row[0]), "last_trade_id": row[1],
+                    "last_recorded_at": row[2].isoformat() if row[2] is not None else None,
+                    "last_reason": (row[3] or "")[:120] or None}
+    finally:
+        _put_conn(conn)
+
+
+def sell_trade_since(ticker: str, since, until=None) -> bool:
+    """Whether sell_trades_since finds any sale. Raises on a DB error."""
+    return sell_trades_since(ticker, since, until) is not None
 
 
 def get_next_earnings_row(ticker: str) -> tuple | None:

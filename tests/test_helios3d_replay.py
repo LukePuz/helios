@@ -204,6 +204,18 @@ def test_not_replayable_reasons():
         "stored model output fails the live parse (ValueError)": 1}
 
 
+def test_salvaged_parse_mode_is_not_replayable():
+    src = FakeSource()
+    dec, prov, _ = _decision(_mo("WATCH", 5))
+    src.add(1, "AAA", None, decision={**dec, "parse_mode": "salvaged"}, prov=prov)
+    src.add(2, "BBB", None, decision={**dec, "parse_mode": "json_substring"}, prov=prov)
+    rep = H.run(DAY, DAY, src)
+    assert _entry(rep, 1)["status"] == "not_replayable"
+    assert _entry(rep, 1)["reasons"] == [
+        "model output salvaged from malformed JSON (decision.parse_mode)"]
+    assert _entry(rep, 2)["status"] == "match"
+
+
 def test_dated_catalyst_without_expected_return_downgrades():
     src = FakeSource()
     mo = _mo("OPEN", 8, pass_to_risk=True, ret=None)
@@ -464,6 +476,57 @@ def test_report_is_byte_identical_across_runs_and_input_order():
     c = H.report_bytes(H.run(DAY, DAY, _mixed_source(2)))   # same rows, another order
     assert a == b == c
     assert json.loads(a)["summary"]["decisions"] == 40
+
+
+def test_replay_code_sha_covers_the_modules_the_output_depends_on():
+    import ast
+    for rel in ("db.py", "config.py", "helios3d/portfolio/limits.py", "helios3d/record/decision.py",
+                "helios3d/replay/gates.py", "helios3d/replay/harness.py"):
+        assert rel in H.REPLAY_CODE_FILES
+    # every repo module harness imports is hashed
+    tree = ast.parse((H.REPO / "helios3d/replay/harness.py").read_text())
+    mods = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            mods.update(f"{node.module}.{a.name}" for a in node.names)
+            mods.add(node.module)
+        elif isinstance(node, ast.Import):
+            mods.update(a.name for a in node.names)
+    for m in mods:
+        for cand in (m.replace(".", "/") + ".py",):
+            if (H.REPO / cand).is_file():
+                assert cand in H.REPLAY_CODE_FILES, cand
+    a = H.replay_code_sha()
+    assert len(a) == 12 and a == H.replay_code_sha()
+    assert H.replay_code_sha(("db.py",)) != H.replay_code_sha(("config.py",))
+    assert len(H.replay_code_sha(("no/such/file.py",))) == 12     # never raises
+
+
+def test_report_records_git_head_and_dirty_flag(tmp_path):
+    rep = H.run(DAY, DAY, FakeSource())
+    g = rep["replay_git"]
+    assert set(g) == {"head", "dirty"}
+    assert g["head"] is None or re.fullmatch(r"[0-9a-f]{40}", g["head"])
+    assert g["dirty"] in (True, False, None)
+    with patch.object(H, "REPO", tmp_path):              # not a git repo: no raise
+        assert H.replay_git_state() == {"head": None, "dirty": None}
+    with patch("subprocess.run", side_effect=OSError("no git")):
+        assert H.replay_git_state() == {"head": None, "dirty": None}
+
+
+def test_report_records_the_config_env_hash(monkeypatch):
+    from agents import analyst
+    rep = H.run(DAY, DAY, FakeSource())
+    monkeypatch.setattr(analyst, "_CONFIG_ENV_CACHE", {})
+    assert rep["replay_env_sha"] == analyst._config_env_record()["env_sha"]
+    assert re.fullmatch(r"[0-9a-f]{12}", rep["replay_env_sha"])
+    import config
+    monkeypatch.setattr(config, "QUIVER_ENABLED", not config.QUIVER_ENABLED)   # an .env override
+    assert H.replay_env_sha() != rep["replay_env_sha"]
+    with patch("config_env.env_record", side_effect=RuntimeError("x")):
+        assert H.replay_env_sha() is None
+    with patch("config_env.env_record", return_value={"error": "OSError"}):
+        assert H.replay_env_sha() is None
 
 
 def test_range_is_et_days_inclusive():

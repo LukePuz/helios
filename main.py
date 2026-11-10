@@ -147,6 +147,7 @@ def _adopt_position(client, rm, symbol, qty, manage_stop_place, resting_sell_sto
             ticker=symbol, entry_price=entry_price, stop_price=stop_price,
             stop_method=f"AUTO-ADOPTED ({stop_method}) — verify bucket/stop manually",
             bucket="Accelerator", conviction=5, trail_distance_pct=None,
+            entry_price_source="broker_avg",
         ) is not False
     except Exception as e:
         logging.error(f"[{symbol}] adopted stop record write failed: {type(e).__name__}: {e}")
@@ -328,6 +329,43 @@ def _start_telegram_bot() -> list[threading.Thread]:
     return threads
 
 
+# How long, from the start of a stop, an approval already running on the
+# Telegram worker gets to finish: the 30 s fill wait plus one stop placement
+# through the orders worker (manage_stop_place's 30 s timeout plus
+# tasks._ORDERS_EXTRA_WAIT_S). Stop retries beyond the first are not covered.
+# The wait runs inside stop_all just before the orders worker is stopped, so
+# that worker is still there to place the stop, and it overlaps the other
+# workers' grace: the worst case stays 5 + max(390, 180) + 60 = 455 s, inside
+# TimeoutStopSec=480 (audit 2026-11-08 17:17 #5).
+_TELEGRAM_JOIN_S = 180.0
+
+
+def _stop_telegram_polling() -> None:
+    """No new Telegram updates are handled from here on: an approval tapped
+    during the stop stays pending (audit 2026-11-08 15:08 #5). Never raises."""
+    try:
+        from telegram_bot import stop_polling
+        stop_polling()
+    except Exception as e:
+        logging.warning(f"Shutdown: Telegram stop failed: {e}")
+
+
+def _join_telegram_worker(threads, deadline: float) -> None:
+    """Waits until deadline (time.monotonic) for the update being handled on
+    the worker thread to finish, so neither the orders-worker stop nor
+    sys.exit cuts an approval off between its fill and its stop. The poller is not joined: it sits in a
+    30 s long poll and does nothing that needs finishing. Never raises."""
+    try:
+        for t in threads or []:
+            if t.name != "telegram-worker":
+                continue
+            t.join(max(0.0, deadline - time.monotonic()))
+            if t.is_alive():
+                logging.warning("Shutdown: an approval was still running on telegram-worker at exit")
+    except Exception as e:
+        logging.warning(f"Shutdown: Telegram join failed: {e}")
+
+
 def _start_dashboard() -> subprocess.Popen:
     import os as _os
     dashboard = str(Path(__file__).parent / "dashboard.py")
@@ -335,9 +373,11 @@ def _start_dashboard() -> subprocess.Popen:
     # main process (Telegram bot → order execution). TWS allows up to 32
     # simultaneous connections with unique IDs.
     env = {**_os.environ, "IB_CLIENT_ID": "2"}
+    from config import DASHBOARD_ADDRESS
     proc = subprocess.Popen(
         [
             sys.executable, "-m", "streamlit", "run", dashboard,
+            "--server.address", DASHBOARD_ADDRESS,
             "--server.port", "8501",
             "--server.headless", "true",
             "--browser.gatherUsageStats", "false",
@@ -346,7 +386,7 @@ def _start_dashboard() -> subprocess.Popen:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    logging.info("Streamlit dashboard started at http://localhost:8501")
+    logging.info(f"Streamlit dashboard started at http://{DASHBOARD_ADDRESS}:8501")
     return proc
 
 
@@ -554,7 +594,7 @@ def main() -> None:
 
     # 5. Telegram bot
     print("  [5/6] Starting Telegram bot...")
-    _start_telegram_bot()
+    telegram_threads = _start_telegram_bot()
 
     # 5b/5c. Position and open-order reconciliation run once the orders
     # worker is up (see _startup_reconcile).
@@ -568,18 +608,21 @@ def main() -> None:
 
     def _shutdown(signum, frame):
         logging.info("Shutdown signal received — stopping all services.")
+        # Telegram first: a manual approval executes its order on the worker
+        # thread, so take no new ones during the stop, and let one already
+        # running finish before exit (audit 2026-11-08 15:08 #5).
+        join_deadline = time.monotonic() + _TELEGRAM_JOIN_S
+        _stop_telegram_polling()
         try:
             import process_manager as pm
-            for name, result in pm.stop_all().items():
+            stopped = pm.stop_all(
+                before_orders=lambda: _join_telegram_worker(telegram_threads, join_deadline))
+            for name, result in stopped.items():
                 if result != "ok":
                     logging.warning(f"Shutdown: {name}: {result}")
         except Exception:
             pass
-        try:
-            from telegram_bot import stop_polling
-            stop_polling()
-        except Exception:
-            pass
+        _join_telegram_worker(telegram_threads, join_deadline)   # if stop_all raised
         dashboard_proc.terminate()
         sys.exit(0)
 

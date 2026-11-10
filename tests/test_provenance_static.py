@@ -61,3 +61,21 @@ def test_verdict_provenance_has_full_template_hashes(monkeypatch):
         prov = analyst._provenance("p")
     assert prov["prompt_template_full_sha"] == analyst._TEMPLATE_SHAS["prompt_template_full_sha"]
     assert prov["brief_template_full_sha"] == analyst._TEMPLATE_SHAS["brief_template_full_sha"]
+
+
+def test_db_queries_hash_moves_with_the_track_record_query(monkeypatch):
+    """The track record's date bound lives in db, outside the prompt hashes;
+    prompt_db_queries_sha covers it and leaves the others alone (m596)."""
+    import db
+    base = analyst._template_shas()
+    assert isinstance(base["prompt_db_queries_sha"], str) and len(base["prompt_db_queries_sha"]) == 12
+
+    def get_conviction_calibration(since=None):
+        return []
+    monkeypatch.setattr(db, "get_conviction_calibration", get_conviction_calibration)
+    after = analyst._template_shas()
+    assert after["prompt_db_queries_sha"] != base["prompt_db_queries_sha"]
+    assert after["prompt_template_full_sha"] == base["prompt_template_full_sha"]
+    monkeypatch.setattr(analyst, "_PROVENANCE_STATIC", None)
+    with patch.object(analyst, "_code_mixed_check", return_value={}):
+        assert analyst._provenance("p")["prompt_db_queries_sha"] == analyst._TEMPLATE_SHAS["prompt_db_queries_sha"]

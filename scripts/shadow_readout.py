@@ -10,7 +10,10 @@ start from a standing number instead of an ad-hoc query.
 
 For the window it reports: rows per signal kind, and for every key path in
 signals.provenance and signals.decision (to depth 3) the number of rows that
-carry it and, for booleans, how many were true. Counts only: no values, no
+carry it and, for booleans, how many were true. Routing-exit rows (decision
+carries db._VERDICT_COPY_KEY) copy their verdict's provenance, so their
+provenance is not walked: one shadow counted once. Their kinds and decision
+paths are still counted. Counts only: no values, no
 prices, no account data. Which count decides anything is a study choice, not
 this script's.
 """
@@ -41,12 +44,14 @@ def walk(obj, prefix: str, depth: int, present: Counter, true: Counter) -> None:
 
 
 def readout(rows, days: int, env: str, head: str) -> str:
+    import db
     kinds: Counter = Counter()
     present: Counter = Counter()
     true: Counter = Counter()
     for kind, provenance, decision in rows:
         kinds[kind or "?"] += 1
-        walk(provenance or {}, "provenance", 1, present, true)
+        if not (isinstance(decision, dict) and db._VERDICT_COPY_KEY in decision):
+            walk(provenance or {}, "provenance", 1, present, true)
         walk(decision or {}, "decision", 1, present, true)
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [f"# Shadow readout ({env}, last {days} days)", "",

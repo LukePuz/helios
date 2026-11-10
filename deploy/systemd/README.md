@@ -56,6 +56,22 @@ tail -f /opt/helios/helios.log    # the bot's own application log
   unit or container. Set that up separately and make sure it's listening
   on the port in `.env` (`IB_PORT`) before Helios starts placing orders.
 
+## Database port per unit
+
+The bot reads `SUPABASE_PORT` from the environment, else `.env`, else 5432.
+`helios-local.service.d/db-port.conf` sets 6543 (the transaction-mode
+pooler) for `helios-local` and every process it starts, including the
+dashboard probe. The session pooler on 5432 caps at 15 clients.
+
+| Unit | Port | Why |
+|---|---|---|
+| `helios-local` (main.py, its workers, dashboard) | 6543 with the drop-in, else `.env` | the drop-in |
+| `helios-watchdog`, `helios-gateway-watchdog` (deploy/watchdog.py) | `.env` (5432) | no drop-in; a few short reads per run |
+| `helios-backup` (user unit, scripts/backup_db.py: pg_dump) | `.env` (5432); must stay there | pg_dump isn't supported through the transaction pooler, so never give it 6543 |
+| `helios-standby`, `helios-notify-failure@`, `helios-evening-stop`, `ibc`, `ollama-cpu` | none | no database access |
+
+Agent and ad-hoc scripts should set `SUPABASE_PORT=6543` themselves.
+
 ## Fully unattended: wake, login, run, sleep on a schedule
 
 For a machine that should power itself up premarket, log into TWS with no

@@ -18,6 +18,22 @@ def today_et(now: datetime | None = None) -> date:
     return (now or datetime.now(timezone.utc)).astimezone(ET).date()
 
 
+def parse_catalyst_date(raw) -> date | None:
+    """The model's catalyst date as a calendar date for the log-only
+    records: "YYYY-MM-DD" as is, "YYYY-MM" as the 15th, anything else None
+    (decision.catalyst_check and the thesis snapshots share it, professor
+    59n). The gate's own reading is compute_weeks_to_catalyst."""
+    s = str(raw or "").strip()
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+            return datetime.strptime(s, "%Y-%m-%d").date()
+        if re.fullmatch(r"\d{4}-\d{2}", s):
+            return datetime.strptime(s + "-15", "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    return None
+
+
 def weeks_to_catalyst_et(catalyst_date: str | None, as_of: datetime | None = None,
                          month_midpoint: bool | None = None) -> float | None:
     """compute_weeks_to_catalyst with the date read as ET midnight: same

@@ -761,6 +761,80 @@ class _StopRecordNoBroker(ValueError):
 SWAP_NAME_CAP_SLACK_PP = 0.5
 
 
+
+# AI infrastructure tickers (approximate) for the 60% cap in
+# check_concentration; the daily digest's Book block reads the same set.
+AI_INFRA_TICKERS = frozenset({"NVDA", "AMD", "ARM", "INTC", "MSFT", "AMZN", "GOOG", "GOOGL",
+                              "META", "AVGO", "ANET", "CRDO", "MRVL", "ASML", "SNPS", "KLAC",
+                              "LRCX", "AMAT", "MU", "CRWV", "ORCL", "CLS", "PLTR", "SNOW",
+                              "DDOG", "VRT", "PWR", "GEV", "CEG"})
+
+
+def _theme_prefix(sector: str) -> str:
+    """The part of a watchlist ### heading before " — ": "AI Infrastructure"
+    for "AI Infrastructure — Compute / Accelerators"; the whole heading
+    when there is no dash."""
+    return (sector or "").split(" — ")[0].strip()
+
+
+def _theme_group_shadow(ticker: str, sector: str, watchlist: dict, pos_values: dict,
+                        proposed_size_pct: float) -> dict:
+    """Log-only (audit 2026-11-07 07:07 #5): the 35% theme cap groups on the
+    full ### sub-heading, so NVDA, MSFT and ANET count as three themes
+    (PLTR sits under "AI Software / Agent Economy", its own prefix), and a
+    name off the watchlist (sector "") skips the check. This records the
+    same check grouped on the heading prefix, beside today's. Nothing
+    reads it to size. Never raises."""
+    try:
+        prefix = _theme_prefix(sector)
+        if not prefix:
+            return {"group": "heading_prefix", "theme": None, "reason": "no_watchlist_sector"}
+        total = sum(v for t, v in pos_values.items()
+                    if _theme_prefix(watchlist.get(t, {}).get("sector", "")) == prefix)
+        cap = max(0.0, MAX_SINGLE_THEME_PCT - (total - proposed_size_pct))
+        current = sum(v for t, v in pos_values.items()
+                      if watchlist.get(t, {}).get("sector", "") == sector)
+        return {"group": "heading_prefix", "theme": prefix,
+                "theme_total": round(total, 4), "would_cap_pct": round(cap, 4),
+                "would_breach": total > MAX_SINGLE_THEME_PCT,
+                "current_theme_total": round(current, 4)}
+    except Exception as e:
+        return {"group": "heading_prefix", "error": type(e).__name__}
+
+
+def _inflight_theme_shadow(ticker: str, proposed_size_pct: float, theme_shadow: dict | None) -> dict:
+    """Log-only (audit 2026-11-07 11:07 #4): check_concentration counts
+    filled positions only, so buys approved or deferred but not yet filled
+    are invisible to the 35% theme cap, and several same-theme buys bound for
+    one open each pass it alone. This records the same-theme in-flight buys
+    and the theme total if they were counted. Nothing reads it to size.
+    Never raises."""
+    try:
+        import db
+        from knowledge_loader import load_watchlist
+        inflight = db.get_inflight_buy_approvals(exclude_ticker=ticker)
+        if inflight is None:
+            return {"errored": True}
+        watchlist = load_watchlist()
+        sector = watchlist.get(ticker, {}).get("sector", "")
+        same = [r for r in inflight
+                if sector and watchlist.get(r["ticker"], {}).get("sector", "") == sector]
+        out = {"inflight_n": len(inflight), "same_theme": [
+                   {"id": r["id"], "ticker": r["ticker"], "status": r["status"],
+                    "pct": round(r["pct"], 4)} for r in same],
+               "theme": sector or None}
+        current = (theme_shadow or {}).get("current_theme_total")
+        if not sector or not isinstance(current, (int, float)):
+            return {**out, "would_theme_total": None, "would_breach": None, "would_cap_pct": None}
+        extra = sum(r["pct"] for r in same)
+        total = current + extra
+        return {**out, "would_theme_total": round(total, 4),
+                "would_breach": total > MAX_SINGLE_THEME_PCT,
+                "would_cap_pct": round(max(0.0, MAX_SINGLE_THEME_PCT - (total - proposed_size_pct)), 4)}
+    except Exception as e:
+        return {"errored": True, "error": type(e).__name__}
+
+
 class RiskManager:
     simulation = False   # set per instance by __init__
     # The ATR-fallback alert only (the swap pre-check); nothing else changes.
@@ -1136,6 +1210,7 @@ class RiskManager:
                               f"of {ticker} at ${price:,.2f} — skipping"]}
 
         # Stop loss
+        self.last_stop_atr = None
         stop_price, stop_method = self.calculate_stop(ticker, price, bucket,
                                                       log_fallback=log_fallback,
                                                       log_caller="size_position")
@@ -1206,6 +1281,13 @@ class RiskManager:
             "conviction":          conviction,
             "flags":               flags,
             "heat_shadow":         self._heat_shadow(ticker, shares_initial, price, stop_price, pv, mult),
+            # Log-only (audit 2026-11-07 11:07 #7): the ATR the stop was set
+            # from (live IBKR bars, today's partial bar included); None when
+            # the stop didn't use one (0 means the flat fallback was used). The brief shows the nightly ladder's
+            # ATR(14) instead; crew records that beside it as atr_brief.
+            "atr_stop":            (round(float(self.last_stop_atr), 4)
+                                    if isinstance(getattr(self, "last_stop_atr", None), (int, float))
+                                    and self.last_stop_atr > 0 else None),
         }
 
     def _heat_shadow(self, ticker: str, shares: int, price: float, stop_price, pv: float,
@@ -1447,6 +1529,7 @@ class RiskManager:
         except Exception:
             pass
         atr = self.get_atr(ticker)
+        self.last_stop_atr = atr          # log-only: size_position records it
         if atr is None or atr == 0:
             fallback_pct = 0.08 if bucket == "Compounder" else 0.05
             stop = round(entry_price * (1 - fallback_pct), 2)
@@ -1535,11 +1618,7 @@ class RiskManager:
         # Add proposed
         pos_values[ticker] = pos_values.get(ticker, 0) + proposed_size_pct
 
-        # AI infrastructure tickers (approximate)
-        ai_infra_keywords = {"NVDA", "AMD", "ARM", "INTC", "MSFT", "AMZN", "GOOG", "GOOGL",
-                             "META", "AVGO", "ANET", "CRDO", "MRVL", "ASML", "SNPS", "KLAC",
-                             "LRCX", "AMAT", "MU", "CRWV", "ORCL", "CLS", "PLTR", "SNOW",
-                             "DDOG", "VRT", "PWR", "GEV", "CEG"}
+        ai_infra_keywords = AI_INFRA_TICKERS
         ai_infra_total = sum(v for t, v in pos_values.items() if t in ai_infra_keywords)
 
         ai_infra_size_cap_pct = None
@@ -1563,10 +1642,13 @@ class RiskManager:
         # 2026-08-11). Only meaningful for a ticker that's actually in the
         # breaching sector; None otherwise.
         theme_size_cap_pct = None
+        theme_shadow = None
         try:
             from knowledge_loader import load_watchlist
             watchlist = load_watchlist()
             sector = watchlist.get(ticker, {}).get("sector", "")
+            theme_shadow = _theme_group_shadow(ticker, sector, watchlist, pos_values,
+                                               proposed_size_pct)
             if sector:
                 theme_total = sum(
                     v for t, v in pos_values.items()
@@ -1612,6 +1694,8 @@ class RiskManager:
                                     if theme_size_cap_pct is not None else None),
             "moonshot_size_cap_pct": (round(moonshot_size_cap_pct, 4)
                                        if moonshot_size_cap_pct is not None else None),
+            # Log-only: the theme cap if themes were grouped by heading prefix.
+            "theme_shadow": theme_shadow,
         }
 
     def check_correlation(self, ticker: str, corr_threshold: float = 0.7,
@@ -2139,7 +2223,12 @@ class RiskManager:
                         mult = (mult_lo + mult_hi) / 2
                         trail_amount = round(mult * atr, 2)
                         new_stop = round(current - trail_amount, 2)
-                        method_label = f"{mult:.1f}x ATR (${atr:.2f}) = ${trail_amount:.2f}"
+                        # The applied distance as a percent of price next to
+                        # TRAILING_STOP_DISTANCE's, which applies only without
+                        # ATR (audit 11-06 01:32 #7). Log only.
+                        method_label = (f"{mult:.1f}x ATR (${atr:.2f}) = ${trail_amount:.2f}, "
+                                        f"{trail_amount / current:.1%} of price; configured "
+                                        f"flat {trail_dist:.1%} not used")
                     else:
                         trail_pct = round(trail_dist * 100, 2)
                         new_stop = round(current * (1 - trail_dist), 2)
@@ -2758,7 +2847,8 @@ class RiskManager:
                 # A remainder may still fill: reconcile picks up 'partial' (M53).
                 if not db.update_order_fill(local_id, order_result["fill_price"], filled,
                                             "filled" if filled >= float(sell_qty) - 1e-6 else "partial",
-                                            filled_at=order_result.get("fill_time")):
+                                            filled_at=order_result.get("fill_time"),
+                                            filled_at_source=order_result.get("fill_time_source")):
                     db.set_order_reconcile_note(local_id, "fill_write_failed")
             elif local_id and local_id > 0:
                 # Filled with no price from the broker: the row stays

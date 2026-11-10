@@ -152,3 +152,13 @@ def test_stop_reader_survives_missing_trail_columns():
 
 def test_migration_58_adds_trail_columns():
     assert any(v == 58 and "trail_amount" in sql for v, sql in db._MIGRATIONS)
+
+
+def test_conversion_log_names_applied_and_configured_distance(caplog):
+    """Audit 11-06 01:32 #7: the ATR trail's distance as a percent of price,
+    next to the configured flat distance it replaces."""
+    with caplog.at_level("INFO"):
+        _, trail = _trail_check(stop_price=112.0, atr=4.0)
+    trail.assert_called_once()
+    line = next(r.getMessage() for r in caplog.records if "Converted to native TRAIL" in r.getMessage())
+    assert "of price; configured flat" in line and "not used" in line

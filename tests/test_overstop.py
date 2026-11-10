@@ -216,7 +216,7 @@ def test_backstop_sale_gets_an_orders_row_and_a_part_fill_waits_for_reconcile():
             assert tasks._execute_backstop_sell("AMD", TestBackstopSellReads._alert) is True
         assert log_order.call_args.kwargs["intent"] == "BACKSTOP"
         assert log_order.call_args.kwargs["broker_order_id"] == 77
-        upd.assert_called_once_with(5, 140.0, filled, status, filled_at=None)
+        upd.assert_called_once_with(5, 140.0, filled, status, filled_at=None, filled_at_source=None)
         assert close.called is closes
         # A part fill keeps the stop record: a broker-cancelled remainder
         # leaves held shares the next cycle must see (professor, M128 class).
@@ -458,7 +458,8 @@ def test_queued_flat_exit_closes_at_its_orders_average_fill():
     stale-stop branch never closed the outcome."""
     r, close, alert = _queued_flat("EXIT", {"status": "filled", "fill_price": 171.5, "broker_order_id": 77, "created_at": _T0})
     assert r is None
-    close.assert_called_once_with("CRWD", exit_price=171.5, exit_source="late_exit", exit_price_source="fill", exit_fill_at=None)
+    close.assert_called_once_with("CRWD", exit_price=171.5, exit_source="late_exit", exit_price_source="fill", exit_fill_at=None,
+                                  exit_fill_at_source=None)
     alert.assert_not_called()
 
 
@@ -527,7 +528,8 @@ def test_a_queued_profit_target_keeps_a_later_exits_order_for_the_flat_close():
          patch("db.close_trade_outcome") as close:
         tasks._reprotect_after_late_sell("CRWD", rec, 171.0, from_queue=True)
     row.assert_called_once_with(5)
-    close.assert_called_once_with("CRWD", exit_price=171.5, exit_source="late_exit", exit_price_source="fill", exit_fill_at=None)
+    close.assert_called_once_with("CRWD", exit_price=171.5, exit_source="late_exit", exit_price_source="fill", exit_fill_at=None,
+                                  exit_fill_at_source=None)
 
 
 def test_a_restore_replacing_a_queued_exit_keeps_the_exits_order():
@@ -634,7 +636,8 @@ def test_a_queued_flat_backstop_with_its_kept_record_closes_from_its_fill():
         r = tasks._reprotect_after_late_sell("CRWD", {"intent": "BACKSTOP", "order_id": 5}, 171.0,
                                              from_queue=True)
     assert r is None
-    close.assert_called_once_with("CRWD", exit_price=171.5, exit_source="late_backstop", exit_price_source="fill", exit_fill_at=None)
+    close.assert_called_once_with("CRWD", exit_price=171.5, exit_source="late_backstop", exit_price_source="fill", exit_fill_at=None,
+                                  exit_fill_at_source=None)
     delete.assert_called_once_with("CRWD")
 
 

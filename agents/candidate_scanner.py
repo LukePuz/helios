@@ -162,9 +162,15 @@ def run_candidate_scan(min_composite_score: int = 40, max_results: int = 25) -> 
     bulk_bars = db.get_price_history_bulk(candidate_tickers, days=220)
 
     results: list[dict] = []
+    # The scan's funnel, log-only (audit 11-07 01:08 #4): the 25-name cap,
+    # not the threshold, decided every run, and nothing said how many cleared.
+    funnel = {"screened": len(candidate_tickers), "short_history": 0, "below_movement": 0,
+              "scored": 0, "above_threshold": 0, "returned": 0,
+              "watchlist_outside_universe": len(watchlist - set(constituents))}
     for ticker in candidate_tickers:
         bars = bulk_bars.get(ticker, [])
         if len(bars) < 60:
+            funnel["short_history"] += 1
             continue  # same minimum agents.scanner/price_action require
 
         info = constituents[ticker]
@@ -175,7 +181,9 @@ def run_candidate_scan(min_composite_score: int = 40, max_results: int = 25) -> 
         # tickers with no real movement at all, since a thesis match alone
         # isn't actionable without something happening in the name.
         if movement_score < 15:
+            funnel["below_movement"] += 1   # thesis match not scored (cost)
             continue
+        funnel["scored"] += 1
 
         thesis_score, thesis_notes, matched_thesis = _score_thesis_match(
             ticker, info["company"], info["gics_sector"], info["gics_sub_industry"],
@@ -199,9 +207,23 @@ def run_candidate_scan(min_composite_score: int = 40, max_results: int = 25) -> 
             })
 
     results.sort(key=lambda c: c["composite_score"], reverse=True)
+    funnel["above_threshold"] = len(results)
     results = results[:max_results]
+    funnel["returned"] = len(results)
 
     log.info(f"Candidate scan complete: {len(results)} candidates above threshold")
+    log.info("Candidate scan funnel: " + ", ".join(f"{k} {v}" for k, v in funnel.items())
+             + f" (threshold {min_composite_score}, cap {max_results})")
+    try:
+        # One row per run, so the cap-vs-threshold question can be read from
+        # data, not only the log (professor 63l, as m603).
+        db.log_activity("candidate_scan_funnel", "",
+                        f"Candidate scan: {funnel['above_threshold']} above threshold, "
+                        f"{funnel['returned']} returned (cap {max_results})", "neutral",
+                        {**funnel, "threshold": min_composite_score, "cap": max_results,
+                         "env": db.TRADING_ENV})
+    except Exception as e:
+        log.warning(f"Candidate scan funnel row failed: {e}")
 
     newest_bar, median_age, stale_share = _bars_age(bulk_bars)
     stale = median_age is None or stale_share > 0.5
@@ -212,6 +234,7 @@ def run_candidate_scan(min_composite_score: int = 40, max_results: int = 25) -> 
     return {
         "agent": "candidate_scanner",
         "screened": len(candidate_tickers),
+        "funnel": funnel,
         "candidates": results,
         "newest_bar": newest_bar,
         "median_bar_age": median_age,

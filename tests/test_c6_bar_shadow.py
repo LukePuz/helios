@@ -376,10 +376,12 @@ def test_task_entry_point():
 # ── outcomes ──────────────────────────────────────────────────────────────────
 
 def _bars(n, start_close=100.0):
-    from datetime import date, timedelta
-    d0 = date(2026, 11, 2)
-    return [{"date": (d0 + timedelta(days=i)).isoformat(), "open": 1, "high": 1, "low": 1,
-             "close": start_close + i} for i in range(n)]
+    """n daily bars, one per NYSE session from 2026-11-02 (the verdict day),
+    close start_close + the session's index."""
+    import tasks
+    days = ["2026-11-02"] + tasks._c6_sessions_after("2026-11-02", max(n - 1, 1))
+    return [{"date": d, "open": 1, "high": 1, "low": 1, "close": start_close + i}
+            for i, d in enumerate(days[:n])]
 
 
 _VERDICT = {"kind": "verdict", "ticker": "MSFT", "env": "paper", "signal_id": 41,
@@ -387,9 +389,13 @@ _VERDICT = {"kind": "verdict", "ticker": "MSFT", "env": "paper", "signal_id": 41
             "would_queue": True, "c7_gates": ["regime"], "shadow_key": "paper:MSFT:s41:c6"}
 
 
-def _outcomes(verdict, bars, done=frozenset(), today=None):
+def _outcomes(verdict, bars, done=frozenset(), today=None, actions=(), raw_close=None):
     import tasks
+    acts = ({"side_effect": actions} if isinstance(actions, Exception) else
+            {"return_value": {"events": list(actions), "raw_close": dict(raw_close or {}),
+                              "fetched_at": "2026-12-31T00:00:00+00:00"}})
     with patch("db.get_activity_rows", return_value=[verdict]) as rows, \
+         patch("tasks._c6_corporate_actions", **acts), \
          patch("db.get_activity_shadow_keys", return_value=set(done)), \
          patch("db.get_price_history_bulk", return_value={"MSFT": bars}), \
          patch("stop_lock._redis", side_effect=RuntimeError("no redis")), \
@@ -411,6 +417,30 @@ def test_outcome_tracker_logs_each_horizon_and_status_once():
         ("outcome_status", "complete", [5, 10, 20])
     n2, recs2, _ = _outcomes(_VERDICT, _bars(22), done={r["shadow_key"] for r in recs})
     assert n2 == 0 and recs2 == []
+
+
+def test_outcome_horizon_counts_sessions_not_cached_bars():
+    """A session missing from the cache doesn't move the horizon to a later
+    bar; the outcome says how many sessions inside it were missing."""
+    import tasks
+    sessions = tasks._c6_sessions_after("2026-11-02", 20)
+    assert sessions[:5] == ["2026-11-03", "2026-11-04", "2026-11-05", "2026-11-06", "2026-11-09"]
+    assert "2026-11-26" not in sessions          # Thanksgiving
+    bars = [b for b in _bars(22) if b["date"] != "2026-11-04"]
+    n, recs, _ = _outcomes(_VERDICT, bars)
+    r5, r10, r20 = recs[:3]
+    assert (r5["close_date"], r5["close"]) == ("2026-11-09", 105.0)
+    assert (r5["missing_sessions"], r5["bars_gap"]) == (1, True)
+    assert (r20["close_date"], r20["close"], r20["bars_gap"]) == (sessions[19], 120.0, True)
+    _, full, _ = _outcomes(_VERDICT, _bars(22))
+    assert (full[0]["missing_sessions"], full[0]["bars_gap"]) == (0, False)
+
+
+def test_outcome_horizon_without_its_own_session_bar_is_not_logged():
+    bars = [b for b in _bars(22) if b["date"] != "2026-11-09"]
+    n, recs, _ = _outcomes(_VERDICT, bars)
+    assert [r.get("horizon_days") for r in recs] == [10, 20]
+    assert all(r["kind"] == "outcome" for r in recs)
 
 
 def test_outcome_tracker_waits_for_bars():
@@ -518,3 +548,94 @@ def test_class_level_flags_stay_false():
 def test_flag_not_in_treatment_config():
     from agents.analyst import _treatment_config
     assert "C6_BAR_SHADOW_ENABLED" not in _treatment_config()
+
+
+def test_session_counts_past_the_holiday_calendar_warn_once(caplog):
+    """NYSE_HOLIDAYS ends at CALENDAR_LAST_YEAR: counting past it warns once
+    per process (no holidays are made up), and within it stays quiet."""
+    import logging
+    import tasks
+    from market_calendar import CALENDAR_LAST_YEAR
+    with patch.object(tasks, "_calendar_end_warned", False, create=True), caplog.at_level(logging.WARNING):
+        tasks._c6_sessions_after("2026-11-02", 20)
+        tasks._c6_trading_days_after("2026-11-02", "2026-12-31")
+        assert not [r for r in caplog.records if "holiday calendar ends" in r.getMessage()]
+        last = f"{CALENDAR_LAST_YEAR}-12-20"
+        assert len(tasks._c6_sessions_after(last, 20)) == 20
+        tasks._c6_trading_days_after(last, f"{CALENDAR_LAST_YEAR + 1}-02-01")
+        tasks._c6_sessions_after(last, 5)
+    warned = [r for r in caplog.records if "holiday calendar ends" in r.getMessage()]
+    assert len(warned) == 1 and str(CALENDAR_LAST_YEAR) in warned[0].getMessage()
+
+
+def test_outcome_rows_flag_splits_and_dividends_after_the_verdict():
+    """m602: events after the verdict day are listed; in_window flags cover
+    those up to the horizon's close date."""
+    acts = [{"date": "2026-10-30", "kind": "dividend", "value": 0.8},   # before: ignored
+            {"date": "2026-11-04", "kind": "dividend", "value": 0.8},   # inside r5
+            {"date": "2026-11-20", "kind": "split", "value": 4.0}]      # after r5, inside r20
+    n, recs, _ = _outcomes(_VERDICT, _bars(22), today=__import__("datetime").date(2026, 12, 31), actions=acts)
+    r5, r20 = recs[0], recs[2]
+    assert [a["date"] for a in r5["corp_actions_after_verdict"]] == ["2026-11-04", "2026-11-20"]
+    assert (r5["dividend_in_window"], r5["split_in_window"]) == (True, False)
+    assert (r20["dividend_in_window"], r20["split_in_window"]) == (True, True)
+    # M320: the split after r5's close still biases r5's adjusted return
+    assert (r5["split_after_verdict_any"], r5["dividend_after_verdict_any"]) == (True, True)
+
+
+def test_outcome_rows_carry_the_unadjusted_close_return():
+    """63d: yfinance's Close is split-adjusted; a 2:1 split after the r5
+    close is multiplied back."""
+    d5 = _bars(22)[5]["date"]
+    n, recs, _ = _outcomes(_VERDICT, _bars(22), today=__import__("datetime").date(2026, 12, 31),
+                           raw_close={d5: 55.0},
+                           actions=[{"date": "2026-12-20", "kind": "split", "value": 2.0}])
+    assert recs[0]["close_split_adj"] == 55.0 and recs[0]["close_unadjusted"] == 110.0
+    assert recs[0]["return_pct_unadjusted"] == 10.0
+    assert recs[1]["close_split_adj"] is None and recs[1]["return_pct_unadjusted"] is None
+    assert recs[0]["corp_actions_fetched_at"] == "2026-12-31T00:00:00+00:00"
+
+
+def test_unreadable_corporate_actions_are_unknown_not_none():
+    with patch("tasks._c6_corporate_actions", return_value=None):
+        import tasks
+        with patch("db.get_activity_rows", return_value=[_VERDICT]), \
+             patch("db.get_activity_shadow_keys", return_value=set()), \
+             patch("db.get_price_history_bulk", return_value={"MSFT": _bars(22)}), \
+             patch("stop_lock._redis", side_effect=RuntimeError("no redis")), \
+             patch("db.log_activity", return_value=True) as la:
+            tasks._check_c6_bar_outcomes(today=__import__("datetime").date(2026, 12, 31))
+    r5 = la.call_args_list[0].args[4]
+    assert r5["corp_actions_after_verdict"] is None and r5["split_in_window"] is None
+
+
+def test_corporate_actions_are_parsed_and_cached():
+    import pandas as pd
+    import tasks
+    idx = pd.to_datetime(["2026-11-04", "2026-11-20"]).tz_localize("America/New_York")
+    frame = pd.DataFrame({"Close": [1.0, 1.0], "Dividends": [0.8, 0.0], "Stock Splits": [0.0, 4.0]},
+                         index=idx)
+    r = MagicMock()
+    r.get.return_value = None
+    with patch("yfinance.Ticker") as t:
+        t.return_value.history.return_value = frame
+        cache = {}
+        out = tasks._c6_corporate_actions("MSFT", r, cache)
+        assert tasks._c6_corporate_actions("MSFT", r, cache) is out
+    assert out["events"] == [{"date": "2026-11-04", "kind": "dividend", "value": 0.8},
+                             {"date": "2026-11-20", "kind": "split", "value": 4.0}]
+    assert out["raw_close"] == {"2026-11-04": 1.0, "2026-11-20": 1.0} and out["fetched_at"]
+    assert t.call_count == 1 and r.set.call_args.kwargs["ex"] == tasks._C6_ACTIONS_TTL_S
+    assert t.return_value.history.call_args.kwargs["timeout"] == 10
+    with patch("yfinance.Ticker", side_effect=RuntimeError("rate limited")):
+        assert tasks._c6_corporate_actions("AMD", None, {}) is None
+    r2 = MagicMock()
+    r2.get.return_value = None
+    with patch("yfinance.Ticker") as t2:      # an empty frame is unknown, not "none", and not cached
+        t2.return_value.history.return_value = pd.DataFrame()
+        assert tasks._c6_corporate_actions("AMD", r2, {}) is None
+    r2.set.assert_not_called()
+    with patch("yfinance.Ticker") as t3:      # bars but no events: none found
+        t3.return_value.history.return_value = pd.DataFrame(
+            {"Close": [1.0], "Dividends": [0.0], "Stock Splits": [0.0]}, index=idx[:1])
+        assert tasks._c6_corporate_actions("AMD", None, {})["events"] == []

@@ -720,6 +720,7 @@ def test_free_text_caps():
     {"imputed_fields": ["conviction"]},
     {"trend_template": {"pass": True, "criteria": {"above_200": True}}},
     {"trend_template": {"status": "insufficient_history"}},
+    {"parse_mode": "salvaged"},
 ])
 def test_malformed_catalyst_keys_are_kept(keys):
     inputs = D.recover_inputs(_prov(), _dec(**keys))

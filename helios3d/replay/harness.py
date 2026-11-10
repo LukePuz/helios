@@ -44,7 +44,8 @@ STEPS
 
 STATUS of a decision
 - not_replayable: no stored model output (ANALYST_FAILED, rows before the
-  decision column, salvaged output) or an output the live parse rejects.
+  decision column, decision.parse_mode "salvaged") or an output the live
+  parse rejects.
 - differ: any of model_action, model_conviction, model_pass_to_risk,
   final_action, final_conviction, final_pass_to_risk, the gate kinds in
   order, or routed differs from the record.
@@ -55,6 +56,10 @@ STATUS of a decision
   oracle step); route_branch and sizing are reported apart.
 The gates are today's rules; a decision made under older code can differ
 because the rule changed (code_sha is in the report and the summary).
+The report also carries replay_code_sha (a hash of REPLAY_CODE_FILES) and
+replay_git (the git HEAD and whether any of those files is dirty), and
+replay_env_sha (the hash of the env-overridable config values in force,
+config_env; null if it can't be computed).
 
 Reads only, inside READ ONLY transactions. Writes the report file only.
 """
@@ -77,7 +82,7 @@ DEFAULT_OUT_DIR = REPO / "logs" / "helios3d"
 
 # Routing rows that end a routing attempt (crew._route_to_approval,
 # scan_guard), in the order they can occur.
-ROUTE_TERMINAL = ("ROUTE_APPROVAL_PENDING", "COOLDOWN_SKIPPED", "SELL_POSITION_UNREADABLE",
+ROUTE_TERMINAL = ("ROUTE_GUARD_UNREADABLE", "ROUTE_APPROVAL_PENDING", "COOLDOWN_SKIPPED", "SELL_POSITION_UNREADABLE",
                   "SELL_NO_POSITION", "CATALYST_BLOCKED", "EARNINGS_BLOCKED", "ROUTE_NO_NEW_FACT",
                   "ROUTE_RISK_INIT_FAILED", "ROUTE_NO_PRICE", "ROUTE_ZERO_SHARES",
                   "ROUTE_CONCENTRATION_ZERO", "ROUTE_MICRO_NAME_CAP", "ROUTE_NO_BROKER", "ROUTE_ERROR")
@@ -90,6 +95,15 @@ SIZING_CONFIG_KEYS = ("TIER_MAX_CONCURRENT_POSITIONS", "MAX_TRADE_PCT_OF_CASH_RE
 BUCKETS = ("Compounder", "Accelerator", "Moonshot")
 COMPARED = ("model_action", "model_conviction", "model_pass_to_risk", "final_action",
             "final_conviction", "final_pass_to_risk", "gate_kinds", "routed")
+# The code the replay output depends on, relative to REPO: the replay, the
+# modules it reads rules, config and record fields from (db for
+# _NON_ANALYST_SIGNALS and DEGRADED_SIGNAL_PREFIX, config, the limits module
+# behind sizing, the decision record), and the DB source's helpers.
+REPLAY_CODE_FILES = ("helios3d/replay/gates.py", "helios3d/replay/harness.py",
+                     "helios3d/replay/__main__.py", "db.py", "config.py",
+                     "helios3d/portfolio/limits.py", "helios3d/record/decision.py",
+                     "helios3d/features/store.py", "helios3d/record/labels.py",
+                     "helios3d/schema/conn.py", "config_env.py")
 # How long after the range end routing rows and next verdicts are read.
 ROUTE_LOOKAHEAD = timedelta(days=3)
 
@@ -139,12 +153,53 @@ def range_bounds(start: date, end: date) -> tuple[datetime, datetime]:
     return lo, hi
 
 
-def replay_code_sha() -> str:
-    """Hash of the replay code itself, so a report names the rules it ran."""
+def replay_code_sha(files=None) -> str:
+    """Hash of the code the replay output depends on (REPLAY_CODE_FILES), so
+    a report names the rules it ran. A file that can't be read is hashed as
+    its name and "missing". Never raises."""
     h = hashlib.sha256()
-    for name in ("gates.py", "harness.py"):
-        h.update((Path(__file__).parent / name).read_bytes())
+    for rel in (REPLAY_CODE_FILES if files is None else files):
+        h.update(rel.encode() + b"\0")
+        try:
+            h.update((REPO / rel).read_bytes())
+        except Exception:
+            h.update(b"missing")
+        h.update(b"\0")
     return h.hexdigest()[:12]
+
+
+def replay_env_sha() -> str | None:
+    """env_sha of the env-overridable config.py settings in this process
+    (config_env.env_record, the hash agents.analyst records as
+    config_env.env_sha): the live config values the replay reads that .env
+    can override and config.py's hash does not cover. None on failure;
+    never raises."""
+    try:
+        import config_env
+        sha = config_env.env_record().get("env_sha")
+        return sha if isinstance(sha, str) else None
+    except Exception:
+        return None
+
+
+def replay_git_state(files=None) -> dict:
+    """{"head": the repo's git HEAD, "dirty": whether any of REPLAY_CODE_FILES
+    differs from HEAD or is untracked}; None for a value git can't give.
+    Never raises."""
+    import subprocess
+    files = list(REPLAY_CODE_FILES if files is None else files)
+
+    def git(*args):
+        try:
+            p = subprocess.run(["git", "-C", str(REPO), *args], capture_output=True,
+                               text=True, timeout=5)
+            return p.stdout if p.returncode == 0 else None
+        except Exception:
+            return None
+    head = git("rev-parse", "HEAD")
+    status = git("status", "--porcelain", "--", *files)
+    return {"head": (head or "").strip() or None,
+            "dirty": None if status is None else bool(status.strip())}
 
 
 def _current_config(key, default=None):
@@ -365,6 +420,8 @@ def replay_one(rec: dict, sig: dict | None, approval: dict | None, route: dict,
     mo = dec.get("model_output")
     if not isinstance(mo, dict):
         return not_replayable("decision.model_output is not a JSON object")
+    if dec.get("parse_mode") == "salvaged":
+        return not_replayable("model output salvaged from malformed JSON (decision.parse_mode)")
     try:
         G.parse_model_output(mo)
     except Exception as e:
@@ -480,6 +537,7 @@ def build_report(start: date, end: date, records: list[dict], source_name: str,
                                   prev_lookup, portfolio_lookup, sizing_enabled))
     lo, hi = range_bounds(start, end)
     return {"format": REPLAY_FORMAT, "llm_mode": LLM_MODE, "replay_code_sha": replay_code_sha(),
+            "replay_git": replay_git_state(), "replay_env_sha": replay_env_sha(),
             "range": {"start": start.isoformat(), "end": end.isoformat(),
                       "from_utc": lo.isoformat(), "to_utc": hi.isoformat(), "calendar": "ET"},
             "record_source": source_name, "sizing_enabled": sizing_enabled,

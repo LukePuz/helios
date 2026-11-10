@@ -8,7 +8,10 @@ No model is called. Two sources, each optional:
   worker runs ``-c 1``, so pairing by worker name is unambiguous. Log times are
   the box's local time, America/New_York.
 * db: ``signals.provenance->'llm_call'->>'total_duration'`` (Ollama's own
-  figure, nanoseconds), written on every verdict that reached the model. Only
+  figure, nanoseconds), written on every verdict that reached the model. Routing
+  exit rows copy the verdict's provenance, llm_call included, and carry
+  ``decision.route_exit`` (``db._VERDICT_COPY_KEY``), so they are left out: one
+  call, one row. Only
   SELECTs run, inside a READ ONLY transaction that is rolled back.
 
 Output: median and p90 seconds per call, then a capacity table: how many calls,
@@ -109,6 +112,7 @@ SELECT (timestamp AT TIME ZONE 'America/New_York') AS ts_et,
        (provenance->'llm_call'->>'total_duration')::numeric AS total_ns
   FROM signals
  WHERE provenance ? 'llm_call'
+   AND NOT (COALESCE(decision, '{}'::jsonb) ? %s)
    AND provenance->'llm_call'->>'total_duration' IS NOT NULL
    AND timestamp >= %s::date AND timestamp < (%s::date + 1)
  ORDER BY timestamp
@@ -141,7 +145,7 @@ def read_db_calls(start: str, end: str, repo: str = DEFAULT_REPO) -> list[Call]:
     try:
         with conn.cursor() as cur:
             cur.execute("SET TRANSACTION READ ONLY")
-            cur.execute(DB_SQL, (start, end))
+            cur.execute(DB_SQL, (db._VERDICT_COPY_KEY, start, end))
             rows = cur.fetchall()
     finally:
         try:

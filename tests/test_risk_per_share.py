@@ -41,3 +41,20 @@ def test_a_failed_risk_computation_is_logged_at_warning(caplog):
                for r in caplog.records)
     kw = log_outcome.call_args.kwargs
     assert kw["planned_risk_per_share"] is None and kw["fill_risk_per_share"] is None
+
+
+def test_the_outcome_row_carries_imputed_fields():
+    """imputed_fields reaches trade_outcomes, so a stored default sub-score
+    can be told from one the model gave (professor 65f). Record only."""
+    approval = {**_approval(), "analyst_json": {"imputed_fields": ["catalyst_quality"]}}
+    with patch("db.log_trade_outcome", return_value=True) as log_outcome:
+        execution.log_buy_outcome(approval, "NVDA", "OPEN", 107.0)
+    assert log_outcome.call_args.kwargs["imputed_fields"] == ["catalyst_quality"]
+
+
+def test_imputed_fields_column_migration():
+    import db
+    sql = dict(db._MIGRATIONS)[86]
+    assert "trade_outcomes" in sql and "imputed_fields JSONB" in sql
+    src = open(db.__file__).read()
+    assert "fill_risk_per_share, imputed_fields) " in src

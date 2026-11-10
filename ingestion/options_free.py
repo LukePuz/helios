@@ -108,6 +108,47 @@ def _implied_move(calls, puts, underlying_quote, expiry, today) -> dict | None:
         return None
 
 
+_EXTRA_TARGET_DTE = 30
+
+
+def extra_expiry_moves(ticker: str, earnings_date, today) -> dict:
+    """Log-only (audit 2026-11-07 19:07 #4): the nearest expiry is 0-2 DTE
+    most days and ends before most prints, so it isn't the event move. This
+    prices two more ATM straddles: the first expiry after the next earnings
+    date (None when there is no date in the window) and the expiry whose
+    DTE is nearest 30. After, not on: earnings_calendar has no BMO/AMC
+    time, and an expiry on an after-close print's date ends before the
+    move (professor 68f). At most two option_chain calls, once per ticker per day.
+    Never raises."""
+    out = {"fetched": True, "earnings_date": None, "event_spanning": None, "dte30": None,
+           "rule": "event: first expiry > next earnings date (spans BMO and AMC); dte30: DTE nearest 30"}
+    try:
+        ed = date.fromisoformat(str(earnings_date)[:10]) if earnings_date else None
+        out["earnings_date"] = ed.isoformat() if ed else None
+        t = yf.Ticker(ticker)
+        exps = [date.fromisoformat(str(e)[:10]) for e in (t.options or [])]
+        if not exps:
+            out["error"] = "no_expirations"
+            return out
+        picks = {}
+        if ed is not None:
+            after = [e for e in exps if e > ed]
+            picks["event_spanning"] = after[0] if after else None
+        picks["dte30"] = min(exps, key=lambda e: (abs((e - today).days - _EXTRA_TARGET_DTE), e))
+        cache = {}
+        for name, exp in picks.items():
+            if exp is None:
+                continue
+            if exp not in cache:
+                chain = t.option_chain(exp.isoformat())
+                cache[exp] = _implied_move(chain.calls, chain.puts, getattr(chain, "underlying", None),
+                                           exp.isoformat(), today)
+            out[name] = cache[exp]
+    except Exception as e:
+        out["error"] = type(e).__name__
+    return out
+
+
 def get_flow_summary(ticker: str, implied_sink: dict | None = None) -> dict:
     """
     Free proxy for options_flow.get_flow_summary(). Uses call/put VOLUME

@@ -83,6 +83,41 @@ def test_db_rows_shift_to_call_start():
     ]
 
 
+def test_db_read_leaves_out_routing_rows_that_copy_llm_call(monkeypatch):
+    """A routing row copies its verdict's provenance (llm_call included), so
+    counting it would count one 72B call 2-3 times."""
+    import db
+    seen = []
+
+    class Cur:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=None):
+            seen.append((sql, params))
+
+        def fetchall(self):
+            return []
+
+    class Conn:
+        def cursor(self):
+            return Cur()
+
+        def rollback(self):
+            pass
+    monkeypatch.setattr(db, "_get_conn", lambda: Conn())
+    monkeypatch.setattr(db, "_put_conn", lambda c: None)
+    assert timing.read_db_calls("2026-11-01", "2026-11-02", repo="") == []
+    sql, params = seen[-1]
+    assert "NOT (COALESCE(decision, '{}'::jsonb) ? %s)" in sql and "signal NOT IN" not in sql
+    assert params == ("route_exit", "2026-11-01", "2026-11-02")
+    from agents import crew
+    assert db._VERDICT_COPY_KEY in crew._route_row_fields({"provenance": {"llm_call": {}}}, "X")["decision"]
+
+
 def test_report_and_cli_on_fixture_logs(tmp_path, capsys):
     (tmp_path / "celery_llm_worker.log").write_text(FIXTURE_LOG)
     rc = timing.main(["--source", "logs", "--logs-dir", str(tmp_path),

@@ -386,6 +386,9 @@ def send_daily_digest(
     halted: bool,
     ingestion_issues: list[str],
     atr_fallback_tickers: list[str] | None = None,
+    catalysts_label: str | None = None,
+    exits_text: list[str] | None = None,
+    book_text: list[str] | None = None,
 ) -> None:
     """
     Richer post-close digest — day P&L vs SPY, open positions with stop
@@ -413,9 +416,22 @@ def send_daily_digest(
     else:
         lines.append("\nNo open positions.")
 
+    if book_text:
+        lines.append("\n<b>Book:</b>")
+        lines.extend(f"  {b}" for b in book_text)
+
+    if exits_text:
+        lines.append("\n<b>Exits booked today:</b>")
+        lines.extend(f"  {x}" for x in exits_text[:10])
+        if len(exits_text) > 10:
+            lines.append(f"  +{len(exits_text) - 10} more")
+
     if catalysts_text:
-        lines.append("\n<b>Tomorrow's Catalysts:</b>")
+        label = catalysts_label or "Tomorrow's Catalysts"
+        lines.append(f"\n<b>{label}:</b>")
         lines.extend(f"  {c}" for c in catalysts_text[:10])
+        if len(catalysts_text) > 10:
+            lines.append(f"  +{len(catalysts_text) - 10} more")
 
     lines.append(f"\nPending approvals: {pending_count}")
 

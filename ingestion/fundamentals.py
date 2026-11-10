@@ -185,7 +185,7 @@ def get_peer_percentile(ticker: str, metric: str) -> float | None:
 _MAX_PEER_DISPERSION_RATIO = 8.0
 
 
-def get_sector_peer_median(ticker: str, metric: str) -> float | None:
+def get_sector_peer_median(ticker: str, metric: str, out: dict | None = None) -> float | None:
     """
     Median `metric` among watchlist tickers sharing `ticker`'s sector (per
     knowledge/watchlist.md), not the whole watchlist -- unlike
@@ -201,6 +201,10 @@ def get_sector_peer_median(ticker: str, metric: str) -> float | None:
     means there isn't a real, coherent comp set to derive a multiple from,
     and compute_fair_value falls back to the Street-consensus anchor
     alone rather than blending in a number this unreliable.
+
+    When `out` is a dict, out["peer_count"] is set to how many values the
+    median is taken over (the ticker's own value included) once the group
+    is known; the return value is the same either way.
     """
     import db
     from knowledge_loader import load_watchlist
@@ -213,6 +217,8 @@ def get_sector_peer_median(ticker: str, metric: str) -> float | None:
 
     sector_tickers = {t for t, e in watchlist.items() if e.get("sector") == sector}
     sector_values = sorted(r[metric] for r in rows if r["ticker"] in sector_tickers and r.get(metric) is not None)
+    if out is not None:
+        out["peer_count"] = len(sector_values)
     if len(sector_values) < 3:
         return None
 
@@ -238,7 +244,7 @@ def get_sector_peer_median(ticker: str, metric: str) -> float | None:
 _INDUSTRY_MIN_PEERS = 5
 
 
-def get_industry_peer_median(ticker: str, metric: str) -> float | None:
+def get_industry_peer_median(ticker: str, metric: str, out: dict | None = None) -> float | None:
     """
     Broadened Comps peer search (2026-09-13) -- groups by yfinance's own
     `industry` field (finer-grained than GICS sector, and works for ANY
@@ -255,6 +261,10 @@ def get_industry_peer_median(ticker: str, metric: str) -> float | None:
     Same fail-closed posture as get_sector_peer_median: returns None on
     <_INDUSTRY_MIN_PEERS members or >_MAX_PEER_DISPERSION_RATIO spread,
     never falls back to a less coherent grouping just to produce a number.
+
+    When `out` is a dict, out["peer_count"] is set to how many peer values
+    the median is taken over once the pool is known; the return value is
+    the same either way.
     """
     import db
 
@@ -271,6 +281,8 @@ def get_industry_peer_median(ticker: str, metric: str) -> float | None:
         if r["ticker"] != ticker and r.get("industry") == industry and r.get(metric) is not None
     ) + sorted(r[metric] for r in sp500_rows if r.get(metric) is not None)
     peer_values.sort()
+    if out is not None:
+        out["peer_count"] = len(peer_values)
 
     if len(peer_values) < _INDUSTRY_MIN_PEERS:
         return None

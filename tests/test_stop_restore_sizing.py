@@ -275,7 +275,7 @@ def _trim(reads, set_id_effect=None, record=90.0):
 def test_trim_re_place_is_floored_at_a_resting_trail():
     place, update, _, send = _trim([[_stp(103.0, qty=100.0)], []])
     place.assert_called_once_with("NVDA", 70.0, 103.0, market_price=120.0)
-    update.assert_called_once_with("NVDA", 103.0, 125.0, native_trail=False)
+    update.assert_called_once_with("NVDA", 103.0, 125.0, native_trail=False, strict=True)
     assert _sent(send, "UNPROTECTED") == 0
 
 
@@ -320,7 +320,7 @@ def _manual_sell(reads, set_id_effect=None, sell_effect=None):
 def test_manual_sell_re_place_is_floored_at_a_resting_trail():
     _, place, update, _, _ = _manual_sell([[_stp(104.0, qty=5.0)], []])
     place.assert_called_once_with("NVDA", 3.0, 104.0, market_price=110.0)
-    update.assert_called_once_with("NVDA", 104.0, 115.0, native_trail=False)
+    update.assert_called_once_with("NVDA", 104.0, 115.0, native_trail=False, strict=True)
 
 
 def test_manual_sell_re_place_with_a_failing_write_is_not_unprotected():
@@ -334,7 +334,7 @@ def test_manual_sell_failure_restores_at_the_resting_trail():
     _, place, update, _, _ = _manual_sell([[_stp(104.0, qty=5.0)], []],
                                           sell_effect=RuntimeError("rejected"))
     place.assert_called_once_with("NVDA", 5.0, 104.0)
-    update.assert_called_once_with("NVDA", 104.0, 115.0, native_trail=False)
+    update.assert_called_once_with("NVDA", 104.0, 115.0, native_trail=False, strict=True)
 
 
 def test_failed_sell_restore_is_floored_and_raises_the_record():
@@ -348,7 +348,7 @@ def test_failed_sell_restore_is_floored_and_raises_the_record():
          patch("alerts._send"):
         execution._restore_stop_after_failed_sell("NVDA", floor=95.0)
     place.assert_called_once_with("NVDA", 3.0, 95.0)
-    update.assert_called_once_with("NVDA", 95.0, 99.0, native_trail=False)
+    update.assert_called_once_with("NVDA", 95.0, 99.0, native_trail=False, strict=True)
 
 
 def test_floor_before_cancel_comes_from_the_pre_cancel_read_with_no_extra_read():

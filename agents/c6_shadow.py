@@ -262,26 +262,30 @@ def _sizing_block(sizing: dict) -> str:
 
 def _routing_blocks(ticker: str, action: str, conviction: int) -> list[str]:
     """crew._route_to_approval's checks before sizing, read-only, failing
-    the same way it does (open on an error, closed for earnings)."""
+    the same way it does (closed on an unreadable duplicate-buy guard for a
+    buy, as crew does since audit 11-06 21:36 #8; closed for earnings)."""
     import db
     out = []
     try:
-        if db.has_active_approval(ticker):
+        if db.has_active_approval(ticker, strict=True):
             out.append("active_approval")
     except SoftTimeLimitExceeded:
         raise
     except Exception:
-        pass
+        if action in ("OPEN", "ADD"):
+            out.append("guard_unreadable")
     try:
         from config import REBUY_COOLDOWN_HOURS
     except ImportError:
         REBUY_COOLDOWN_HOURS = 4
     try:
-        prior = db.get_last_executed_approval(ticker, REBUY_COOLDOWN_HOURS)
+        prior = db.get_last_executed_approval(ticker, REBUY_COOLDOWN_HOURS, strict=True)
     except SoftTimeLimitExceeded:
         raise
     except Exception:
         prior = None
+        if action in ("OPEN", "ADD") and "guard_unreadable" not in out:
+            out.append("guard_unreadable")
     if prior and conviction <= prior["conviction"]:
         out.append("rebuy_cooldown")
     try:

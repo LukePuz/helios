@@ -43,15 +43,56 @@ def _clean(value: str) -> str | None:
     return None if value.strip().lower() in ("", "nan", "none") else value.strip()
 
 
+# Log-only, per poll (audit 2026-11-07 03:08 #5, as news.py's _FEED_STATS):
+# a fetch failure was a debug line returning [], and yfinance can answer a
+# block with an empty frame, so a dead feed looked like a quiet one. Tickers
+# polled, failures (with the first error), empty frames, rows inside the
+# lookback window, and items returned.
+_STATS: dict = {}
+
+
+def _reset_stats() -> None:
+    _STATS.clear()
+    _STATS.update({"tickers": 0, "failed": 0, "empty": 0, "recent": 0, "returned": 0,
+                   "first_error": None})
+
+
+def _log_stats() -> None:
+    """One INFO line per poll, and a WARNING when every ticker failed or
+    every frame was empty. Never raises."""
+    try:
+        st = _STATS
+        if not st.get("tickers"):
+            return
+        log.info(f"Analyst ratings this poll (log-only): tickers {st['tickers']} failed {st['failed']} "
+                 f"empty {st['empty']} recent {st['recent']} returned {st['returned']}")
+        if st["failed"] == st["tickers"]:
+            log.warning(f"Analyst ratings feed failed for all {st['tickers']} ticker(s) this poll "
+                        f"(first: {st['first_error']})")
+        elif st["failed"] + st["empty"] == st["tickers"]:
+            log.warning(f"Analyst ratings feed read no rows for any of {st['tickers']} ticker(s) "
+                        f"this poll ({st['failed']} failed)")
+    except Exception as e:
+        log.debug(f"analyst ratings stats failed: {e}")
+
+
+_reset_stats()
+
+
 def _fetch_for_ticker(ticker: str) -> list[dict]:
+    _STATS["tickers"] = _STATS.get("tickers", 0) + 1
     try:
         import yfinance as yf
         df = yf.Ticker(ticker).upgrades_downgrades
     except Exception as e:
         log.debug(f"[{ticker}] upgrades_downgrades fetch failed: {e}")
+        _STATS["failed"] = _STATS.get("failed", 0) + 1
+        if _STATS.get("first_error") is None:
+            _STATS["first_error"] = f"{ticker}: {type(e).__name__}: {str(e)[:120]}"
         return []
 
     if df is None or df.empty:
+        _STATS["empty"] = _STATS.get("empty", 0) + 1
         return []
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=_LOOKBACK_DAYS)
@@ -63,6 +104,7 @@ def _fetch_for_ticker(ticker: str) -> list[dict]:
             grade_dt = grade_date
         if grade_dt < cutoff:
             continue  # yfinance returns full history — only recent rows are new information
+        _STATS["recent"] = _STATS.get("recent", 0) + 1
 
         firm       = str(row.get("Firm", "")).strip()
         to_grade   = str(row.get("ToGrade", "")).strip()
@@ -101,6 +143,7 @@ def _fetch_for_ticker(ticker: str) -> list[dict]:
                        "pt_action": _clean(pt_action)},
             "_seen_keys": [(_SOURCE, item_id)],
         })
+    _STATS["returned"] = _STATS.get("returned", 0) + len(results)
     return results
 
 
@@ -112,11 +155,17 @@ def poll_once() -> list[dict]:
     # ERROR for each one on every poll (2026-10-28).
     etfs = get_etf_tickers()
     all_items = []
-    for ticker in get_all_tickers():
-        if ticker in etfs:
-            continue
-        all_items.extend(_fetch_for_ticker(ticker))
-        time.sleep(0.15)  # be polite to Yahoo's unofficial endpoint
+    _reset_stats()
+    try:
+        for ticker in get_all_tickers():
+            if ticker in etfs:
+                continue
+            all_items.extend(_fetch_for_ticker(ticker))
+            time.sleep(0.15)  # be polite to Yahoo's unofficial endpoint
+    finally:
+        # Logged when a ticker's rows raise too, so every poll has its
+        # stats line (SEF 148, 09fe1e0).
+        _log_stats()
     return all_items
 
 

@@ -66,7 +66,7 @@ class FakeOrders:
         return True
 
     def update_order_fill(self, order_id, fill_price, filled_qty, status,
-                          expect_filled_qty=None, filled_at=None):
+                          expect_filled_qty=None, filled_at=None, filled_at_source=None):
         r = self.rows[order_id]
         if expect_filled_qty is not None and (
                 r["status"] not in ("unconfirmed", "partial")
@@ -78,7 +78,8 @@ class FakeOrders:
             r["reconcile_note"] = None
         return True
 
-    def mark_submitted_order_fill(self, order_id, fill_price, filled_qty, status, filled_at=None):
+    def mark_submitted_order_fill(self, order_id, fill_price, filled_qty, status, filled_at=None,
+                                  filled_at_source=None):
         """Same as the SQL: only while 'submitted'; rows updated."""
         r = self.rows[order_id]
         if r["status"] != "submitted":
@@ -122,9 +123,10 @@ class FakeOrders:
 
     # position_stops and trade_outcomes, as far as these paths use them
     def upsert_position_stop(self, ticker, entry_price, stop_price, stop_method, bucket,
-                             conviction, trail_distance_pct=None):
+                             conviction, trail_distance_pct=None, entry_price_source=None):
         self.events.append("stop_record")
         self.stops[ticker] = {"entry_price": float(entry_price), "stop_price": float(stop_price),
+                              "entry_price_source": entry_price_source,
                               "stop_method": stop_method, "thesis_bucket": bucket,
                               "conviction": conviction, "trailing_active": False,
                               "profit_target_taken": False,
@@ -1462,7 +1464,7 @@ def test_trade_pending_sql():
         assert db.mark_submitted_order_fill(4, 10.0, 3.0, "filled") == 1
     sql, params = cur.execute.call_args.args
     assert ", reconcile_note=%s," in sql and sql.endswith("WHERE id=%s AND status='submitted'")
-    assert params[5] == db.TRADE_PENDING_NOTE
+    assert params[-2] == db.TRADE_PENDING_NOTE
     with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
         assert db.update_order_fill(4, 10.0, 3.0, "filled") is True
     assert "NULLIF(reconcile_note, %s)" in cur.execute.call_args.args[0]   # reconcile's own write
@@ -1817,7 +1819,7 @@ def test_an_add_recovered_through_the_guard_keeps_the_record_and_only_covers():
             tasks._recover_trade_pending_orders()
     assert [t["quantity"] for t in fake.trades] == [3.0]
     assert fake.stops["ZZZ"] == record
-    held.assert_called_once_with("ZZZ", 3.0, "ADD")
+    held.assert_called_once_with("ZZZ", 3.0, "ADD", seen={})
     reprotect.assert_called_once_with("ZZZ", {}, None, from_queue=True)
     stop.assert_not_called()
 
@@ -1932,7 +1934,7 @@ def test_stale_trade_pending_sql_includes_the_stop_done_note():
     with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
         db.get_stale_trade_pending_orders(10)
     sql, params = cur.execute.call_args.args
-    assert "reconcile_note IN (%s, %s)" in sql and ", reconcile_note " in sql
+    assert "reconcile_note IN (%s, %s)" in sql and ", reconcile_note, filled_at_source " in sql
     assert params == (db.TRADE_PENDING_NOTE, db.TRADE_PENDING_STOP_DONE_NOTE, db.TRADING_ENV, 10)
 
 

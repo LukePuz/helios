@@ -199,6 +199,10 @@ def test_one_row_per_ticker_per_day_after_0945():
     amd = by["AMD"][4]
     assert amd["held"] is False and "stop_distance_pct" not in amd
     assert "implied_move_over_stop" not in amd
+    # Extra expiries (audit 2026-11-07 19:07 #4): held names only here, as
+    # the earnings read fails closed to {} without a DB.
+    assert extra["extra_expiries"] == {"fetched": True, "stub": True, "earnings_window_days": 14}
+    assert amd["extra_expiries"]["fetched"] is False
 
     book = json.loads(next(iter(fake.state.values())))
     assert book["NVDA"]["logged_et_date"] == "2026-11-04"
@@ -262,7 +266,7 @@ def test_poll_options_flow_shadow_failure_does_not_change_dispatch():
         return summaries
 
     with patch("market_data._is_market_hours", return_value=True), \
-            patch.dict("os.environ", {"UNUSUAL_WHALES_API_KEY": "your_key_here"}), \
+            patch("ingestion.options_flow._KEY_CONFIGURED", False), \
             patch("ingestion.options_free.get_all_flow_summaries", side_effect=fake_all), \
             patch("db.is_seen", return_value=False), patch("db.mark_seen"), \
             patch("db.get_state_strict", side_effect=RuntimeError("db down")), \
@@ -270,3 +274,23 @@ def test_poll_options_flow_shadow_failure_does_not_change_dispatch():
         tasks.poll_options_flow.run()
     disp.assert_called_once()
     hb.assert_called_once_with("options_flow", 1)
+
+
+def test_poll_uses_the_options_flow_key_test_so_an_empty_key_takes_the_free_path():
+    """Audit 2026-11-07 05:07 #6: tasks tested only startswith("your_"), so an
+    empty key took the paid path and the implied-move shadow went off."""
+    import importlib
+    from ingestion import options_flow
+    with patch.dict("os.environ", {"UNUSUAL_WHALES_API_KEY": ""}):
+        assert importlib.reload(options_flow)._KEY_CONFIGURED is False
+    importlib.reload(options_flow)
+    with patch("market_data._is_market_hours", return_value=True), \
+            patch("ingestion.options_flow._KEY_CONFIGURED", False), \
+            patch("ingestion.options_free.get_all_flow_summaries", return_value={}) as free, \
+            patch("ingestion.options_flow.get_all_flow_summaries") as paid, \
+            patch("tasks._heartbeat_ok"):
+        tasks.poll_options_flow.run()
+    free.assert_called_once()
+    paid.assert_not_called()
+    assert "implied_sink" in free.call_args.kwargs
+

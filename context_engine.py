@@ -114,6 +114,30 @@ def _catalyst_calendar_section(ticker: str) -> str:
         return ""
 
 
+# Why the last POSITION CONTEXT build for a ticker in this process came out
+# as it did (record-only, audit 11-06 23:24 #10): ticker -> (status, monotonic
+# time). The brief is unchanged; the analyst's provenance reads it.
+_POSITION_CONTEXT_STATUS: dict = {}
+_POSITION_CONTEXT_STATUS_TTL_S = 600
+
+
+def _note_position_context(ticker: str, status: str) -> None:
+    import time
+    _POSITION_CONTEXT_STATUS[ticker] = (status, time.monotonic())
+
+
+def position_context_status(ticker: str) -> str | None:
+    """off, not_held, shown, shown_partial:<Type> (theses and verdicts
+    unreadable) or error:<Type> for this ticker's POSITION CONTEXT in the
+    last brief built in this process within 10 min; None if none (each brief
+    build clears it first)."""
+    import time
+    hit = _POSITION_CONTEXT_STATUS.get(ticker)
+    if hit and time.monotonic() - hit[1] < _POSITION_CONTEXT_STATUS_TTL_S:
+        return hit[0]
+    return None
+
+
 def _position_context_section(ticker: str, price: float | None = None) -> str:
     """For a held ticker: entry, stop, days held, profit-target state, the
     thesis at entry and the latest one, and the last three verdicts. The brief
@@ -123,45 +147,65 @@ def _position_context_section(ticker: str, price: float | None = None) -> str:
     Off unless config.BRIEF_POSITION_CONTEXT (Luke's call, Q35)."""
     import config
     if not config.BRIEF_POSITION_CONTEXT:
+        _note_position_context(ticker, "off")
         return ""
     try:
         import db
-        stop = db.get_position_stop(ticker)
+        # Strict: a DB error used to read as "not held", dropping the
+        # section silently (audit 11-06 23:24 #10). The brief still omits
+        # it; the status says why.
+        stop = db.get_position_stop(ticker, strict=True)
         if not stop:
+            _note_position_context(ticker, "not_held")
             return ""
-        ctx = db.get_position_context(ticker)
     except Exception as e:
-        log.debug(f"[{ticker}] position context unavailable: {e}")
+        log.warning(f"[{ticker}] position context unavailable: {e}")
+        _note_position_context(ticker, f"error:{type(e).__name__}")
         return ""
-    from datetime import datetime, timezone
-    lines = [f"=== POSITION CONTEXT — {ticker} (held) ==="]
-    entry, sp = stop.get("entry_price"), stop.get("stop_price")
-    line = f"Entry ${entry:.2f}; protective stop ${sp:.2f}"
-    if price and sp:
-        line += f" ({(sp - price) / price:+.1%} from current price)"
-    if stop.get("stop_method"):
-        line += f" [{stop['stop_method']}]"
-    lines.append(line)
-    if stop.get("opened_at"):
-        days = (datetime.now(timezone.utc) - stop["opened_at"]).days
-        lines.append(f"Held {days} days; bucket {stop.get('thesis_bucket') or 'n/a'}; "
-                     f"conviction at entry {stop.get('conviction') or 'n/a'}; "
-                     f"trailing stop {'active' if stop.get('trailing_active') else 'not active'}; "
-                     f"profit target {'already taken' if ctx.get('profit_target_taken') else 'not taken'}")
+    ctx_status = "shown"
+    try:
+        ctx = db.get_position_context(ticker, strict=True)
+    except Exception as e:
+        # The stop line still shows; the theses and verdicts are missing, as
+        # before. The status says so (professor 62x).
+        log.warning(f"[{ticker}] position context: thesis/verdict read failed: {e}")
+        ctx, ctx_status = {}, f"shown_partial:{type(e).__name__}"
+    try:
+        from datetime import datetime, timezone
+        lines = [f"=== POSITION CONTEXT — {ticker} (held) ==="]
+        entry, sp = stop.get("entry_price"), stop.get("stop_price")
+        line = f"Entry ${entry:.2f}; protective stop ${sp:.2f}"
+        if price and sp:
+            line += f" ({(sp - price) / price:+.1%} from current price)"
+        if stop.get("stop_method"):
+            line += f" [{stop['stop_method']}]"
+        lines.append(line)
+        if stop.get("opened_at"):
+            days = (datetime.now(timezone.utc) - stop["opened_at"]).days
+            lines.append(f"Held {days} days; bucket {stop.get('thesis_bucket') or 'n/a'}; "
+                         f"conviction at entry {stop.get('conviction') or 'n/a'}; "
+                         f"trailing stop {'active' if stop.get('trailing_active') else 'not active'}; "
+                         f"profit target {'already taken' if ctx.get('profit_target_taken') else 'not taken'}")
 
-    def _thesis(t):
-        if not isinstance(t, dict):
-            return None
-        return t.get("thesis_summary") or t.get("summary") or t.get("reasoning")
+        def _thesis(t):
+            if not isinstance(t, dict):
+                return None
+            return t.get("thesis_summary") or t.get("summary") or t.get("reasoning")
 
-    if _thesis(ctx.get("original_thesis")):
-        lines.append(f"Thesis at entry: {_thesis(ctx['original_thesis'])[:300]}")
-    if _thesis(ctx.get("latest_thesis")):
-        lines.append(f"Latest thesis ({str(ctx.get('thesis_updated_at') or '')[:10]}): "
-                     f"{_thesis(ctx['latest_thesis'])[:300]}")
-    if ctx.get("recent_verdicts"):
-        lines.append("Recent verdicts: " + "; ".join(
-            f"{str(v['timestamp'])[:10]} {v['signal']} c{v['conviction']}" for v in ctx["recent_verdicts"]))
+        if _thesis(ctx.get("original_thesis")):
+            lines.append(f"Thesis at entry: {_thesis(ctx['original_thesis'])[:300]}")
+        if _thesis(ctx.get("latest_thesis")):
+            lines.append(f"Latest thesis ({str(ctx.get('thesis_updated_at') or '')[:10]}): "
+                         f"{_thesis(ctx['latest_thesis'])[:300]}")
+        if ctx.get("recent_verdicts"):
+            lines.append("Recent verdicts: " + "; ".join(
+                f"{str(v['timestamp'])[:10]} {v['signal']} c{v['conviction']}" for v in ctx["recent_verdicts"]))
+    except Exception as e:
+        # Raised as before (a null entry or stop price fails the format);
+        # the status records it first (SEF 146j).
+        _note_position_context(ticker, f"error:{type(e).__name__}")
+        raise
+    _note_position_context(ticker, ctx_status)
     return "\n".join(lines)
 
 
@@ -225,6 +269,68 @@ def _price_structure_section(ticker: str, price: float | None = None) -> str:
     except Exception as e:
         log.debug(f"[{ticker}] trade ladder unavailable: {e}")
     return "\n".join(lines) if len(lines) > 1 else ""
+
+
+def _price_history_section(ticker: str, price: float | None = None) -> str:
+    """The price path itself, so the model can judge the pattern (Luke,
+    2026-11-08: "it should be able to see the price history and evaluate
+    the pattern"): the last 10 daily closes with their moves, 26 weekly
+    closes, today's move against the last close, the distance from the
+    20-day and 52-week highs and from the 52-week low, and the last
+    session's volume against its 20-day average. From the nightly
+    price_history cache (completed sessions) plus the brief price. Off
+    unless config.BRIEF_PRICE_HISTORY. Never raises."""
+    import config
+    if not config.BRIEF_PRICE_HISTORY:
+        return ""
+    try:
+        import db
+        bars = db.get_price_history(ticker, days=260)
+    except Exception as e:
+        log.debug(f"[{ticker}] price history unavailable: {e}")
+        return ""
+    bars = [b for b in bars or [] if b.get("close")]
+    if len(bars) < 2:
+        return ""
+    lines = [f"=== PRICE HISTORY — {ticker} (daily closes, oldest first) ==="]
+    last10 = bars[-11:]
+    cells = []
+    for prev, b in zip(last10, last10[1:]):
+        chg = (b["close"] / prev["close"] - 1) * 100 if prev["close"] else 0.0
+        cells.append(f"{b['date']} ${b['close']:.2f} ({chg:+.1f}%)")
+    lines.append("Last sessions: " + "; ".join(cells))
+    weekly: dict = {}
+    from datetime import date as _date
+    for b in bars:
+        try:
+            y, w, _ = _date.fromisoformat(str(b["date"])[:10]).isocalendar()
+        except ValueError:
+            continue
+        weekly[(y, w)] = b["close"]
+    wk = list(weekly.values())[-26:]
+    if len(wk) >= 4:
+        lines.append(f"Weekly closes, last {len(wk)} weeks: " + ", ".join(f"${c:.2f}" for c in wk))
+    last = bars[-1]["close"]
+    ref = price or last
+    if price and last:
+        lines.append(f"Now: ${price:.2f} ({(price / last - 1) * 100:+.1f}% vs the last close "
+                     f"${last:.2f} on {bars[-1]['date']})")
+    hi20 = max(bars[-20:], key=lambda b: b["high"] or 0)
+    hi52 = max(bars, key=lambda b: b["high"] or 0)
+    lo52 = min(bars, key=lambda b: b["low"] or float("inf"))
+    span = f"{len(bars)}-session" if len(bars) < 250 else "52-week"
+    if hi20["high"] and hi52["high"] and lo52["low"]:
+        lines.append(f"From the 20-day high (${hi20['high']:.2f} on {hi20['date']}): "
+                     f"{(ref / hi20['high'] - 1) * 100:+.1f}%; from the {span} high "
+                     f"(${hi52['high']:.2f} on {hi52['date']}): {(ref / hi52['high'] - 1) * 100:+.1f}%; "
+                     f"from the {span} low (${lo52['low']:.2f} on {lo52['date']}): "
+                     f"{(ref / lo52['low'] - 1) * 100:+.1f}%")
+    vols = [b["volume"] for b in bars[-21:-1] if b.get("volume")]
+    if vols and bars[-1].get("volume"):
+        avg = sum(vols) / len(vols)
+        if avg:
+            lines.append(f"Volume, last session: {bars[-1]['volume'] / avg:.1f}x its 20-day average")
+    return "\n".join(lines)
 
 
 def _fundamentals_section(ticker: str) -> str:
@@ -332,6 +438,7 @@ def assemble_brief(
     """
     now = datetime.now(ET).strftime("%A %B %d, %Y %I:%M %p ET")
     ticker = event.get("ticker", "UNKNOWN")
+    _POSITION_CONTEXT_STATUS.pop(ticker, None)   # this brief's status only (62x)
     sections = []
 
     price_line = (
@@ -425,6 +532,10 @@ Event Title: {event.get('title', 'N/A')}
     if price_section:
         sections.append(price_section)
 
+    history_section = _price_history_section(ticker, current_price)
+    if history_section:
+        sections.append(history_section)
+
     fund_section = _fundamentals_section(ticker)
     if fund_section:
         sections.append(fund_section)
@@ -488,6 +599,7 @@ def build_scan_brief(
     current_price: see assemble_brief's docstring — same fix, same reason
     (a ticker not already held had no price anchor anywhere in the prompt).
     """
+    _POSITION_CONTEXT_STATUS.pop(ticker, None)   # this brief's status only (62x)
     positions = positions or {}
     now = datetime.now(ET).strftime("%A %B %d, %Y %I:%M %p ET")
     price_line = (
@@ -568,6 +680,10 @@ Ticker: {ticker}
     price_section = _price_structure_section(ticker, current_price)
     if price_section:
         sections.append(price_section)
+
+    history_section = _price_history_section(ticker, current_price)
+    if history_section:
+        sections.append(history_section)
 
     fund_section = _fundamentals_section(ticker)
     if fund_section:

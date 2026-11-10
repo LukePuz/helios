@@ -89,6 +89,73 @@ class TestBarTimeParsing:
         assert q["is_stale"] is True
 
 
+class TestPriceSource:
+    """price_source records which bars the price came from; the stale
+    verdict and the age are the same as without it."""
+
+    def _quote(self, minute_bars, daily_bars, market_open=True):
+        def bars(ticker, duration, bar_size, **kw):
+            return minute_bars if bar_size == "1 min" else daily_bars
+        with patch("market_data.get_historical_bars", side_effect=bars) as gh, \
+             patch("market_data._is_market_hours", return_value=market_open):
+            return market_data.get_priced_quote("AAPL"), gh
+
+    def _fresh_raw(self, minutes=1):
+        t = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).astimezone(
+            timezone(timedelta(hours=-4)))
+        raw = t.strftime("%Y-%m-%d %H:%M:%S%z")
+        return raw[:-2] + ":" + raw[-2:]
+
+    def test_one_minute_bars(self):
+        q, gh = self._quote(_bars(self._fresh_raw(), 101.0), _bars("2026-07-28", 99.0))
+        assert q["price_source"] == "1min" and q["price"] == 101.0
+        assert q["is_stale"] is False
+        assert gh.call_count == 1
+
+    def test_daily_fallback_when_no_minute_bars(self):
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        q, gh = self._quote([], _bars(today, 99.0))
+        assert q["price_source"] == "daily_fallback" and q["price"] == 99.0
+        assert gh.call_count == 2
+        assert gh.call_args_list[1].kwargs["bar_size"] == "1 day"
+
+    def test_no_bars_at_all_is_still_none(self):
+        q, _ = self._quote([], [])
+        assert q is None
+
+    @pytest.mark.parametrize("raw_fn, market_open", [
+        (lambda s: s._fresh_raw(1), True),
+        (lambda s: s._fresh_raw(1), False),
+        (lambda s: s._fresh_raw(180), True),
+        (lambda s: datetime.now(timezone.utc).strftime("%Y-%m-%d"), True),
+        (lambda s: (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d"), True),
+        (lambda s: "garbage-not-a-date", True),
+    ])
+    def test_stale_verdict_and_age_do_not_depend_on_the_source(self, raw_fn, market_open):
+        """The same bar gives the same is_stale, age and market_open whether
+        it came from the 1-min or the daily request."""
+        raw = raw_fn(self)
+        via_min, _ = self._quote(_bars(raw), [], market_open)
+        via_day, _ = self._quote([], _bars(raw), market_open)
+        assert (via_min["price_source"], via_day["price_source"]) == ("1min", "daily_fallback")
+        for k in ("price", "bar_time", "is_stale", "market_open"):
+            assert via_min[k] == via_day[k], k
+        if via_min["age_minutes"] is None:
+            assert via_day["age_minutes"] is None
+        else:
+            assert abs(via_min["age_minutes"] - via_day["age_minutes"]) <= 0.2
+
+    def test_date_only_daily_bar_is_stale_during_rth(self):
+        """The fallback's date-only bar is aged from midnight UTC: stale
+        whenever it is more than STALE_AFTER_MINUTES past midnight UTC.
+        Unchanged; recorded here with its source."""
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+        q, _ = self._quote([], _bars(yesterday))
+        assert q["price_source"] == "daily_fallback" and q["is_stale"] is True
+        assert set(q) == {"price", "bar_time", "age_minutes", "is_stale", "market_open",
+                          "price_source"}
+
+
 def _daily_intraday(prior_close, opens_and_closes):
     """opens_and_closes: list of (open, close) tuples, one per 1-min bar,
     in order since the open -- lets a test describe a price path cheaply."""

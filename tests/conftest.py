@@ -122,6 +122,46 @@ def _no_real_telegram(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_extra_option_chains(monkeypatch):
+    """The options shadow prices extra expiries over the network (yfinance):
+    stubbed unless a test patches it itself."""
+    from ingestion import options_free
+    monkeypatch.setattr(options_free, "extra_expiry_moves",
+                        lambda ticker, earnings_date, today: {"fetched": True, "stub": True})
+
+
+@pytest.fixture(autouse=True)
+def _no_earnings_dates_fetch(monkeypatch):
+    """Earnings reviews read yfinance's earnings_dates for BMO/AMC: no
+    network in tests."""
+    from agents import crew
+    monkeypatch.setattr(crew, "_fetch_earnings_dates", lambda ticker: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_boot_notice(monkeypatch, request):
+    """watchdog.main() sends a once-per-boot Telegram notice from the real
+    journal and writes logs/.watchdog_boot_id: stubbed except in its own
+    tests. The watchdog loads as "watchdog" or "deploy.watchdog"."""
+    import sys
+    if request.module.__name__.endswith("test_watchdog_boot_notice"):
+        return
+    for name in ("watchdog", "deploy.watchdog"):
+        mod = sys.modules.get(name)
+        if mod is not None and hasattr(mod, "_send_boot_notice"):
+            monkeypatch.setattr(mod, "_send_boot_notice", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_vix(monkeypatch):
+    """Verdict provenance reads live ^VIX from Redis (cache_live_vix fetches
+    it from yfinance): no network or Redis in tests."""
+    from agents import analyst, market_regime
+    monkeypatch.setattr(market_regime, "get_intraday_vix", lambda: None)
+    monkeypatch.setattr(analyst, "_vix_cache_get", lambda: None)
+
+
+@pytest.fixture(autouse=True)
 def _no_kombu_publish(monkeypatch):
     """Backstop for the send_task trap: any message published through kombu
     (control broadcasts, a second app, a raw Producer) fails the test."""
@@ -353,3 +393,14 @@ def _new_fact_gate_off(monkeypatch):
     Its own tests patch config.BUY_REQUIRES_NEW_FACT back on."""
     import config
     monkeypatch.setattr(config, "BUY_REQUIRES_NEW_FACT", False)
+
+
+@pytest.fixture(autouse=True)
+def _clear_qualified_contracts():
+    """ibkr._stock caches qualified contracts per process; keep tests apart."""
+    try:
+        import ibkr
+        ibkr._QUALIFIED.clear()
+    except Exception:
+        pass
+    yield

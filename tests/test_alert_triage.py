@@ -40,6 +40,22 @@ def test_second_run_reads_only_new_rows_and_known_types_are_not_new(tmp_path, ca
     assert rc == 0 and "1 new alert row(s)" in out and "NEW" not in out
 
 
+def test_baseline_marks_types_known_and_exits_0(tmp_path, capsys):
+    _write(tmp_path, "🚨 SHORT POSITION — AAPL")
+    rc, _ = _run(tmp_path, "--baseline", capsys=capsys)
+    assert rc == 0
+    _write(tmp_path, "🚨 SHORT POSITION — AAPL")
+    rc, out = _run(tmp_path, capsys=capsys)
+    assert rc == 0 and "NEW" not in out
+
+
+def test_baseline_with_no_advance_is_rejected(tmp_path, capsys):
+    import pytest
+    with pytest.raises(SystemExit) as e:
+        _run(tmp_path, "--baseline", "--no-advance", capsys=capsys)
+    assert e.value.code == 2
+
+
 def test_no_advance_leaves_the_cursor(tmp_path, capsys):
     _write(tmp_path, "🚨 SHORT POSITION — AAPL")
     _run(tmp_path, "--no-advance", capsys=capsys)

@@ -27,3 +27,26 @@ def test_alert_names_the_bar_date_and_flags_stale_bars():
         tasks.run_candidate_scan.run()
     text = send.call_args[0][0]
     assert "median 12 weekdays old, 75% of tickers stale (newest 2026-10-30)" in text and "STALE" in text
+
+
+def test_scan_reports_its_funnel_before_the_cap():
+    """Audit 11-07 01:08 #4: the cap, not the threshold, decided every run."""
+    bars = [{"date": f"2026-10-{d:02d}", "close": 1.0} for d in range(1, 31)] * 3
+    cons = {f"T{i}": {"company": "c", "gics_sector": "s", "gics_sub_industry": "x"} for i in range(5)}
+    cons["SHORT"] = {"company": "c", "gics_sector": "s", "gics_sub_industry": "x"}
+    hist = {**{f"T{i}": bars for i in range(5)}, "SHORT": bars[:10]}
+    moves = iter([(30, "m"), (30, "m"), (30, "m"), (5, "m"), (30, "m")])
+    with patch("agents.candidate_scanner.seed_thesis_collection"), \
+         patch("knowledge_loader.get_all_tickers", return_value=["WL1", "T9"]), \
+         patch("ingestion.sp500_universe.get_sp500_constituents", return_value=cons), \
+         patch("db.get_price_history_bulk", return_value=hist), \
+         patch("agents.candidate_scanner._score_movement", side_effect=lambda t, b: next(moves)), \
+         patch("agents.candidate_scanner._score_thesis_match", return_value=(20, "t", "x")), \
+         patch("db.log_watchlist_candidate"), patch("db.log_activity") as act:
+        out = cs.run_candidate_scan(min_composite_score=40, max_results=2)
+    stage, _, _, _, extra = act.call_args.args
+    assert stage == "candidate_scan_funnel" and extra["cap"] == 2 and extra["above_threshold"] == 4
+    f = out["funnel"]
+    assert (f["screened"], f["short_history"], f["below_movement"], f["scored"]) == (6, 1, 1, 4)
+    assert (f["above_threshold"], f["returned"]) == (4, 2)
+    assert f["watchlist_outside_universe"] == 2

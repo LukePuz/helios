@@ -59,7 +59,10 @@ def test_revoked_handler(task, expired, reason):
     assert d["task"] == task.name and d["reason"] == reason
     assert d["title"] == _EVENT["title"] and d["url"] == _EVENT["url"] and d["item_id"] == _EVENT["url"]
     assert "error_class" not in d and "text" not in d
-    assert row.kwargs.get("provenance") is None
+    from agents.analyst import _CODE_SHA
+    prov = row.kwargs["provenance"]
+    assert set(prov) == {"code_sha", "env_sha", "lib_versions"}
+    assert prov["code_sha"] == _CODE_SHA.get("code_sha")
 
 
 def test_revoked_handler_ignores_other_tasks():
@@ -91,7 +94,7 @@ def test_handlers_never_raise():
 
 
 def test_kinds_are_not_verdicts():
-    for kind in ("SCREENED_IN", "EVENT_LOST"):
+    for kind in ("SCREENED_IN", "EVENT_LOST", "REVIEW_SKIPPED"):
         assert kind in db._NON_ANALYST_SIGNALS and kind in db._RECORD_ONLY_SIGNALS
         assert kind not in harness.ROUTE_KINDS
 
@@ -202,6 +205,7 @@ def test_task_running_at_a_kill_is_logged_at_the_next_boot(task, monkeypatch):
     assert d["task"] == task.name and d["reason"] == "worker_shutdown"
     assert d["title"] == _EVENT["title"] and d["url"] == _EVENT["url"]
     assert d["started_at"] and "error_class" not in d
+    assert "code_sha" in row.kwargs["provenance"]             # the booting code's
     assert not _running_keys()
 
 
@@ -291,3 +295,22 @@ def test_marker_handlers_never_raise(monkeypatch):
     _start(tasks.screen_event, "t1")
     tasks._on_event_task_end(sender=tasks.screen_event, task_id="t1")
     _boot()
+
+
+def test_positions_unavailable_writes_event_lost_and_still_skips():
+    from unittest.mock import MagicMock
+    with patch("ibkr.IBKRClient", return_value=MagicMock()), \
+         patch("agents.crew._get_positions", return_value=None), \
+         patch("agents.market_regime.get_cached_regime", return_value={"regime": "Neutral"}), \
+         patch("agents.analyst.analyze") as analyze, \
+         patch("agents.crew._route_guarded") as route, \
+         patch("db.log_signal") as log_signal:
+        result = crew.deep_analyze(dict(_EVENT), {"relevant": True})
+    assert result["action"] == "SKIP" and result["pass_to_risk"] is False
+    analyze.assert_not_called()
+    route.assert_not_called()
+    (row,) = _rows(log_signal, "EVENT_LOST")
+    assert row.args[0] == "NVDA"
+    d = row.kwargs["decision"]
+    assert d["task"] == "tasks.deep_analyze_event" and d["reason"] == "positions_unavailable"
+    assert d["title"] == _EVENT["title"] and d["item_id"] == _EVENT["url"] and "text" not in d

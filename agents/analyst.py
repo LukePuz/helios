@@ -53,6 +53,15 @@ _SUBSCORE_LABELS = {
 }
 
 
+def _track_record_since() -> str | None:
+    """The track record's date bound, for provenance (professor C35)."""
+    try:
+        import db
+        return db.track_record_since()
+    except Exception:
+        return None
+
+
 def _build_track_record_text() -> str:
     """
     Realized win-rate and alpha-vs-SPY by conviction level AND by each 1-5
@@ -256,8 +265,20 @@ def boot_record(service: str) -> dict:
                          == (Path(db.__file__).parent / "logs" / "db_write_spill.jsonl").resolve())
     except Exception:
         pass
+    # A TRACK_RECORD_SINCE set but rejected (not a YYYY-MM-DD date) leaves the
+    # track record unbounded; the boot row shows it, not only the log (61).
+    trs = None
+    try:
+        import config
+        import db
+        raw = (getattr(config, "TRACK_RECORD_SINCE", "") or "").strip()
+        trs = {"set": raw or None, "applied": db.track_record_since()}
+        trs["rejected"] = bool(raw) and trs["applied"] is None
+    except Exception:
+        pass
     return {"service": service, "pid": os.getpid(), "process_started_at": started,
-            "spill_path_default": spill_default,
+            "spill_path_default": spill_default, "track_record_since": trs,
+            "db_port": os.getenv("SUPABASE_PORT", "5432"),
             "code_read_at": _BOOT["code_read_at"], "code_read_pid": _BOOT["pid"],
             "code_sha": code, "head_sha": _CODE_SHA.get("head_sha"),
             "dirty": code.endswith("-dirty") if code else None,
@@ -275,6 +296,29 @@ def record_boot(service: str) -> dict | None:
     except Exception as e:
         log.warning(f"boot record unavailable: {e}")
         return None
+    try:
+        # Duplicate and unparsed watchlist rows, logged loudly (audit
+        # 2026-11-07 15:07 #4). Which row loads is unchanged.
+        import watchlist_check
+        rec["watchlist_issues"] = watchlist_check.check_and_warn()
+    except Exception as e:
+        log.warning(f"watchlist check unavailable: {e}")
+    try:
+        # The bracket and limit entry paths book an assumed fill and aren't
+        # safe to enable yet (audit 2026-11-07 17:17 #4): say if one is on.
+        import config
+        rec["use_bracket_orders"] = bool(config.USE_BRACKET_ORDERS)
+        if rec["use_bracket_orders"]:
+            log.warning("USE_BRACKET_ORDERS is on: the bracket entry path assumes the requested size filled")
+    except Exception as e:
+        log.warning(f"bracket flag unreadable: {e}")
+    try:
+        # Which options backend runs: with the Unusual Whales key set the
+        # implied-move shadow writes no rows (SEF 158b). A bool, never the key.
+        from ingestion.options_flow import _KEY_CONFIGURED
+        rec["options_backend"] = "unusual_whales" if _KEY_CONFIGURED else "free_yfinance"
+    except Exception as e:
+        log.warning(f"options backend unreadable: {e}")
     try:
         import db
         db.log_boot_activity(f"{service} started at {rec.get('code_sha')} (pid {rec['pid']})", rec)
@@ -370,10 +414,11 @@ def _trim_shadow(ticker: str, action: str, parsed: dict, brief: str) -> dict | N
 
 
 _ENTRY_UDR_FLOOR = 2.0   # keep equal to the OPEN/ADD UDR gate in analyze_candidate
+_MIN_DISTINCT_SOURCES = 2   # the corroboration gate's bar; the records below read it too
 
 
 def _hold_fails_entry_rule(action: str, udr, parsed: dict, candidate: dict,
-                           conviction=None) -> dict | None:
+                           conviction=None, source_count=None) -> dict | None:
     """Log-only (audit 2026-11-02 19:27 #4, roadmap 01(c)): a HOLD on a held
     name faces no "would I buy it today" check, so a holding whose UDR has
     fallen under the OPEN/ADD floor is kept anyway. Records whether this
@@ -386,7 +431,9 @@ def _hold_fails_entry_rule(action: str, udr, parsed: dict, candidate: dict,
     (UDR under _ENTRY_UDR_FLOOR). The full OPEN/ADD rule also needs
     conviction >= 5 and corroboration, which this does not test; `checks`
     names the clause tested, and `conviction` is recorded so the conviction
-    clause can be applied later."""
+    clause can be applied later. `source_count` (count_distinct_sources, the
+    corroboration gate's own count) and `sources_ok` (>= 2) record the third
+    clause the same way (audit 11-06 09:31 #2); `fails` is unchanged."""
     if action != "HOLD":
         return None
     try:
@@ -397,6 +444,8 @@ def _hold_fails_entry_rule(action: str, udr, parsed: dict, candidate: dict,
         return {"fails": fails, "would_trim": fails, "udr": u if math.isfinite(u) else None,
                 "udr_floor": _ENTRY_UDR_FLOOR, "checks": "udr_floor_only",
                 "conviction": conviction,
+                "source_count": source_count,
+                "sources_ok": (source_count >= _MIN_DISTINCT_SOURCES) if isinstance(source_count, int) else None,
                 "udr_stated": isinstance(raw, (int, float)) and not isinstance(raw, bool),
                 "held_at_gate": (candidate or {}).get("held")}
     except Exception as e:
@@ -734,6 +783,22 @@ def _prompt_template_full_text() -> str:
     return "\n\x00\n".join(parts)
 
 
+# db functions whose queries feed the prompt or the brief (m596): the track
+# record's calibration and its date bound, and POSITION CONTEXT's verdicts.
+_PROMPT_DB_FUNCS = ("get_conviction_calibration", "get_subscore_calibration",
+                    "track_record_since", "get_position_context", "get_position_stop")
+
+
+def _prompt_db_queries_text() -> str:
+    """Source of _PROMPT_DB_FUNCS plus the test-artifact filter they use. Not
+    part of prompt_template_full_sha, which keeps its old definition."""
+    import inspect
+    import db
+    parts = [inspect.getsource(getattr(db, n)) for n in _PROMPT_DB_FUNCS]
+    parts.append(repr(getattr(db, "_NOT_TEST_ARTIFACT", None)))
+    return "\n\x00\n".join(parts)
+
+
 def _template_shas() -> dict:
     """Template hashes, computed once at import (M187).
     prompt_template_sha and brief_template_sha keep their old definitions
@@ -757,78 +822,55 @@ def _template_shas() -> dict:
             _prompt_template_full_text().encode()).hexdigest()[:12]
     except Exception as e:
         log.warning(f"full prompt template hash unavailable: {e}")
+    try:
+        out["prompt_db_queries_sha"] = hashlib.sha256(
+            _prompt_db_queries_text().encode()).hexdigest()[:12]
+    except Exception as e:
+        out["prompt_db_queries_sha"] = None
+        log.warning(f"prompt db queries hash unavailable: {e}")
     srcs = [f"{m}\n{_module_source(m) or '<unreadable>'}" for m in _BRIEF_MODULES]
     out["brief_template_full_sha"] = hashlib.sha256("\n\x00\n".join(srcs).encode()).hexdigest()[:12]
+    # The default-off add-on block (scenarios, event_plan), hashed on its own
+    # so prompt_template_full_sha keeps its series: with the add-ons off the
+    # prompt sent is unchanged, and analyst_addons says what was asked.
+    try:
+        out["addon_template_sha"] = hashlib.sha256(
+            inspect.getsource(_addon_instructions).encode()).hexdigest()[:12]
+    except Exception as e:
+        out["addon_template_sha"] = None
+        log.warning(f"addon template hash unavailable: {e}")
     return out
 
 
-# Env-backed config names left out of the config hash: a per-process
-# identity (each worker sets its own IB_CLIENT_ID) and an account figure.
+# Env-backed config names left out of the config hash (config_env.EXCLUDED):
+# a per-process identity (each worker sets its own IB_CLIENT_ID) and an
+# account figure.
 _CONFIG_ENV_EXCLUDED = ("IB_CLIENT_ID", "START_VALUE")
 _CONFIG_ENV_CACHE: dict = {}
 
 
 def _config_env_names() -> dict:
-    """{config name: env var} for every module-level assignment in config.py
-    whose value reads the environment (os.getenv, os.environ.get or
-    os.environ[...]), found by parsing config.py, so a new switch is
-    covered without being added to a hand-kept list (M182)."""
-    import ast
-    src = _module_source("config")
-    if src is None:
-        return {}
-    out: dict = {}
-
-    def env_key(node):
-        for sub in ast.walk(node):
-            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute):
-                f = sub.func
-                is_getenv = f.attr == "getenv" and isinstance(f.value, ast.Name)
-                is_environ_get = (f.attr == "get" and isinstance(f.value, ast.Attribute)
-                                  and f.value.attr == "environ")
-                if (is_getenv or is_environ_get) and sub.args and isinstance(sub.args[0], ast.Constant):
-                    return sub.args[0].value
-            if (isinstance(sub, ast.Subscript) and isinstance(sub.value, ast.Attribute)
-                    and sub.value.attr == "environ" and isinstance(sub.slice, ast.Constant)):
-                return sub.slice.value
-        return None
-
-    def visit(stmts):
-        for st in stmts:
-            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                continue
-            if isinstance(st, (ast.Assign, ast.AnnAssign)) and st.value is not None:
-                key = env_key(st.value)
-                if key:
-                    targets = st.targets if isinstance(st, ast.Assign) else [st.target]
-                    for t in targets:
-                        if isinstance(t, ast.Name):
-                            out[t.id] = key
-            for field in ("body", "orelse", "finalbody", "handlers"):
-                block = getattr(st, field, None)
-                if isinstance(block, list):
-                    visit(block)
-    visit(ast.parse(src).body)
-    return out
+    """{config name: env var} for every env-reading assignment in config.py
+    (config_env.env_names; M182)."""
+    import config_env
+    return config_env.env_names(_module_source("config") or "")
 
 
 def _config_env_record() -> dict:
     """A hash of every env-overridable setting in config.py (name and value),
     the number hashed, and which of their env vars are set in this process
-    (names only, no values). Log-only; the hand-kept `config` block stays as
-    it was. Computed once per process: config values are fixed at import."""
+    (names only, no values); config_env.env_record. Log-only; the hand-kept
+    `config` block stays as it was. Computed once per process: config values
+    are fixed at import."""
     if _CONFIG_ENV_CACHE:
         return _CONFIG_ENV_CACHE
     try:
-        import hashlib
-        import config
-        names = {k: v for k, v in _config_env_names().items() if k not in _CONFIG_ENV_EXCLUDED}
-        body = "\n".join(f"{k}={getattr(config, k, '<unset>')!r}" for k in sorted(names))
-        rec = {"env_sha": hashlib.sha256(body.encode()).hexdigest()[:12], "n": len(names),
-               "env_set": sorted(e for e in set(names.values()) if e in os.environ),
-               "excluded": list(_CONFIG_ENV_EXCLUDED)}
+        import config_env
+        rec = config_env.env_record(_config_env_names(), _CONFIG_ENV_EXCLUDED)
     except Exception as e:
         return {"error": type(e).__name__}
+    if "error" in rec:
+        return rec
     _CONFIG_ENV_CACHE.update(rec)
     return _CONFIG_ENV_CACHE
 
@@ -856,7 +898,22 @@ def _treatment_config() -> dict:
         "TIER_MAX_CONCURRENT_POSITIONS", "MAX_TRADE_PCT_OF_CASH_RESERVE",
         "ETF_FUNDAMENTALS_CAP_EXEMPT", "PLAN_LEVEL_REVIEW_ENABLED",
         # Added 10-31 (A1031-0253-1): the month-only catalyst reading.
-        "CATALYST_MONTH_MIDPOINT_ENABLED")},
+        "CATALYST_MONTH_MIDPOINT_ENABLED",
+        # Added 11-04 (packet G50): the brief price's last-fallback order.
+        "PRICE_FALLBACK_SESSION_ORDER",
+        # Added 11-06 (professor m585): whether a sold analyst plan closes.
+        "PLAN_CLOSE_ON_EXIT",
+        # Added 11-06 (professor C35): the track record's date bound.
+        "TRACK_RECORD_SINCE",
+        # Added 11-07 (audit 09:07 #9): whether a text sub-score is imputed.
+        "SUBSCORE_TEXT_IMPUTE_ENABLED",
+        # Added 11-08 (Luke): analyst add-ons, price history, drop watch.
+        "ANALYST_SCENARIOS_ENABLED", "ANALYST_EVENT_PLAN_ENABLED", "BRIEF_PRICE_HISTORY",
+        "DIP_REVIEW_ENABLED", "DIP_REVIEW_MIN_DROP_PCT", "DIP_REVIEW_MIN_ATR",
+        "DIP_REVIEW_COUNTS_AS_NEW_FACT",
+        # Added 11-08 (audit 21:30 #8): the switches that decide routing.
+        "BUY_REQUIRES_NEW_FACT", "BUY_NEW_FACT_SCOPE", "BUY_NEW_FACT_WINDOW",
+        "TRIM_FRACTION", "REBUY_COOLDOWN_HOURS")},
         # Added 11-03: fixed, not a switch (a malformed catalyst makes the
         # verdict WATCH); separates verdicts from before it. "watch" was
         # unscoped; "watch_rate_scoped" flags expected_return_pct only at
@@ -948,6 +1005,11 @@ def _provenance(prompt: str) -> dict:
             # that shapes the prompt or the call, and every brief section module.
             "prompt_template_full_sha": _TEMPLATE_SHAS.get("prompt_template_full_sha"),
             "brief_template_full_sha": _TEMPLATE_SHAS.get("brief_template_full_sha"),
+            # The db queries behind the track record and POSITION CONTEXT (m596).
+            "prompt_db_queries_sha": _TEMPLATE_SHAS.get("prompt_db_queries_sha"),
+            # The add-on block's text (11-08); applies only where
+            # provenance.analyst_addons says it was requested.
+            "addon_template_sha": _TEMPLATE_SHAS.get("addon_template_sha"),
         }
     import hashlib
     # model_digest, ollama_version and the model's default parameters, re-read
@@ -1045,7 +1107,7 @@ def _gate_flags(ticker: str, action: str, conviction: int, source_count: int,
     out = {"model_sell_pass_unconfirmed": bool(passes and action in ("TRIM", "EXIT")
                                                and conviction > LOW_CONVICTION_SELL_MAX),
            "rubric_gate_conflict": model_action in ("OPEN", "ADD") and model_conviction == 7
-                                   and source_count >= 2}
+                                   and source_count >= _MIN_DISTINCT_SOURCES}
     try:
         import db
         et = ZoneInfo("America/New_York")
@@ -1074,8 +1136,20 @@ def _brief_exposure(ticker: str, prompt: str) -> dict:
     -1/-2). Read from the prompt text, so it is what the model saw. Since
     BRIEF_POSITION_CONTEXT, repeats on held names see their last verdicts and
     aren't independent draws; the section keys on a stop row, not the broker.
-    held_broker is None when unknown; held_broker_reason says why."""
+    held_broker is None when unknown; held_broker_reason says why.
+    prior_verdicts_before_open (shown sections only): how many of the
+    section's recent verdicts predate the stop record's opened_at, so a
+    re-entry's brief showing the earlier position's verdicts can be counted
+    (audit 11-06 05:33 #2d); None when it can't be read. stop_shown and
+    stop_shown_pct: the protective stop that section printed, when shown."""
     out = {"position_context_shown": False, "prior_verdicts_shown": []}
+    try:
+        # Why the section is in or out (audit 11-06 23:24 #10); None when
+        # the brief was built in another process or over 10 min ago.
+        import context_engine
+        out["position_context_status"] = context_engine.position_context_status(ticker)
+    except Exception:
+        out["position_context_status"] = None
     # Only inside the position section: event text above it is raw news.
     in_section = False
     for line in (prompt or "").splitlines():
@@ -1083,20 +1157,126 @@ def _brief_exposure(ticker: str, prompt: str) -> dict:
             in_section = out["position_context_shown"] = True
         elif line.startswith("==="):
             in_section = False
+        elif in_section and line.startswith("Entry $"):
+            # The stop the model was shown (context_engine's POSITION CONTEXT
+            # line), to test whether its downside copies it (audit 11-06 13:30 #4).
+            m = re.search(r"protective stop \$([\d.]+)(?: \(([+-][\d.]+)% from current price\))?", line)
+            if m:
+                out["stop_shown"] = float(m.group(1))
+                out["stop_shown_pct"] = float(m.group(2)) if m.group(2) else None
         elif in_section and line.startswith("Recent verdicts: "):
             out["prior_verdicts_shown"] = [v.strip() for v in line[len("Recent verdicts: "):].split(";")
                                            if v.strip()]
+    rec = None
+    # When the post-call reads below ran (they follow the model call by its
+    # run time, so a fill or stop-out in between shows here, m599).
+    out["read_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     try:
         import db
-        out["has_stop_row"] = db.get_position_stop(ticker, strict=True) is not None
+        rec = db.get_position_stop(ticker, strict=True)
+        out["has_stop_row"] = rec is not None
     except Exception:
         out["has_stop_row"] = None
+    if out["position_context_shown"]:
+        out["prior_verdicts_before_open"] = None
+        try:
+            opened = (rec or {}).get("opened_at")
+            if opened is not None:
+                # The section's own query (db.get_position_context), read
+                # again; it returns {} on a query error, which stays None.
+                ctx = db.get_position_context(ticker) or {}
+                if "recent_verdicts" in ctx:
+                    out["prior_verdicts_before_open"] = sum(
+                        1 for v in ctx["recent_verdicts"] if v["timestamp"] < opened)
+        except Exception:
+            pass
     try:
         import tasks
         out["held_broker"], out["held_broker_reason"], _ = tasks._broker_held(ticker)
     except Exception:
         out["held_broker"], out["held_broker_reason"] = None, "error"
     return out
+
+
+def _downside_vs_stop_shown(parsed: dict, stop_shown) -> float | None:
+    """Log-only: the verdict's downside_scenario dollar figure over the
+    protective stop the brief showed, minus 1 (0.0 = the downside is the
+    stop). None when either is missing (audit 11-06 13:30 #4)."""
+    try:
+        from agents.plans import _dollars
+        val = parsed.get("valuation") if isinstance(parsed.get("valuation"), dict) else {}
+        floor = _dollars(val.get("downside_scenario"))
+        return round(floor / stop_shown - 1, 4) if floor and stop_shown else None
+    except Exception:
+        return None
+
+
+def _track_record_text_sha(prompt: str) -> str | None:
+    """sha256[:12] of the YOUR TRACK RECORD block as the model saw it (the
+    lines after its header, up to the next === header), so verdicts that saw
+    the same track record can be grouped (professor C35). None when the
+    block isn't in the prompt."""
+    import hashlib
+    head = "=== YOUR TRACK RECORD ===\n"
+    i = (prompt or "").find(head)
+    if i < 0:
+        return None
+    body = prompt[i + len(head):]
+    j = body.find("\n===")
+    return hashlib.sha256((body if j < 0 else body[:j]).strip().encode()).hexdigest()[:12]
+
+
+VIX_LIVE_KEY = "helios:vix_live"    # written by tasks.cache_live_vix every 2 min, 05:00-18:59 ET weekdays
+_VIX_LIVE_MAX_AGE_S = 300
+
+
+def _vix_cache_get() -> dict | None:
+    """The cached live ^VIX record {"vix", "at", "error"}, or None when the
+    key is absent. Redis with a 0.5 s socket bound; raises on a failed read."""
+    import json
+    import redis
+    client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+                                  socket_timeout=0.5, socket_connect_timeout=0.5)
+    raw = client.get(VIX_LIVE_KEY)
+    return json.loads(raw) if raw else None
+
+
+def _vix_live_record(vix_regime) -> dict:
+    """Log-only (audit 2026-11-07 17:17 #2): live ^VIX next to the VIX the
+    regime row was scored on, which is FRED's prior-session close (16.6 all
+    of 11-05 while live VIX ran 24-28). Read from the Redis value that
+    tasks.cache_live_vix keeps fresh: no Yahoo call or thread on the verdict
+    path (the daemon-thread read segfaulted in pyarrow, roadmap 04d/04e).
+    vix_live_at is when that value was fetched. vix_live_status: ok,
+    no_cache (key absent), stale (fetched more than 5 min ago; vix_live is
+    then None), the fetch's own error (none, non_finite or an exception
+    name), or read_error:<Type> (Redis). Never raises."""
+    from datetime import datetime, timezone
+    rec = {"vix_regime": None, "vix_live": None, "vix_live_at": None, "vix_gap": None,
+           "vix_live_status": None}
+    try:
+        rec["vix_regime"] = float(vix_regime) if vix_regime is not None else None
+        try:
+            c = _vix_cache_get()
+        except Exception as e:
+            rec["vix_live_status"] = f"read_error:{type(e).__name__}"
+            return rec
+        if not c:
+            rec["vix_live_status"] = "no_cache"
+            return rec
+        rec["vix_live_at"] = c.get("at")
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(c["at"])).total_seconds()
+        if age > _VIX_LIVE_MAX_AGE_S:
+            rec["vix_live_status"] = "stale"
+        elif c.get("vix") is None:
+            rec["vix_live_status"] = c.get("error") or "none"
+        else:
+            rec["vix_live"], rec["vix_live_status"] = float(c["vix"]), "ok"
+        if rec["vix_live"] is not None and rec["vix_regime"] is not None:
+            rec["vix_gap"] = round(rec["vix_live"] - rec["vix_regime"], 2)
+    except Exception as e:
+        rec["error"] = type(e).__name__
+    return rec
 
 
 def _decision_inputs_record(ticker: str, regime_packet: dict | None) -> dict:
@@ -1111,6 +1291,7 @@ def _decision_inputs_record(ticker: str, regime_packet: dict | None) -> dict:
         "source": rp.get("regime_source") or ("fresh" if rp.get("agent") else None),
         "timestamp": str(rp.get("timestamp")) if rp.get("timestamp") else None,
         "last_bar_date": (rp.get("signals") or {}).get("last_bar_date"),
+        **_vix_live_record(((rp.get("signals") or {}).get("volatility") or {}).get("vix")),
     }
     try:
         import db
@@ -1122,6 +1303,82 @@ def _decision_inputs_record(ticker: str, regime_packet: dict | None) -> dict:
             out["implied_growth"]["as_of"] = str(ladder["computed_at"])
     except Exception as e:
         log.debug(f"[{ticker}] implied growth record failed: {e}")
+    return out
+
+
+def _addon_instructions(trigger: dict | None) -> tuple[str, dict]:
+    """Extra output fields appended after the main prompt when their flags
+    are on (Luke, 2026-11-08): scenarios on every verdict
+    (ANALYST_SCENARIOS_ENABLED) and an earnings event_plan on a held name's
+    pre-print earnings review (ANALYST_EVENT_PLAN_ENABLED). Returns the text
+    to append ("" when nothing applies, so the prompt is unchanged) and a
+    record of what was asked. Hashed on its own as addon_template_sha (not
+    part of prompt_template_full_sha, so that series is unchanged)."""
+    import config
+    t = trigger or {}
+    pre_print = t.get("path") == "earnings_review" and t.get("earnings_phase") == "pre"
+    rec = {"scenarios_requested": bool(config.ANALYST_SCENARIOS_ENABLED),
+           "event_plan_requested": bool(config.ANALYST_EVENT_PLAN_ENABLED and pre_print)}
+    parts = []
+    if rec["scenarios_requested"]:
+        parts.append("""=== ADDITIONAL REQUIRED FIELD: scenarios ===
+Add a "scenarios" array to the same JSON object: up to 3 concrete things that could happen next for this stock, and what you would do in each. At least one must be a downside scenario. Shape:
+"scenarios": [
+  {"if": "<a specific, checkable event or price condition, e.g. 'US adds new China export limits on its data-center chips' or 'closes below the $X support in the brief'>",
+   "probability": "<low|medium|high>",
+   "then_action": "<OPEN|ADD|HOLD|TRIM|EXIT>",
+   "at_price": <the price where you would act, or null if it is not a price condition>,
+   "why": "<one sentence citing the brief>"}
+]
+Keep every other field exactly as specified above.""")
+    if rec["event_plan_requested"]:
+        parts.append("""=== ADDITIONAL REQUIRED FIELD: event_plan (earnings) ===
+This position reports earnings soon. Add an "event_plan" object to the same JSON object:
+"event_plan": {
+  "pre_print": "<hold_through|trim_before|exit_before>",
+  "expected_move_pct": <float: the size of the post-earnings move you expect, either direction, e.g. 8.0>,
+  "breaks_thesis_if": "<the specific result that would mean the thesis is wrong, e.g. a revenue line below a figure, or a guidance cut>",
+  "if_beat": "<HOLD|ADD|TRIM> and why, in one line",
+  "if_miss": "<HOLD|TRIM|EXIT> and why, in one line",
+  "stop_fits_gap": <true|false: would the current stop survive a gap of expected_move_pct?>
+}
+Your "action" field is the decision now: if pre_print is trim_before set action to TRIM, if exit_before set it to EXIT.""")
+    if not parts:
+        return "", rec
+    return "\n\n".join(parts) + "\n- Output ONLY the JSON object, nothing else\n", rec
+
+
+_SCENARIO_ACTIONS = ("OPEN", "ADD", "HOLD", "TRIM", "EXIT")
+_PRE_PRINT_ACTIONS = {"hold_through": ("HOLD", "ADD"), "trim_before": ("TRIM",), "exit_before": ("EXIT",)}
+
+
+def _addon_parse_record(parsed: dict, rec: dict) -> dict:
+    """Log-only: whether the model filled the add-on fields it was asked
+    for. Nothing reads them to decide. Never raises."""
+    out = {}
+    try:
+        if rec.get("scenarios_requested"):
+            sc = parsed.get("scenarios")
+            items = sc if isinstance(sc, list) else []
+            ok = [x for x in items if isinstance(x, dict) and str(x.get("if") or "").strip()
+                  and str(x.get("then_action") or "").upper() in _SCENARIO_ACTIONS]
+            out.update(scenarios_present=isinstance(sc, list), scenarios_n=len(items),
+                       scenarios_valid=len(ok),
+                       scenarios_actions=sorted({str(x["then_action"]).upper() for x in ok}))
+        if rec.get("event_plan_requested"):
+            ep = parsed.get("event_plan")
+            ep = ep if isinstance(ep, dict) else None
+            pre = str((ep or {}).get("pre_print") or "").lower()
+            move = (ep or {}).get("expected_move_pct")
+            out.update(event_plan_present=ep is not None,
+                       event_plan_valid=bool(ep and pre in _PRE_PRINT_ACTIONS
+                                             and isinstance(move, (int, float)) and not isinstance(move, bool)
+                                             and str(ep.get("breaks_thesis_if") or "").strip()),
+                       pre_print=pre or None,
+                       action_matches_pre_print=(str(parsed.get("action") or "").upper()
+                                                 in _PRE_PRINT_ACTIONS[pre]) if pre in _PRE_PRINT_ACTIONS else None)
+    except Exception as e:
+        out["error"] = type(e).__name__
     return out
 
 
@@ -1333,6 +1590,33 @@ Rules:
 # Ollama call
 # ---------------------------------------------------------------------------
 
+_OLLAMA_PS_TIMEOUT = (1, 2)         # (connect, read) seconds
+
+
+def _ollama_ps_state() -> dict | None:
+    """How the server holds the analyst model right after a call, from
+    /api/ps: total and GPU-resident bytes, their ratio, and the loaded
+    context length. The digest alone doesn't say how the model ran: the
+    GPU/CPU split moved 79/81, 64/81, 78/81 and 77/81 layers under one
+    digest, with a 2.6x speed change (audit 2026-11-07 09:07 #3). None when
+    the read fails or the model isn't listed. Log-only; never raises."""
+    try:
+        models = requests.get(f"{OLLAMA_HOST}/api/ps", timeout=_OLLAMA_PS_TIMEOUT).json().get("models") or []
+        names = {ANALYST_MODEL, ANALYST_MODEL if ":" in ANALYST_MODEL.split("/")[-1]
+                 else f"{ANALYST_MODEL}:latest"}
+        m = next((m for m in models if names & {m.get("name"), m.get("model")}), None)
+        if m is None:
+            return None
+        size, vram = m.get("size"), m.get("size_vram")
+        share = (round(vram / size, 4) if isinstance(size, (int, float)) and size > 0
+                 and isinstance(vram, (int, float)) else None)
+        return {"size": size, "size_vram": vram, "vram_share": share,
+                "context_length": m.get("context_length"),
+                "digest": (m.get("digest") or "")[:12] or None}
+    except Exception:
+        return None
+
+
 def _conviction_distribution(tokens) -> dict | None:
     """The model's probability over the conviction digit it wrote, from the
     same call's top-5 token logprobs: an expected value and P(>=7) instead of
@@ -1479,19 +1763,54 @@ def _prior_verdicts(ticker: str) -> list | None:
         return None
 
 
+# A figure glued to a letter or digit ("Q4") is not a move (SEF 138b).
+_UPSIDE_RANGE = re.compile(r"(?<![A-Za-z\d.])([-+]?\d+(?:\.\d+)?)\s*%?\s*(?:to|–|—|-)\s*([-+]?\d+(?:\.\d+)?)\s*%")
+_UPSIDE_ONE = re.compile(r"(?<![A-Za-z\d.])([-+]?\d+(?:\.\d+)?)\s*%")
+
+
+def _upside_range(text) -> tuple[float | None, float | None]:
+    """(low, high) percent from catalyst.expected_upside_if_positive, e.g.
+    "+8 to +15%" -> (8.0, 15.0), "+10%" -> (10.0, 10.0); (None, None) when
+    there is no percent figure ("Unknown"). Log-only."""
+    s = str(text or "")
+    # Whichever figure comes first: a later range ("falls 3-4% if miss")
+    # mustn't beat an earlier single upside (professor 59i).
+    r, one = _UPSIDE_RANGE.search(s), _UPSIDE_ONE.search(s)
+    # A range starting at a year is not a move ("Q3 2026 to +12%", SEF 138):
+    # fall back to the single percent figure. A real >100% range stays
+    # ("+100 to +150%", professor 59j).
+    if r and re.fullmatch(r"(19|20)\d\d", r[1]) and s[r.end(1):r.end(1) + 1] != "%":
+        r = None
+    if r and (not one or r.start() <= one.start()):
+        a, b = float(r[1]), float(r[2])
+        return min(a, b), max(a, b)
+    return (float(one[1]), float(one[1])) if one else (None, None)
+
+
 def _catalyst_check(ticker: str, parsed: dict) -> dict:
     """Shadow record of how the model's catalyst date relates to the calendar
     (limitations audit 2026-10-28 14:53, #5). Logged only; the rate gate
     is unchanged. past_or_today: the date is on or before today's ET date
     (it floors to 1 day in compute_weeks_to_catalyst, the most favourable
     rate). month_only: "YYYY-MM",
-    read as the 15th."""
+    read as the 15th. days_to_catalyst_raw: ET days to that date, not
+    floored (negative when past). catalyst_upside_low/high_pct: the
+    catalyst's own stated move (expected_upside_if_positive), beside the
+    12-month expected_return_pct the rate gate divides (audit 11-06 09:31
+    #4, packet G31); which one a rate should use is Luke's."""
     cat = parsed.get("catalyst") or {}
     raw = str(cat.get("date") or "").strip()
     out = {"model_date": raw or None, "past_or_today": None,
            "month_only": bool(re.fullmatch(r"\d{4}-\d{2}", raw)),
            "calendar_next_earnings": None, "days_model_vs_calendar": None,
-           "weeks_to_catalyst_utc": None, "weeks_to_catalyst_et": None}
+           "weeks_to_catalyst_utc": None, "weeks_to_catalyst_et": None,
+           "days_to_catalyst_raw": None, "catalyst_upside_low_pct": None,
+           "catalyst_upside_high_pct": None}
+    try:
+        out["catalyst_upside_low_pct"], out["catalyst_upside_high_pct"] = _upside_range(
+            cat.get("expected_upside_if_positive"))
+    except Exception:
+        pass
     try:
         # The gate's UTC-midnight distance and an ET-midnight shadow, same
         # clock reading (log-only; agents/catalyst_time.py).
@@ -1499,15 +1818,13 @@ def _catalyst_check(ticker: str, parsed: dict) -> dict:
         now = datetime.now(timezone.utc)
         out["weeks_to_catalyst_utc"] = compute_weeks_to_catalyst(raw or None, as_of=now)
         out["weeks_to_catalyst_et"] = weeks_to_catalyst_et(raw or None, as_of=now)
-        d = None
-        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
-            d = datetime.strptime(raw, "%Y-%m-%d").date()
-        elif out["month_only"]:
-            d = datetime.strptime(raw + "-15", "%Y-%m-%d").date()
+        from agents.catalyst_time import parse_catalyst_date
+        d = parse_catalyst_date(raw)
         from agents.catalyst_time import today_et
         today = today_et(now)   # the ET calendar day; log-only
         if d is not None:
             out["past_or_today"] = d <= today
+            out["days_to_catalyst_raw"] = (d - today).days
         import db
         nxt = db.get_next_earnings(ticker)
         if nxt is not None:
@@ -1742,6 +2059,20 @@ def _extract_json(raw: str) -> dict | None:
     return extracted if extracted else None
 
 
+def _reply_parse_mode(raw: str, parsed: dict) -> str:
+    """Which _extract_json path read raw into parsed: "json" (the whole reply,
+    fences removed), "json_substring" (the outermost {...} in it) or
+    "salvaged" (fields regex-pulled from broken JSON). Log-only. Kept out of
+    _extract_json, whose source the prompt-order A/B tool_sha hashes."""
+    if parsed.get("_salvaged"):
+        return "salvaged"
+    try:
+        json.loads(re.sub(r"```(?:json)?", "", raw).strip())
+        return "json"
+    except ValueError:
+        return "json_substring"
+
+
 # ---------------------------------------------------------------------------
 # Stub for unavailable model
 # ---------------------------------------------------------------------------
@@ -1761,17 +2092,126 @@ def _signal_age_days(signal: dict) -> float:
     return (datetime.now(timezone.utc) - ts).total_seconds() / 86400
 
 
-def _low_conviction_sell(ticker: str, action: str, conviction: int) -> tuple[str, bool, str]:
+def _review_session() -> str | None:
+    """market_data.market_session() now, or None if it fails. Never raises."""
+    try:
+        from market_data import market_session
+        return market_session()
+    except Exception as e:
+        log.debug(f"review session label failed: {e}")
+        return None
+
+
+def _sell_confirm_record(ticker: str, prev: dict | None, trigger: dict | None) -> dict:
+    """Record-only (audit 11-06 23:24 #4): how independent the confirming
+    verdict is. The rule itself has no spacing, trigger or position test;
+    these let one be set from data. None where unknown."""
+    from datetime import datetime, timezone
+    rec = {"prev_signal_id": None, "prev_at": None, "confirm_gap_s": None,
+           "prev_trigger_path": None, "confirm_same_item": None, "confirm_before_open": None}
+    if not prev:
+        return rec
+    ts = prev.get("timestamp")
+    if isinstance(ts, datetime):
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        rec["prev_at"] = ts.isoformat()
+        rec["confirm_gap_s"] = round((datetime.now(timezone.utc) - ts).total_seconds(), 1)
+    rec["prev_signal_id"] = prev.get("id")
+    pt = prev.get("trigger") if isinstance(prev.get("trigger"), dict) else None
+    if pt is not None:
+        rec["prev_trigger_path"] = pt.get("path")
+        cur = trigger or {}
+        pairs = [(pt.get(k), cur.get(k)) for k in ("url", "title") if pt.get(k) and cur.get(k)]
+        if pairs:
+            rec["confirm_same_item"] = any(x == y for x, y in pairs)
+    try:
+        import db
+        opened = (db.get_position_stop(ticker, strict=True) or {}).get("opened_at")
+        if isinstance(opened, datetime) and isinstance(ts, datetime):
+            if opened.tzinfo is None:
+                opened = opened.replace(tzinfo=timezone.utc)
+            rec["confirm_before_open"] = ts < opened
+    except Exception:
+        pass
+    return rec
+
+
+_ENTRY_RULE_REGIMES = ("Neutral", "Risk-Off", "Strong Risk-Off")   # the c>=7 OPEN rule below
+
+
+def _regime_entry_record(ticker: str, regime_str: str, model_action: str | None,
+                         rule_fired: bool) -> dict:
+    """Record-only (audit 11-07 01:08 #5): which regime entry rule this
+    buy-side verdict met, and the ticker's own sector regime, which
+    REGIME_OVERALL_ONLY leaves out of entries. The event path's only regime
+    rule is c>=7 for an OPEN in Neutral/Risk-Off/Strong Risk-Off; Strong
+    Risk-Off's entry block exists only on the scan path. Never raises."""
+    rec = {"regime": regime_str, "model_action": model_action,
+           # The rule gates OPENs only, so an ADD reads none (SEF 147o).
+           "rule": ("open_min_c7" if model_action == "OPEN" and regime_str in _ENTRY_RULE_REGIMES
+                    else "none"),
+           "rule_fired": rule_fired, "sector_etf": None, "sector_regime": None}
+    try:
+        from ingestion.sp500_universe import SECTOR_ETF_MAP, get_sp500_constituents
+        sector = (get_sp500_constituents().get(ticker) or {}).get("gics_sector")
+        etf = SECTOR_ETF_MAP.get(sector) if sector else None
+        rec["sector_etf"] = etf
+        if etf:
+            import db
+            rec["sector_regime"] = db.get_latest_sector_regime(etf)
+    except Exception as e:
+        rec["sector_regime"] = {"error": type(e).__name__}
+    return rec
+
+
+_SCAN_REASON_KEYS = ("scan_type", "priority", "composite_score", "technical_score", "momentum_score",
+                     "catalyst_score", "thesis_alignment_score", "catalyst_detail",
+                     "technical_notes", "momentum_notes", "thesis_notes")
+
+_BY_POSITION_TTL_S = 600
+_BY_POSITION_CACHE: dict = {}
+
+
+def _track_record_by_position() -> dict:
+    """Record-only (audit 11-06 23:24 #8): the track record per position
+    (db.get_conviction_calibration_by_position) beside the per-tranche block
+    the prompt shows, cached 10 min per process so each verdict doesn't add
+    a pooled read. {"rows": [...], "computed_at": ISO} or {"error": <type>};
+    errors are not cached (m607). Never raises."""
+    import time
+    from datetime import datetime, timezone
+    hit = _BY_POSITION_CACHE.get("v")
+    if hit and time.monotonic() - hit[0] < _BY_POSITION_TTL_S:
+        return hit[1]
+    try:
+        import db
+        out = {"rows": db.get_conviction_calibration_by_position(),
+               "computed_at": datetime.now(timezone.utc).isoformat()}
+    except Exception as e:
+        return {"error": type(e).__name__}
+    _BY_POSITION_CACHE["v"] = (time.monotonic(), out)
+    return out
+
+
+def _low_conviction_sell(ticker: str, action: str, conviction: int, trigger: dict | None = None,
+                         record: dict | None = None) -> tuple[str, bool, str]:
     """Decide a TRIM/EXIT at conviction <= 4. Returns (action, pass_to_risk, note).
     Needs the previous analyst verdict on this ticker to be <= 4 too, so one
     noisy reading can't sell; db.get_latest_signal_for skips routing rows and
-    runs before this analysis is logged."""
+    runs before this analysis is logged. `record`, when given, is filled
+    with _sell_confirm_record's fields (record-only)."""
     try:
         import db
-        prev = db.get_latest_signal_for(ticker)
+        prev = db.get_latest_signal_for(ticker, with_trigger=True)
     except Exception as e:
         log.warning(f"[{ticker}] low-conviction sell: previous verdict lookup failed: {e}")
         prev = None
+    if record is not None:
+        try:
+            record.update(_sell_confirm_record(ticker, prev, trigger))
+        except Exception as e:
+            record["error"] = type(e).__name__
     if prev and _signal_age_days(prev) > LOW_CONVICTION_CONFIRM_MAX_AGE_DAYS:
         return action, False, (f"Low-conviction {action} held for confirmation: previous "
                                f"verdict is older than {LOW_CONVICTION_CONFIRM_MAX_AGE_DAYS} days")
@@ -1982,13 +2422,14 @@ def trigger_record(path: str, event: dict | None = None) -> dict:
     # The trigger headline's tone from the screener's keyword lists (not a
     # model), so a buy on a negative headline can be counted (audit 11-05
     # 17:32 #3). Tag only; the gate ignores it.
-    rec["title_tone"] = None
+    # None means no title; "error" means the tagger raised (professor m583).
+    rec["title_tone"], rec["title_tone_sha"] = None, None
     if e.get("title"):
         try:
-            from agents.screener import title_tone
-            rec["title_tone"] = title_tone(e["title"])
+            from agents.screener import TONE_SHA, title_tone
+            rec["title_tone"], rec["title_tone_sha"] = title_tone(e["title"]), TONE_SHA
         except Exception:
-            pass
+            rec["title_tone"] = "error"
     # The item's own time, from the first structured key the source carries
     # (M266): EDGAR/arXiv timestamp, news published_at, a rating's
     # event_time, a Form 4 filing_date, a congressional trade date.
@@ -1997,6 +2438,12 @@ def trigger_record(path: str, event: dict | None = None) -> dict:
         if e.get(key):
             rec["event_time"], rec["event_time_source"] = str(e[key]), key
             break
+    if e.get("earnings_phase"):
+        rec["earnings_phase"] = e["earnings_phase"]   # pre / day / post (event_plan add-on)
+    if isinstance(e.get("earnings_timing"), dict):
+        # BMO/AMC and the source's own time for an earnings review (audit
+        # 2026-11-08 13:18 #3/#6; crew._earnings_timing). Log-only.
+        rec["earnings_timing"] = e["earnings_timing"]
     if isinstance(e.get("rating"), dict):
         # pt_only: a maintained or reiterated rating whose news is a price
         # target raise or cut (audit 2026-11-05-0725 #2; G59). "Maintains"
@@ -2009,6 +2456,21 @@ def trigger_record(path: str, event: dict | None = None) -> dict:
                          "pt_action": r.get("pt_action"),
                          "pt_only": action in ("main", "reit") and not r.get("grade_changed")
                          and pt in ("raises", "lowers")}
+    # LLM queue timing (audit 2026-11-07 05:07 #5), set by tasks.screen_event
+    # and tasks.deep_analyze_event; absent on paths that skip the queue.
+    if e.get("_llm_enqueued_at") or e.get("_llm_started_at"):
+        rec["llm_enqueued_at"] = e.get("_llm_enqueued_at")
+        rec["llm_started_at"] = e.get("_llm_started_at")
+        # 0 for the first attempt; a retry's wait includes the failed attempt.
+        rec["llm_attempt"] = e.get("_llm_attempt")
+        rec["llm_queue_wait_s"] = None
+        try:
+            if rec["llm_enqueued_at"] and rec["llm_started_at"]:
+                rec["llm_queue_wait_s"] = round(
+                    (datetime.fromisoformat(rec["llm_started_at"])
+                     - datetime.fromisoformat(rec["llm_enqueued_at"])).total_seconds(), 1)
+        except (TypeError, ValueError):
+            pass
     if isinstance(e.get("text"), str) and e["text"]:
         # The brief shows only the first EVENT_TEXT_CAP characters (SEF data QA).
         rec["text_len"] = len(e["text"])
@@ -2088,10 +2550,19 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
 
     prompt = _build_prompt(candidate, situation_brief, thesis_text, regime_packet,
                            _philosophy_sections(philosophy_text, candidate.get("role", "Accelerator")))
+    # Default-off add-on fields (config.ANALYST_SCENARIOS_ENABLED /
+    # ANALYST_EVENT_PLAN_ENABLED); with both off nothing is appended.
+    addon_text, addon_rec = _addon_instructions(trigger)
+    if addon_text:
+        prompt = prompt + "\n" + addon_text
 
     ctx["prompt"] = prompt
 
     raw_response = _call_ollama(prompt)
+    # Read here, not in _call_ollama, whose source is part of the prompt
+    # template sha. Also after a failed call: a model pushed onto the CPU
+    # shows first as timeouts.
+    _LAST_CALL_STATS["ollama_ps"] = _ollama_ps_state()
     ctx["called"], ctx["raw"] = True, raw_response
     if not raw_response:
         reason = _STUB_REASONS.get(_LAST_CALL_FAILURE["kind"], "Ollama returned nothing")
@@ -2107,6 +2578,7 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
                              prompt=prompt, trigger=trigger, raw=raw_response)
         ctx["failure_logged"] = True
         return _stub_recommendation(candidate, "JSON parse failed")
+    parse_mode = _reply_parse_mode(raw_response, parsed)   # log-only, before the pop below
     if parsed.pop("_salvaged", False) and str(parsed.get("action", "")).upper() in (
             "OPEN", "ADD", "TRIM", "EXIT"):
         # Fields regex-pulled from broken JSON carry no reasoning, sources or
@@ -2124,6 +2596,12 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
     # Log-only (m429): scores the model left out and a default filled in
     # (conviction 1, a sub-score 3), so they aren't read as its own.
     imputed_fields: list[str] = ["conviction"] if parsed.get("conviction") is None else []
+    # Log-only (professor m618): the model's conviction as written when the
+    # line above changed it (7.5 -> 7, 0 -> 1, 11 -> 10, "7" -> 7); None when
+    # it was already an integer 1-10, or missing (then imputed_fields says so).
+    _conv_given = parsed.get("conviction")
+    conviction_coerced = (None if _conv_given is None or (
+        type(_conv_given) is int and 1 <= _conv_given <= 10) else str(_conv_given)[:20])
     udr        = float(parsed.get("upside_downside_ratio", 0) or 0)
     # Decision record (roadmap 0e #8): the model's own verdict and full
     # output before any gate, plus each gate that changed it. signals kept
@@ -2177,12 +2655,32 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
     # that number down. `... or 3` here would silently turn a genuine 0 (bad
     # output, should floor to 1) into the neutral default 3 instead — missing
     # key and "explicitly 0" need different handling, not the same fallback.
+    # With config.SUBSCORE_TEXT_IMPUTE_ENABLED (default off), a sub-score the
+    # model wrote as text ("4/5", "high") is imputed like a missing one, with
+    # its raw text kept in unparsed_scores, instead of raising and failing the
+    # whole verdict (audit 2026-11-07 09:07 #9). Off, int() raises as before.
+    # Sub-scores gate nothing, but they are copied into trade_outcomes and
+    # shown by sub-score in the prompt's track record, so an imputed 3 is
+    # listed in imputed_fields (also on trade_outcomes) to tell it apart.
+    unparsed_scores: dict[str, str] = {}
+
     def _sub_score(field: str) -> int:
         value = parsed.get(field)
         if value is None:
             value = 3
             imputed_fields.append(field)
-        return max(1, min(5, int(value)))
+        try:
+            return max(1, min(5, int(value)))
+        except (TypeError, ValueError, OverflowError):
+            import config
+            if not getattr(config, "SUBSCORE_TEXT_IMPUTE_ENABLED", False):
+                raise
+        try:
+            return max(1, min(5, int(float(value))))
+        except (TypeError, ValueError, OverflowError):
+            unparsed_scores[field] = str(value)[:40]
+            imputed_fields.append(field)
+            return 3
 
     def _optional_float(field: str) -> float | None:
         value = parsed.get(field)
@@ -2317,13 +2815,13 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
     # different wording.
     sources = parsed.get("sources") or []
     source_count = count_distinct_sources(sources)
-    if source_count < 2 and action in ("OPEN", "ADD"):
+    if source_count < _MIN_DISTINCT_SOURCES and action in ("OPEN", "ADD"):
         log.info(f"[{ticker}] Only {source_count} distinct source(s) cited — downgrading to WATCH")
-        gates.append(f"sources {source_count} < 2: {action} -> WATCH")
+        gates.append(f"sources {source_count} < {_MIN_DISTINCT_SOURCES}: {action} -> WATCH")
         action = "WATCH"
         parsed["pass_to_risk"] = False
         parsed["reasoning"] = (parsed.get("reasoning", "") +
-                               f" [Downgraded: {source_count} distinct source(s) cited, need >=2]")
+                               f" [Downgraded: {source_count} distinct source(s) cited, need >={_MIN_DISTINCT_SOURCES}]")
 
     # Minimum expected-return RATE gate (2026-08-30, user request) --
     # scoped to Accelerator/Moonshot only, see config.py's
@@ -2451,7 +2949,8 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
     # model now scores conviction on evidence alone; this applies the actual
     # selectivity policy deterministically instead of via prompt anchoring.
     regime_str = regime_packet.get("regime", "Neutral")
-    if action == "OPEN" and regime_str in ("Neutral", "Risk-Off", "Strong Risk-Off") and conviction < 7:
+    regime_rule_fired = (action == "OPEN" and regime_str in _ENTRY_RULE_REGIMES and conviction < 7)
+    if regime_rule_fired:   # one condition for the gate and its record (63n)
         log.info(f"[{ticker}] {regime_str} regime — conviction {conviction} < 7 for new position — downgrading to WATCH")
         gates.append(f"{regime_str} regime conviction {conviction} < 7: OPEN -> WATCH")
         action = "WATCH"
@@ -2507,9 +3006,12 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
     # low reading, conservatively: the previous analyst verdict on the ticker
     # must also be <= 4, EXIT needs <= 2, and an EXIT at 3-4 becomes a TRIM.
     # UDR doesn't apply to sells.
+    sell_confirm = None
     if action in ("TRIM", "EXIT") and conviction <= LOW_CONVICTION_SELL_MAX:
         sell_from = action
-        action, sell_passes, sell_note = _low_conviction_sell(ticker, action, conviction)
+        sell_confirm = {}
+        action, sell_passes, sell_note = _low_conviction_sell(ticker, action, conviction,
+                                                              trigger, sell_confirm)
         gates.append(f"low-conviction sell {sell_from} c{conviction} -> {action}, "
                      f"pass={sell_passes}" + (f" ({sell_note})" if sell_note else ""))
         parsed["pass_to_risk"] = sell_passes
@@ -2536,9 +3038,16 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
         log.warning(f"[{ticker}] c6 bar shadow record failed: {e}")
     try:
         provenance["brief_exposure"] = _brief_exposure(ticker, prompt)
+        # The track record's window and whether the block was shown (C35).
+        provenance["track_record"] = {"since": _track_record_since(),
+                                      "shown": "=== YOUR TRACK RECORD ===" in (prompt or ""),
+                                      "text_sha": _track_record_text_sha(prompt),
+                                      "by_position": _track_record_by_position()}
         # The held flag the gates used (crew sets it from broker positions
         # before the call); the other held fields are read after it (M138).
         provenance["brief_exposure"].update(_held_at_gate(candidate))
+        provenance["brief_exposure"]["downside_vs_stop_shown_frac"] = _downside_vs_stop_shown(
+            parsed, provenance["brief_exposure"].get("stop_shown"))
     except Exception as e:
         # Kept as an error, not dropped: a missing key read as "not
         # applicable" (m239).
@@ -2547,6 +3056,21 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
             provenance["brief_exposure"]["error"] = type(e).__name__
         else:
             provenance["brief_exposure"] = {"error": type(e).__name__}
+    be = provenance.get("brief_exposure") if isinstance(provenance.get("brief_exposure"), dict) else {}
+    basis = [k for k, on in (("held", (candidate or {}).get("held")),
+                             ("context_shown", be.get("position_context_shown")),
+                             ("stop_row", be.get("has_stop_row"))) if on]
+    if basis:
+        # Held reviews too: the buy-side shadow (crew._route_to_approval)
+        # only sees sized OPEN/ADD verdicts (audit 11-06 13:30 #6). Keyed on
+        # the stop row and the brief as well, since some held verdicts carry
+        # no candidate.held (SEF 141b). Never raises.
+        try:
+            from agents.crew import _tighten_sizing_shadow
+            provenance["tighten_sizing_shadow"] = _tighten_sizing_shadow(ticker)
+        except Exception as e:
+            provenance["tighten_sizing_shadow"] = {"n": None, "error": type(e).__name__}
+        provenance["tighten_sizing_shadow"]["basis"] = basis   # which test made it held (m599)
     try:
         provenance["gate_flags"] = _gate_flags(ticker, action, conviction, source_count,
                                                bool(parsed.get("pass_to_risk")),
@@ -2555,6 +3079,21 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
         log.warning(f"[{ticker}] gate flags record failed: {e}")
         provenance["gate_flags"] = {"error": type(e).__name__}
     provenance["trigger"] = trigger
+    provenance["analyst_addons"] = {**addon_rec, **_addon_parse_record(parsed, addon_rec)}
+    # Which prompt variant was sent (audit 2026-11-08 21:30 #7): "base", or
+    # base plus the add-on blocks; group by this with addon_template_sha.
+    provenance["prompt_variant"] = "+".join(
+        ["base"] + [k for k, on in (("scenarios", addon_rec.get("scenarios_requested")),
+                                    ("event_plan", addon_rec.get("event_plan_requested"))) if on])
+    if model_action in ("OPEN", "ADD"):
+        provenance["regime_entry"] = _regime_entry_record(ticker, regime_str, model_action,
+                                                          regime_rule_fired)
+    if (trigger or {}).get("path") == "daily_scan":
+        # Why the scanner picked it; the prompt shows only the composite
+        # (audit 11-07 01:08 #3). Record-only.
+        provenance["scan_reasons"] = {k: candidate.get(k) for k in _SCAN_REASON_KEYS}
+    if sell_confirm is not None:
+        provenance["sell_confirm"] = sell_confirm   # audit 11-06 23:24 #4, record-only
     est = _estimate_tokens(prompt)
     llm = {**_LAST_CALL_STATS, "prompt_tokens_est": est,
            # The options actually sent, and the seed (None: none is sent) (M7).
@@ -2575,6 +3114,10 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
         provenance["plan"] = _plan_observe(ticker, parsed, action, conviction, situation_brief)
     except Exception as e:
         log.warning(f"[{ticker}] plan shadow unavailable: {e}")
+    # The plan's horizon comes from the model's thesis_bucket; sizing uses
+    # this one (audit 11-06 07:38 #13). Log-only, so the two can be compared.
+    if isinstance(provenance.get("plan"), dict):
+        provenance["plan"]["sizing_bucket"] = bucket
     pending_entry = _pending_entry_shadow(ticker, action, conviction, model_action, parsed,
                                           situation_brief)
     try:
@@ -2597,7 +3140,8 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
                 "rule_shadows": _rule_shadows(ticker, action, situation_brief),
                 "trim_shadow": _trim_shadow(ticker, action, parsed, situation_brief),
                 "hold_fails_entry_rule": _hold_fails_entry_rule(action, udr, parsed, candidate,
-                                                                conviction=conviction),
+                                                                conviction=conviction,
+                                                                source_count=source_count),
                 "pending_entry": pending_entry,
                 "udr_check": _udr_check(parsed, situation_brief),
                 "udr_structural": _udr_structural(ticker, parsed, udr, situation_brief),
@@ -2609,7 +3153,16 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
                 # A held-position review or a held scan name (log-only); a
                 # scan with no broker positions reads False.
                 "held_review": candidate.get("held_review") is True,
+                # When a held review ran, so a boot catch-up after the close
+                # or at a weekend can be told from the 10:15 run (audit
+                # 2026-11-07 05:07 #2). Log-only.
+                "review_session": _review_session() if candidate.get("held_review") is True else None,
                 "imputed_fields": imputed_fields,
+                "unparsed_scores": unparsed_scores,
+                "conviction_coerced": conviction_coerced,
+                # How the reply was parsed (_reply_parse_mode); the replay
+                # harness treats "salvaged" as not replayable.
+                "parse_mode": parse_mode,
                 # The Trend Template check (M273): its result, or why there
                 # is none; the replay harness reads it.
                 "trend_template": trend_template_record,
@@ -2637,6 +3190,8 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
         # poison the conviction→outcome track record with manufactured 6s.
         "conviction_raw": conviction_raw,
         "imputed_fields": imputed_fields,
+        "unparsed_scores": unparsed_scores,
+        "conviction_coerced": conviction_coerced,
         "thesis_strength": thesis_strength,
         "catalyst_quality": catalyst_quality,
         "valuation_risk_reward": valuation_risk_reward,

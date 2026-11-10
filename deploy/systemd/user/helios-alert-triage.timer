@@ -1,0 +1,9 @@
+[Unit]
+Description=Helios Telegram outbox triage every 30 min, every day
+
+[Timer]
+OnCalendar=*-*-* *:05,35:00 America/New_York
+Persistent=true
+
+[Install]
+WantedBy=timers.target

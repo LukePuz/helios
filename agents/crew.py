@@ -24,6 +24,7 @@ price-drift abort, ATR stops) is unchanged.
 """
 
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -80,8 +81,14 @@ def screen_event_only(event: dict) -> dict:
         try:
             import db
             prov = screening.get("provenance") or {}
+            # The item's identifiers, as on SCREENED_IN, so a rejected item
+            # can be found again (audit 2026-11-07 15:07 #1: only a 70-char
+            # feed title survived). Never its text.
             db.log_signal(ticker, "SCREENED_OUT", 0.0, reason,
-                          model=prov.get("model"), provenance=prov or None)
+                          model=prov.get("model"), provenance=prov or None,
+                          decision={**event_item_fields(event),
+                                    "urgency": screening.get("urgency"),
+                                    "new_fact": screening.get("new_fact")})
         except Exception as e:
             log.warning(f"[{ticker}] SCREENED_OUT signal log failed: {e}")
     else:
@@ -140,6 +147,7 @@ def deep_analyze(event: dict, screening: dict | None = None) -> dict:
     # ── Assemble situation brief ──────────────────────────────────────────────
     held_as_of = None
     brief_error = None
+    brief_price = None     # the price the brief showed (audit 2026-11-07 17:17 #1)
     try:
         from ibkr import IBKRClient
         client = IBKRClient()
@@ -148,6 +156,12 @@ def deep_analyze(event: dict, screening: dict | None = None) -> dict:
         if positions is None:
             log.warning(f"[{ticker}] Broker positions unavailable — skipping analysis "
                         f"rather than analysing against an empty book")
+            # The SCREENED_IN row this event got would otherwise have no outcome.
+            try:
+                from tasks import _log_event_lost
+                _log_event_lost("tasks.deep_analyze_event", "positions_unavailable", [event])
+            except Exception as e:
+                log.warning(f"[{ticker}] EVENT_LOST log failed: {e}")
             return {"action": "SKIP", "ticker": ticker, "conviction": 0, "pass_to_risk": False,
                     "reasoning": "Skipped: broker positions unavailable"}
         # Held tickers get a price via the CURRENT PORTFOLIO section; anything
@@ -155,6 +169,7 @@ def deep_analyze(event: dict, screening: dict | None = None) -> dict:
         # would invent one for any dollar-denominated valuation output (found
         # 2026-07-17: a SNDK target of "$300" while it traded near $1,350).
         price = _get_price(ticker, client)
+        brief_price = price
         brief = assemble_brief(event, positions, client, current_price=price)
     except Exception as e:
         log.warning(f"[{ticker}] Brief assembly failed: {e}")
@@ -187,6 +202,9 @@ def deep_analyze(event: dict, screening: dict | None = None) -> dict:
         trigger = trigger_record("event", event)
         if screening and screening.get("override"):
             trigger["screen_override"] = screening["override"]   # review 4 #4
+            # Whether the title names this ticker (audit 11-06 09:31 #3).
+            trigger["title_names_ticker"] = ((screening.get("provenance") or {})
+                                             .get("title_names_ticker"))
         trigger["new_fact"] = candidate["new_fact"]
         sprov = (screening or {}).get("provenance") or {}
         trigger["screener_model_digest"] = sprov.get("model_digest")
@@ -196,6 +214,7 @@ def deep_analyze(event: dict, screening: dict | None = None) -> dict:
         # Log-only: the fallback brief (event text only, no book or price).
         trigger["brief_degraded"] = brief_error is not None
         trigger["brief_built_at"] = brief_built_at
+        trigger["brief_price"] = brief_price
         if brief_error:
             trigger["brief_error"] = brief_error
         result = analyze(candidate, situation_brief=brief, regime_packet=regime,
@@ -246,7 +265,8 @@ def _log_route_exit(ticker: str, kind: str, result: dict, reason: str,
         log.warning(f"[{ticker}] route-exit signal log failed: {e}")
 
 
-_VERDICT_ONLY_PROVENANCE = ("plan", "brief_exposure", "gate_flags")
+_VERDICT_ONLY_PROVENANCE = ("plan", "brief_exposure", "gate_flags", "tighten_sizing_shadow",
+                            "sell_confirm", "scan_reasons", "regime_entry")
 
 
 def _route_row_fields(result: dict, kind: str) -> dict:
@@ -258,8 +278,13 @@ def _route_row_fields(result: dict, kind: str) -> dict:
     if prov and any(k in prov for k in _VERDICT_ONLY_PROVENANCE):
         # The plan observation belongs to the verdict row only; copied onto
         # routing rows it was counted 2-3 times (pre-pull review 10-29).
-        # brief_exposure and gate_flags likewise.
+        # brief_exposure, gate_flags, tighten_sizing_shadow and sell_confirm likewise.
         prov = {k: v for k, v in prov.items() if k not in _VERDICT_ONLY_PROVENANCE}
+    if prov and isinstance(prov.get("track_record"), dict) and "by_position" in prov["track_record"]:
+        # The per-position track record is the verdict's alone (m607); the
+        # rest of track_record stays on routing rows as before.
+        prov = {**prov, "track_record": {k: v for k, v in prov["track_record"].items()
+                                         if k != "by_position"}}
     return {
         "model": (prov or {}).get("model"),
         "provenance": prov,
@@ -370,6 +395,53 @@ def _shadow_swap(rm, ticker: str, conviction: int, sizing: dict, result: dict, n
         return None
 
 
+def _fetch_earnings_dates(ticker: str):
+    """yfinance's dated earnings table (index: event time, tz-aware). Its own
+    function so tests stub the network call."""
+    import yfinance as yf
+    return yf.Ticker(ticker).get_earnings_dates(limit=8)
+
+
+def _earnings_timing(ticker: str, earnings_date) -> dict:
+    """Log-only (limitations audits 2026-11-08 13:18 #3/#6): when in the day
+    the print falls, from yfinance's earnings_dates row on the calendar date:
+    AMC at or after 16:00 ET, BMO before 09:30, "during" between, "unknown"
+    at midnight (no time given). The calendar marks every date confirmed;
+    this source gives no estimate flag either, so is_estimate stays None.
+    Read on the calling thread (a daemon-thread version segfaulted in
+    pyarrow, roadmap 04d); yfinance bounds the request itself. Held
+    earnings reviews are a few a day. Never raises; nothing reads it to
+    decide."""
+    from zoneinfo import ZoneInfo
+    out = {"source": "yfinance.earnings_dates", "calendar_date": str(earnings_date),
+           "event_at": None, "time_of_day": None, "is_estimate": None,
+           "reported": None, "status": None}
+    try:
+        df = _fetch_earnings_dates(ticker)
+    except Exception as e:
+        out["status"] = type(e).__name__
+        return out
+    try:
+        import math
+        et = ZoneInfo("America/New_York")
+        for ts, row in (df.iterrows() if df is not None else []):
+            at = ts.to_pydatetime().astimezone(et)
+            if str(at.date()) != str(earnings_date):
+                continue
+            mins = at.hour * 60 + at.minute
+            out["event_at"] = at.isoformat()
+            out["time_of_day"] = ("unknown" if mins == 0 else "BMO" if mins < 570
+                                  else "AMC" if mins >= 960 else "during")
+            rep = row.get("Reported EPS")
+            out["reported"] = rep is not None and not (isinstance(rep, float) and math.isnan(rep))
+            out["status"] = "ok"
+            return out
+        out["status"] = "no_match"
+    except Exception as e:
+        out["status"] = type(e).__name__
+    return out
+
+
 def _earnings_review_event(ticker: str, earnings_date, today=None) -> dict:
     """Review event for a held name that reports within a few days, or just
     did (limitations audit 2026-10-27: no earnings playbook; held names went
@@ -394,6 +466,9 @@ def _earnings_review_event(ticker: str, earnings_date, today=None) -> dict:
         "ticker": ticker, "source": "portfolio_review", "type": "earnings review",
         "title": f"Earnings position review — {ticker} {when}",
         "text": f"{ticker} {when}. {ask}",
+        # Not shown in the brief (it reads source/type/title/text/url); lets
+        # the analyst's event_plan add-on know the print is still ahead.
+        "earnings_phase": "pre" if days > 0 else "day" if days == 0 else "post",
     }
 
 
@@ -447,7 +522,130 @@ def _analyze_held_position(ticker: str, client, positions: dict, regime: dict,
         return {
             "action": "SKIP", "ticker": ticker, "conviction": 0, "pass_to_risk": False,
             "reasoning": f"Review failed with exception: {exc}",
+            # Read by review_all_held_positions to record the review as
+            # skipped (SEF 148, e6d099f). Not routed.
+            "review_error": type(exc).__name__,
         }
+
+
+def _catalyst_precision(catalyst) -> str | None:
+    """How precise a thesis's catalyst date is: day (YYYY-MM-DD), month
+    (YYYY-MM), ongoing, other, or None with no date."""
+    d = str((catalyst or {}).get("date") or "").strip()
+    if not d:
+        return None
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
+        return "day"
+    if re.fullmatch(r"\d{4}-\d{2}", d):
+        return "month"
+    return "ongoing" if d.lower() == "ongoing" else "other"
+
+
+def _record_thesis_drift(ticker: str, latest: dict, previous: dict | None = None,
+                         previous_read: str | None = None) -> None:
+    """Log-only: an activity row (stage thesis_drift) diffing this review's
+    thesis against the entry thesis with db.compute_thesis_drift, which had
+    no caller (audit 11-06 01:32 #2), plus catalyst_date_passed, whether the
+    entry thesis's catalyst date is before today (ET). No alert, no routing,
+    nothing in the brief. catalyst_status is still always "pending", so
+    material_change never comes from it. Calibration fields, so a threshold
+    can be set from data before anything triggers on the row (audit 11-06
+    03:34 #b): entry and latest conviction, the change since the previous
+    review (`previous`, the latest thesis this review replaced), risk counts
+    beside the new-risk list, and each thesis's catalyst precision.
+    previous_read says whether `previous` was read (ok), absent (none) or
+    unreadable (error), and previous_predates_position flags a previous
+    thesis from an earlier position, as for the original (professor 62r).
+    Never raises."""
+    try:
+        import db
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from agents.plans import _catalyst_date
+        original = (db.get_thesis(ticker) or {}).get("original")
+        if not original:
+            return              # no entry thesis to diff against
+        drift = db.compute_thesis_drift(original, latest)
+        cdate = _catalyst_date((original.get("catalyst") or {}).get("date"))
+        today = datetime.now(ZoneInfo("America/New_York")).date()
+        drift["catalyst_date_passed"] = None if cdate is None else cdate < today
+        prev_conv = (previous or {}).get("conviction")
+        cur_conv = latest.get("conviction")
+        drift.update(
+            entry_conviction=original.get("conviction"), latest_conviction=cur_conv,
+            previous_conviction=prev_conv, previous_as_of=(previous or {}).get("as_of"),
+            previous_read=previous_read, previous_predates_position=None,
+            # The fill writes the entry thesis to latest too, so a first
+            # review's previous is the entry snapshot (SEF 146d).
+            previous_is_entry=(None if not previous else
+                               previous.get("as_of") is not None
+                               and previous.get("as_of") == original.get("as_of")),
+            conviction_delta_vs_previous=(cur_conv - prev_conv
+                                          if isinstance(cur_conv, (int, float))
+                                          and isinstance(prev_conv, (int, float)) else None),
+            original_risk_count=len(original.get("key_risks") or []),
+            latest_risk_count=len(latest.get("key_risks") or []),
+            new_risk_count=len(drift.get("new_risks") or []),
+            original_catalyst_precision=_catalyst_precision(original.get("catalyst")),
+            latest_catalyst_precision=_catalyst_precision(latest.get("catalyst")))
+        drift.update(original_as_of=original.get("as_of"),
+                     original_action=original.get("action"), latest_action=latest.get("action"),
+                     env=db.TRADING_ENV)     # activity_feed has no env column
+        # Whether the entry thesis belongs to an earlier position: a re-entry
+        # over a leftover stop record keeps that record's original_thesis
+        # and opened_at, so this diff can be against the old position
+        # (professor m587). Reference: the newest open trade_outcomes entry.
+        # Record only; None when unknown.
+        drift.update(position_entry_at=None, position_entry_basis=None,
+                     original_predates_position=None, position_opened_at=None, review_path=None)
+        try:
+            drift["review_path"] = latest["provenance"]["trigger"]["path"]
+        except Exception:
+            pass
+        try:
+            from datetime import timedelta
+            legs = [o for o in db.get_open_outcomes()
+                    if o.get("ticker") == ticker and o.get("entry_date")]
+            # Every BUY approval, ADDs too, opens its own outcome row, so the
+            # position's entry is its newest OPEN leg (a re-entry over a
+            # leftover record is an OPEN; later ADDs don't move it), else
+            # its oldest leg (professor 58h).
+            opens = [o["entry_date"] for o in legs if o.get("action") == "OPEN"]
+            if opens:
+                entry, drift["position_entry_basis"] = max(opens), "open_leg"
+            elif legs:
+                entry, drift["position_entry_basis"] = min(o["entry_date"] for o in legs), "min_leg"
+            else:
+                entry = None
+            rec = db.get_position_stop(ticker) or {}
+            opened = rec.get("opened_at")
+            drift["position_opened_at"] = opened.isoformat() if hasattr(opened, "isoformat") else opened
+            if entry is not None:
+                drift["position_entry_at"] = entry.isoformat()
+                as_of = original.get("as_of")
+                if as_of:
+                    orig = datetime.fromisoformat(str(as_of).replace("Z", "+00:00"))
+                    if orig.tzinfo and entry.tzinfo:
+                        drift["original_predates_position"] = orig < entry - timedelta(minutes=5)
+                prev_as_of = (previous or {}).get("as_of")
+                if prev_as_of:
+                    prev = datetime.fromisoformat(str(prev_as_of).replace("Z", "+00:00"))
+                    if prev.tzinfo and entry.tzinfo:
+                        drift["previous_predates_position"] = prev < entry - timedelta(minutes=5)
+        except Exception as e:
+            log.debug(f"[{ticker}] thesis drift position check failed: {e}")
+        try:
+            from agents.analyst import shadow_versions
+            drift.update(shadow_versions())     # code_sha, env_sha, lib_versions
+        except Exception:
+            drift.update(code_sha=None, env_sha=None, lib_versions=None)
+        db.log_activity_direct(
+            "thesis_drift", ticker,
+            f"Thesis drift: conviction {drift['conviction_delta']:+}" if drift["conviction_delta"] is not None
+            else "Thesis drift: conviction change unknown",
+            "neutral", drift)
+    except Exception as e:
+        log.warning(f"[{ticker}] thesis drift record failed: {e}")
 
 
 def _capture_latest_thesis(ticker: str, result: dict) -> None:
@@ -483,13 +681,20 @@ def _capture_latest_thesis(ticker: str, result: dict) -> None:
             "expected_downside_pct": result.get("expected_downside_pct"),
             "weeks_to_catalyst": weeks_to_catalyst,
             "no_near_term_catalyst": db.compute_no_near_term_catalyst(result.get("catalyst"), weeks_to_catalyst),
+            **db.catalyst_horizon_any(result.get("catalyst")),
             "catalyst_stale": result.get("catalyst_stale", False),
             "valuation_tier": None,
             "key_risks": result.get("key_risks", []),
             "reasoning": result.get("reasoning"),
             "provenance": result.get("provenance"),
         }
+        try:
+            previous = (db.get_thesis(ticker, strict=True) or {}).get("latest")   # before it's replaced
+            previous_read = "ok" if previous else "none"
+        except Exception:
+            previous, previous_read = None, "error"
         db.update_latest_thesis(ticker, thesis)
+        _record_thesis_drift(ticker, thesis, previous, previous_read)
 
         # #4 (2026-09-15, user request): a legacy position matching ZERO
         # live setup categories AND carrying no genuine near-term catalyst
@@ -523,6 +728,15 @@ def review_held_position(ticker: str, client, positions: dict, regime: dict,
     log.info(f"[{ticker}] Scheduled position review"
              + (f" (earnings {earnings_date})" if earnings_date else ""))
     event = _earnings_review_event(ticker, earnings_date) if earnings_date else None
+    if event is not None:
+        # Provenance only (trigger_record); the brief reads title and text.
+        event["earnings_timing"] = _earnings_timing(ticker, earnings_date)
+        # A print after today's close is still ahead (audit review of the
+        # add-ons: AMC-today reviews asked to "decide whether to hold through
+        # it" but got no event_plan).
+        if (event.get("earnings_phase") == "day"
+                and (event["earnings_timing"] or {}).get("time_of_day") == "AMC"):
+            event["earnings_phase"] = "pre"
     result = _analyze_held_position(ticker, client, positions, regime, event=event,
                                     held_review=True)
     _capture_latest_thesis(ticker, result)
@@ -575,6 +789,19 @@ def review_plan_level(ticker: str, kind: str, level, price: float | None) -> dic
     return result
 
 
+def log_review_skipped(symbol: str, reasoning: str, decision: dict) -> None:
+    """Log-only REVIEW_SKIPPED row, so a held-position review that did not
+    happen is on the record rather than indistinguishable from no review.
+    symbol is "PORTFOLIO" for a whole-run skip, else the ticker. Never raises."""
+    try:
+        import db
+        from agents.analyst import shadow_versions
+        db.log_signal(symbol, "REVIEW_SKIPPED", 0.0, reasoning,
+                      decision=decision, provenance=shadow_versions())
+    except Exception as e:
+        log.warning(f"REVIEW_SKIPPED log failed: {e}")
+
+
 def review_all_held_positions(max_per_run: int = 10, priority_tickers: list[str] | None = None) -> list[dict]:
     """
     Batch driver (tasks.review_positions) — capped per run since each review
@@ -604,6 +831,11 @@ def review_all_held_positions(max_per_run: int = 10, priority_tickers: list[str]
     positions = _get_positions(client, strict=True)
     if positions is None:
         log.warning("Position review skipped: broker positions unavailable")
+        log_review_skipped("PORTFOLIO",
+                           "held review skipped: broker positions unavailable",
+                           {"task": "review_all_held_positions",
+                            "reason": "positions_unavailable",
+                            "priority_tickers": list(priority_tickers or [])})
         return []
     regime = get_cached_regime()
 
@@ -632,10 +864,24 @@ def review_all_held_positions(max_per_run: int = 10, priority_tickers: list[str]
     now_iso = datetime.now(timezone.utc).isoformat()
     for ticker in tickers:
         try:
-            results.append(review_held_position(ticker, client, positions, regime,
-                                                earnings_date=earnings.get(ticker)))
+            res = review_held_position(ticker, client, positions, regime,
+                                       earnings_date=earnings.get(ticker))
+            results.append(res)
+            # A stub (no model reply) is not a review: record it like a skip
+            # (audit 2026-11-07 05:07 #2). The cursor still advances as before.
+            if (res or {}).get("model_used") == "stub":
+                log_review_skipped(ticker, "held review skipped: stub verdict (no model reply)",
+                                   {"task": "review_all_held_positions", "reason": "stub"})
+            elif (res or {}).get("review_error"):
+                log_review_skipped(ticker, f"held review skipped: analyze raised {res['review_error']}",
+                                   {"task": "review_all_held_positions", "reason": "analyze_raised",
+                                    "error_class": res["review_error"]})
         except Exception as e:
             log.error(f"[{ticker}] Position review failed: {e}")
+            log_review_skipped(ticker, f"held review failed: {type(e).__name__}",
+                               {"task": "review_all_held_positions",
+                                "reason": "ticker_review_failed",
+                                "error_class": type(e).__name__})
         last_reviewed[ticker] = now_iso
 
     try:
@@ -1022,7 +1268,8 @@ def _attach_shadows(sizing: dict, ticker: str, result: dict, price: float, clien
     error (the helper raised; the dict holds the message) or unencodable."""
     stop = sizing.get("stop_loss_price")
     values = {"r_shadow": _r_shadow(result, price, stop),
-              "plan_compiled": _compiled_plan(ticker, result, price, stop)}
+              "plan_compiled": _compiled_plan(ticker, result, price, stop),
+              "arrival": _arrival_record(result, price)}
     try:
         values["partial_exec"] = _partial_exec_shadow(sizing, result.get("thesis_bucket"))
     except Exception as e:
@@ -1043,6 +1290,62 @@ def _attach_shadows(sizing: dict, ticker: str, result: dict, price: float, clien
             status[name] = ("n/a" if safe is None
                             else "error" if isinstance(safe, dict) and "error" in safe else "ok")
     sizing["shadow_status"] = status
+
+
+def _parse_when(value):
+    """An ISO or RFC 2822 time string as an aware UTC datetime, else None."""
+    from datetime import datetime, timezone
+    from email.utils import parsedate_to_datetime
+    if not value:
+        return None
+    s = str(value).strip()
+    for parse in (lambda x: datetime.fromisoformat(x.replace("Z", "+00:00")), parsedate_to_datetime):
+        try:
+            ts = parse(s)
+            return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+    return None
+
+
+def _arrival_record(result: dict, price: float) -> dict:
+    """Log-only (audit 2026-11-07 17:17 #1): how far price moved and how much
+    time passed between the brief the analyst read and the sizing quote the
+    order is checked against, and how old the triggering item was. The drift
+    guard and decision_price only see the sizing quote. Event path only has
+    a brief price and an event time; elsewhere they are None. Never
+    raises."""
+    from datetime import datetime, timezone
+    rec = {"brief_price": None, "brief_built_at": None, "event_time": None,
+           "event_time_source": None, "event_time_date_only": None,
+           "sizing_price": price, "sizing_at": datetime.now(timezone.utc).isoformat(),
+           "move_brief_to_sizing_pct": None, "minutes_brief_to_sizing": None,
+           "minutes_event_to_sizing": None}
+    try:
+        prov = result.get("provenance")
+        trig = (prov.get("trigger") if isinstance(prov, dict) else None) or {}
+        now = datetime.now(timezone.utc)
+        bp = trig.get("brief_price")
+        rec["brief_price"] = float(bp) if bp else None
+        rec["brief_built_at"] = trig.get("brief_built_at")
+        rec["event_time"] = trig.get("event_time")
+        rec["event_time_source"] = trig.get("event_time_source")
+        if rec["event_time"]:
+            # A filing_date or "date" key holds a day, not a time: it would
+            # parse as 00:00 UTC and inflate the minutes by up to a day
+            # (professor 67j).
+            rec["event_time_date_only"] = bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(rec["event_time"]).strip()))
+        if rec["brief_price"] and price:
+            rec["move_brief_to_sizing_pct"] = round((price - rec["brief_price"]) / rec["brief_price"] * 100, 3)
+        built = _parse_when(rec["brief_built_at"])
+        if built:
+            rec["minutes_brief_to_sizing"] = round((now - built).total_seconds() / 60, 2)
+        ev = None if rec["event_time_date_only"] else _parse_when(rec["event_time"])
+        if ev:
+            rec["minutes_event_to_sizing"] = round((now - ev).total_seconds() / 60, 1)
+    except Exception as e:
+        rec["error"] = type(e).__name__
+    return rec
 
 
 def _compiled_plan(ticker: str, result: dict, price: float, stop) -> dict | None:
@@ -1079,6 +1382,223 @@ def _r_shadow(result: dict, price: float, stop) -> dict | None:
     except Exception as e:
         log.debug(f"R shadow failed: {e}")
         return {"error": str(e)[:200]}
+
+
+def _gap_risk_shadow(ticker: str, shares, price, stop, equity, setup_gate_path: bool = False,
+                     bucket: str | None = None, regime_multiplier=None, today=None,
+                     held_shares=None) -> dict:
+    """What a stop that fills through a gap would cost, next to the per-trade
+    risk cap, which assumes the stop fills at the stop price. The gap is the
+    larger of the stop distance and today's options implied move (the
+    nearest-expiry ATM straddle the options poll stores; null when there is
+    none for today). All _pct values are percent units (4.0 = 4%), as
+    implied_move_pct is; no dollar amount is returned. held_shares (ADDs
+    only; None on an OPEN or when unknown) adds
+    gap_risk_pct_of_equity_position: an ADD re-places the stop for the whole
+    position, so a gap through it hits held plus new shares. Log-only: never
+    raises, read by nothing that sizes or routes.
+    implied_move_last_pct/_last_date/_last_dte (days to the straddle's expiry
+    on that date): the stored move whatever its date, so
+    a pre-open or Monday verdict (today's poll not run yet) still has one;
+    gap_risk_pct_of_equity_last uses it when today's is missing (m604).
+    implied_move_pct and status keep their today-only meaning."""
+    out = {"implied_move_pct": None, "implied_move_dte": None, "stop_distance_pct": None,
+           "implied_move_last_pct": None, "implied_move_last_date": None,
+           "implied_move_last_dte": None, "gap_risk_pct_of_equity_last": None,
+           "gap_risk_pct_of_equity": None, "gap_risk_pct_of_equity_position": None,
+           "cap_pct": None, "would_exceed": None, "next_earnings_days": None, "status": "error"}
+    try:
+        import json
+        import math
+        from datetime import date, datetime
+        from zoneinfo import ZoneInfo
+        import db
+        from config import (TRADING_ENV, RISK_PCT_PER_TRADE, CATEGORY_RISK_PCT_PER_TRADE)
+        today = today or datetime.now(ZoneInfo("America/New_York")).date()
+
+        def num(v):
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                return None
+            return f if math.isfinite(f) else None
+
+        if setup_gate_path and bucket in CATEGORY_RISK_PCT_PER_TRADE:
+            cap = CATEGORY_RISK_PCT_PER_TRADE[bucket] * (num(regime_multiplier) or 0.75)
+        else:
+            cap = RISK_PCT_PER_TRADE
+        out["cap_pct"] = round(cap * 100, 4)
+        try:
+            er = db.get_next_earnings(ticker)
+            if er is not None:
+                out["next_earnings_days"] = (er - today).days
+        except Exception as e:
+            log.debug(f"[{ticker}] gap risk shadow earnings read failed: {e}")
+        try:
+            book = json.loads(db.get_state(f"options_implied_move_{TRADING_ENV}") or "{}")
+            m = book.get(ticker) if isinstance(book, dict) else None
+            last_date = str(m.get("et_date") or "") if isinstance(m, dict) else ""
+            if last_date and last_date <= today.isoformat():
+                last = num(m.get("implied_move_pct"))
+                if last is not None and last >= 0:
+                    out["implied_move_last_pct"] = last
+                    out["implied_move_last_date"] = last_date
+                    try:   # the straddle's days to expiry on its own date
+                        exp = date.fromisoformat(str(m.get("expiry"))[:10]) if m.get("expiry") else None
+                        out["implied_move_last_dte"] = (exp - date.fromisoformat(last_date[:10])).days if exp else None
+                    except ValueError:
+                        pass
+            if isinstance(m, dict) and str(m.get("et_date") or "") == today.isoformat():
+                mv = num(m.get("implied_move_pct"))
+                out["implied_move_pct"] = mv if mv is not None and mv >= 0 else None
+                try:   # days to the straddle's expiry, when the record has one
+                    exp = date.fromisoformat(str(m.get("expiry"))[:10]) if m.get("expiry") else None
+                    out["implied_move_dte"] = (exp - today).days if exp else None
+                except ValueError:
+                    pass
+        except Exception as e:
+            log.debug(f"[{ticker}] gap risk shadow implied move read failed: {e}")
+
+        shares, price, stop, equity = num(shares), num(price), num(stop), num(equity)
+        if not (price and price > 0 and stop and 0 < stop < price):
+            out["status"] = "no_stop"
+            return out
+        dist = (price - stop) / price * 100
+        out["stop_distance_pct"] = round(dist, 4)
+        if not (equity and equity > 0 and shares and shares > 0):
+            out["status"] = "no_equity"
+            return out
+        gap = max(dist, out["implied_move_pct"] or 0.0)
+        # shares is this order (shares_initial), the count the per-trade
+        # risk cap bounds in size_position
+        risk = shares * price * gap / equity
+        out["gap_risk_pct_of_equity"] = round(risk, 4)
+        held = num(held_shares)
+        if held is not None and held > 0:
+            out["gap_risk_pct_of_equity_position"] = round((held + shares) * price * gap / equity, 4)
+        if out["implied_move_pct"] is None and out["implied_move_last_pct"] is not None:
+            gap_last = max(dist, out["implied_move_last_pct"])
+            out["gap_risk_pct_of_equity_last"] = round(shares * price * gap_last / equity, 4)
+        out["would_exceed"] = risk > cap * 100
+        out["status"] = "ok" if out["implied_move_pct"] is not None else "no_implied_move"
+        return out
+    except Exception as e:
+        log.debug(f"[{ticker}] gap risk shadow failed: {e}")
+        out["status"] = "error"
+        return out
+
+
+def _gap_risk_held_shares(ticker: str):
+    """Shares held in ticker from the fresh portfolio snapshot
+    (tasks._broker_held, no broker call), or None when unknown or not held."""
+    try:
+        import tasks
+        held, _, pos = tasks._broker_held(ticker)
+        qty = float((pos or {}).get("qty") or 0) if held else 0.0
+        return qty if qty > 0 else None
+    except Exception as e:
+        log.debug(f"[{ticker}] gap risk shadow held read failed: {e}")
+        return None
+
+
+# Which check_concentration rule each flag comes from (record-only; the flag
+# text is unchanged because other readers parse it).
+_CONC_RULE_PREFIXES = (
+    ("RISK CHECK FAILED", "errored"),
+    ("AI infrastructure exposure", "ai_infra"),
+    ("Total moonshot exposure", "moonshot_total"),
+)
+
+
+def _conc_failed_rules(flags) -> list:
+    rules = []
+    for f in flags or []:
+        f = str(f)
+        rule = next((r for pre, r in _CONC_RULE_PREFIXES if f.startswith(pre)), None)
+        if rule is None:
+            rule = ("single_name" if " position " in f and "exceeds" in f and " cap " in f
+                    else "theme" if "theme exposure" in f else "other")
+        if rule not in rules:
+            rules.append(rule)
+    return rules
+
+
+_TIGHTEN_SIZING_LOOKAHEAD_DAYS = 3
+
+
+def _tighten_sizing_shadow(ticker: str) -> dict:
+    """Log-only (audit 11-06 11:34 #6): the macro and sector calendars set
+    action_flags.tighten_sizing on events such as FOMC, CPI, jobs reports
+    and sector earnings clusters, and nothing reads it. Records which such
+    events fall from today through the next _TIGHTEN_SIZING_LOOKAHEAD_DAYS
+    days, with their dates, so any window can be applied later. Sizing is
+    unchanged; whether it should read this is Luke's. Never raises."""
+    try:
+        from catalyst_service.client import upcoming_events
+        rows = [{"date": e.get("event_date"), "scope": e.get("scope"),
+                 "event_type": e.get("event_type"), "ticker": e.get("ticker")}
+                for e in upcoming_events(ticker, days_ahead=_TIGHTEN_SIZING_LOOKAHEAD_DAYS)
+                if (e.get("action_flags") or {}).get("tighten_sizing")]
+        return {"lookahead_days": _TIGHTEN_SIZING_LOOKAHEAD_DAYS, "n": len(rows), "events": rows[:10]}
+    except Exception as e:
+        return {"lookahead_days": _TIGHTEN_SIZING_LOOKAHEAD_DAYS, "n": None, "error": type(e).__name__}
+
+
+def _udr_at_sizing(result: dict, price) -> dict | None:
+    """Log-only: the model's own bull target and downside floor against the
+    price the order is sized at, which can be hours after the brief's price.
+    gate_at_sizing says whether that ratio still clears the entry UDR
+    floor; nothing reads it
+    to decide. Never raises."""
+    try:
+        import math
+        from agents.plans import _dollars
+        from agents.analyst import _ENTRY_UDR_FLOOR
+        val = result.get("valuation") if isinstance(result.get("valuation"), dict) else {}
+        target, floor = _dollars(val.get("bull_case_target")), _dollars(val.get("downside_scenario"))
+        try:
+            model = float(result.get("upside_downside_ratio"))
+            model = model if math.isfinite(model) else None
+        except (TypeError, ValueError):
+            model = None
+        p = float(price) if price else None
+        raw = ((target - p) / (p - floor)
+               if p and target and floor and target > p > floor else None)
+        udr = round(raw, 2) if raw is not None else None
+        return {"price": p, "target": target, "floor": floor, "udr": udr, "model_udr": model,
+                # the unrounded ratio, so 1.995 doesn't pass a 2.0 floor
+                "gate_at_sizing": (raw >= _ENTRY_UDR_FLOOR) if raw is not None else None,
+                "reason": None if udr is not None else
+                ("no_price" if not p else "no_target_or_floor" if not (target and floor)
+                 else "price_outside_target_floor")}
+    except Exception as e:
+        return {"error": str(e)[:120]}
+
+
+def _attach_gap_risk_shadow(rm, ticker: str, sizing: dict, price, action: str | None = None) -> None:
+    """sizing["gap_risk_shadow"] for the order as it will be sent (after the
+    concentration, correlation and micro-name cuts). Equity is read for the
+    ratio and not stored. On an ADD the held share count comes from the
+    portfolio snapshot. Log-only, never raises."""
+    try:
+        held_shares = _gap_risk_held_shares(ticker) if action == "ADD" else None
+        try:
+            equity = rm.portfolio_value()
+        except Exception as e:
+            log.debug(f"[{ticker}] gap risk shadow equity read failed: {e}")
+            equity = None
+        shadow = _json_safe(_gap_risk_shadow(
+            ticker, sizing.get("shares_initial"), price, sizing.get("stop_loss_price"), equity,
+            setup_gate_path="heat_blocked" in sizing, bucket=sizing.get("bucket"),
+            regime_multiplier=sizing.get("regime_multiplier"), held_shares=held_shares))
+        sizing["gap_risk_shadow"] = None if shadow is _UNENCODABLE else shadow
+        status = sizing.get("shadow_status")
+        if isinstance(status, dict):
+            status["gap_risk_shadow"] = (
+                "unencodable" if shadow is _UNENCODABLE
+                else "error" if (shadow or {}).get("status") == "error" else "ok")
+    except Exception as e:
+        log.debug(f"[{ticker}] gap risk shadow attach failed: {e}")
 
 
 SWAP_CASH_WAIT_S = 16
@@ -1299,12 +1819,22 @@ def new_fact_gate(ticker: str, action, trigger: dict | None) -> dict | None:
         rec.update(applies=False, passed=True, reason=f"not gated ({scope})")
         return rec
     rec["applies"] = True
-    if news and not isinstance(item, bool):
+    if trig.get("source") == "dip_watch":
+        # A drop-watch review has no news item, so it has no new_fact by
+        # construction. DIP_REVIEW_COUNTS_AS_NEW_FACT (default off; Luke's)
+        # lets the drop itself count; otherwise the window rule below decides.
+        import config
+        rec["dip_review"] = True
+        if config.DIP_REVIEW_COUNTS_AS_NEW_FACT:
+            rec.update(passed=True, reason="a drop-watch review (DIP_REVIEW_COUNTS_AS_NEW_FACT)")
+            return rec
+    elif news and not isinstance(item, bool):
         log.warning(f"[{ticker}] screener new_fact missing for the triggering item; "
                     f"counted as false")
         rec["item_new_fact_missing"] = True
     if item is True:
         rec.update(passed=True, reason="the triggering news item is a new fact")
+        _note_new_fact_tone(rec, [trig.get("title_tone")])
         return rec
     if NEW_FACT_WINDOWS[window]:
         import db
@@ -1312,6 +1842,7 @@ def new_fact_gate(ticker: str, action, trigger: dict | None) -> dict | None:
         if items:
             rec.update(passed=True, window_items=items,
                        reason=f"a new-fact news item on {ticker} within {window}")
+            _note_new_fact_tone(rec, [i.get("title_tone") for i in items])
             return rec
         if items is None:
             rec["window_lookup_error"] = True
@@ -1326,6 +1857,20 @@ def new_fact_gate(ticker: str, action, trigger: dict | None) -> dict | None:
 
 
 _NEW_FACT_FALLBACK_ALERT_WINDOW_S = 3600
+
+
+def _note_new_fact_tone(rec: dict, tones: list) -> None:
+    """Log-only (audit 2026-11-09 16:53 #3): the headline tones of the
+    new-fact items that let a buy pass, and new_fact_tone_mismatch when every
+    one with a known tone reads negative (a bad-news fact licensing an
+    OPEN/ADD). None when no tone is known. The gate's decision never reads
+    it. Never raises."""
+    try:
+        known = [t for t in tones if t in ("pos", "neg", "neutral", "mixed")]
+        rec["licensing_tones"] = list(tones)
+        rec["new_fact_tone_mismatch"] = (all(t == "neg" for t in known) if known else None)
+    except Exception:
+        rec["new_fact_tone_mismatch"] = None
 
 
 def _alert_new_fact_fallback_block(ticker: str, gate: dict, trigger, now: datetime | None = None) -> bool:
@@ -1380,6 +1925,16 @@ def _apply_micro_name_cap(rm, ticker: str, sizing: dict, price: float, result: d
     if rec is None:            # flag off or not the micro tier
         return False
     sizing["micro_name_cap"] = rec
+    for f in list(sizing.get("flags") or []):
+        # The micro name cap sits under every tier cap, so a "bucket maximum"
+        # flag names a limit that can't bind here (audit 11-06 21:36 #9). The
+        # note doesn't claim the name cap binds: another limit may size lower
+        # (professor 62n); a name-cap cut gets its own flag below.
+        m = re.match(r"Size capped at (\d+(?:\.\d+)?)% bucket maximum$", f)
+        if m and float(m.group(1)) > float(rec["cap_pct"]):
+            sizing["flags"].append(f"Micro tier: the {rec['cap_pct']:g}% name cap is below the "
+                                   f"{m.group(1)}% bucket maximum, so the bucket maximum can't bind")
+            break
     old = sizing["shares_initial"]
     if rec["shares_after"] >= old:
         return False
@@ -1391,7 +1946,10 @@ def _apply_micro_name_cap(rm, ticker: str, sizing: dict, price: float, result: d
         sizing["flags"].append(reason)
         log.info(f"[{ticker}] Entry blocked: {reason}")
         _log_route_exit(ticker, "ROUTE_MICRO_NAME_CAP", result, reason,
-                        decision_extra={"micro_name_cap": rec})
+                        decision_extra={"micro_name_cap": rec,
+                                        "theme_group_shadow": sizing.get("theme_group_shadow"),
+                                        "concentration_inflight_shadow":
+                                            sizing.get("concentration_inflight_shadow")})
         return True
     new = rec["shares_after"]
     sizing["shares_initial"] = new
@@ -1406,6 +1964,26 @@ def _apply_micro_name_cap(rm, ticker: str, sizing: dict, price: float, result: d
     log.info(f"[{ticker}] Micro-tier name cap: {old} -> {new} shares")
     return False
 
+
+def _atr_brief(ticker: str) -> dict | None:
+    """The ATR(14) the brief showed (the nightly trade ladder's) and when
+    that ladder was computed, beside sizing's atr_stop (audit 2026-11-07
+    11:07 #7: the model reasons about one volatility and the stop is set
+    from another). ladder_row is False when get_trade_ladder gave nothing,
+    which is either no row or a failed read (it swallows errors); None only
+    when the call itself raised. Log-only. Never raises."""
+    try:
+        import db
+        row = db.get_trade_ladder(ticker)
+        ld = row or {}
+        try:
+            atr = round(float(ld["atr"]), 4) if ld.get("atr") is not None else None
+        except (TypeError, ValueError):
+            atr = None
+        return {"atr": atr, "ladder_row": bool(row),
+                "computed_at": str(ld.get("computed_at")) if ld.get("computed_at") else None}
+    except Exception:
+        return None
 
 def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
     """
@@ -1427,16 +2005,23 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
     except Exception:
         _feed_emit = None
 
-    # Skip if this ticker already has an open approval waiting for decision
+    action = result["action"]
+    # Skip if this ticker already has an open approval waiting for decision.
+    # An unreadable guard skips a buy (both duplicate-buy guards read the same
+    # table, so one DB error used to disable both: audit 11-06 21:36 #8); a
+    # sell goes on as before.
     try:
-        if db.has_active_approval(ticker):
+        if db.has_active_approval(ticker, strict=True):
             log.info(f"[{ticker}] Active approval already pending — skipping duplicate")
             _log_route_exit(ticker, "ROUTE_APPROVAL_PENDING", result, "active approval already pending")
             return
-    except Exception:
-        pass
+    except Exception as e:
+        if action in ("OPEN", "ADD"):
+            log.warning(f"[{ticker}] Pending-approval check unreadable ({e}); {action} skipped")
+            _log_route_exit(ticker, "ROUTE_GUARD_UNREADABLE", result,
+                            f"pending-approval check unreadable: {type(e).__name__}")
+            return
 
-    action = result["action"]
     if action == "ADD":
         _rule_shadow_average_down(ticker, bucket, trading_client)
 
@@ -1446,9 +2031,12 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
         except ImportError:
             REBUY_COOLDOWN_HOURS = 4
         try:
-            prior = db.get_last_executed_approval(ticker, REBUY_COOLDOWN_HOURS)
-        except Exception:
-            prior = None
+            prior = db.get_last_executed_approval(ticker, REBUY_COOLDOWN_HOURS, strict=True)
+        except Exception as e:
+            log.warning(f"[{ticker}] Rebuy-cooldown check unreadable ({e}); {action} skipped")
+            _log_route_exit(ticker, "ROUTE_GUARD_UNREADABLE", result,
+                            f"rebuy-cooldown check unreadable: {type(e).__name__}")
+            return
         if prior and conviction <= prior["conviction"]:
             log.info(
                 f"[{ticker}] Rebuy cooldown — approved {prior['conviction']}/10 at "
@@ -1521,6 +2109,12 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
             "conviction":        conviction,
             "price_at_sizing":   price,
         }
+        if action == "TRIM":
+            # Record-only: at a few shares the whole-share floor turns a TRIM
+            # into a sale of most or all of the position.
+            sizing["trim_granularity"] = {"owned": owned, "fraction": TRIM_FRACTION,
+                                          "intended_qty": round(owned * TRIM_FRACTION, 4),
+                                          "sell_qty": sell_qty, "full_exit": sell_qty >= owned}
         entry_strategy = f"{action}: sell {sell_qty:g} of {owned:g} held shares @ ~${price:.2f}."
     else:
         try:
@@ -1730,9 +2324,34 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
         # ADD), so check whichever is larger (audit 10-28 #5).
         proposed_pct = max(sizing["position_size_pct"], sizing.get("order_pct") or 0)
         conc = rm.check_concentration(ticker, proposed_pct, bucket=bucket)
+        # Log-only theme grouping on the heading prefix (risk_manager.
+        # _theme_group_shadow); the caps below use today's grouping.
+        sizing["theme_group_shadow"] = conc.get("theme_shadow")
+        sizing["atr_brief"] = _atr_brief(ticker)
+        # Log-only: the theme total if buys approved or deferred but not yet
+        # filled were counted (risk_manager._inflight_theme_shadow).
+        from risk_manager import _inflight_theme_shadow
+        sizing["concentration_inflight_shadow"] = _inflight_theme_shadow(
+            ticker, proposed_pct, conc.get("theme_shadow"))
         if not conc["passed"]:
-            log.info(f"[{ticker}] Concentration check failed: {conc['flags']}")
+            # The flags state the checked weight (the larger of target and
+            # order), not what the order will buy after the caps below.
+            log.info(f"[{ticker}] Concentration check failed: {conc['flags']} "
+                     f"(checked {proposed_pct:.1%}: target {sizing['position_size_pct']:.1%}, "
+                     f"order {sizing.get('order_pct') or 0:.1%})")
             sizing["flags"].extend(conc["flags"])
+            # The flag text states the checked weight (the larger of target
+            # and order), before any cap; these keys say which was which and
+            # what the cap left.
+            conc_rec = {"checked_pct": round(proposed_pct, 4),
+                        "target_pct": round(sizing["position_size_pct"], 4),
+                        "order_pct": round(sizing.get("order_pct") or 0, 4),
+                        "cap_pct": None, "shares_before": sizing["shares_initial"],
+                        "shares_after": sizing["shares_initial"], "order_pct_after": None,
+                        "failed_rules": _conc_failed_rules(conc.get("flags")),
+                        "errored": bool(conc.get("errored")), "cap_binding": False,
+                        "binding_cap": None}
+            sizing["concentration_check"] = conc_rec
             # 2026-08-11: this used to only flag AI-infra breaches in text
             # nobody reviews (auto-execution has no human-in-the-loop tap) —
             # the portfolio sat over its own 60% limit for a week-plus while
@@ -1746,11 +2365,11 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
             # address a breach caused by other positions) -- take the
             # tightest of whichever apply, since more than one can breach
             # at once (e.g. a moonshot name in an over-concentrated theme).
-            caps = [c for c in (
-                conc.get("ai_infra_size_cap_pct"),
-                conc.get("theme_size_cap_pct"),
-                conc.get("moonshot_size_cap_pct"),
-            ) if c is not None]
+            named = [(n, conc.get(k)) for n, k in (("ai_infra", "ai_infra_size_cap_pct"),
+                                                    ("theme", "theme_size_cap_pct"),
+                                                    ("moonshot_total", "moonshot_size_cap_pct"))
+                     if conc.get(k) is not None]
+            caps = [c for _, c in named]
             cap = min(caps) if caps else None
             if cap is not None and cap < proposed_pct:
                 order_pct = sizing.get("order_pct") or 0
@@ -1765,23 +2384,57 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
                 sizing["shares_initial"] = shares
                 sizing["initial_dollar"] = (round(sizing["initial_dollar"] * shares / old_shares, 2)
                                             if old_shares else 0.0)
+                if sizing.get("order_pct"):
+                    sizing["order_pct"] = (round(sizing["order_pct"] * shares / old_shares, 4)
+                                           if old_shares else 0.0)
+                # cap_binding: the cap reduced the share count (an errored
+                # check's 0.0 caps cut to 0, so it binds there too); a cap
+                # between order and target leaves the shares unchanged.
+                conc_rec.update(cap_pct=round(cap, 4), shares_after=shares,
+                                order_pct_after=sizing.get("order_pct"),
+                                cap_binding=shares < old_shares,
+                                # An errored check sets every cap to 0.0, so no
+                                # single rule binds (professor m534).
+                                binding_cap=("errored" if conc.get("errored")
+                                             else next(n for n, c in named if c == cap)))
                 sizing["flags"].append(
                     f"Size capped to {cap:.1%} target ({sizing['shares_initial']} shares) "
                     f"to stay within concentration limits"
                 )
+                log.info(f"[{ticker}] {sizing['flags'][-1]}")
                 if sizing["shares_initial"] <= 0:
                     log.info(f"[{ticker}] Concentration limits leave 0 shares of room — "
                              f"skipping entry (already at/over the limit)")
                     _log_route_exit(ticker, "ROUTE_CONCENTRATION_ZERO", result,
-                                    "; ".join(sizing.get("flags", [])))
+                                    "; ".join(sizing.get("flags", [])),
+                                    decision_extra={"concentration_check": conc_rec,
+                                                    "theme_group_shadow": sizing.get("theme_group_shadow"),
+                                                    "concentration_inflight_shadow":
+                                                        sizing.get("concentration_inflight_shadow")})
                     return
 
         # Correlation check
         corr = rm.check_correlation(ticker)
         if corr["reduce_by"] > 0:
             log.info(f"[{ticker}] Correlation adjustment: reducing size 25% ({corr['note']})")
+            shares_before = sizing["shares_initial"]
             sizing["shares_initial"] = max(1, int(sizing["shares_initial"] * 0.75))
             sizing["initial_dollar"] = round(sizing["initial_dollar"] * 0.75, 2)
+            # order_pct follows the shares (professor m507/66c): nothing on
+            # this route sizes from it after the cut (the micro cap reads
+            # shares and price), so only the stored weight changes. The
+            # target, position_size_pct, stays. Recorded in correlation_cut.
+            op = sizing.get("order_pct") or 0
+            if shares_before and op:
+                sizing["order_pct"] = round(op * sizing["shares_initial"] / shares_before, 4)
+            sizing["correlation_cut"] = {
+                "applied": True, "reduce_by": corr.get("reduce_by"),
+                # The fail-closed cut (positions unreadable) also reduces 25%.
+                "errored": str(corr.get("note") or "").startswith("RISK CHECK FAILED"),
+                "shares_before": shares_before, "shares_after": sizing["shares_initial"],
+                "order_pct_before": op, "order_pct_after": sizing.get("order_pct")}
+        else:
+            sizing["correlation_cut"] = {"applied": False, "reduce_by": corr.get("reduce_by")}
 
         # Last, so it bounds the final order (after the swap's re-size too).
         if _apply_micro_name_cap(rm, ticker, sizing, price, result):
@@ -1797,6 +2450,9 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
             return
         if new_fact is not None:
             sizing["new_fact_gate"] = new_fact
+        _attach_gap_risk_shadow(rm, ticker, sizing, price, action)   # log-only, final shares
+        sizing["udr_at_sizing"] = _udr_at_sizing(result, price)      # log-only
+        sizing["tighten_sizing_shadow"] = _tighten_sizing_shadow(ticker)   # log-only
 
         entry_strategy = (
             f"{sizing['initial_entry_pct']:.0%} initial ({sizing['shares_initial']} shares @ ~${price:.2f}). "
@@ -1887,27 +2543,50 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
                        f"({sizing['position_size_pct']:.1%} portfolio) | "
                        f"stop {stop_str} | {bucket} bucket",
                        sentiment)
-        else:
-            _feed_emit("execution", ticker,
-                       f"Auto-execution FAILED for {result['action']} {ticker} — check logs", "alert")
 
     # _execute_approved_order already sends a Telegram trade alert on success;
-    # only notify separately here on failure, so a broken execution doesn't
-    # fail silently.
-    if not success and status == "FAILED":   # left to reconcile has its own alert
-        try:
-            alert_module._send(
-                f"⚠️ AUTO-EXECUTION FAILED\n"
-                f"<b>{result['action']} {ticker}</b> (approval #{approval_id}) could not be executed.\n"
-                f"Check helios.log for details."
-            )
-        except Exception:
-            pass
+    # only notify separately here when it didn't execute, so a broken
+    # execution doesn't fail silently.
+    if not success:
+        _report_auto_execution_not_done(_feed_emit, alert_module._send, ticker,
+                                        result["action"], approval_id, status, reason)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _report_auto_execution_not_done(feed_emit, send, ticker: str, action: str,
+                                    approval_id: int, status: str, reason: str | None) -> None:
+    """Feed row and Telegram alert for an auto-execution that returned False.
+    A deferral to a scheduled retry (market closed, stale price, gap check)
+    is not a failure: execute_approved already sent its own deferral alert and
+    the approval stays FAILED only so retry_deferred_entry can claim it, so
+    this writes a deferral feed row and no failure alert. A fill left to
+    reconcile (APPROVED) has its own alert. Anything else is a real failure."""
+    from execution import outcome_deferred
+    deferred = status == "FAILED" and outcome_deferred(reason)
+    if feed_emit:
+        try:
+            if deferred:
+                feed_emit("execution", ticker,
+                          f"Auto-execution of {action} {ticker} deferred — {reason}", "info")
+            else:
+                feed_emit("execution", ticker,
+                          f"Auto-execution FAILED for {action} {ticker} — check logs", "alert")
+        except Exception:
+            pass
+    if status != "FAILED" or deferred:
+        return
+    try:
+        send(
+            f"⚠️ AUTO-EXECUTION FAILED\n"
+            f"<b>{action} {ticker}</b> (approval #{approval_id}) could not be executed.\n"
+            f"Check helios.log for details."
+        )
+    except Exception:
+        pass
+
 
 def _get_positions(client, strict: bool = False) -> dict | None:
     """Held positions by symbol. On a broker error returns {} or, with
@@ -1962,14 +2641,27 @@ def _get_price(ticker: str, client) -> float | None:
     try:
         import yfinance as yf
         t = yf.Ticker(ticker)
-        # Prefer extended-hours price so sizing reflects what we'd actually pay
+        # Outside regular hours prefer the extended-hours price (what we'd
+        # actually pay, Luke D6); during them, postMarketPrice is the previous
+        # evening's after-hours print, so the regular price comes first.
         full = t.info
-        price = (
-            full.get("postMarketPrice")
-            or full.get("preMarketPrice")
-            or full.get("regularMarketPrice")
-            or getattr(t.fast_info, "last_price", None)
-        )
+        from config import PRICE_FALLBACK_SESSION_ORDER
+        try:
+            from market_data import is_market_hours
+            rth = PRICE_FALLBACK_SESSION_ORDER and is_market_hours()
+        except Exception:
+            rth = False
+        # Before noon ET the newer extended print is today's pre-market one;
+        # after the close, the after-hours one. Off: after-hours first always.
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        morning = (PRICE_FALLBACK_SESSION_ORDER
+                   and datetime.now(ZoneInfo("America/New_York")).hour < 12)
+        ext = ((full.get("preMarketPrice"), full.get("postMarketPrice")) if morning
+               else (full.get("postMarketPrice"), full.get("preMarketPrice")))
+        order = ((full.get("regularMarketPrice"), *ext) if rth
+                 else (*ext, full.get("regularMarketPrice")))
+        price = next((v for v in order if v), None) or getattr(t.fast_info, "last_price", None)
         if price:
             p = float(price)
             if 0.01 <= p <= 50000.0:

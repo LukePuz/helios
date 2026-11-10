@@ -21,7 +21,10 @@ def test_screened_out_signal_logs_model_and_provenance():
          patch("agents.screener.screen", return_value={"relevant": False, "reason": "noise", "provenance": prov}), \
          patch("db.log_signal") as log_signal:
         crew.screen_event_only({"ticker": "NVDA", "source": "news", "title": "t", "text": "x"})
-    assert log_signal.call_args.kwargs == {"model": "qwen2.5:7b", "provenance": prov}
+    kw = log_signal.call_args.kwargs
+    assert kw["model"] == "qwen2.5:7b" and kw["provenance"] == prov
+    assert kw["decision"]["title"] == "t" and kw["decision"]["source"] == "news"
+    assert "text" not in kw["decision"]
 
 
 def test_title_tone_tags_cuts_and_raises():
@@ -77,6 +80,13 @@ def test_recap_headline_does_not_use_up_a_rating_changes_override():
     assert _screen("BTIG main NOW: Buy, price target lowers to $180")["relevant"]
 
 
+def test_provenance_records_the_source_and_form():
+    with patch("agents.screener._call_ollama", return_value='{"relevant": false, "urgency": "eod", "reason": "x"}'), \
+         patch("feed.emit"), patch("db.get_position_stop", return_value=None):
+        r = screener.screen({"ticker": "NOW", "source": "sec_filing", "form": "10-Q", "title": "t", "text": "x"})
+    assert r["provenance"]["source"] == "sec_filing" and r["provenance"]["form"] == "10-Q"
+
+
 def test_provenance_records_how_much_text_the_screener_saw():
     from agents import screener
     reply = '{"relevant": false, "urgency": "low", "reason": "noise"}'
@@ -115,3 +125,13 @@ def test_provenance_records_the_reply_keys_and_a_missing_reason():
     with patch("agents.screener._call_ollama", return_value=None), patch("feed.emit"):
         r = screener.screen({"ticker": "NVDA", "source": "news", "title": "t", "text": "x"})
     assert "reply_keys" not in r["provenance"] and "reason_missing" not in r["provenance"]
+
+
+def test_provenance_records_the_filings_own_form():
+    """Audit 2026-11-07 03:08 #1: a 424B5 arrives with form "4"."""
+    reply = '{"relevant": false, "urgency": "low", "reason": "noise"}'
+    for event, want in (({"source": "sec_form4", "form": "4", "actual_form": "424B5"}, "424B5"),
+                        ({"source": "news"}, None)):
+        with patch("agents.screener._call_ollama", return_value=reply), patch("feed.emit"):
+            r = screener.screen({"ticker": "META", "title": "t", "text": "x", **event})
+        assert r["provenance"]["actual_form"] == want

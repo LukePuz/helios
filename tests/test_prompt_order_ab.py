@@ -686,6 +686,43 @@ def _toy_rows():
             + [{"kind": "skip", "signal_id": 21, "reason": "no_stored_prompt"}])
 
 
+RUNNER_SHA_AT_9B913D7 = "6986d414e4458de52f1254c1d44d738ef01831344d6a1f1323ad326d40e79f5f"
+
+
+def test_runner_is_byte_identical_to_9b913d7():
+    # its hash keys the resume of a run in progress
+    import hashlib
+    with open(os.path.join(REPO, "scripts", "prompt_order_ab.py"), "rb") as f:
+        assert hashlib.sha256(f.read()).hexdigest() == RUNNER_SHA_AT_9B913D7
+
+
+def test_bounds_treat_a_cut_off_reply_with_a_conviction_as_cut_off():
+    last = [_pair(1, 7, 8, b_kw={"done_reason": "length"}),   # B cut off, parsed c8
+            _pair(2, 5, 9),
+            _pair(3, 8, 4)]
+    b = rep.bounds(last, "A", "B")
+    assert b["failed_or_cut"] == {"A": 0, "B": 1}
+    assert b["dropped"]["n"] == 2
+    assert b["dropped"]["x"] == pytest.approx(1 / 2) and b["dropped"]["y"] == pytest.approx(1 / 2)
+    assert b["not_c7"]["x"] == pytest.approx(2 / 3) and b["not_c7"]["y"] == pytest.approx(1 / 3)
+    assert b["not_c7"]["diff"] == pytest.approx(-1 / 3)
+    text = rep.render_bounds(b, "A", "B")
+    assert "bound 'dropped'" in text and "bound 'not-c7'" in text
+
+
+def test_report_prints_its_own_sha_and_the_runner_tool_sha(tmp_path, capsys):
+    import hashlib
+    path = tmp_path / "r.jsonl"
+    rows = _toy_rows()
+    rows[0] = {**rows[0], "tool_sha": "t" * 64}
+    _write(path, rows)
+    rep.main([str(path), "--primary", "c7_share", "--boot", "50"])
+    first = capsys.readouterr().out.splitlines()[0]
+    with open(os.path.join(REPO, "scripts", "prompt_order_ab_report.py"), "rb") as f:
+        sha = hashlib.sha256(f.read()).hexdigest()
+    assert first == f"report_sha256: {sha}; runner tool_sha on run lines: {'t' * 64}"
+
+
 def test_report_math_on_a_toy_file(tmp_path):
     path = tmp_path / "r.jsonl"
     _write(path, _toy_rows())
@@ -711,11 +748,14 @@ def test_report_math_on_a_toy_file(tmp_path):
     assert s["by_position"]["A@1"] == (7, 8) and s["by_position"]["B@1"] == (1, 1)
     assert rep.summarize(rep.usable(last, "A", "B", clean_only=False), 100, 0)["n"] == 10
 
-    # missing B conviction (signal 20) counted both ways
+    # missing B conviction (signal 20): pair dropped, or counted as not c7+
     b = rep.bounds(last, "A", "B")
-    assert b["n"] == 11 and b["y"][2] == 1 and b["x"][2] == 0
-    assert b["y"][0] == pytest.approx(3 / 11) and b["y"][1] == pytest.approx(4 / 11)
-    assert b["diff"] == (pytest.approx(3 / 11 - 7 / 11), pytest.approx(4 / 11 - 7 / 11))
+    assert b["n"] == 11 and b["failed_or_cut"] == {"A": 0, "B": 1}
+    assert b["dropped"]["n"] == 10
+    assert b["dropped"]["x"] == pytest.approx(7 / 10) and b["dropped"]["y"] == pytest.approx(3 / 10)
+    assert b["dropped"]["diff"] == pytest.approx(-4 / 10)
+    assert b["not_c7"]["x"] == pytest.approx(7 / 11) and b["not_c7"]["y"] == pytest.approx(3 / 11)
+    assert b["not_c7"]["diff"] == pytest.approx(-4 / 11)
 
     t = rep.arm_tables(last, ("A", "B"))
     assert t["B"]["counts"]["parse_failed"] == 1 and t["B"]["counts"]["num_predict_cut"] == 1

@@ -13,6 +13,10 @@ def test_boot_record_fields(tmp_path, monkeypatch):
     assert rec["process_started_at"] and rec["code_read_at"]
     assert len(rec["venv_sha"]) == 12 and rec["venv_packages"] > 10
     assert "sp500_cache_sha" in rec
+    monkeypatch.setenv("SUPABASE_PORT", "6543")
+    assert analyst.boot_record("celery:llm")["db_port"] == "6543"
+    monkeypatch.delenv("SUPABASE_PORT")
+    assert analyst.boot_record("celery:llm")["db_port"] == "5432"
 
 
 def test_boot_record_says_whether_the_spill_path_is_the_repo_default(monkeypatch, tmp_path):
@@ -76,3 +80,27 @@ def test_verdict_provenance_names_the_process():
     with patch.object(analyst, "_code_mixed_check", return_value={}):
         p = analyst._provenance("p")["process"]
     assert p["code_read_pid"] == analyst._BOOT["pid"] and p["code_read_at"] == analyst._BOOT["code_read_at"]
+
+
+def test_boot_row_shows_a_rejected_track_record_bound():
+    from unittest.mock import patch
+    from agents import analyst
+    with patch("config.TRACK_RECORD_SINCE", "2027-13-01", create=True):
+        assert analyst.boot_record("t")["track_record_since"] == {
+            "set": "2027-13-01", "applied": None, "rejected": True}
+    with patch("config.TRACK_RECORD_SINCE", "2027-01-01", create=True):
+        assert analyst.boot_record("t")["track_record_since"]["rejected"] is False
+    with patch("config.TRACK_RECORD_SINCE", "", create=True):
+        assert analyst.boot_record("t")["track_record_since"] == {
+            "set": None, "applied": None, "rejected": False}
+
+
+def test_a_failed_boot_row_is_spilled_for_replay():
+    """Professor m614: it returned False with nothing to replay."""
+    from unittest.mock import patch
+    with patch("db._spill") as spill:
+        assert db.log_boot_activity("m", {"a": 1}) is False
+    writer, rec, err = spill.call_args.args
+    assert writer == "log_activity" and rec["stage"] == "boot" and rec["ticker"] == ""
+    assert rec["message"] == "m" and rec["extra"]["a"] == 1 and rec["extra"]["env"] == db.TRADING_ENV
+    assert err

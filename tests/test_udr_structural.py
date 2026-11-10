@@ -93,6 +93,15 @@ def _analyze(shadow=None):
     return result, log_signal.call_args.kwargs["decision"], ladder.call_count
 
 
+def _without_clock(d):
+    """Drop *_at times (provenance.brief_exposure.read_at, process.code_read_at
+    are whole-second reads, so two runs across a second boundary differ; the
+    suite-order flake of 11-07/11-08)."""
+    if isinstance(d, dict):
+        return {k: _without_clock(v) for k, v in d.items() if not k.endswith("_at")}
+    return d
+
+
 def test_recorded_on_the_verdict_row_and_the_verdict_is_unchanged():
     result, decision, reads_on = _analyze()
     s = decision["udr_structural"]
@@ -101,7 +110,7 @@ def test_recorded_on_the_verdict_row_and_the_verdict_is_unchanged():
     assert reads_on - reads_off == 1                   # one ladder read per verdict
     for r in (result, off):
         r.pop("timestamp")
-    assert result == off
+    assert _without_clock(result) == _without_clock(off)
     assert "udr_structural" not in result
     # catalyst_check reads the clock (weeks to catalyst), so it is left out
     assert {k: v for k, v in decision.items() if k not in ("udr_structural", "catalyst_check")} == \

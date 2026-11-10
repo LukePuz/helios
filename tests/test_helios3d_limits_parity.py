@@ -348,12 +348,9 @@ UNIVERSE = list(WATCHLIST) + ["MSFT", "ZZZ"]
 
 
 def test_ai_infra_set_matches_live():
+    assert risk_manager.AI_INFRA_TICKERS == limits.AI_INFRA_TICKERS
     src = textwrap.dedent(inspect.getsource(risk_manager.RiskManager.check_concentration))
-    for node in ast.walk(ast.parse(src)):
-        if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") == "ai_infra_keywords":
-            assert frozenset(ast.literal_eval(node.value)) == limits.AI_INFRA_TICKERS
-            return
-    pytest.fail("ai_infra_keywords not found in check_concentration")
+    assert "ai_infra_keywords = AI_INFRA_TICKERS" in src
 
 
 @pytest.mark.parametrize("watchlist_ok", [True, False])

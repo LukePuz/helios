@@ -57,3 +57,9 @@ def test_trigger_record_tags_the_headline_tone():
     assert trigger_record("event", {"title": "AMD Tumbles 13% on AI Regulation Fears"})["title_tone"] == "neg"
     assert trigger_record("event", {"title": "Nvidia beats estimates, raises guidance"})["title_tone"] == "pos"
     assert trigger_record("daily_scan", {"source": "scanner"})["title_tone"] is None
+    from agents import screener
+    assert trigger_record("daily_scan", {"source": "scanner"})["title_tone_sha"] is None
+    rec = trigger_record("event", {"title": "Nvidia beats estimates"})
+    assert rec["title_tone_sha"] == screener.TONE_SHA and len(screener.TONE_SHA) == 12
+    with patch("agents.screener.title_tone", side_effect=TypeError("boom")):
+        assert trigger_record("event", {"title": "x"})["title_tone"] == "error"

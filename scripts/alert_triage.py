@@ -11,6 +11,7 @@ read offset and the set of known types.
     venv/bin/python scripts/alert_triage.py              # new rows since last run
     venv/bin/python scripts/alert_triage.py --no-advance # look without moving the cursor
     venv/bin/python scripts/alert_triage.py --from-start # reread the whole outbox
+    venv/bin/python scripts/alert_triage.py --baseline   # mark what is there as known, exit 0
 
 Exit status is 0, or 2 when a new critical type appeared, so a cron wrapper
 can escalate on it.
@@ -157,7 +158,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--logs-dir", type=Path, default=DEFAULT_LOGS)
     ap.add_argument("--no-advance", action="store_true", help="don't move the cursor")
     ap.add_argument("--from-start", action="store_true", help="reread the whole outbox")
+    ap.add_argument("--baseline", action="store_true",
+                    help="mark every type in the rows read as known and exit 0 (first install)")
     args = ap.parse_args(argv)
+    if args.baseline and args.no_advance:
+        ap.error("--baseline needs the cursor to advance; drop --no-advance")
 
     outbox = args.logs_dir / OUTBOX_NAME
     cursor_path = args.logs_dir / CURSOR_NAME
@@ -190,6 +195,8 @@ def main(argv: list[str] | None = None) -> int:
             save_cursor(cursor_path, cursor)
         except OSError as e:
             print(f"alert_triage: could not save cursor: {e}", file=sys.stderr)
+    if args.baseline:
+        return 0
     return 2 if any(groups[k]["severity"] == "critical" for k in new) else 0
 
 

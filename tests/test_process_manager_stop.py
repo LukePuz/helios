@@ -48,7 +48,7 @@ def test_celery_worker_gets_sigterm_on_main_only(procs):
     assert pm.stop("celery_llm_worker") == "ok"
     assert p.terminated
     p.kids[0].terminate.assert_not_called()  # pool children finish their task
-    assert 400 < p.waited <= 420
+    assert 380 < p.waited <= 390
 
 
 def test_non_celery_service_terminates_its_tree(procs):
@@ -78,7 +78,7 @@ def test_stop_all_stops_beat_first_and_waits_in_parallel(procs):
     assert order[0] == "beat" and set(order[1:]) == {"llm", "ops"}
     assert set(results.values()) == {"ok"}
     # each waited against its own deadline from the same start, not one after another
-    assert llm.waited == 420 and ops.waited == 60
+    assert llm.waited == 390 and ops.waited == 60
 
 
 def test_orders_worker_stops_after_the_other_workers(procs):
@@ -89,6 +89,26 @@ def test_orders_worker_stops_after_the_other_workers(procs):
     l.terminate = lambda: order.append("llm")
     pm.stop_all()
     assert order == ["llm", "orders"]
+
+
+def test_before_orders_runs_between_the_workers_and_the_orders_worker(procs):
+    """main waits there for a Telegram approval (audit 2026-11-08 17:17 #5)."""
+    order = []
+    procs["celery_orders_worker"] = o = _Proc(30)
+    procs["celery_llm_worker"] = l = _Proc(31)
+    o.terminate = lambda: order.append("orders")
+    l.terminate = lambda: order.append("llm")
+    pm.stop_all(before_orders=lambda: order.append("hook"))
+    assert order == ["llm", "hook", "orders"]
+
+
+def test_a_failing_hook_still_stops_the_orders_worker(procs):
+    procs["celery_orders_worker"] = o = _Proc(32)
+
+    def boom():
+        raise RuntimeError("x")
+    assert pm.stop_all(before_orders=boom)["celery_orders_worker"] == "ok"
+    assert o.terminated
 
 
 def test_rotation_archives_the_previous_backup(tmp_path, monkeypatch):

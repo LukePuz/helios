@@ -16,7 +16,7 @@ load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 import alerts
 import db
 import process_manager as pm
-from config import SYMBOLS, START_VALUE, IB_PORT
+from config import SYMBOLS, START_VALUE, IB_PORT, TRADING_ENV
 from market_data import get_latest_quotes
 from ibkr import IBKRClient, place_market_order
 
@@ -57,7 +57,9 @@ def _get_workflow_status() -> dict[str, bool]:
     db_ok = False
     if supabase_host:
         try:
-            with socket.create_connection((supabase_host, 5432), timeout=2):
+            # The port the bot connects on (the 6543 pooler drop-in sets it).
+            port = int(os.getenv("SUPABASE_PORT", "5432"))
+            with socket.create_connection((supabase_host, port), timeout=2):
                 db_ok = True
         except Exception:
             db_ok = False
@@ -186,7 +188,9 @@ def _build_workflow_figure(statuses: dict[str, bool]) -> go.Figure:
 # ── Sidebar: System Control ───────────────────────────────────────────────────
 with st.sidebar:
     st.title("Helios Hedgefund")
-    st.caption("Paper trading only")
+    # From TRADING_ENV: this said "Paper trading only" on the live stack too
+    # (audit 2026-11-07 03:08 #4).
+    st.caption("LIVE trading: real money" if TRADING_ENV == "live" else "Paper trading only")
 
 
     status = pm.get_status()
@@ -1113,7 +1117,10 @@ with tab_logs:
 # ── Tab 5: Manual Trade ───────────────────────────────────────────────────────
 with tab_trade:
     st.header("Manual Trade")
-    st.warning("Paper trading only — executes on IBKR paper account (TWS must be running).")
+    if TRADING_ENV == "live":
+        st.error("LIVE account: orders here are real MARKET orders with real money.")
+    else:
+        st.warning("Paper trading only — executes on IBKR paper account (TWS must be running).")
 
     col_form, col_confirm = st.columns(2)
 
@@ -1144,7 +1151,10 @@ with tab_trade:
 | Est. Value | **${est_price * trade_qty:,.2f}** |
         """)
 
-        confirmed = st.checkbox("I confirm this is a paper trade and I want to submit this order.")
+        confirmed = st.checkbox(
+            "I confirm this is a LIVE order with real money and I want to submit it."
+            if TRADING_ENV == "live" else
+            "I confirm this is a paper trade and I want to submit this order.")
 
         if st.button("Submit Order", type="primary", disabled=not confirmed):
             try:

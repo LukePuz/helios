@@ -139,7 +139,7 @@ LLM_EVENT_EXPIRES_SECONDS = 4 * 3600
 # the "orders" queue and wait for the result. The direct-call branch also
 # means celery_orders_worker's own tasks never call back into themselves.
 from celery.signals import (beat_init, task_failure, task_postrun, task_prerun, task_revoked,
-                            worker_init, worker_ready)
+                            worker_init, worker_process_shutdown, worker_ready)
 
 
 def _boot_service_name(sender) -> str:
@@ -164,6 +164,24 @@ def _pin_code_stamp(sender=None, **_):
         agents.analyst.record_boot(_boot_service_name(sender))
     except Exception as e:
         log.warning(f"boot row not written: {e}")
+
+
+@worker_process_shutdown.connect
+def _drain_on_child_exit(**_):
+    """A pool child exits through os._exit, which skips atexit, so its
+    queued activity rows (stop_lock_skipped and the other queued writes)
+    were dropped at a stop (audit 2026-11-08 15:08 #6). Drain them here, in
+    the child, before it exits. Never raises."""
+    try:
+        import db
+        db.drain_activity_queue_now()
+    except Exception as e:
+        log.debug(f"activity drain at child exit failed: {e}")
+    try:
+        import ibkr
+        ibkr.drain_commission_queue()
+    except Exception as e:
+        log.debug(f"commission drain at child exit failed: {e}")
 
 
 @beat_init.connect
@@ -448,12 +466,66 @@ app.conf.beat_schedule = {
     },
     # Daily scanner — 9:35 AM ET (5 min after regime). The scan itself is
     # fast (ops); it enqueues analyze_candidates onto the llm lane.
+    # Drop watch (Luke 11-08): shadow rows only unless DIP_REVIEW_ENABLED.
+    "dip-watch": {
+        "task":     "tasks.dip_watch",
+        "schedule": crontab(hour="10,12,13,15", minute="30", day_of_week="mon-fri"),
+        # Ingestion, not ops: one blocking yfinance batch for ~80 names.
+        "options":  {"queue": INGESTION_QUEUE, "expires": 1800},
+    },
     # Log-only: held names that moved 5%+ close to close today (audit
     # 2026-11-05-0525 #4). After the close so today's daily bar is final.
     "held-move-shadow": {
         "task":     "tasks.held_move_shadow",
         "schedule": crontab(hour=16, minute=20, day_of_week="mon-fri"),
         "options":  {"queue": "ops", "expires": 2 * 3600},
+    },
+    # Log-only: each held position's exit frame (peak since entry, giveback,
+    # distance to the trail arm and the stop) after the close (audit
+    # 2026-11-07 11:07 #1). Reads the cached daily bars, so it runs after
+    # refresh-price-history (16:45; finishes about 17:08-17:15) (professor 66h).
+    "position-exit-frame": {
+        "task":     "tasks.position_exit_frame",
+        "schedule": crontab(hour=17, minute=30, day_of_week="mon-fri"),
+        "options":  {"queue": "ops", "expires": 2 * 3600},
+    },
+    # Log-only: one row per ET day of screener pass counts by source, tier,
+    # held and prompt version, for the days not yet written (audit
+    # 2026-11-07 15:07 #1). After the close, off the 05:00 boot window
+    # (professor 66u); days through yesterday, so Monday covers the weekend.
+    # Log-only: the trade ledger's net shares per ticker against the broker,
+    # the stop records and the open outcomes (audit 2026-11-07 17:17 #3).
+    # After the exit frame, before the evening stop.
+    # Log-only: a post-boot check that the code that booted is the code on
+    # disk and that screens and verdicts have happened since 05:00 (audit
+    # 2026-11-07 19:07 #6). Never touches the boot itself.
+    "pre-open-readiness": {
+        "task":     "tasks.pre_open_readiness",
+        "schedule": crontab(hour=8, minute=45, day_of_week="mon-fri"),
+        "options":  {"queue": "ops", "expires": 1800},
+    },
+    "post-boot-canary": {
+        "task":     "tasks.post_boot_canary",
+        "schedule": crontab(hour=10, minute=30, day_of_week="mon-fri"),
+        "options":  {"queue": "ops", "expires": 3600},
+    },
+    "ledger-reconcile": {
+        "task":     "tasks.ledger_reconcile",
+        "schedule": crontab(hour=17, minute=45, day_of_week="mon-fri"),
+        "options":  {"queue": "ops", "expires": 3600},
+    },
+    # Log-only: new items per ingestion source per ET day against the prior
+    # weekdays, flagging a source whose yield collapsed (audit 2026-11-07
+    # 17:17 #6). ingestion_health only keeps the last poll.
+    "source-yield": {
+        "task":     "tasks.source_yield",
+        "schedule": crontab(hour=18, minute=20, day_of_week="mon-fri"),
+        "options":  {"queue": "ops", "expires": 3 * 3600},
+    },
+    "screen-funnel": {
+        "task":     "tasks.screen_funnel",
+        "schedule": crontab(hour=18, minute=10, day_of_week="mon-fri"),
+        "options":  {"queue": "ops", "expires": 3 * 3600},
     },
     "daily-scan": {
         "task":     "tasks.run_daily_scan",
@@ -521,6 +593,13 @@ app.conf.beat_schedule = {
         "options":  {"queue": INGESTION_QUEUE, "expires": 300},
     },
     # Macro data snapshot — every hour
+    # Live ^VIX for verdict provenance (agents.analyst._vix_live_record),
+    # fetched here so no Yahoo call or thread sits on the verdict path.
+    "cache-live-vix": {
+        "task":     "tasks.cache_live_vix",
+        "schedule": crontab(minute="*/2", hour="5-18", day_of_week="mon-fri"),
+        "options":  {"queue": INGESTION_QUEUE, "expires": 100},
+    },
     "poll-macro": {
         "task":     "tasks.poll_macro",
         "schedule": 3600,
@@ -970,11 +1049,18 @@ def _log_event_lost(task_name: str, reason: str, args, error_class: str | None =
         decision = {"task": task_name, "reason": reason, **event_item_fields(event)}
         if error_class:
             decision["error_class"] = error_class
+        if event.get("_llm_enqueued_at"):
+            # So an event that expired in the LLM queue still shows how long
+            # it waited (professor 64l: the trigger wait is right-censored).
+            decision["llm_enqueued_at"] = event["_llm_enqueued_at"]
         if started_at is not None:
             from datetime import datetime, timezone
             decision["started_at"] = datetime.fromtimestamp(started_at, timezone.utc).isoformat()
         log.error(f"[{ticker}] {task_name} lost the event ({reason}): {decision.get('title')}")
-        db.log_signal(ticker, "EVENT_LOST", 0.0, f"{task_name}: {reason}", decision=decision)
+        # The writing process's code: for worker_shutdown, the next boot's.
+        from agents.analyst import shadow_versions
+        db.log_signal(ticker, "EVENT_LOST", 0.0, f"{task_name}: {reason}", decision=decision,
+                      provenance=shadow_versions())
         return True
     except Exception as e:
         log.warning(f"EVENT_LOST log failed for {task_name}: {e}")
@@ -1008,12 +1094,37 @@ def _on_event_task_killed(sender=None, task_id=None, exception=None, args=None, 
     _log_event_lost(sender.name, reason, args, type(exception).__name__)
 
 
+def _log_task_lost(name: str, reason: str, request) -> None:
+    """Log-only activity row (stage task_lost) for any other task that
+    expired in the queue or was revoked: a stop check, reconcile or review
+    that never ran left only an INFO line, indistinguishable from one that
+    ran and found nothing (audit 2026-11-07 13:07 #8: 67 ops tasks on
+    10-19). Queued to the process's one activity writer, so the consumer
+    never waits on the DB and a mass expiry opens one session at a time.
+    Never raises."""
+    try:
+        def _iso(v):
+            return v.isoformat() if hasattr(v, "isoformat") else (str(v) if v else None)
+        extra = {"task": name, "reason": reason, "task_id": getattr(request, "id", None),
+                 "eta": _iso(getattr(request, "eta", None)),
+                 "expires": _iso(getattr(request, "expires", None))}
+
+        import db
+        db.log_activity_queued("task_lost", "", f"{name} {reason} without running",
+                               "neutral", {**extra, "env": db.TRADING_ENV})
+    except Exception as e:
+        log.debug(f"task_lost record failed for {name}: {e}")
+
+
 @task_revoked.connect
 def _on_event_task_revoked(sender=None, request=None, terminated=None, signum=None,
                            expired=None, **_):
-    """A screen or analysis task that expired in the queue or was revoked."""
+    """A screen or analysis task that expired in the queue or was revoked
+    gets an EVENT_LOST row; any other task a task_lost row."""
     name = getattr(sender, "name", None) or getattr(request, "task_name", None)
     if name not in _EVENT_TASKS:
+        if name:
+            _log_task_lost(name, "expired" if expired else "revoked", request)
         return
     _clear_event_running(getattr(request, "id", None))
     _log_event_lost(name, "expired" if expired else "revoked", getattr(request, "args", None))
@@ -1109,6 +1220,11 @@ def screen_event(self, event: dict):
             return
         ticker = str(event.get("ticker") or "").upper()
         queue = LLM_QUEUE_HELD if ticker and ticker in _held_tickers() else LLM_QUEUE_BULK
+        # When it joined the LLM queue, for the verdict's trigger record
+        # (audit 2026-11-07 05:07 #5: the screen-pass to analysis wait was
+        # only reconstructable from logs). Log-only.
+        from datetime import datetime, timezone
+        event = {**event, "_llm_enqueued_at": datetime.now(timezone.utc).isoformat()}
         deep_analyze_event.apply_async(
             args=[event, result], queue=queue, expires=LLM_EVENT_EXPIRES_SECONDS,
         )
@@ -1123,6 +1239,12 @@ def deep_analyze_event(self, event: dict, screening: dict | None = None):
     passed screening — see tasks.screen_event."""
     try:
         from agents.crew import deep_analyze
+        # Each attempt sets its own start: a retry re-sends the original args,
+        # so its wait includes the failed attempt.
+        if not event.get("_llm_started_at"):
+            from datetime import datetime, timezone
+            event = {**event, "_llm_started_at": datetime.now(timezone.utc).isoformat(),
+                     "_llm_attempt": int(getattr(self.request, "retries", 0) or 0)}
         deep_analyze(event, screening)
     except Exception as e:
         log.error(f"deep_analyze_event failed for {event.get('ticker')}: {e}")
@@ -1318,6 +1440,7 @@ def retry_deferred_entry(self, approval_id: int, gap_retry_attempt: int = 1, pri
         return
 
     ticker = approval.get("ticker", "?")
+    _note_deferred_retry_ran(approval_id)
 
     # Stale decisions get re-analysed instead of executed (2026-10-27,
     # limitations audit finding 13). A Friday-evening approval used to fill at
@@ -1387,6 +1510,17 @@ def retry_deferred_entry(self, approval_id: int, gap_retry_attempt: int = 1, pri
                                              countdown=DEFERRED_RECHECK_RETRY_MINUTES * 60, queue="ops")
         except Exception as e:
             log.error(f"retry_deferred_entry: [{ticker}] could not schedule the re-check retry: {e}")
+            try:
+                import alerts
+                alerts._send(
+                    f"⚠️ DEFERRED ENTRY RETRY NOT SCHEDULED — {ticker} approval #{approval_id} "
+                    f"({approval.get('action', '?')}): the re-size check couldn't read the account "
+                    f"and the next re-check couldn't be scheduled ({str(e)[:120]}). Nothing was "
+                    f"executed; check and re-approve or expire.")
+                # The stuck-retry check would report the same row later.
+                _mark_deferred_stuck_alerted(approval_id)
+            except Exception as e2:
+                log.warning(f"retry_deferred_entry: [{ticker}] scheduling-failure alert not sent: {e2}")
         return
     if shares_now is not None:
         approved = int((approval.get("risk_json") or {}).get("shares_initial") or 0)
@@ -1421,6 +1555,15 @@ def retry_deferred_entry(self, approval_id: int, gap_retry_attempt: int = 1, pri
         from execution import approval_outcome
         status, reason = approval_outcome(False)
         db.update_approval_status(approval_id, status, reason=reason)
+        # A retry that ends in a real failure alerts like a first attempt
+        # does; deferred again (a new retry scheduled) stays quiet.
+        try:
+            import alerts
+            from agents.crew import _report_auto_execution_not_done
+            _report_auto_execution_not_done(None, alerts._send, ticker, approval.get("action", "?"),
+                                            approval_id, status, reason)
+        except Exception as e:
+            log.warning(f"retry_deferred_entry: [{ticker}] failure alert not sent: {e}")
     log.info(f"retry_deferred_entry: [{ticker}] approval #{approval_id} "
              f"{'executed' if success else 'still failed'} on retry "
              f"(gap_attempt={gap_retry_attempt}, price_attempt={price_retry_attempt})")
@@ -1573,7 +1716,7 @@ def _deferred_buy_superseded(approval: dict) -> str | None:
         if lts.tzinfo is None:
             lts = lts.replace(tzinfo=timezone.utc)
         if lts > ts:
-            return (f"newer {latest['signal']} verdict (conviction "
+            return (f"newer {latest['signal']} verdict (confidence "
                     f"{latest.get('confidence', 0):g}) at {lts:%Y-%m-%d %H:%M} UTC")
     return None
 
@@ -1922,7 +2065,8 @@ def _orphan_fill_already_booked(order: dict, fill: dict, total_qty: float, total
     if abs(booked - total_qty) <= 1e-4:
         if db.update_order_fill(order["id"], fill_price=total_avg, filled_qty=total_qty,
                                 status="filled" if complete else "partial", expect_filled_qty=0.0,
-                                filled_at=fill.get("fill_time")) is False:
+                                filled_at=fill.get("fill_time"),
+                                filled_at_source=fill.get("fill_time_source")) is False:
             log.error(f"[{ticker}] reconcile: could not mark orphaned order {order['id']} filled")
             return True, 0.0
         log.warning(f"[{ticker}] reconcile: orphaned order {oid} already has trade rows for "
@@ -1934,7 +2078,8 @@ def _orphan_fill_already_booked(order: dict, fill: dict, total_qty: float, total
         return True, 0.0
 
     if db.update_order_fill(order["id"], fill_price=total_avg, filled_qty=booked, status="partial",
-                            expect_filled_qty=0.0, filled_at=fill.get("fill_time")) is False:
+                            expect_filled_qty=0.0, filled_at=fill.get("fill_time"),
+                            filled_at_source=fill.get("fill_time_source")) is False:
         log.error(f"[{ticker}] reconcile: could not mark orphaned order {order['id']} "
                   f"partial at {booked:g}")
         return True, 0.0
@@ -2027,12 +2172,14 @@ def _reconcile_unconfirmed_orders_locked(task):
         # (professor M51). A failed log_trade after this is spilled.
         if db.update_order_fill(order["id"], fill_price=total_avg, filled_qty=total_qty,
                                 status="filled" if complete else "partial",
-                                expect_filled_qty=prev_qty, filled_at=fill.get("fill_time")) is False:
+                                expect_filled_qty=prev_qty, filled_at=fill.get("fill_time"),
+                                filled_at_source=fill.get("fill_time_source")) is False:
             log.error(f"[{ticker}] reconcile: could not mark order {order['id']} filled; "
                       f"trade not logged this cycle")
             continue
         _book_late_fill(order, fill_qty, fill_price, total_avg, prev_qty,
-                        fill_time=fill.get("fill_time"))
+                        fill_time=fill.get("fill_time"),
+                        fill_time_source=fill.get("fill_time_source"))
 
 
 def _stop_record_is_this_orders(ticker: str, since, fill_price: float,
@@ -2128,7 +2275,8 @@ def _book_late_fill(order: dict, fill_qty: float, fill_price: float, total_avg: 
                     what: str = ("this order was marked unconfirmed but had actually filled "
                                  "at the broker."),
                     trade_logged: bool = False, keep_record_since=None,
-                    approval=_APPROVAL_NOT_READ, progress: dict | None = None) -> None:
+                    approval=_APPROVAL_NOT_READ, progress: dict | None = None,
+                    fill_time_source: str | None = None) -> None:
     """Book a fill the execution path did not record, once the order row is
     already marked: the trade row, then what the execution path would have
     done after it (a BUY's outcome row and whole-position stop, a SELL's
@@ -2147,7 +2295,7 @@ def _book_late_fill(order: dict, fill_qty: float, fill_price: float, total_avg: 
     import alerts
     ticker = order["ticker"]
     intent = order.get("intent")
-    fill = {"fill_time": fill_time}
+    fill = {"fill_time": fill_time, "fill_time_source": fill_time_source}
     if not trade_logged:
         db.log_trade(
             symbol=ticker, side=order["side"], quantity=fill_qty, price=fill_price,
@@ -2187,8 +2335,7 @@ def _book_late_fill(order: dict, fill_qty: float, fill_price: float, total_avg: 
             try:
                 if _stop_record_is_this_orders(ticker, keep_record_since, total_avg, approval):
                     pass   # the execution path's own record: leave it, cover-only below
-                elif not db.get_position_stop(ticker) or not _held_before_fill(
-                        ticker, fill_qty, approval.get("action")):
+                elif _late_buy_is_fresh(ticker, fill_qty, approval.get("action"), "reconcile"):
                     # No record, or the record is a closed position's
                     # leftover (kept up to 2 reconcile cycles): a re-entry
                     # must not inherit that old level (audit 00:53 A0053-5).
@@ -2201,6 +2348,7 @@ def _book_late_fill(order: dict, fill_qty: float, fill_price: float, total_avg: 
                         bucket=approval.get("thesis_bucket", "Accelerator"),
                         conviction=approval.get("conviction", 5),
                         trail_distance_pct=risk_json.get("trailing_stop_distance_pct"),
+                        entry_price_source="fill",
                     )
                 stop_placed = _reprotect_after_late_sell(ticker, {}, None, from_queue=True)
             except Exception as e:
@@ -2237,7 +2385,7 @@ def _book_late_fill(order: dict, fill_qty: float, fill_price: float, total_avg: 
         try:
             if _stop_record_is_this_orders(ticker, keep_record_since, total_avg):
                 pass   # the execution path's own record: leave it, cover-only below
-            elif not db.get_position_stop(ticker) or not _held_before_fill(ticker, fill_qty, action):
+            elif _late_buy_is_fresh(ticker, fill_qty, action, "reconcile_manual"):
                 from execution import _MANUAL_FALLBACK_STOP_PCT as pct
                 if not (math.isfinite(total_avg) and total_avg > 0):
                     raise ValueError(f"unusable fill price {total_avg}")
@@ -2255,6 +2403,7 @@ def _book_late_fill(order: dict, fill_qty: float, fill_price: float, total_avg: 
                     stop_price=stop_price,
                     stop_method=f"manual late fill, flat {pct:.0%}",
                     bucket="Accelerator", conviction=5, trail_distance_pct=None,
+                    entry_price_source="fill",
                 )
             stop_placed = _reprotect_after_late_sell(ticker, {}, None, from_queue=True)
         except Exception as e:
@@ -2268,7 +2417,8 @@ def _book_late_fill(order: dict, fill_qty: float, fill_price: float, total_avg: 
         # before the sale) leaves the rest without a stop. Re-protect it at
         # the recorded stop (professor C12, 2026-10-28).
         stop_placed = _reprotect_after_late_sell(ticker, order, fill_price, exit_avg=total_avg,
-                                                 exit_fill_at=fill.get("fill_time"))
+                                                 exit_fill_at=fill.get("fill_time"),
+                                                 exit_fill_at_source=fill.get("fill_time_source"))
         if stop_placed is False:
             # Busy ticker or a failed placement: the order is already
             # marked filled, so remember to retry (professor M50).
@@ -2505,6 +2655,7 @@ def _recover_trade_pending_order(order: dict, db, ibkr) -> None:
     try:
         _book_late_fill(order, qty, float(price), float(price), 0.0,
                         fill_time=order.get("filled_at"), why=_TRADE_PENDING_WHY,
+                        fill_time_source=order.get("filled_at_source"),
                         headline="🚨 TRADE ROW RECOVERED",
                         what=("the order row was marked filled but the worker stopped before "
                               "recording the trade; booked now, with the stop work it skipped."),
@@ -2571,6 +2722,14 @@ def _queue_reprotect(ticker: str, order: dict, fill_price: float | None) -> None
     # retry pass running meanwhile can't pop it as the one it saw (m36).
     entry = {"intent": order.get("intent"), "stop_price": order.get("stop_price"),
              "fill_price": fill_price, "order_id": order.get("id"), "nonce": uuid.uuid4().hex}
+    if order.get("floor"):
+        # The highest stop read before the sell's cancel (M228): the retry
+        # never puts back a stop below it (professor 62i).
+        entry["floor"] = float(order["floor"])
+    if order.get("seed_stop"):
+        # No stop record: the stop that rested before the sell, placed only
+        # under a fresh price (m606).
+        entry["seed_stop"] = float(order["seed_stop"])
 
     def add(pending):
         old = pending.get(ticker) or {}
@@ -2580,6 +2739,11 @@ def _queue_reprotect(ticker: str, order: dict, fill_price: float | None) -> None
             # with the lower stop on record (professor M80).
             pending[ticker] = {**{k: v for k, v in old.items() if k != "tries"},
                                "nonce": entry["nonce"]}
+            if entry.get("floor"):
+                # The later sell's floor still applies to the target's stop.
+                pending[ticker]["floor"] = max(float(old.get("floor") or 0), entry["floor"])
+            if entry.get("seed_stop"):
+                pending[ticker]["seed_stop"] = entry["seed_stop"]   # used only with no record (63h)
             if (entry["intent"] or "").upper() in ("EXIT", "BACKSTOP"):
                 # The flat close needs the exit's own order (professor m111).
                 pending[ticker]["exit_intent"] = entry["intent"]
@@ -2807,7 +2971,8 @@ def _close_queued_flat_exit(ticker: str, rec: dict) -> bool:
         try:
             db.close_trade_outcome(ticker, exit_price=row["fill_price"],
                                    exit_source=f"late_{(rec.get('intent') or 'sell').lower()}",
-                                   exit_price_source="fill", exit_fill_at=row.get("filled_at"))
+                                   exit_price_source="fill", exit_fill_at=row.get("filled_at"),
+                                   exit_fill_at_source=row.get("filled_at_source"))
             db.delete_position_stop(ticker)
         except Exception as e:
             log.warning(f"[{ticker}] reconcile: close after a queued flat exit failed: {e}; waiting")
@@ -3043,7 +3208,40 @@ def _retry_pending_reprotects() -> None:
     _reprotect_queue_edit(apply)
 
 
-def _held_before_fill(ticker: str, fill_qty: float, action: str | None = None) -> bool:
+def _late_buy_is_fresh(ticker: str, fill_qty: float, action: str | None, path: str) -> bool:
+    """True when a late BUY opens a position: no stop record, or a record
+    _held_before_fill calls a closed position's leftover. That leftover case
+    also writes the log-only stale_record_at_entry row (professor m586: the
+    execution-path row alone undercounted). Same result as before."""
+    import db
+    try:
+        rec = db.get_position_stop(ticker, strict=True)
+    except Exception as e:
+        # A failed read is "unknown", not "no record". On an ADD, keep the
+        # record (cover-only below) rather than rewrite a possibly ratcheted
+        # stop (professor m589). On an OPEN, or with no action, write it as
+        # fresh, as before: the reprotect retry reads only the record, so
+        # skipping the write could leave a new position unstopped, and
+        # unprotected is worse than over-stopped (professor 58c).
+        keep = action == "ADD"
+        log.warning(f"[{ticker}] late BUY: stop record unreadable ({type(e).__name__}: {e}); "
+                    + ("keeping any existing record" if keep else "writing it as a fresh position"))
+        return not keep
+    if not rec:
+        return True
+    seen: dict = {}
+    if _held_before_fill(ticker, fill_qty, action, seen=seen):
+        return False
+    from execution import _record_stale_entry
+    # broker_qty is the position read _held_before_fill used, None when the
+    # approval's action decided (professor 57o), so a lagged read can be checked.
+    _record_stale_entry(ticker, rec, fill_qty, seen.get("broker_qty"), path=path,
+                        decision_basis="approval_action" if action in ("ADD", "OPEN") else "position_read")
+    return True
+
+
+def _held_before_fill(ticker: str, fill_qty: float, action: str | None = None,
+                      seen: dict | None = None) -> bool:
     """True if this late BUY added to a position (keep its stop record),
     False if it opened one (an existing record is a closed position's
     leftover). The approval's action decides; the broker cache can read
@@ -3060,6 +3258,8 @@ def _held_before_fill(ticker: str, fill_qty: float, action: str | None = None) -
         return True
     pos = next((p for p in positions if p.symbol == ticker), None)
     held = float(pos.qty) if pos else 0.0
+    if seen is not None:
+        seen["broker_qty"] = held     # what the decision used (stale_record_at_entry)
     return round(held - float(fill_qty), 4) > 0
 
 
@@ -3108,13 +3308,46 @@ def _fresh_read_short(ticker: str, cache_qty: float) -> bool:
     return False
 
 
+def _record_seeded_stop(ticker: str, stop_rec: dict, order: dict, px, qty, result: dict) -> None:
+    """A seeded stop (no stop record, m606) has nowhere to keep its broker
+    order id: set_stop_broker_order_id updates no row. Write it to an
+    activity row instead (professor 63h). Never raises."""
+    if stop_rec or not order.get("seed_stop"):
+        return
+    try:
+        import db
+        db.log_activity_direct(
+            "seeded_stop", ticker,
+            f"Seeded stop @ ${float(px):.2f} for {qty:g} shares (no stop record)", "neutral",
+            {"order_id": (result or {}).get("order_id"), "stop_price": float(px), "qty": qty,
+             "env": db.TRADING_ENV})
+    except Exception as e:
+        log.warning(f"[{ticker}] reconcile: seeded stop record failed: {e}")
+
+
+def _record_floored_stop(ticker: str, placed_px, unfloored_px, stop_rec: dict) -> None:
+    """A queued stop the floor raised: record the placed price, so
+    position_stops.stop_price isn't left below the broker's stop (professor
+    62k). The stop is placed, so a failed write only logs."""
+    if not unfloored_px or float(placed_px) <= float(unfloored_px) + 1e-9:
+        return
+    import db
+    try:
+        db.update_trailing_stop(ticker, float(placed_px), stop_rec.get("trailing_high"),
+                                native_trail=False, strict=True)
+    except Exception as e:
+        log.error(f"[{ticker}] reconcile: stop placed @ ${float(placed_px):.2f} but the record "
+                  f"write failed ({e}); the record stays lower")
+
+
 @locked_by_ticker(lambda ticker, *a, **k: ticker, on_busy=False)
 def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
                                fill_price: float | None = None,
                                from_queue: bool = False,
                                expect_at_least: float | None = None,
                                exit_avg: float | None = None,
-                               exit_fill_at=None) -> bool | None | str:
+                               exit_fill_at=None,
+                               exit_fill_at_source: str | None = None) -> bool | None | str:
     """After a late SELL fill, finish what the selling path would have done
     (professor M-3, 2026-10-28):
     - nothing left: delete the stop record and close the outcome at the fill
@@ -3192,14 +3425,49 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
                 db.close_trade_outcome(ticker, exit_price=exit_price,
                                        exit_source=f"late_{(order.get('intent') or 'sell').lower()}",
                                        exit_price_source="fill",   # broker average fill
-                                       exit_fill_at=exit_fill_at)
+                                       exit_fill_at=exit_fill_at,
+                                       exit_fill_at_source=exit_fill_at_source)
             except Exception as e:
                 log.warning(f"[{ticker}] reconcile: close_trade_outcome failed: {e}")
         return None
-    stop_price = (db.get_position_stop(ticker) or {}).get("stop_price")
+    stop_rec = db.get_position_stop(ticker) or {}
+    stop_price = stop_rec.get("stop_price")
     if order.get("intent") == "PROFIT_TARGET" and order.get("stop_price"):
         stop_price = order["stop_price"]
         db.mark_profit_target_taken(ticker, float(stop_price))
+    mkt = None
+    if not stop_price and order.get("seed_stop"):
+        # No record (the sell found none): the pre-cancel stop, only when a
+        # fresh price is above it, so it can't fill at once (m606, the 62j
+        # guard). No price, or the market at/below it: wait; the manual
+        # action from the sell stays open.
+        import risk_manager
+        try:
+            mkt = risk_manager._plausible_price(ibkr.get_latest_price(ticker))
+        except Exception as e:
+            log.warning(f"[{ticker}] reconcile: price read for the seeded stop failed: {e}")
+        seed = float(order["seed_stop"])
+        if mkt is None or seed >= mkt:
+            log.warning(f"[{ticker}] reconcile: no stop record; seeded stop ${seed:.2f} waits "
+                        f"(price {'unread' if mkt is None else f'${mkt:.2f}'})")
+            return False
+        stop_price = seed
+    unfloored = stop_price
+    if stop_price and order.get("floor"):
+        # A fresh price, not the queued one: the floor may sit above the
+        # market after a drop, and a stop there fills at once (professor 62j).
+        # No price, no floor.
+        import risk_manager
+        try:
+            mkt = risk_manager._plausible_price(ibkr.get_latest_price(ticker))
+        except Exception as e:
+            log.warning(f"[{ticker}] reconcile: price read for the stop floor failed: {e}")
+        if mkt is None:
+            log.warning(f"[{ticker}] reconcile: no fresh price; queued stop goes at "
+                        f"${float(stop_price):.2f}, without the ${float(order['floor']):.2f} floor")
+        else:
+            stop_price = risk_manager._floored_level(ticker, float(stop_price), order["floor"],
+                                                     mkt, "Queued stop restore")
     if not stop_price:
         log.error(f"[{ticker}] reconcile: {remaining} shares left after a late sell, no stop on record")
         return False
@@ -3272,8 +3540,10 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
         if need <= 0:
             return True
         try:
-            result = manage_stop_place(ticker, need, float(stop_price))
+            result = manage_stop_place(ticker, need, float(stop_price), **({"market_price": mkt} if mkt else {}))
             db.set_stop_broker_order_id(ticker, result["order_id"])
+            _record_floored_stop(ticker, stop_price, unfloored, stop_rec)
+            _record_seeded_stop(ticker, stop_rec, order, stop_price, need, result)
             log.info(f"[{ticker}] reconcile: stop @ ${float(stop_price):.2f} placed for {need} shares")
             return True
         except Exception as e:
@@ -3292,8 +3562,10 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
             return True
     try:
         manage_cancel_stop_orders_for(ticker)
-        result = manage_stop_place(ticker, remaining, float(stop_price))
+        result = manage_stop_place(ticker, remaining, float(stop_price), **({"market_price": mkt} if mkt else {}))
         db.set_stop_broker_order_id(ticker, result["order_id"])
+        _record_floored_stop(ticker, stop_price, unfloored, stop_rec)
+        _record_seeded_stop(ticker, stop_rec, order, stop_price, remaining, result)
         log.info(f"[{ticker}] reconcile: stop @ ${float(stop_price):.2f} placed for {remaining} shares")
         return True
     except Exception as e:
@@ -3326,6 +3598,766 @@ def _session_move_pct(bars: list[dict], today: str) -> float | None:
         return None
     prev, last = float(done[-2]["close"]), float(done[-1]["close"])
     return round((last - prev) / prev * 100, 2) if prev > 0 else None
+
+
+def _exit_frame(stop: dict, bars: list[dict]) -> dict:
+    """One held position's exit frame from its position_stops row and its
+    cached daily bars (oldest first): the last close, the highest close since
+    opened_at, and in percent the gain, the peak gain, the giveback from that
+    peak, the gain still needed to arm the trail, and the distance to the
+    stop. None where an input is missing. Never raises."""
+    from config import TRAILING_STOP_ACTIVATE
+
+    def num(v):
+        try:
+            f = float(v)
+            return f if f == f and abs(f) != float("inf") else None
+        except (TypeError, ValueError):
+            return None
+
+    def pct(a, b):
+        return round((a / b - 1) * 100, 2) if a is not None and b else None
+
+    out = {"bucket": stop.get("thesis_bucket"), "trailing_active": stop.get("trailing_active"),
+           "profit_target_taken": stop.get("profit_target_taken")}
+    try:
+        entry, stop_px = num(stop.get("entry_price")), num(stop.get("stop_price"))
+        opened = str(stop.get("opened_at") or "")[:10]
+        closes = [(str(b.get("time") or b.get("date") or "")[:10], num(b.get("close")))
+                  for b in bars or []]
+        closes = sorted((d, c) for d, c in closes if c is not None)
+        since = [c for d, c in closes if not opened or d >= opened]
+        last = closes[-1] if closes else (None, None)
+        peak = max(since) if since else None
+        arm = TRAILING_STOP_ACTIVATE.get(stop.get("thesis_bucket") or "")
+        gain = pct(last[1], entry)
+        out.update({
+            "close_date": last[0], "bars_since_entry": len(since),
+            "gain_pct": gain, "peak_gain_pct": pct(peak, entry),
+            "giveback_from_peak_pct": pct(last[1], peak),
+            "trail_arm_pct": round(arm * 100, 2) if arm is not None else None,
+            "to_trail_arm_pp": (round(arm * 100 - gain, 2)
+                                if arm is not None and gain is not None and not stop.get("trailing_active")
+                                else None),
+            "above_stop_pct": pct(last[1], stop_px),
+            "stop_vs_entry_pct": pct(stop_px, entry),
+        })
+    except Exception as e:
+        out["error"] = type(e).__name__
+    return out
+
+
+@app.task(name="tasks.position_exit_frame")
+def position_exit_frame():
+    """Log-only (audit 2026-11-07 11:07 #1): one activity row (stage
+    position_exit_frame) per position_stops row after the close, so a
+    position that climbed and gave it back toward its stop is visible, and
+    the held brief's missing exit frame can be measured. Reads the cached
+    daily bars (price_history). close_is_today flags a frame built on an
+    older close (a holiday, or the refresh not done); broker_held flags a
+    stop row for a name the broker no longer shows (None when positions are
+    unreadable). No alert, no review."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    import db
+    today = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    try:
+        stops = db.get_all_position_stops(strict=True)
+    except Exception as e:
+        log.warning(f"position exit frame: position stops unreadable ({e})")
+        return
+    try:
+        broker = {p.symbol for p in _get_client().get_all_positions() if float(p.qty or 0)}
+    except Exception as e:
+        broker = None
+        log.warning(f"position exit frame: broker positions unreadable ({e})")
+    for stop in stops:
+        ticker = stop.get("ticker") or ""
+        try:
+            bars = db.get_price_history(ticker, days=400)
+        except Exception as e:
+            log.debug(f"[{ticker}] position exit frame: bars unreadable ({type(e).__name__})")
+            bars = []
+        frame = _exit_frame(stop, bars)
+        frame["bars_read"] = len(bars or [])        # 0: no frame could be computed
+        frame["close_is_today"] = frame.get("close_date") == today
+        frame["broker_held"] = (ticker in broker) if broker is not None else None
+        try:
+            db.log_activity_direct(
+                "position_exit_frame", ticker,
+                f"exit frame: gain {frame.get('gain_pct')}%, peak {frame.get('peak_gain_pct')}%, "
+                f"{frame.get('above_stop_pct')}% above the stop", "neutral",
+                {**frame, "env": db.TRADING_ENV})
+        except Exception as e:
+            log.warning(f"[{ticker}] position exit frame: write failed ({e})")
+    log.info(f"position exit frame: {len(stops)} positions")
+
+
+def _stop_coverage(positions: dict | None, open_orders: list[dict] | None) -> dict:
+    """Per held long position, working SELL stop quantity over held quantity
+    (_working_sell_stops' definition), as a ratio: no share counts.
+    uncovered lists tickers under 1.0. Unreadable inputs give
+    {"readable": False}."""
+    if positions is None or open_orders is None:
+        return {"readable": False}
+    stops: dict[str, float] = {}
+    for o in _working_sell_stops(open_orders):
+        stops[o["ticker"].upper()] = stops.get(o["ticker"].upper(), 0.0) + float(o["qty"] or 0)
+    ratio = {}
+    for t, p in positions.items():
+        try:
+            qty = float(p.get("qty") or 0)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if qty > 0:
+            ratio[t.upper()] = round(stops.get(t.upper(), 0.0) / qty, 3)
+    return {"readable": True, "ratio": ratio,
+            "uncovered": sorted(t for t, r in ratio.items() if r < 1.0)}
+
+
+def _canary_verdict(running: dict, on_disk: dict, counts: dict | None) -> dict:
+    """The post-boot canary's checks from the ops worker's own code shas (other
+    services are covered only through today's boot rows: one that has not
+    rebooted since 05:00 writes none and is not checked), a fresh
+    read of the repo, and get_canary_counts. failed lists hard failures
+    (no screens since 05:00, code changed on disk since this process
+    started, more than one code_sha among today's boot rows, a dirty tree,
+    an unreadable count); warnings lists soft ones (no verdicts yet, any
+    ANALYST_FAILED)."""
+    failed, warnings = [], []
+    # code_sha, not head_sha: a research-log-only pull moves HEAD but not
+    # the code.
+    run_code = str(running.get("code_sha") or "").removesuffix("-dirty")
+    disk_code = str(on_disk.get("code_sha") or "").removesuffix("-dirty")
+    if run_code and disk_code and run_code != disk_code:
+        failed.append("code_on_disk_differs_from_running")
+    if str(running.get("code_sha") or "").endswith("-dirty") or str(on_disk.get("code_sha") or "").endswith("-dirty"):
+        failed.append("dirty_tree")
+    if counts is None:
+        failed.append("counts_unreadable")
+    else:
+        if counts["screens"] == 0:
+            failed.append("no_screens_since_0500")
+        if counts["verdicts"] == 0:
+            warnings.append("no_verdicts_since_0500")
+        if counts["analyst_failed"]:
+            warnings.append("analyst_failed")
+        shas = sorted({b["code_sha"] for b in counts["boots"] if b.get("code_sha")})
+        if len(shas) > 1:
+            failed.append("mixed_boot_code_sha")
+        if not counts["boots"]:
+            warnings.append("no_boot_rows_since_0500")
+    return {"ok": not failed, "failed": failed, "warnings": warnings}
+
+
+@app.task(name="tasks.post_boot_canary")
+def post_boot_canary():
+    """Log-only (audit 2026-11-07 19:07 #6): new code first runs at the
+    unattended 05:00 boot, and the watchdog only checks that processes are
+    alive. At 10:30 ET on NYSE days, one activity row (stage
+    post_boot_canary) records whether the code this worker booted is still
+    the code on disk, whether today's boot rows agree on one code_sha, and
+    how many screens and verdicts there have been since 05:00. A hard
+    failure is a log ERROR, read only by the 15-min operator monitor
+    session until alert_triage is installed (audit 1907 #2); nothing is
+    sent to Telegram and nothing is stopped or rolled back. Never raises."""
+    from datetime import datetime, time as dtime
+    from zoneinfo import ZoneInfo
+    try:
+        import db
+        from market_calendar import NYSE_HOLIDAYS
+        from agents.analyst import _CODE_SHA, _git_code_sha
+        et = ZoneInfo("America/New_York")
+        today = datetime.now(et).date()
+        if today.weekday() >= 5 or today in NYSE_HOLIDAYS:
+            return
+        since = datetime.combine(today, dtime(5, 0), et)
+        on_disk = _git_code_sha()
+        counts = db.get_canary_counts(since)
+        verdict = _canary_verdict(_CODE_SHA, on_disk, counts)
+        # Stop coverage on every held name (audit 2026-11-08 13:18 #4: the
+        # run47 load rewrites stop placement on part-filled and manual sells).
+        try:
+            import ibkr
+            open_orders = ibkr.get_open_orders()
+        except Exception as e:
+            log.warning(f"post-boot canary: open-order read failed: {e}")
+            open_orders = None
+        try:
+            positions = _snapshot_positions_or_none(30)
+        except Exception as e:
+            log.warning(f"post-boot canary: snapshot read failed: {e}")
+            positions = None
+        coverage = _stop_coverage(positions, open_orders)
+        if not coverage["readable"]:
+            verdict["warnings"].append("stop_coverage_unreadable")
+        elif coverage["uncovered"]:
+            verdict["failed"].append("holdings_without_full_stop")
+            verdict["ok"] = False
+        extra = {"day": today.isoformat(), **verdict, "counts": counts, "stop_coverage": coverage,
+                 "running": dict(_CODE_SHA), "on_disk": on_disk, "env": db.TRADING_ENV}
+        db.log_activity_direct("post_boot_canary", "",
+                               "post-boot canary: " + ("ok" if verdict["ok"] else ", ".join(verdict["failed"])),
+                               "neutral" if verdict["ok"] else "alert", extra)
+        if not verdict["ok"]:
+            log.error(f"post-boot canary failed: {verdict['failed']} (warnings {verdict['warnings']})")
+        elif verdict["warnings"]:
+            log.warning(f"post-boot canary warnings: {verdict['warnings']}")
+    except Exception as e:
+        log.warning(f"post-boot canary did not run: {e}")
+
+
+_READINESS_CODE_FAILURES = ("code_on_disk_differs_from_running", "dirty_tree", "mixed_boot_code_sha",
+                            "counts_unreadable")
+
+
+def _readiness_problems(verdict: dict, coverage: dict) -> list[str]:
+    """What the pre-open check reports: the canary's code failures (screen
+    and verdict counts are left out, since screens may not have run by
+    08:45) and stop coverage. Empty means ready."""
+    out = [f for f in verdict.get("failed", []) if f in _READINESS_CODE_FAILURES]
+    if not coverage.get("readable"):
+        out.append("positions or open orders unreadable from IBKR, stop coverage unknown")
+    elif coverage.get("uncovered"):
+        out.append("without a full working stop: " + ", ".join(coverage["uncovered"]))
+    return out
+
+
+@app.task(name="tasks.pre_open_readiness")
+def pre_open_readiness():
+    """08:45 ET on NYSE days: the canary's code checks and stop coverage on
+    every held name, before the open rather than at 10:30 (audit 2026-11-08
+    11:07 #3). Sends one Telegram message only when something is wrong;
+    silence means ready (the watchdog covers a stack that is down). Writes
+    one activity row (stage pre_open_readiness) either way. Never raises."""
+    from datetime import datetime, time as dtime
+    from zoneinfo import ZoneInfo
+    try:
+        import db
+        from market_calendar import NYSE_HOLIDAYS
+        from agents.analyst import _CODE_SHA, _git_code_sha
+        et = ZoneInfo("America/New_York")
+        today = datetime.now(et).date()
+        if today.weekday() >= 5 or today in NYSE_HOLIDAYS:
+            return
+        counts = db.get_canary_counts(datetime.combine(today, dtime(5, 0), et))
+        verdict = _canary_verdict(_CODE_SHA, _git_code_sha(), counts)
+        try:
+            import ibkr
+            open_orders = ibkr.get_open_orders()
+        except Exception as e:
+            log.warning(f"pre-open readiness: open-order read failed: {e}")
+            open_orders = None
+        try:
+            positions = _snapshot_positions_or_none(30)
+        except Exception as e:
+            log.warning(f"pre-open readiness: snapshot read failed: {e}")
+            positions = None
+        coverage = _stop_coverage(positions, open_orders)
+        problems = _readiness_problems(verdict, coverage)
+        # Sent before the row: in a DB outage (counts_unreadable) the write
+        # would fail too, and silence would read as ready (audit 2026-11-08
+        # 19:19 #9).
+        if problems:
+            import alerts
+            alerts._send("⚠️ <b>Helios pre-open check</b> (08:45 ET)\n"
+                         + "\n".join(f"• {p}" for p in problems))
+        try:
+            db.log_activity_direct("pre_open_readiness", "",
+                                   "pre-open readiness: " + ("ok" if not problems else "; ".join(problems)),
+                                   "neutral" if not problems else "alert",
+                                   {"day": today.isoformat(), "problems": problems, "stop_coverage": coverage,
+                                    "canary_failed": verdict.get("failed"), "env": db.TRADING_ENV})
+        except Exception as e:
+            log.warning(f"pre-open readiness row not written: {e}")
+    except Exception as e:
+        log.warning(f"pre-open readiness did not run: {e}")
+
+
+def _ledger_by_ticker(trades: list[dict], broker: dict | None, stops: set,
+                      open_outcomes: dict) -> dict:
+    """Per ticker, from get_ledger_trades rows (oldest first): buys, sells,
+    the ledger's net, the broker's quantity (None when positions were
+    unreadable), whether a stop record and how many open outcomes exist,
+    match (ledger net == broker quantity; None when the broker is unknown)
+    and first_negative_at, when the running ledger net first went below
+    zero (a sell of shares the ledger never bought). Covers every ticker in
+    any of the four sources."""
+    out: dict = {}
+    names = {t["symbol"] for t in trades} | set(broker or {}) | set(stops) | set(open_outcomes)
+    for name in sorted(n for n in names if n):
+        rows = [t for t in trades if t["symbol"] == name]
+        buys = sells = net = 0.0
+        other = 0
+        first_negative_at = None
+        for t in rows:
+            q = t["quantity"]
+            if t["side"] == "BUY":
+                buys += q
+                net += q
+            elif t["side"] == "SELL":
+                sells += q
+                net -= q
+            else:
+                other += 1          # a side value the net ignores (professor 67h)
+            if net < 0 and first_negative_at is None:
+                first_negative_at = t["timestamp"].isoformat() if hasattr(t["timestamp"], "isoformat") \
+                    else str(t["timestamp"])
+        bq = None if broker is None else float(broker.get(name, 0.0))
+        out[name] = {"ledger_buys": buys, "ledger_sells": sells, "ledger_net": net,
+                     "broker_qty": bq, "stop_record": name in stops,
+                     "open_outcomes": int(open_outcomes.get(name, 0)),
+                     "match": None if bq is None else abs(net - bq) < 1e-9,
+                     "first_negative_at": first_negative_at, "other_side_rows": other,
+                     "last_trade_at": (rows[-1]["timestamp"].isoformat()
+                                       if rows and hasattr(rows[-1]["timestamp"], "isoformat") else None)}
+    return out
+
+
+@app.task(name="tasks.ledger_reconcile")
+def ledger_reconcile():
+    """Log-only (audit 2026-11-07 17:17 #3): one activity row (stage
+    ledger_reconcile) with the trade ledger's net shares per ticker against
+    the broker's quantity, the stop records and the open outcomes. Nothing
+    compared them: QBTS and LUNR were sold beyond what the ledger bought.
+    A mismatch is logged as a warning; no alert, no repair."""
+    import db
+    trades = db.get_ledger_trades()
+    if trades is None:
+        log.warning("ledger reconcile: trades unreadable; skipping")
+        return
+    try:
+        broker = {}
+        for p in _get_client().get_all_positions():
+            if float(p.qty or 0):
+                broker[p.symbol] = broker.get(p.symbol, 0.0) + float(p.qty)
+    except Exception as e:
+        broker = None
+        log.warning(f"ledger reconcile: broker positions unreadable ({e})")
+    try:
+        stops = {s.get("ticker") for s in db.get_all_position_stops(strict=True)}
+        outcomes: dict = {}
+        for o in db.get_open_outcomes(strict=True):
+            outcomes[o["ticker"]] = outcomes.get(o["ticker"], 0) + 1
+    except Exception as e:
+        log.warning(f"ledger reconcile: stops or outcomes unreadable ({e}); skipping")
+        return
+    by_ticker = _ledger_by_ticker(trades, broker, stops, outcomes)
+    # None, not [], when the broker wasn't read: no match verdict (SEF 155j).
+    mismatched = (sorted(t for t, r in by_ticker.items() if r["match"] is False)
+                  if broker is not None else None)
+    negative = sorted(t for t, r in by_ticker.items() if r["first_negative_at"])
+    try:
+        db.log_activity_direct(
+            "ledger_reconcile", "",
+            (f"ledger reconcile: {len(mismatched)} of {len(by_ticker)} tickers differ from the broker"
+             if mismatched is not None else
+             f"ledger reconcile: {len(by_ticker)} tickers, broker positions unreadable"),
+            "neutral", {"tickers": by_ticker, "mismatched": mismatched, "ledger_negative": negative,
+                        "broker_read": broker is not None, "trade_rows": len(trades),
+                        "env": db.TRADING_ENV})
+    except Exception as e:
+        log.warning(f"ledger reconcile: write failed ({e})")
+    if mismatched:
+        log.warning(f"ledger reconcile: ledger net differs from the broker for {mismatched}")
+
+
+_YIELD_BASELINE_DAYS = 5     # prior weekdays the day is compared with
+_YIELD_DROP_RATIO = 0.5      # flagged below half the baseline mean ...
+_YIELD_MIN_BASELINE = 20     # ... when that mean is at least 20 items a day
+
+
+def _yield_summary(day, counts: list[dict]) -> dict:
+    """{source: {"n", "baseline_mean", "baseline_days", "ratio", "drop"}} for
+    one ET day from get_seen_item_counts rows covering it and the weeks
+    before. The baseline is the prior _YIELD_BASELINE_DAYS weekdays that had
+    any item in any source (a missing source on such a day counts as 0); a
+    weekday with no items at all (a holiday, the stack down) is skipped, at
+    most 10 weekdays back (professor 68a). drop is only set on weekdays."""
+    from datetime import timedelta
+    by = {}
+    totals: dict = {}
+    for r in counts:
+        by.setdefault(r["source"], {})[r["day"]] = r["n"]
+        totals[r["day"]] = totals.get(r["day"], 0) + r["n"]
+    prior, skipped, d, looked = [], [], day - timedelta(days=1), 0
+    while len(prior) < _YIELD_BASELINE_DAYS and looked < 10:
+        if d.weekday() < 5:
+            looked += 1
+            (prior if totals.get(d, 0) else skipped).append(d)
+        d -= timedelta(days=1)
+    out = {}
+    for src, days in sorted(by.items()):
+        n = days.get(day, 0)
+        base = [days.get(p, 0) for p in prior]
+        mean = round(sum(base) / len(base), 1) if base else 0
+        ratio = round(n / mean, 3) if mean else None
+        out[src] = {"n": n, "baseline_mean": mean, "baseline_days": [p.isoformat() for p in prior],
+                    "baseline_skipped_days": [x.isoformat() for x in skipped],
+                    "ratio": ratio,
+                    "drop": bool(day.weekday() < 5 and mean >= _YIELD_MIN_BASELINE
+                                 and n < _YIELD_DROP_RATIO * mean)}
+    return out
+
+
+@app.task(name="tasks.source_yield")
+def source_yield(days_back: int = 4):
+    """Log-only (audit 2026-11-07 17:17 #6): one activity row (stage
+    source_yield) per finished ET day in the last `days_back` days not yet
+    written, with new items per ingestion source (seen_items) against the
+    prior weekdays, and the sources whose yield fell below half of it. A
+    per-ticker fetch failure is a debug line, and ingestion_health keeps
+    only the last poll, so a slow collapse was invisible. A day can have two
+    rows (a spilled row replayed after a rewrite); readers take the latest
+    computed_at per shadow_key. No alert."""
+    from datetime import datetime, time as dtime, timedelta
+    from zoneinfo import ZoneInfo
+    import db
+    et = ZoneInfo("America/New_York")
+    today = datetime.now(et).date()
+    done = db.get_activity_shadow_keys("source_yield")
+    if done is None:
+        log.warning("source yield: written days unreadable; skipping")
+        return
+    # Up to 10 weekdays (about 14 calendar days) before the oldest day
+    # written, so a baseline day is never outside the read (professor 68b).
+    oldest = today - timedelta(days=days_back + 16)
+    counts = db.get_seen_item_counts(datetime.combine(oldest, dtime(0), et),
+                                     datetime.combine(today, dtime(0), et))
+    if counts is None:
+        log.warning("source yield: counts unreadable; skipping")
+        return
+    for k in range(days_back, 0, -1):
+        day = today - timedelta(days=k)
+        key = f"{db.TRADING_ENV}:{day.isoformat()}"
+        if key in done:
+            continue
+        summary = _yield_summary(day, counts)
+        drops = sorted(s for s, r in summary.items() if r["drop"])
+        try:
+            db.log_activity_direct(
+                "source_yield", "", f"source yield {day}: {sum(r['n'] for r in summary.values())} items, "
+                f"{len(drops)} source(s) below half their baseline", "neutral",
+                {"day": day.isoformat(), "shadow_key": key, "sources": summary, "drops": drops,
+                 "computed_at": datetime.now(ZoneInfo("UTC")).isoformat(), "env": db.TRADING_ENV})
+        except Exception as e:
+            log.warning(f"source yield: write for {day} failed ({e})")
+            continue
+        if drops:
+            log.warning(f"source yield {day}: below half the prior weekdays for {drops}")
+
+
+_FUNNEL_SWING_MIN_N = 50   # screens in the day, and in the prior 7 days
+# shadow_keys this process spilled: the spill replays them later, so the next
+# run must not write the day again (SEF 154g). Lost on a restart; readers
+# dedupe on shadow_key.
+_FUNNEL_SPILLED: set = set()
+
+
+def _funnel_summary(rows: list[dict]) -> dict:
+    """Pass counts by tier from get_screen_funnel rows:
+    {tier: {"in", "out", "rate", "fallback", "override"}}; a missing tier is
+    "unknown". in/out/rate count the 7B's own verdicts only: keyword-fallback
+    screens go to "fallback" (any outcome) and held-override passes to
+    "override" (professor m622). The raw rows keep every group."""
+    out: dict = {}
+    for r in rows:
+        t = out.setdefault(r.get("tier") or "unknown",
+                           {"in": 0, "out": 0, "rate": None, "fallback": 0, "override": 0})
+        n = int(r.get("n") or 0)
+        if r.get("model") == "keyword_fallback":
+            t["fallback"] += n
+        elif r.get("override") and r.get("signal") == "SCREENED_IN":
+            t["override"] += n
+        else:
+            t["in" if r.get("signal") == "SCREENED_IN" else "out"] += n
+    for t in out.values():
+        n = t["in"] + t["out"]
+        t["rate"] = round(t["in"] / n, 4) if n else None
+    return out
+
+
+def _funnel_swings(day: dict, prior: dict) -> list[dict]:
+    """Tiers whose pass rate today moved by more than half the prior 7 days'
+    rate and by at least 2 points, each side with at least
+    _FUNNEL_SWING_MIN_N screens. Log-only flag; no alert."""
+    swings = []
+    for tier, d in day.items():
+        p = prior.get(tier)
+        if not p or d["rate"] is None or p["rate"] is None:
+            continue
+        if d["in"] + d["out"] < _FUNNEL_SWING_MIN_N or p["in"] + p["out"] < _FUNNEL_SWING_MIN_N:
+            continue
+        diff = d["rate"] - p["rate"]
+        if abs(diff) >= 0.02 and abs(diff) > 0.5 * p["rate"]:
+            swings.append({"tier": tier, "rate": d["rate"], "prior_rate": p["rate"]})
+    return swings
+
+
+@app.task(name="tasks.screen_funnel")
+def screen_funnel(days_back: int = 4):
+    """Log-only (audit 2026-11-07 15:07 #1): one activity row (stage
+    screen_funnel) per finished ET day in the last `days_back` days not yet
+    written, with the day's SCREENED_IN/OUT counts by source, tier, held,
+    model and prompt version, a by-tier summary against the prior 7 days,
+    and the tiers whose pass rate swung. Signal rows before 11-05 have no
+    SCREENED_IN, and before run47 no tier or held, so early days count them
+    as unknown. A day can have two rows (a spilled row replayed after a
+    restart rewrote it); readers take the latest computed_at per shadow_key
+    (professor m621). No alert."""
+    from datetime import datetime, time as dtime, timedelta
+    from zoneinfo import ZoneInfo
+    import db
+    et = ZoneInfo("America/New_York")
+    today = datetime.now(et).date()
+    done = db.get_activity_shadow_keys("screen_funnel")
+    if done is None:
+        log.warning("screen funnel: written days unreadable; skipping")
+        return
+    for k in range(days_back, 0, -1):
+        day = today - timedelta(days=k)
+        key = f"{db.TRADING_ENV}:{day.isoformat()}"
+        if key in done or key in _FUNNEL_SPILLED:
+            continue
+        start = datetime.combine(day, dtime(0), et)
+        end = datetime.combine(day + timedelta(days=1), dtime(0), et)
+        rows = db.get_screen_funnel(start, end)
+        prior_rows = db.get_screen_funnel(start - timedelta(days=7), start)
+        if rows is None or prior_rows is None:
+            log.warning(f"screen funnel: counts for {day} unreadable")
+            continue
+        summary, prior = _funnel_summary(rows), _funnel_summary(prior_rows)
+        swings = _funnel_swings(summary, prior)
+        n_in = sum(t["in"] for t in summary.values())
+        n_all = n_in + sum(t["out"] for t in summary.values())
+        try:
+            if not db.log_activity_direct(
+                    "screen_funnel", "", f"screen funnel {day}: {n_in}/{n_all} passed", "neutral",
+                    {"day": day.isoformat(), "shadow_key": key, "rows": rows, "by_tier": summary,
+                     "prior7_by_tier": prior, "swings": swings, "env": db.TRADING_ENV,
+                     "computed_at": datetime.now(ZoneInfo("UTC")).isoformat()}):
+                _FUNNEL_SPILLED.add(key)
+        except Exception as e:
+            log.warning(f"screen funnel: write for {day} failed ({e})")
+            continue
+        if swings:
+            log.warning(f"screen funnel {day}: pass rate swing {swings}")
+
+
+# Drop watch (tasks.dip_watch). Shadow rows are written for any name at or
+# below either floor, wider than the review thresholds, so a threshold can
+# later be chosen from them.
+_DIP_SHADOW_FLOOR_PCT = 3.0
+_DIP_SHADOW_FLOOR_ATR = 1.5
+_DIP_REVIEW_KEY = "helios:dip_review:{day}:{ticker}"
+_DIP_SHADOW_KEY = "helios:dip_shadow:{day}:{ticker}"
+_DIP_SHADOW_DEEPER_PP = 2.0
+
+
+def _atr14(bars: list[dict]) -> float | None:
+    """Simple 14-session average true range from daily bars, oldest first."""
+    if len(bars) < 15:
+        return None
+    trs = []
+    for prev, b in zip(bars[-15:], bars[-14:]):
+        trs.append(max(b["high"] - b["low"], abs(b["high"] - prev["close"]), abs(b["low"] - prev["close"])))
+    return sum(trs) / len(trs) if trs else None
+
+
+def _dip_metrics(last: float, prev_close: float, history: list[dict]) -> dict:
+    """Today's move, its size in ATRs, and the distance from the 20-session
+    high (cached completed sessions plus today's price)."""
+    move = (last / prev_close - 1) * 100 if prev_close else None
+    atr = _atr14(history)
+    atr_pct = atr / prev_close * 100 if atr and prev_close else None
+    hi20 = max([b["high"] for b in history[-20:] if b.get("high")] + [last]) if history else None
+    return {"move_pct": round(move, 2) if move is not None else None,
+            "atr_pct": round(atr_pct, 2) if atr_pct else None,
+            "atr_mult": round(move / atr_pct, 2) if move is not None and atr_pct else None,
+            "from_20d_high_pct": round((last / hi20 - 1) * 100, 2) if hi20 else None}
+
+
+def _today_prices(tickers: list[str], today: str) -> dict[str, dict]:
+    """{ticker: {"last", "prev_close"}} from one batched yfinance daily read
+    (threads off: threaded yfinance reads crashed in pyarrow, roadmap 04d).
+    A ticker whose latest bar isn't dated today is left out."""
+    import yfinance as yf
+    df = yf.download(tickers, period="5d", interval="1d", group_by="ticker",
+                     threads=False, progress=False, auto_adjust=False)
+    out = {}
+    import pandas as pd
+    multi = isinstance(df.columns, pd.MultiIndex)   # yfinance 1.5 keeps it for one ticker too
+    for t in tickers:
+        try:
+            closes = (df[t] if multi else df)["Close"].dropna()
+            if len(closes) < 2 or str(closes.index[-1])[:10] != today:
+                continue
+            out[t] = {"last": float(closes.iloc[-1]), "prev_close": float(closes.iloc[-2])}
+        except Exception:
+            continue
+    return out
+
+
+def _dip_event(ticker: str, m: dict, held: bool) -> dict:
+    """The review event for a drop: no headline, so the text says so and
+    points the model at the price sections it actually has."""
+    import config
+    atr = f" ({abs(m['atr_mult']):.1f}x its ATR)" if m.get("atr_mult") is not None else ""
+    hi = (f", {abs(m['from_20d_high_pct']):.1f}% below its 20-day high"
+          if m.get("from_20d_high_pct") is not None else "")
+    return {
+        "ticker": ticker, "source": "dip_watch", "type": "price drop",
+        "title": f"{ticker} down {abs(m['move_pct']):.1f}% today{atr}{hi}, no headline trigger",
+        "text": (f"Price-only trigger from the drop watch: no news item started this review. "
+                 f"{'You hold this position. ' if held else 'You do not hold this stock. '}"
+                 + ("Use the PRICE HISTORY and PRICE STRUCTURE sections"
+                    if config.BRIEF_PRICE_HISTORY else "Use the PRICE STRUCTURE section")
+                 + (f" (the market moved {m['spy_move_pct']:+.1f}% today)" if m.get("spy_move_pct") is not None else "")
+                 + " to judge whether this is a "
+                 "pullback inside an intact trend and thesis (a chance to buy at a better price) "
+                 "or a breakdown (the trend or the thesis is breaking). Decide with the same rules "
+                 "as any other verdict."),
+    }
+
+
+@app.task(name="tasks.dip_watch")
+def dip_watch(today: str | None = None):
+    """Held and watchlist names that fell hard today with no headline (Luke,
+    2026-11-08: "if the stock tanks it can see that and decide if it wants
+    to buy at a discount"). A name qualifies when today's move is at or
+    below -DIP_REVIEW_MIN_DROP_PCT or -DIP_REVIEW_MIN_ATR x ATR(14). With
+    DIP_REVIEW_ENABLED off (the default) it writes DIP_WATCH_SHADOW rows
+    only; on, it also queues one analyst review per ticker per day through
+    the normal event path, so every existing gate applies. Never raises."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    try:
+        import config
+        import db
+        from market_calendar import NYSE_HOLIDAYS
+        et = ZoneInfo("America/New_York")
+        now = datetime.now(et)
+        today = today or now.date().isoformat()
+        if now.date().weekday() >= 5 or now.date() in NYSE_HOLIDAYS:
+            return
+        # "Held" for the event text and queue is the broker's view: a sold
+        # name with a lingering stop row (m542) must not be told "You hold
+        # this position". Stop rows only widen the watched universe, and
+        # stand in for held when the broker can't be read.
+        # The broker's view comes from the 5-minute portfolio snapshot, not a
+        # broker read: this task runs on the ingestion worker, whose forks have
+        # no IB_CLIENT_ID and could take main's clientId (audit 2026-11-08
+        # 23:22, day-one risk 2).
+        broker, stops = None, set()
+        try:
+            snap = _snapshot_positions_or_none(30)
+            if snap is not None:
+                broker = {t.upper() for t, p in snap.items()
+                          if float((p or {}).get("qty") or 0) > 0}
+        except Exception as e:
+            log.warning(f"dip watch: portfolio snapshot unreadable ({e})")
+        try:
+            stops = {r["ticker"] for r in db.get_all_position_stops(strict=True)}
+        except Exception as e:
+            log.warning(f"dip watch: position stops unreadable ({e})")
+        held = broker if broker is not None else stops
+        try:
+            from knowledge_loader import load_watchlist
+            watch = set(load_watchlist() or {})
+        except Exception as e:
+            log.warning(f"dip watch: watchlist unreadable ({e})")
+            watch = set()
+        universe = sorted(held | stops | watch)
+        if not universe:
+            return
+        try:
+            prices = _today_prices(universe + ["SPY"], today)
+        except Exception as e:
+            log.warning(f"dip watch: price read failed ({type(e).__name__}: {e})")
+            return
+        spy = prices.pop("SPY", None)
+        spy_move = (round((spy["last"] / spy["prev_close"] - 1) * 100, 2)
+                    if spy and spy.get("prev_close") else None)
+        try:
+            import redis
+            rcli = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+                                        socket_timeout=2, socket_connect_timeout=2)
+        except Exception:
+            rcli = None
+        reviewed = []
+        for t, q in prices.items():
+            try:
+                m = _dip_metrics(q["last"], q["prev_close"], db.get_price_history(t, days=40))
+            except Exception as e:
+                log.debug(f"[{t}] dip watch: metrics failed ({e})")
+                continue
+            m["spy_move_pct"] = spy_move
+            m["rel_move_pct"] = round(m["move_pct"] - spy_move, 2) if (
+                m["move_pct"] is not None and spy_move is not None) else None
+            mv, am = m["move_pct"], m["atr_mult"]
+            if mv is None or not (mv <= -_DIP_SHADOW_FLOOR_PCT or (am is not None and am <= -_DIP_SHADOW_FLOOR_ATR)):
+                continue
+            # One shadow row per ticker-session at the first crossing, and
+            # again only if the drop deepened by _DIP_SHADOW_DEEPER_PP (audit
+            # 2026-11-08 21:30 #3h). No Redis: write the row anyway.
+            row_due, first = True, True
+            try:
+                key = _DIP_SHADOW_KEY.format(day=today, ticker=t)
+                prev = rcli.get(key) if rcli is not None else None
+                if prev is not None:
+                    first = False
+                    row_due = mv <= float(prev) - _DIP_SHADOW_DEEPER_PP
+                if row_due and rcli is not None:
+                    rcli.set(key, str(mv), ex=86400)
+            except Exception:
+                pass
+            would = mv <= -config.DIP_REVIEW_MIN_DROP_PCT or (am is not None and am <= -config.DIP_REVIEW_MIN_ATR)
+            queued = False
+            if not row_due and not (would and config.DIP_REVIEW_ENABLED):
+                continue
+            if would and config.DIP_REVIEW_ENABLED:
+                try:
+                    if rcli is None:
+                        raise RuntimeError("Redis unavailable")
+                    if rcli.set(_DIP_REVIEW_KEY.format(day=today, ticker=t), "1", nx=True, ex=86400):
+                        deep_analyze_event.apply_async(
+                            args=[_dip_event(t, m, t in held), None],
+                            queue=LLM_QUEUE_HELD if t in held else LLM_QUEUE_BULK,
+                            expires=LLM_EVENT_EXPIRES_SECONDS)
+                        queued = True
+                        reviewed.append(t)
+                except Exception as e:
+                    # No Redis, no review: an unbounded repeat is worse than a missed one.
+                    log.warning(f"[{t}] dip watch: review not queued ({type(e).__name__}: {e})")
+            if not row_due:
+                continue
+            news_24h = None
+            try:
+                from datetime import timedelta, timezone as _tz
+                cutoff = datetime.now(_tz.utc) - timedelta(hours=24)
+                news_24h = sum(1 for n in db.get_recent_news_for_ticker(t, limit=15)
+                               if n.get("published_at") and n["published_at"] >= cutoff)
+            except Exception:
+                pass
+            try:
+                db.log_signal(t, "DIP_WATCH_SHADOW", 0.0,
+                              f"down {abs(mv):.1f}% today"
+                              + (f" ({abs(am):.1f}x ATR)" if am is not None else "")
+                              + ("; review queued" if queued else "; would review" if would else ""),
+                              provenance={**m, "session": today, "held": t in held,
+                                          "first_crossing": first, "news_items_24h": news_24h,
+                                          "would_review": would, "review_queued": queued,
+                                          "review_enabled": bool(config.DIP_REVIEW_ENABLED),
+                                          "thresholds": {"min_drop_pct": config.DIP_REVIEW_MIN_DROP_PCT,
+                                                         "min_atr": config.DIP_REVIEW_MIN_ATR},
+                                          "price_source": "yfinance_daily_batch",
+                                          "checked_at": now.isoformat(timespec="seconds")})
+            except Exception as e:
+                log.warning(f"[{t}] dip watch: signal log failed ({e})")
+        log.info(f"dip watch: {len(prices)}/{len(universe)} priced"
+                 + (f"; reviews queued: {', '.join(reviewed)}" if reviewed else ""))
+    except Exception as e:
+        log.warning(f"dip watch did not run: {e}")
 
 
 @app.task(name="tasks.held_move_shadow")
@@ -3441,7 +4473,7 @@ def run_daily_scan(self):
 
         log.info(f"Daily scan: {len(high_medium)} candidates to analyze")
         try:
-            log.info(_scan_summary(regime, candidates))
+            log.info(_scan_summary(regime, candidates, scan_result.get("disqualified") or []))
         except Exception as e:
             log.debug(f"scan summary failed: {e}")
         if high_medium:
@@ -3500,7 +4532,7 @@ def check_ipo_watch(self):
                      f"until it is activated on the watchlist.")
 
 
-def _scan_summary(regime: dict, candidates: list[dict]) -> str:
+def _scan_summary(regime: dict, candidates: list[dict], disqualified: list[dict] | None = None) -> str:
     """One line per daily scan: regime, threshold, counts by priority, top
     scores, and regime inputs that were unavailable. On 10-15 the regime moved
     55 -> 53, the MEDIUM threshold went 50 -> 65 and candidates fell from 20-33
@@ -3513,7 +4545,14 @@ def _scan_summary(regime: dict, candidates: list[dict]) -> str:
     missing = regime.get("missing_inputs") or (regime.get("signals") or {}).get("missing_inputs") or []
     return (f"Scan summary: regime {name} score {regime.get('score')} -> threshold "
             f"{_regime_threshold(name)}; HIGH {counts.get('HIGH', 0)} MEDIUM {counts.get('MEDIUM', 0)} "
-            f"LOW {counts.get('LOW', 0)} PASS {counts.get('PASS', 0)}; top scores {top}"
+            # PASS names go to the scan's disqualified list, never to
+            # candidates; that list also holds skips (no price data, earnings
+            # blackout), counted apart (audit 11-07 01:08 #3, professor 63i).
+            f"LOW {counts.get('LOW', 0)} PASS "
+            + (f"{sum(1 for d in disqualified if d.get('priority') == 'PASS')} skipped "
+               f"{sum(1 for d in disqualified if d.get('priority') != 'PASS')}"
+               if disqualified is not None else f"{counts.get('PASS', 0)}")
+            + f"; top scores {top}"
             + (f"; regime inputs unavailable: {', '.join(missing)}" if missing else "")
             # Which row and which bars (A0853-1, A1053-2).
             + f"; regime source {regime.get('regime_source') or 'fresh'} @ {regime.get('timestamp')}"
@@ -3569,7 +4608,78 @@ def review_positions(self):
         review_all_held_positions(max_per_run=10, priority_tickers=stale_tickers)
     except Exception as e:
         log.error(f"review_positions failed: {e}")
+        if self.request.retries >= self.max_retries:
+            # Final attempt: leave a log-only REVIEW_SKIPPED row before the
+            # retry call re-raises. Earlier attempts write nothing.
+            # The import is guarded too: the failure may be agents.crew itself.
+            try:
+                from agents.crew import log_review_skipped
+                log_review_skipped("PORTFOLIO", f"held review failed: {type(e).__name__}",
+                                   {"task": "review_positions",
+                                    "reason": "review_failed",
+                                    "error_class": type(e).__name__,
+                                    "attempts": self.request.retries + 1})
+            except Exception as log_e:
+                log.warning(f"REVIEW_SKIPPED log failed: {log_e}")
         raise self.retry(exc=e, countdown=300)
+
+
+def _monitor_price_fields(r: dict) -> dict:
+    """current_price, stop_price, rth and pct_vs_stop (price / stop - 1, in
+    percent: negative is below the stop) from one monitor result; None where
+    the result has no number. Never raises."""
+    def num(v):
+        try:
+            f = float(v)
+            return f if f == f and abs(f) != float("inf") else None
+        except (TypeError, ValueError):
+            return None
+    cur, stop = num(r.get("current_price")), num(r.get("stop_price"))
+    rth = r.get("rth")
+    return {"current_price": cur, "stop_price": stop,
+            "rth": rth if isinstance(rth, bool) else None,
+            "pct_vs_stop": round((cur / stop - 1) * 100, 2) if cur is not None and stop else None}
+
+
+def _record_monitor_actions(task: str, results) -> None:
+    """One activity row (stage monitor_action) per action a price monitor
+    returned, with how far into the session it ran: the monitors run every
+    30 min from boot, so the first in-session run lands at about 09:30-09:32
+    and acts on the opening print (audit 2026-11-07 07:07 #6). Each row also
+    carries the price, the stop and the price's distance below the stop, so
+    a stop already breached before the open is measured (audit 2026-11-07
+    11:07 #2: RGTI 09-14, QBTS 10-13 and NVDA 11-05 were seen breached for
+    2.5-4 h and filled at the opening print). Log-only.
+    The rows are written on a daemon thread: in check_trailing_stops this
+    runs before the backstop sell, which must never wait on the DB
+    (professor 65a). Never raises."""
+    if not results:
+        return
+    import threading
+    try:
+        from market_data import market_session, minutes_since_open
+        mins, session = minutes_since_open(), market_session()
+        rows = [(str(r.get("ticker") or ""), r.get("action"), _monitor_price_fields(r))
+                for r in (x if isinstance(x, dict) else {} for x in results)]
+    except Exception as e:
+        log.warning(f"monitor action record failed ({task}): {e}")
+        return
+
+    def _write():
+        try:
+            import db
+            for ticker, action, px in rows:
+                db.log_activity_direct(
+                    "monitor_action", ticker,
+                    f"{task}: {action or 'triggered'} at {mins} min after the open", "neutral",
+                    {"task": task, "action": action, "minutes_since_open": mins,
+                     "market_session": session, **px, "env": db.TRADING_ENV})
+        except Exception as e:
+            log.warning(f"monitor action record failed ({task}): {e}")
+    try:
+        threading.Thread(target=_write, name="monitor-action", daemon=True).start()
+    except Exception as e:
+        log.warning(f"monitor action record failed ({task}): {e}")
 
 
 @app.task(name="tasks.check_profit_targets", bind=True, max_retries=2)
@@ -3592,6 +4702,9 @@ def check_profit_targets(self):
         rm = RiskManager(client)
         sold = rm.check_profit_targets()
         failed = rm.monitor_read_failed is True
+        # Log-only, before the alerts so an alert error can't skip it (SEF
+        # 148); the write is on a daemon thread, so nothing here waits on it.
+        _record_monitor_actions("check_profit_targets", sold)
         for result in sold:
             if result.get("action") == "BREAKEVEN_STOP":
                 # No shares sold (the partial rounds to 0); only the stop moved.
@@ -3894,7 +5007,8 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
             if local_id and local_id > 0:
                 db.update_order_fill(local_id, result.get("fill_price"), filled,
                                      "filled" if filled >= owned - 1e-6 else "partial",
-                                     filled_at=result.get("fill_time"))
+                                     filled_at=result.get("fill_time"),
+                                     filled_at_source=result.get("fill_time_source"))
         except Exception as e:
             log.warning(f"[{ticker}] Backstop sale order logging failed: {e}")
         db.log_trade(symbol=ticker, side="SELL", quantity=filled, price=fill_price,
@@ -3922,7 +5036,8 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
                 try:
                     db.close_trade_outcome(ticker, exit_price=fill_price, exit_source="backstop_sell",
                                            exit_price_source="fill" if result.get("fill_price") else "quote",
-                                           exit_fill_at=result.get("fill_time"))
+                                           exit_fill_at=result.get("fill_time"),
+                                           exit_fill_at_source=result.get("fill_time_source"))
                 except Exception as e:
                     log.error(f"[{ticker}] close_trade_outcome failed after the backstop sell: {e}")  # m98
         log.warning(f"[{ticker}] BACKSTOP SELL executed: {filled} shares @ ~${fill_price:.2f}")
@@ -4001,6 +5116,7 @@ def check_trailing_stops(self):
         rm = RiskManager(client)
         triggered = rm.check_trailing_stops()
         failed = rm.monitor_read_failed is True
+        _record_monitor_actions("check_trailing_stops", triggered)
         if not triggered:
             return
 
@@ -4184,10 +5300,18 @@ def poll_edgar(self):
     overlapping runs doubled the request rate against SEC's limit (A1053-4)."""
     try:
         from ingestion.edgar import poll_once, LAST_PASS
+        from ingestion import edgar as _edgar
 
         def run():
             filings = poll_once(on_filing=lambda f: _dispatch_event(f, seen_source="edgar"))
             log.info(f"EDGAR: {len(filings)} new filing(s)")
+            # A backoff-skipped pass leaves the previous pass's list in place
+            # (SEF 145e), so it writes no coverage row.
+            if not LAST_PASS.get("backoff_skip"):
+                _log_ingest_coverage("edgar", {
+                    "aged_out_unseen": LAST_PASS.get("aged_out_unseen", 0),
+                    "aged_out": [label for _, label in _edgar._AGED_OUT_THIS_PASS[:50]]},
+                    change_key=frozenset(acc for acc, _ in _edgar._AGED_OUT_THIS_PASS))
             # A failed pass (ingestion.edgar._note_pass_health) is a failure,
             # not a quiet success, so ingestion_health and the staleness check
             # see it. A pass skipped during a 429 backoff records neither.
@@ -4205,15 +5329,71 @@ def poll_edgar(self):
         raise self.retry(exc=e, countdown=60)
 
 
+_INGEST_COVERAGE_LAST: dict = {}   # source -> the last written row's change key (this process)
+
+
+def _log_ingest_coverage(source: str, extra: dict, change_key=None, always: bool = False) -> None:
+    """Log-only (professor m603): an activity_feed row (stage
+    ingest_coverage) for a poll that cut or aged out unseen items, so the
+    Monday boot's coverage can be read from the DB, not only the logs.
+    Nothing is written when every count is zero, nor when change_key equals
+    the last written one for this source (aged-out items repeat every poll
+    and would fill the dashboard feed, 62d), unless `always`. The first row
+    after a boot is always written. Never raises."""
+    try:
+        if not any(v for v in extra.values()):
+            _INGEST_COVERAGE_LAST.pop(source, None)   # a set that comes back after a clean poll is new
+            return
+        if not always and change_key is not None and _INGEST_COVERAGE_LAST.get(source) == change_key:
+            return
+        _INGEST_COVERAGE_LAST[source] = change_key
+        import db
+        db.log_activity("ingest_coverage", "", f"{source}: items cut or aged out this poll (log-only)",
+                        extra={"source": source, **extra})
+    except Exception as e:
+        log.debug(f"ingest coverage row for {source} not written: {e}")
+
+
 _IMPLIED_MOVE_KEY = "options_implied_move_{env}"
 _IMPLIED_MOVE_KEEP_DAYS = 7
 _IMPLIED_MOVE_LOG_AFTER = (9, 45)      # ET: the daily row is the first computation from here
+_IMPLIED_MOVE_EXTRA_EARNINGS_DAYS = 14  # extra expiries for held names and prints this close
+_IMPLIED_MOVE_EXTRA_BUDGET_S = 20.0     # all extra chain reads in one cycle (professor 68f)
+
+
+def _bounded_extra_expiries(ticker: str, earnings_date, today, deadline: float) -> dict:
+    """options_free.extra_expiry_moves on a daemon thread, given what is left
+    of the cycle's budget (monotonic deadline); {fetched: false, reason:
+    budget} when none is left or the call runs past it. Never raises."""
+    import threading
+    import time
+    left = deadline - time.monotonic()
+    if left <= 0:
+        return {"fetched": False, "reason": "budget"}
+    box: dict = {}
+
+    def run():
+        try:
+            from ingestion.options_free import extra_expiry_moves
+            box["v"] = extra_expiry_moves(ticker, earnings_date, today)
+        except Exception as e:
+            box["v"] = {"fetched": True, "error": type(e).__name__}
+    th = threading.Thread(target=run, name="options-extra", daemon=True)
+    th.start()
+    th.join(left)
+    if th.is_alive():
+        return {"fetched": False, "reason": "budget"}
+    return box.get("v") or {"fetched": False, "reason": "no_result"}
 
 
 def _log_implied_move_shadow(moves: dict, now=None) -> int:
     """Log-only: the nearest-expiry ATM straddle implied move per ticker,
     computed by ingestion.options_free from the chain poll_options_flow
-    already downloads (no extra network call). Overwrites one system_state
+    already downloads. On the daily row, held names and names with a print
+    within 14 days also get the event-spanning and ~30-DTE straddles: up to
+    two more chain reads each, within a 20 s budget per cycle, in an order
+    shuffled with the date as seed so budget misses don't always fall on the
+    same names. Overwrites one system_state
     map (latest per ticker) and writes one activity_feed row per ticker
     per ET date (stage options_shadow), the first computation at or after
     09:45 ET. Held tickers also get stop_distance_pct and
@@ -4250,7 +5430,20 @@ def _log_implied_move_shadow(moves: dict, now=None) -> int:
                 stops = ({s["ticker"].upper(): s for s in db.get_all_position_stops()}
                          if held & set(due) else {})
                 versions = shadow_versions()
-                for t in due:
+                try:
+                    earn = db.get_earnings_around(due, days_ahead=_IMPLIED_MOVE_EXTRA_EARNINGS_DAYS,
+                                                  days_back=0) or {}
+                except Exception:
+                    earn = {}
+                import time as _t
+                extra_deadline = _t.monotonic() + _IMPLIED_MOVE_EXTRA_BUDGET_S
+                # Shuffled with the date as seed (SEF 158c, professor 68h):
+                # with sorted() alone, budget misses always fell late in the
+                # alphabet. Reproducible from the date.
+                import random
+                order = list(due)
+                random.Random(et_now.date().toordinal()).shuffle(order)
+                for t in order:
                     try:
                         sk = f"{TRADING_ENV}:{t}:{et_date}"
                         if sk not in done:
@@ -4258,6 +5451,16 @@ def _log_implied_move_shadow(moves: dict, now=None) -> int:
                             extra = {"ticker": t, **m, "et_date": et_date,
                                      "computed_at": et_now.isoformat(),
                                      "held": t.upper() in held, "shadow_key": sk, **versions}
+                            # The event-spanning and ~30-DTE straddles (audit
+                            # 2026-11-07 19:07 #4), only where they matter.
+                            if extra["held"] or t in earn:
+                                extra["extra_expiries"] = _bounded_extra_expiries(
+                                    t, earn.get(t), et_now.date(), extra_deadline)
+                                extra["extra_expiries"]["earnings_window_days"] = \
+                                    _IMPLIED_MOVE_EXTRA_EARNINGS_DAYS
+                            else:
+                                extra["extra_expiries"] = {"fetched": False,
+                                                           "reason": "not held, no print within 14 days"}
                             if extra["held"]:
                                 stop = (stops.get(t.upper()) or {}).get("stop_price")
                                 u = m.get("underlying")
@@ -4288,6 +5491,9 @@ def _log_implied_move_shadow(moves: dict, now=None) -> int:
         return 0
 
 
+_UW_SHADOW_OFF_WARNED = False
+
+
 @app.task(name="tasks.poll_options_flow", bind=True, max_retries=3)
 def poll_options_flow(self):
     """Checks for unusual options activity across all symbols (Unusual Whales,
@@ -4304,20 +5510,28 @@ def poll_options_flow(self):
 
         import os
         implied = None
-        if os.getenv("UNUSUAL_WHALES_API_KEY", "").startswith("your_"):
+        # The same test as ingestion.options_flow: an empty key used to take
+        # the paid path here, turning the implied-move shadow off (audit
+        # 2026-11-07 05:07 #6).
+        from ingestion.options_flow import _KEY_CONFIGURED as _uw_key_configured
+        if not _uw_key_configured:
             from ingestion.options_free import get_all_flow_summaries
             log.info("UNUSUAL_WHALES_API_KEY not configured — using free yfinance options proxy")
             implied = {}       # log-only implied-move shadow, from the same chains
         else:
             from ingestion.options_flow import get_all_flow_summaries
+            global _UW_SHADOW_OFF_WARNED
+            if not _UW_SHADOW_OFF_WARNED:
+                # The implied-move shadow only runs on the free path
+                # (audit 2026-11-07 19:07 #4): say so once per process.
+                log.warning("poll_options_flow: Unusual Whales key set, implied-move shadow is off")
+                _UW_SHADOW_OFF_WARNED = True
 
         import db
         from datetime import date
 
         summaries = (get_all_flow_summaries(implied_sink=implied) if implied is not None
                      else get_all_flow_summaries())
-        if implied:
-            _log_implied_move_shadow(implied)
         unusual_count = 0
         for ticker, flow in summaries.items():
             if flow.get("unusual"):
@@ -4338,6 +5552,10 @@ def poll_options_flow(self):
                 }
                 _dispatch_event(event)
                 db.mark_seen("options_flow_dispatch", seen_key)
+        # After the dispatch, so the log-only shadow (and its extra chain
+        # reads) can't delay an unusual-flow event (professor 68f).
+        if implied:
+            _log_implied_move_shadow(implied)
         _heartbeat_ok("options_flow", unusual_count)
     except Exception as e:
         log.error(f"poll_options_flow failed: {e}")
@@ -4379,6 +5597,39 @@ def _log_would_reassess(live_vix: float) -> None:
             db.set_state(key, row_at)
     except Exception as e:
         log.debug(f"would_reassess log failed: {e}")
+
+
+@app.task(name="tasks.cache_live_vix")
+def cache_live_vix():
+    """Log-only input: fetch live ^VIX (get_intraday_vix) on this task's own
+    thread and keep it in Redis (agents.analyst.VIX_LIVE_KEY, 15 min expiry)
+    as {"vix", "at", "error"}; a non-finite or non-positive value is stored
+    as None with error non_finite. Never raises."""
+    import json
+    import math
+    from datetime import datetime, timezone
+    try:
+        import redis
+        from agents.analyst import VIX_LIVE_KEY
+        from agents.market_regime import get_intraday_vix
+        vix, err = None, None
+        try:
+            v = get_intraday_vix()
+            vix = float(v) if v is not None else None
+            if vix is not None and (not math.isfinite(vix) or vix <= 0):
+                vix, err = None, "non_finite"
+            elif vix is None:
+                err = "none"
+        except Exception as e:
+            err = type(e).__name__
+        rec = {"vix": vix, "at": datetime.now(timezone.utc).isoformat(), "error": err}
+        redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+                             socket_timeout=2, socket_connect_timeout=2
+                             ).set(VIX_LIVE_KEY, json.dumps(rec), ex=900)
+        return rec
+    except Exception as e:
+        log.warning(f"cache_live_vix failed: {e}")
+        return None
 
 
 @app.task(name="tasks.poll_macro", bind=True, max_retries=3)
@@ -4557,6 +5808,12 @@ def poll_news(self):
 
         items = poll_once()
         log.info(f"News: {len(items)} new item(s)")
+        from ingestion import news as _news
+        _log_ingest_coverage("news", {
+            "cap_hits": {k: sorted(v) for k, v in _news._CAP_HITS.items()},
+            "aged_out_n": sum(_news._AGED_OUT.values()),
+            "aged_out": dict(sorted(_news._AGED_OUT.items()))},
+            change_key=frozenset(_news._AGED_OUT), always=bool(_news._CAP_HITS))
         watchlist = load_watchlist()
         for item in items:
             # Logged for the public research site's News section regardless
@@ -4912,6 +6169,25 @@ _C6_OUTCOME_HORIZONS = (5, 10, 20)   # trading days
 _C6_OUTCOME_EXPIRE_DAYS = 40         # sessions after which an incomplete verdict gets its status
 _C6_OUTCOME_LOOKBACK_DAYS = 75       # calendar days of verdict rows re-read each run
 _C6_OUTCOME_MARKER_TTL_S = 120 * 86400   # past the lookback plus the 40-session wait
+_C6_ACTIONS_TTL_S = 86400                # yfinance splits/dividends cached a day per ticker
+_C6_ACTIONS_KEY = "helios:corp_actions:v2:"   # v2: events + raw closes + fetched_at (M320)
+
+
+_calendar_end_warned = False
+
+
+def _warn_past_calendar_end(day) -> None:
+    """Warn once per process when a session count or check reaches past
+    market_calendar.CALENDAR_LAST_YEAR: NYSE_HOLIDAYS lists no holidays
+    after it, so those days count as sessions."""
+    global _calendar_end_warned
+    from market_calendar import CALENDAR_LAST_YEAR
+    if _calendar_end_warned or day.year <= CALENDAR_LAST_YEAR:
+        return
+    _calendar_end_warned = True
+    log.warning(f"NYSE holiday calendar ends {CALENDAR_LAST_YEAR}; sessions on or after "
+                f"{day.isoformat()} are counted without holidays. Extend "
+                f"market_calendar.NYSE_HOLIDAYS")
 
 
 def _c6_trading_days_after(et_date: str, today: str) -> int:
@@ -4919,27 +6195,111 @@ def _c6_trading_days_after(et_date: str, today: str) -> int:
     from datetime import date, timedelta
     from market_calendar import NYSE_HOLIDAYS
     d, end, n = date.fromisoformat(et_date) + timedelta(days=1), date.fromisoformat(today), 0
+    _warn_past_calendar_end(end)
     while d <= end:
         n += d.weekday() < 5 and d not in NYSE_HOLIDAYS
         d += timedelta(days=1)
     return n
 
 
+def _c6_sessions_after(et_date: str, n: int) -> list[str]:
+    """The first n NYSE sessions after et_date, as ISO dates."""
+    from datetime import date, timedelta
+    from market_calendar import NYSE_HOLIDAYS
+    d, out = date.fromisoformat(et_date), []
+    while len(out) < n:
+        d += timedelta(days=1)
+        if d.weekday() < 5 and d not in NYSE_HOLIDAYS:
+            out.append(d.isoformat())
+    _warn_past_calendar_end(d)
+    return out
+
+
+def _c6_corporate_actions(ticker: str, r, cache: dict) -> dict | None:
+    """yfinance splits and dividends for a ticker, cached in Redis for a day
+    and per run: {"events": [{"date", "kind", "value"}] (kind split: the
+    ratio; dividend: per share), "raw_close": {date: Close with
+    auto_adjust=False, which yfinance still split-adjusts, so not dividend-
+    adjusted only (63d)}, "fetched_at": ISO time of the read}. None when unreadable: the outcome
+    row then says unknown, not "none" (professor m602). A year of daily bars
+    with actions, unadjusted, 10 s timeout, raising on errors (62p): no bars
+    is unknown and not cached, bars with no events has events [] (none
+    found). With the split events it gives a fully unadjusted close
+    (M320)."""
+    if ticker in cache:
+        return cache[ticker]
+    key = _C6_ACTIONS_KEY + ticker
+    out = None
+    try:
+        hit = r.get(key) if r is not None else None
+        if hit:
+            out = json.loads(hit)
+    except Exception:
+        out = None
+    if out is None:
+        try:
+            import yfinance as yf
+            acts = yf.Ticker(ticker).history(period="1y", interval="1d", actions=True,
+                                             auto_adjust=False, timeout=10, raise_errors=True)
+            if acts is None or acts.empty:
+                raise ValueError("no bars returned")
+            from datetime import datetime, timezone
+            out = {"events": [], "raw_close": {},
+                   "fetched_at": datetime.now(timezone.utc).isoformat()}
+            for ts, row in acts.iterrows():
+                d = ts.date().isoformat()
+                try:
+                    close = float(row.get("Close"))
+                    if close == close and close > 0:      # not NaN
+                        out["raw_close"][d] = close
+                except (TypeError, ValueError):
+                    pass
+                for col, kind in (("Dividends", "dividend"), ("Stock Splits", "split")):
+                    val = float(row.get(col) or 0)
+                    if val > 0:
+                        out["events"].append({"date": d, "kind": kind, "value": val})
+            try:
+                if r is not None:
+                    r.set(key, json.dumps(out), ex=_C6_ACTIONS_TTL_S)
+            except Exception:
+                pass
+        except Exception as e:
+            log.warning(f"[{ticker}] c6 bar outcomes: corporate actions unreadable: {e}")
+            out = None
+    cache[ticker] = out
+    return out
+
+
 def _check_c6_bar_outcomes(today=None) -> int:
     """Log-only forward outcomes for the c6 bar shadow (agents/c6_shadow.py).
     For each c6_bar_shadow verdict row of the last _C6_OUTCOME_LOOKBACK_DAYS
     days with an entry_ref_price, and each horizon N in
-    _C6_OUTCOME_HORIZONS: once the cache holds N daily bars dated after the
-    verdict's ET date, one row, stage c6_bar_shadow, kind outcome, with the
-    Nth bar's close and its return from entry_ref_price (and from the
-    verdict day's close when that bar is cached). Closes are adjusted; see
-    the c6_shadow docstring. Each verdict also gets one kind outcome_status
+    _C6_OUTCOME_HORIZONS: once the cache holds the bar of the Nth NYSE
+    session after the verdict's ET date, one row, stage c6_bar_shadow, kind
+    outcome, with that bar's close and its return from entry_ref_price (and
+    from the verdict day's close when that bar is cached). The horizon counts
+    sessions, not cached bars, so a gap in the cache can't shift it: the row
+    carries missing_sessions (sessions up to the horizon with no cached bar)
+    and bars_gap (missing_sessions > 0). A horizon whose own session has no
+    bar is not logged. Closes are adjusted; see
+    the c6_shadow docstring. Each outcome row lists the yfinance splits and
+    dividends dated after the verdict day, up to the day the row is written
+    (corp_actions_after_verdict; null when unreadable), with
+    split_in_window / dividend_in_window for those up to close_date (m602)
+    and split/dividend_after_verdict_any for all of them: any of these
+    biases return_pct, since the adjusted close is read from a series
+    rewritten on each refresh (M320). close_split_adj is yfinance's Close
+    (dividends not taken out, splits still are); close_unadjusted multiplies
+    back the splits after close_date, and return_pct_unadjusted runs from
+    it, both from the same read (corp_actions_fetched_at). A split inside
+    the window still breaks the raw-to-raw return (split_in_window). Each verdict also gets one kind outcome_status
     row, so attrition is countable: complete (every horizon logged), no_ref
     (no entry_ref_price), or, _C6_OUTCOME_EXPIRE_DAYS sessions after the
     verdict with horizons missing, missing_bars (some bars cached after the
     verdict, too few) or expired (none). One row per key (shadow_key
     <verdict key>:r<N> / :status, plus a Redis NX marker). The first failed
-    write stops the run. Reads the DB cache only. Never raises."""
+    write stops the run. Reads the DB cache, plus yfinance corporate actions
+    (cached a day) for the rows it writes. Never raises."""
     try:
         from datetime import datetime
         from zoneinfo import ZoneInfo
@@ -4959,6 +6319,7 @@ def _check_c6_bar_outcomes(today=None) -> int:
             r = None
         bars = db.get_price_history_bulk(sorted({v["ticker"] for v in rows}), days=90)
         logged = 0
+        actions_cache: dict = {}
 
         def write(key, ticker, msg, extra):
             """None when written now, True when already there, False when
@@ -5006,11 +6367,30 @@ def _check_c6_bar_outcomes(today=None) -> int:
                     after = [b for b in series if b["date"] > et_date]
                     day0 = next((b for b in series if b["date"] == et_date), None)
                     c0 = float(day0["close"]) if day0 else None
+                    by_date = {b["date"]: b for b in after}
+                    sessions = _c6_sessions_after(et_date, max(_C6_OUTCOME_HORIZONS))
                     for n in _C6_OUTCOME_HORIZONS:
-                        if len(after) < n:
-                            break
-                        bar = after[n - 1]
+                        bar = by_date.get(sessions[n - 1])
+                        if bar is None:
+                            continue
+                        missing = sum(1 for d in sessions[:n] if d not in by_date)
                         close = float(bar["close"])
+                        ca = acts = None
+                        if done is None or f"{v['shadow_key']}:r{n}" not in done:
+                            ca = _c6_corporate_actions(ticker, r, actions_cache)
+                        if ca is not None:
+                            acts = [a for a in ca.get("events") or [] if et_date < a["date"] <= today]
+                        split_adj = (ca or {}).get("raw_close", {}).get(bar["date"])
+                        unadj = None
+                        if split_adj:
+                            # Un-split: yfinance's Close divides by every split
+                            # after the bar up to the read (professor 63d).
+                            unadj = split_adj
+                            for a in ca.get("events") or []:
+                                if a["kind"] == "split" and a["date"] > bar["date"]:
+                                    unadj *= float(a["value"])
+                        in_win = (None if acts is None else
+                                  [a for a in acts if a["date"] <= bar["date"]])
                         writes.append((f"{v['shadow_key']}:r{n}",
                                        f"c6 {v.get('action')} {n}-day return "
                                        f"{(close / ref - 1) * 100:+.2f}% (verdict {et_date})",
@@ -5020,7 +6400,27 @@ def _check_c6_bar_outcomes(today=None) -> int:
                                         "return_pct": round((close / ref - 1) * 100, 4),
                                         "verdict_day_close": c0,
                                         "return_from_verdict_close_pct": (
-                                            round((close / c0 - 1) * 100, 4) if c0 else None)}))
+                                            round((close / c0 - 1) * 100, 4) if c0 else None),
+                                        "missing_sessions": missing,
+                                        "bars_gap": missing > 0,
+                                        "corp_actions_after_verdict": acts,
+                                        "split_in_window": (None if in_win is None else
+                                                            any(a["kind"] == "split" for a in in_win)),
+                                        "dividend_in_window": (None if in_win is None else
+                                                               any(a["kind"] == "dividend" for a in in_win)),
+                                        # Any event after the verdict up to the
+                                        # read biases return_pct, in the window
+                                        # or not: the adjusted series is
+                                        # rewritten on refresh (M320).
+                                        "split_after_verdict_any": (None if acts is None else
+                                                                    any(a["kind"] == "split" for a in acts)),
+                                        "dividend_after_verdict_any": (None if acts is None else
+                                                                       any(a["kind"] == "dividend" for a in acts)),
+                                        "close_split_adj": split_adj,
+                                        "close_unadjusted": (round(unadj, 6) if unadj else None),
+                                        "return_pct_unadjusted": (round((unadj / ref - 1) * 100, 4)
+                                                                  if unadj else None),
+                                        "corp_actions_fetched_at": (ca or {}).get("fetched_at")}))
                         have.append(n)
                     if len(have) == len(_C6_OUTCOME_HORIZONS):
                         status = "complete"
@@ -5170,6 +6570,7 @@ def _log_plan_cross_section(now=None) -> int:
         from agents.analyst import shadow_versions
         now = now or datetime.now(timezone.utc)
         day = now.astimezone(ZoneInfo("America/New_York")).date()
+        _warn_past_calendar_end(day)
         if day.weekday() >= 5 or day in NYSE_HOLIDAYS:
             return 0
         snapshot_date = day.isoformat()
@@ -5315,6 +6716,31 @@ def refresh_price_history(self):
         raise self.retry(exc=e, countdown=300)
 
 
+def _ladder_stale_bars(now=None) -> dict:
+    """Log-only (audit 11-06 17:34 #9): the ladder runs on a clock after
+    refresh_price_history, not after it finishes, so it can read yesterday's
+    bars (10-28, after a SIGTERM). The latest NYSE session on or before
+    today (ET) and the watchlist tickers whose newest cached bar is older.
+    Never raises."""
+    try:
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+        import db
+        from knowledge_loader import get_all_tickers
+        from market_calendar import NYSE_HOLIDAYS
+        d = (now or datetime.now(ZoneInfo("America/New_York"))).date()
+        while d.weekday() >= 5 or d in NYSE_HOLIDAYS:
+            d -= timedelta(days=1)
+        tickers = get_all_tickers()
+        newest = db.get_newest_bar_dates(tickers)
+        if tickers and not newest:   # {} is also the read's error return
+            return {"session": d.isoformat(), "tickers": len(tickers), "error": "no_bar_dates_read"}
+        stale = sorted(t for t in tickers if t not in newest or newest[t] < d)
+        return {"session": d.isoformat(), "tickers": len(tickers), "stale": stale}
+    except Exception as e:
+        return {"error": type(e).__name__}
+
+
 @app.task(name="tasks.refresh_trade_ladder", bind=True, max_retries=2)
 def refresh_trade_ladder(self):
     """Nightly per-ticker trade ladder (2026-09-13, swing-trading redesign)
@@ -5326,6 +6752,13 @@ def refresh_trade_ladder(self):
     consumer side."""
     try:
         from agents.trade_ladder import refresh_all_ladders
+        fresh = _ladder_stale_bars()
+        if fresh.get("error"):
+            log.warning(f"Trade ladder: bar-freshness check unavailable ({fresh['error']}); ladder still built")
+        elif fresh.get("stale"):
+            log.warning(f"Trade ladder: {len(fresh['stale'])} of {fresh['tickers']} tickers have no "
+                        f"bar for the {fresh['session']} session yet (log-only, ladder still built): "
+                        + ", ".join(fresh["stale"][:20]))
         count = refresh_all_ladders()
         log.info(f"Trade ladder refreshed: {count} tickers updated")
         _heartbeat_ok("trade_ladder", count)
@@ -5521,6 +6954,83 @@ def flush_alert_digest():
         log.error(f"flush_alert_digest failed: {e}")
 
 
+def _digest_book_lines(positions, pv: float, cash: float | None) -> list[str]:
+    """Report-only "Book" lines for the daily digest (audit 2026-11-07 19:07
+    #7): the three largest themes by watchlist heading prefix, the
+    AI-infrastructure total against its 60% cap (risk_manager.AI_INFRA_TICKERS,
+    the set check_concentration uses), and cash
+    against the current regime's cash target. Percentages of portfolio
+    value only. Nothing here sizes or blocks. Never raises; a part that
+    can't be read is left out."""
+    lines: list[str] = []
+    if not pv:
+        return lines
+    try:
+        weights = {p.symbol: float(p.market_value) / pv for p in positions}
+    except Exception:
+        return lines
+    try:
+        from knowledge_loader import load_watchlist
+        from risk_manager import _theme_prefix
+        wl = load_watchlist()
+        themes: dict[str, float] = {}
+        for t, w in weights.items():
+            theme = _theme_prefix(wl.get(t, {}).get("sector", "")) or "Off watchlist"
+            themes[theme] = themes.get(theme, 0.0) + w
+        top = sorted(themes.items(), key=lambda kv: -kv[1])[:3]
+        if top:
+            lines.append("Themes: " + ", ".join(f"{k} {v:.0%}" for k, v in top))
+    except Exception as e:
+        log.debug(f"digest book themes unavailable: {e}")
+    try:
+        from config import MAX_AI_INFRA_PCT
+        from risk_manager import AI_INFRA_TICKERS
+        ai = sum(w for t, w in weights.items() if t in AI_INFRA_TICKERS)
+        lines.append(f"AI infrastructure: {ai:.0%} of a {MAX_AI_INFRA_PCT:.0%} cap")
+    except Exception as e:
+        log.debug(f"digest book AI-infra total unavailable: {e}")
+    try:
+        if cash is not None:
+            import db
+            reg = db.get_latest_regime() or {}
+            target = (reg.get("portfolio_impact_json") or {}).get("cash_target_pct")
+            line = f"Cash: {cash / pv:.0%}"
+            if target is not None and reg.get("regime"):
+                line += f" (target {target}% in {reg['regime']})"
+            lines.append(line)
+    except Exception as e:
+        log.debug(f"digest book cash line unavailable: {e}")
+    return lines
+
+
+def _digest_exits_today(today_et, tz) -> list[str]:
+    """Today's (ET) SELL trades as digest lines, oldest first. A broker stop
+    fill is booked by reconcile with no Telegram message, so without this a
+    closed position shows only as missing from the list (audit 2026-11-07
+    03:08 #3). trades.timestamp is when the row was written, so a fill that
+    reconcile books late lists on the day it was booked (professor 63t).
+    Never raises; [] when the read fails."""
+    import html
+    from datetime import timezone
+    try:
+        import db
+        out = []
+        for t in reversed(db.get_recent_trades(limit=200)):
+            ts = t.get("timestamp")
+            if str(t.get("side") or "").upper() != "SELL" or ts is None:
+                continue
+            if (ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)).astimezone(tz).date() != today_et:
+                continue
+            px = f" @ ${t['price']:,.2f}" if t.get("price") is not None else ""
+            reason = str(t.get("reason") or "").strip()
+            reason = f" ({html.escape(reason[:60])})" if reason else ""
+            out.append(f"{html.escape(str(t.get('symbol')))}: {float(t.get('quantity') or 0):g}sh{px}{reason}")
+        return out
+    except Exception as e:
+        log.debug(f"exits lookup failed for digest: {e}")
+        return []
+
+
 @app.task(name="tasks.send_daily_digest", bind=True, max_retries=2)
 def send_daily_digest(self):
     """
@@ -5605,16 +7115,43 @@ def send_daily_digest(self):
                 except Exception as e:
                     log.debug(f"[{p.symbol}] thesis lookup failed for digest: {e}")
 
+            # Today's analyst verdicts on the holding, so a day of reviews
+            # with no action shows (audit 11-06 17:34 #8).
+            verdict_line = ""
+            try:
+                day_start = datetime.combine(today_et, datetime.min.time(), tzinfo=_et).astimezone(timezone.utc)
+                vs = db.get_verdict_day_summary(p.symbol, day_start)
+                if vs.get("n"):
+                    counts = ", ".join(f"{k} {v}" for k, v in sorted(vs["by_signal"].items()))
+                    last = vs["last"]
+                    verdict_line = (f"\n    📋 Today: {vs['n']} verdict{'s' if vs['n'] != 1 else ''} ({counts}); "
+                                    f"last {last['signal']} c{last['conviction']}")
+            except Exception as e:
+                log.debug(f"[{p.symbol}] verdict summary failed for digest: {e}")
+
             positions_text.append(
-                f"{p.symbol}: {p.qty:.0f}sh{entry_line}, P&amp;L ${float(p.unrealized_pl):+,.0f}{dist}{thesis_line}"
+                f"{p.symbol}: {p.qty:.0f}sh{entry_line}, P&amp;L ${float(p.unrealized_pl):+,.0f}{dist}{thesis_line}{verdict_line}"
             )
 
-        catalysts_text = []
+        catalysts_text, catalysts_label = [], None
         try:
             from catalyst_service.client import query_events
-            tomorrow = (today_et + timedelta(days=1)).isoformat()
-            events = query_events(start=tomorrow, end=tomorrow)
-            catalysts_text = [f"{e.get('ticker')}: {e.get('event_type')}" for e in events]
+            from market_calendar import NYSE_HOLIDAYS
+            # Through the next NYSE session, so a Friday digest shows Monday's
+            # events (and the weekend's), held names first (audit 11-06 17:34 #8).
+            tomorrow = today_et + timedelta(days=1)
+            next_session = tomorrow
+            while next_session.weekday() >= 5 or next_session in NYSE_HOLIDAYS:
+                next_session += timedelta(days=1)
+            events = query_events(start=tomorrow.isoformat(), end=next_session.isoformat())
+            held = {p.symbol for p in positions}
+            events = sorted(events, key=lambda e: e.get("ticker") not in held)
+            dated = next_session != tomorrow
+            catalysts_text = [(f"{e.get('event_date')} " if dated else "")
+                              + f"{e.get('ticker')}: {e.get('event_type')}"
+                              + (" (held)" if e.get("ticker") in held else "") for e in events]
+            if dated:
+                catalysts_label = f"Catalysts through the next session ({next_session.strftime('%a %b %d')})"
         except Exception as e:
             log.debug(f"Catalyst lookup unavailable for digest: {e}")
 
@@ -5630,10 +7167,15 @@ def send_daily_digest(self):
         except Exception as e:
             log.debug(f"ATR fallback tickers unavailable for digest: {e}")
 
+        exits_text = _digest_exits_today(today_et, _et)
+        book_text = _digest_book_lines(positions, pv, getattr(account, "cash", None))
+
         alerts.send_daily_digest(
             portfolio_value=pv, day_pl=day_pl, day_pl_pct=day_pl_pct,
             spy_pl_pct=spy_pl_pct, positions_text=positions_text,
-            catalysts_text=catalysts_text, pending_count=pending_count,
+            exits_text=exits_text, book_text=book_text,
+            catalysts_text=catalysts_text, catalysts_label=catalysts_label,
+            pending_count=pending_count,
             halted=halted, ingestion_issues=ingestion_issues,
             atr_fallback_tickers=atr_fallback_tickers,
         )
@@ -5669,6 +7211,29 @@ def review_plan_level_hit(ticker: str, kind: str, level: str, price: float | Non
         return (result or {}).get("action")
     except Exception as e:
         log.error(f"[{ticker}] review_plan_level_hit failed: {e}")
+        return None
+
+
+def _plan_exited(plan: dict, held: dict) -> bool | None:
+    """Record-only (limitations audit 2026-11-08 11:07 #2): whether the
+    plan's position was sold after the plan was made (a trade_outcomes exit
+    after it, entry bounded by the revision chain's first plan, as
+    agents.plans.observe checks). A plan stays active until its next
+    verdict (PLAN_CLOSE_ON_EXIT off pending G75), so a held_seed plan for a
+    name sold and not re-analysed keeps logging level hits; this lets a
+    reader tell those rows apart. False when the name is held, None when
+    nothing is held (stale snapshot) or the lookup fails."""
+    if plan["ticker"] in held:
+        return False
+    if not held:
+        return None
+    try:
+        import db
+        entered = (db.plan_root_created_at(plan["id"]) if plan.get("revision")
+                   else None) or plan["created_at"]
+        return bool(db.outcome_closed_since(plan["ticker"], plan["created_at"], entered_since=entered))
+    except Exception as e:
+        log.debug(f"[{plan['ticker']}] plan {plan['id']} exit lookup failed: {e}")
         return None
 
 
@@ -5716,7 +7281,9 @@ def watch_plan_levels():
                               + ("review queued" if queued else "would re-review"),
                               provenance={"plan_id": plan["id"], "kind": kind, "level": level,
                                           "price": price, "plan_source": plan.get("source"),
-                                          "review_queued": queued, **shadow_versions()})
+                                          "review_queued": queued,
+                                          "exited_since_plan": _plan_exited(plan, held),
+                                          **shadow_versions()})
                 if queued:
                     review_plan_level_hit.apply_async(
                         args=[plan["ticker"], kind, str(level), price],
@@ -5752,6 +7319,27 @@ def take_portfolio_snapshot(self):
         except Exception as e:
             log.debug(f"Benchmark snapshot fetch failed (non-critical): {e}")
 
+        # The stop record's entry beside the broker's average cost: the broker
+        # can move its basis without a trade (an IBKR wash-sale adjustment
+        # raised NVDA's 12.5% overnight on 11-06), and the brief reads the
+        # broker figure (audit 11-06 05:33 #4). Record only; None if unread.
+        try:
+            record_entry = {r.get("ticker"): r.get("entry_price") for r in db.get_all_position_stops()}
+        except Exception as e:
+            log.debug(f"Snapshot stop-record read failed (non-critical): {e}")
+            record_entry = {}
+        try:   # how each record's entry_price was set (migration 85, professor m590)
+            entry_source = db.get_entry_price_sources()
+        except Exception as e:
+            log.debug(f"Snapshot entry-source read failed (non-critical): {e}")
+            entry_source = {}
+
+        def _basis_gap(avg, rec):
+            try:
+                return round(float(avg) / float(rec) - 1, 4) if rec and float(rec) > 0 else None
+            except (TypeError, ValueError):
+                return None
+
         db.log_snapshot(
             total_value=float(account.portfolio_value),
             cash=float(account.cash),
@@ -5761,6 +7349,9 @@ def take_portfolio_snapshot(self):
                     "market_value":     float(p.market_value),
                     "avg_entry_price":  float(p.avg_entry_price),
                     "unrealized_pl":    float(p.unrealized_pl),
+                    "record_entry_price": record_entry.get(p.symbol),
+                    "record_entry_source": entry_source.get(p.symbol),
+                    "basis_gap_frac":    _basis_gap(p.avg_entry_price, record_entry.get(p.symbol)),
                 }
                 for p in positions
             },
@@ -5773,9 +7364,135 @@ def take_portfolio_snapshot(self):
 
 # ── New tasks: safety, earnings, outcomes, pruning ────────────────────────────
 
+# A deferred entry whose scheduled retry_deferred_entry was lost (worker or
+# broker restart, a dropped eta) sat FAILED with nothing to touch it again.
+# Alert only: the check never executes, retries, expires or edits a row.
+DEFERRED_STUCK_SLACK_MINUTES = 40   # after the expected retry; 45 min for the 5-min re-checks
+_DEFERRED_STUCK_ALERTED_KEY = "deferred_entry_stuck_alerted_{env}"
+_DEFERRED_RETRY_RAN_KEY = "deferred_entry_retry_ran_{env}"
+_DEFERRED_STATE_KEEP_DAYS = 7
+
+
+def _deferred_state_load(key_fmt: str) -> dict:
+    import db
+    from config import TRADING_ENV
+    try:
+        data = json.loads(db.get_state(key_fmt.format(env=TRADING_ENV)) or "{}")
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _deferred_state_save(key_fmt: str, data: dict) -> None:
+    """Writes {approval id: iso time}, dropping entries older than
+    _DEFERRED_STATE_KEEP_DAYS so the set stays small."""
+    from datetime import datetime, timedelta, timezone
+    import db
+    from config import TRADING_ENV
+    cutoff = datetime.now(timezone.utc) - timedelta(days=_DEFERRED_STATE_KEEP_DAYS)
+    kept = {}
+    for k, v in data.items():
+        try:
+            if datetime.fromisoformat(v) >= cutoff:
+                kept[str(k)] = v
+        except Exception:
+            continue
+    db.set_state(key_fmt.format(env=TRADING_ENV), json.dumps(kept, sort_keys=True))
+
+
+def _note_deferred_retry_ran(approval_id: int) -> None:
+    """Records that a retry_deferred_entry ran for this approval. A run that
+    leaves the row FAILED without rewriting it (the re-size re-check) would
+    otherwise look like a lost retry to _check_stuck_deferred_entries."""
+    try:
+        from datetime import datetime, timezone
+        ran = _deferred_state_load(_DEFERRED_RETRY_RAN_KEY)
+        ran[str(approval_id)] = datetime.now(timezone.utc).isoformat()
+        _deferred_state_save(_DEFERRED_RETRY_RAN_KEY, ran)
+    except Exception as e:
+        log.warning(f"_note_deferred_retry_ran(#{approval_id}) failed: {e}")
+
+
+def _mark_deferred_stuck_alerted(approval_id: int) -> None:
+    from datetime import datetime, timezone
+    alerted = _deferred_state_load(_DEFERRED_STUCK_ALERTED_KEY)
+    alerted[str(approval_id)] = datetime.now(timezone.utc).isoformat()
+    _deferred_state_save(_DEFERRED_STUCK_ALERTED_KEY, alerted)
+
+
+def _deferred_retry_due_at(row: dict, ran_at=None):
+    """When the retry for a deferred row should have run (UTC). A market-closed
+    deferral is due at the next session open after it was written (overnight,
+    weekends and holidays included); the timed re-checks (gap, stale price)
+    after their longest delay. A retry run recorded after the row's last write
+    left it FAILED for a re-size re-check, due DEFERRED_RECHECK_RETRY_MINUTES
+    after that run."""
+    from datetime import timedelta, timezone
+    from config import GAP_CONFIRMATION_RETRY_MINUTES, STALE_PRICE_RETRY_MINUTES
+    updated = row["updated_at"]
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    if ran_at is not None and ran_at > updated:
+        return ran_at + timedelta(minutes=DEFERRED_RECHECK_RETRY_MINUTES)
+    if "market closed" in (row.get("status_reason") or ""):
+        from market_data import next_market_open
+        return next_market_open(updated)
+    return updated + timedelta(minutes=max(GAP_CONFIRMATION_RETRY_MINUTES, STALE_PRICE_RETRY_MINUTES))
+
+
+def _check_stuck_deferred_entries(now=None) -> list[int]:
+    """Alert once per deferred entry whose retry is more than
+    DEFERRED_STUCK_SLACK_MINUTES past due. Reads pending_approvals and never
+    writes it. Returns the ids alerted. Never raises."""
+    try:
+        from datetime import datetime, timedelta, timezone
+        import alerts
+        import db
+        now = now or datetime.now(timezone.utc)
+        rows = db.get_deferred_entries()
+        if not rows:
+            return []
+        alerted = _deferred_state_load(_DEFERRED_STUCK_ALERTED_KEY)
+        ran = _deferred_state_load(_DEFERRED_RETRY_RAN_KEY)
+        slack = timedelta(minutes=DEFERRED_STUCK_SLACK_MINUTES)
+        new = []
+        for row in rows:
+            aid = str(row["id"])
+            if aid in alerted:
+                continue
+            try:
+                ran_at = datetime.fromisoformat(ran[aid]) if aid in ran else None
+                late = _deferred_retry_due_at(row, ran_at) + slack
+                if now <= late:
+                    continue
+            except Exception as e:
+                log.warning(f"stuck deferred check: approval #{aid} skipped: {e}")
+                continue
+            why = (row.get("status_reason") or "")[len(db.DEFERRED_REASON_PREFIX):].strip()[:160]
+            # "Hasn't run by", not "never ran": a busy ops queue can still
+            # run a late eta task (professor m485 nit).
+            from zoneinfo import ZoneInfo
+            by = late.astimezone(ZoneInfo("America/New_York")).strftime("%m-%d %H:%M ET")
+            alerts._send(
+                f"⚠️ DEFERRED ENTRY STUCK — {row.get('ticker', '?')} approval #{aid} "
+                f"({row.get('action', '?')}) was deferred ({why}) but its retry hadn't run by {by}. "
+                f"Nothing was executed; check and re-approve or expire.")
+            log.error(f"stuck deferred check: approval #{aid} {row.get('ticker')} retry hadn't run "
+                      f"by {by} ({why})")
+            alerted[aid] = datetime.now(timezone.utc).isoformat()
+            new.append(row["id"])
+        if new:
+            _deferred_state_save(_DEFERRED_STUCK_ALERTED_KEY, alerted)
+        return new
+    except Exception as e:
+        log.warning(f"_check_stuck_deferred_entries failed: {e}")
+        return []
+
+
 @app.task(name="tasks.auto_expire_approvals", bind=True, max_retries=2)
 def auto_expire_approvals(self):
-    """Auto-expire pending approvals that are past their expiry time."""
+    """Auto-expire pending approvals that are past their expiry time, sweep
+    stuck PROCESSING rows, and alert on deferred entries whose retry was lost."""
     try:
         import db
         import alerts
@@ -5792,6 +7509,7 @@ def auto_expire_approvals(self):
                          f"{db.STUCK_PROCESSING_MINUTES} min and are now FAILED. Check TWS for a fill "
                          f"on each: one may have executed. They won't be retried automatically "
                          f"(a scheduled retry is skipped); re-approve if still wanted.")
+        _check_stuck_deferred_entries()
     except Exception as e:
         log.error(f"auto_expire_approvals failed: {e}")
         raise self.retry(exc=e, countdown=60)
@@ -7505,7 +9223,8 @@ def _reconcile_stop_orders_body(self):
                     )
                     try:
                         db.close_trade_outcome(ticker, exit_price=fill["fill_price"], exit_source="broker_exit",
-                                               exit_price_source="fill", exit_fill_at=fill.get("fill_time"))
+                                               exit_price_source="fill", exit_fill_at=fill.get("fill_time"),
+                                               exit_fill_at_source=fill.get("fill_time_source"))
                     except Exception as e:
                         log.error(f"[{ticker}] close_trade_outcome failed after reconciling "
                                   f"exit: {e}")
@@ -8185,6 +9904,17 @@ def check_vector_store_health(self):
         log.error(f"check_vector_store_health failed: {e}")
 
 
+def _checkpoint_target_date(entry_date, days: int) -> str | None:
+    """The calendar date a days-day checkpoint is labelled for: entry_date's
+    date plus days, the same basis as days_held. None when unreadable."""
+    try:
+        from datetime import timedelta
+        d = entry_date.date() if hasattr(entry_date, "date") else None
+        return (d + timedelta(days=days)).isoformat() if d else None
+    except Exception:
+        return None
+
+
 def _log_outcome_checkpoint(o: dict, days: int, days_held: int, price: float) -> None:
     """One activity_feed row per checkpoint written, so when and from what
     each 30/60/90-day price was taken can be read back (trade_outcomes keeps
@@ -8199,6 +9929,11 @@ def _log_outcome_checkpoint(o: dict, days: int, days_held: int, price: float) ->
                          "days_held": days_held, "price": round(float(price), 4),
                          "source": "yfinance fast_info.last_price",
                          "entry_date": str(o.get("entry_date")),
+                         # How late the price is against its label (audit
+                         # 2026-11-07 13:07 #7: 278 written on 11-03, a
+                         # median 37 days late). The price is today's either way.
+                         "days_late": days_held - days,
+                         "target_date": _checkpoint_target_date(o.get("entry_date"), days),
                          "written_at": datetime.now(timezone.utc).isoformat()})
     except Exception as e:
         log.warning(f"[{o.get('ticker')}] checkpoint activity row failed: {e}")
@@ -8373,7 +10108,9 @@ def weekly_self_review(self):
                 f"outcome={o.get('outcome_pct')}, alpha={o.get('alpha_pct')}"
             )
 
-        context_lines.append("\n=== CONVICTION CALIBRATION (all-time) ===")
+        since = db.track_record_since()
+        context_lines.append(
+            f"\n=== CONVICTION CALIBRATION ({'trades entered since ' + since if since else 'all-time'}) ===")
         for c in calibration:
             context_lines.append(
                 f"  Conviction {c['conviction']}/10: {c['total']} trades, "

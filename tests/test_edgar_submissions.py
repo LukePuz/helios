@@ -97,8 +97,11 @@ def test_filing_dict_has_the_same_fields_as_before():
          patch.object(edgar, "_SEEN_THIS_PASS", set()):
         filings = edgar._get_recent_filings("META", "0001326801")
     f8k, f4 = filings[0], filings[3]
-    assert set(f8k) == {"ticker", "cik", "form", "source", "type", "title", "url",
-                        "timestamp", "text", "_seen_key"}
+    assert set(f8k) == {"ticker", "cik", "form", "actual_form", "source", "type", "title",
+                        "url", "timestamp", "text", "_seen_key"}
+    # The filing's own form beside the matched prefix (audit 2026-11-07 03:08 #1).
+    assert [(f["form"], f["actual_form"]) for f in filings] == [
+        ("8-K", "8-K"), ("8-K", "8-K/A"), ("10-Q", "10-Q"), ("4", "4"), ("4", "424B5")]
     assert (f8k["form"], f8k["source"], f8k["type"]) == ("8-K", "sec_filing", "8-K")
     assert (f4["form"], f4["source"], f4["type"]) == ("4", "sec_form4", "Form 4")
     assert f8k["cik"] == "0001326801" and f8k["text"] == "body"
@@ -580,3 +583,50 @@ def test_title_falls_back_to_primary_doc_description():
          patch.object(edgar, "_SEEN_THIS_PASS", set()):
         filings = edgar._get_recent_filings("META", "0001326801")
     assert filings[0]["title"] == "424B7  - Prospectus supplement"
+
+
+def test_unseen_filings_just_past_the_age_cutoff_are_counted_not_dispatched():
+    """A filing accepted Friday evening is ~58 h old at Monday's first poll:
+    the 48 h filter drops it; it is now counted and logged (audit 11-06 17:34 #4)."""
+    now = datetime.now(timezone.utc)
+    data = _fixture(now)
+    rec = data["filings"]["recent"]
+    rec["form"].insert(0, "8-K")
+    rec["accessionNumber"].insert(0, "0001326801-26-000099")
+    rec["acceptanceDateTime"].insert(0, _iso(now - timedelta(hours=58)))
+    rec["filingDate"].insert(0, (now - timedelta(hours=58)).strftime("%Y-%m-%d"))
+    rec["primaryDocument"].insert(0, "meta-fri.htm")
+    edgar._AGED_OUT_THIS_PASS.clear()
+    with patch("ingestion.edgar._is_seen", return_value=False):
+        edgar._note_aged_out("META", data, timezone.utc)
+    assert len(edgar._AGED_OUT_THIS_PASS) == 1
+    acc, label = edgar._AGED_OUT_THIS_PASS[0]
+    assert acc == "0001326801-26-000099" and label.startswith("META 8-K ")
+    edgar._AGED_OUT_THIS_PASS.clear()
+    with patch("ingestion.edgar._is_seen", return_value=True):
+        edgar._note_aged_out("META", data, timezone.utc)
+    assert edgar._AGED_OUT_THIS_PASS == []
+    with patch("ingestion.edgar._is_seen", return_value=False):
+        assert all(r["accession"] != "0001326801-26-000099"
+                   for r in edgar._parse_submissions(data, tz=timezone.utc))
+
+
+
+def test_an_aged_out_filing_is_warned_once_but_counted_every_pass(caplog):
+    item = ("0001326801-26-000099", "META 8-K 2026-11-06T19:30-05:00")
+    edgar._AGED_OUT_WARNED.discard(item[0])
+
+    def recent(ticker, cik):
+        edgar._AGED_OUT_THIS_PASS.append(item)
+        return []
+    counts = []
+    with patch("ingestion.edgar.TICKER_TO_CIK", {"META": "1"}), \
+         patch("ingestion.edgar._get_recent_filings", side_effect=recent), \
+         patch("ingestion.edgar._get_state", return_value=None), patch("ingestion.edgar._set_state"), \
+         patch("ingestion.edgar._backoff_until", return_value=None), patch("ingestion.edgar._note_pass_health"), \
+         patch("db.seen_ids", return_value=set()), caplog.at_level("WARNING"):
+        for _ in range(2):
+            edgar.poll_once()
+            counts.append(edgar.LAST_PASS["aged_out_unseen"])
+    assert counts == [1, 1]
+    assert caplog.text.count("META 8-K 2026-11-06T19:30") == 1

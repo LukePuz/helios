@@ -228,12 +228,17 @@ _ORDERS_PING_GRACE_S = 10.0
 # A count older than this is from an earlier session (last check before the
 # night stop, a manual run hours ago) and doesn't make the next miss "in a row".
 _ORDERS_PING_STALE_S = 30 * 60
+# A ping that can't be sent (the Celery broker, Redis, refusing or not
+# answering) said nothing and the check was skipped, so a Redis outage left
+# no problem line (audit 2026-11-07 05:07 #5). Counted separately; alert-only.
+_ORDERS_PING_UNSENT_STATE_FILE = _BASE_DIR / "logs" / ".watchdog_orders_ping_unsent"
 
 
 def _ping_orders_worker(timeout: float = _ORDERS_PING_TIMEOUT_S) -> bool | None:
     """True when orders@<host> answers a Celery ping, False when it doesn't,
     None when the ping itself can't be sent (broker down, import error):
-    that says nothing about the worker, and other checks cover the broker."""
+    that says nothing about the worker; two in a row are reported by
+    _check_orders_worker_responds as the broker line."""
     import threading
     box: dict = {}
 
@@ -261,6 +266,27 @@ def _ping_orders_worker(timeout: float = _ORDERS_PING_TIMEOUT_S) -> bool | None:
     return None
 
 
+def _count_in_a_row(path, hit: bool) -> int:
+    """The in-a-row count kept in `path`: +1 on a hit (restarting at 1 when
+    the file is older than _ORDERS_PING_STALE_S), 0 otherwise. Saved back;
+    never raises."""
+    try:
+        if not hit:
+            n = 0
+        elif time.time() - path.stat().st_mtime > _ORDERS_PING_STALE_S:
+            n = 1
+        else:
+            n = int(path.read_text().strip() or 0) + 1
+    except (OSError, ValueError):
+        n = 1 if hit else 0
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(n))
+    except OSError as e:
+        _say(f"Could not save {path.name}: {e}")
+    return n
+
+
 def _check_orders_worker_responds(proc_problems: list[str]) -> list[str]:
     """A problem line once the orders worker, alive by PID, has missed
     _ORDERS_PING_MISSES_TO_ALERT pings in a row; [] otherwise."""
@@ -269,22 +295,14 @@ def _check_orders_worker_responds(proc_problems: list[str]) -> list[str]:
     if any(p.startswith(label) for p in proc_problems):
         return []   # already reported as not running
     ok = _ping_orders_worker()
+    unsent = _count_in_a_row(_ORDERS_PING_UNSENT_STATE_FILE, ok is None)
     if ok is None:
+        if unsent >= _ORDERS_PING_MISSES_TO_ALERT:
+            return [f"Celery broker (Redis) unreachable, or the ping could not be built: the orders "
+                    f"worker ping could not be sent on {unsent} checks in a row (cause in the watchdog "
+                    f"log); queued tasks, stop moves included, may not run"]
         return []
-    try:
-        if ok:
-            misses = 0
-        elif time.time() - _ORDERS_PING_STATE_FILE.stat().st_mtime > _ORDERS_PING_STALE_S:
-            misses = 1
-        else:
-            misses = int(_ORDERS_PING_STATE_FILE.read_text().strip() or 0) + 1
-    except (OSError, ValueError):
-        misses = 0 if ok else 1
-    try:
-        _ORDERS_PING_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _ORDERS_PING_STATE_FILE.write_text(str(misses))
-    except OSError as e:
-        _say(f"Could not save the orders ping count: {e}")
+    misses = _count_in_a_row(_ORDERS_PING_STATE_FILE, not ok)
     if misses >= _ORDERS_PING_MISSES_TO_ALERT:
         return [f"{label} is running but has not answered a Celery ping on {misses} checks "
                 f"in a row; it may be hung, and stops may not be moving"]
@@ -423,7 +441,19 @@ def _gateway_service_name() -> str:
     return "ibc-live.service" if TRADING_ENV == "live" else "ibc.service"
 
 
-def _check_gateway_login() -> list[str]:
+def _gateway_expected_up(now: datetime | None = None) -> bool:
+    """Weekdays 05:00-18:59 ET and Sunday 17:00-18:59 ET: the hours the
+    live gateway must be running for the next session (limitations audit
+    2026-11-08 11:07 #3). Nothing on the box stops ibc-live on a schedule,
+    so inactive inside these hours means a reboot or a manual stop."""
+    from zoneinfo import ZoneInfo
+    et = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo("America/New_York"))
+    if et.weekday() < 5:
+        return 5 <= et.hour < 19
+    return et.weekday() == 6 and 17 <= et.hour < 19
+
+
+def _check_gateway_login(now: datetime | None = None) -> list[str]:
     """Catches the exact silent failure that cost a full weekend
     (2026-10-16 Fri eve -> 2026-10-18 Sun eve): IBKR forces a re-login
     roughly weekly (often Sunday), IBC fires a 2FA push, nobody approves
@@ -433,22 +463,102 @@ def _check_gateway_login() -> list[str]:
     its API port closed, while systemd still reports ibc-live.service as
     active (running). Nothing else noticed: the port was dead for ~2 days.
 
-    Deliberately conditional on the gateway service being active, so it
-    stays silent whenever the gateway is intentionally stopped (overnight
-    suspend, manual stop) and never false-alarms -- it fires ONLY on the
-    up-but-not-listening state, which always means a login stuck on 2FA.
-    Safe to run 7 days a week for that reason; see
+    It also fires when the gateway service is not running inside the hours
+    it must be up (_gateway_expected_up): after the 2026-11-08 maintenance
+    reboot ibc-live stayed down, and this check said OK because it treated
+    inactive as intentional. Outside those hours an inactive gateway stays
+    silent, so a weekend manual stop doesn't alarm. See
     helios-gateway-watchdog.timer."""
     from config import IB_PORT, TRADING_ENV
     service = _gateway_service_name()
     if not _service_is_active(service):
-        return []   # intentionally down -> nothing to alert on
+        if _gateway_expected_up(now):
+            return [f"IBKR gateway ({service}, {TRADING_ENV}) is NOT running — nothing "
+                    f"starts it after a reboot. Start it (sudo systemctl start {service}) "
+                    f"and approve the 2FA prompt."]
+        return []   # outside the hours it must be up -> nothing to alert on
     if _ibkr_port_reachable():
         return []   # up and listening -> healthy
     return [f"IBKR gateway ({service}, {TRADING_ENV}) is running but its API "
             f"port {IB_PORT} is NOT listening — almost certainly a login stuck "
             f"on 2FA. Approve the second-factor prompt, or restart {service} "
             f"to re-fire it."]
+
+
+# Pool children killed by these are planned (warm-shutdown kills, the 19:00
+# stop), not crashes. A child can also die with an exit code and no signal
+# (eight at once with exitcode 70 on 08-26; audit 2026-11-08 19:19 #7);
+# exitcode 15 is a planned stop.
+_PLANNED_EXITS = {("signal", "9"), ("signal", "15"), ("exitcode", "0"), ("exitcode", "15")}
+_WORKER_EXIT_RE = re.compile(
+    r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)[^\]]*\] Process '([^']+)' pid:\d+ "
+    r"exited with '(signal|exitcode) (\d+)(?: \((\w+)\))?'")
+_WORKER_EXIT_TAIL_BYTES = 4 * 1024 * 1024
+_LOG_DIR = _BASE_DIR / "logs"
+
+
+def _check_worker_crashes(service: str = _HELIOS_SERVICE, run=subprocess.run,
+                          log_dir: Path | None = None) -> list[str]:
+    """One problem line when a Celery pool child died on a signal other than
+    a planned kill (SIGSEGV, SIGABRT, SIGBUS ...) since the service last
+    started, from the Celery masters' own "Process ... exited with 'signal
+    N'" lines (the libarrow crashes of 11-08; audit 2026-11-08 15:08 #3).
+    Keyed on Helios's logs rather than the kernel log, so test or repro runs
+    on this box don't page and a ChromaDB crash in a worker isn't hidden
+    (audit 2026-11-08 17:17 #9). Never raises."""
+    try:
+        since = run(["systemctl", "show", service, "-p", "ActiveEnterTimestamp", "--value",
+                     "--timestamp=unix"], capture_output=True, text=True, timeout=10).stdout.strip()
+        if not since.startswith("@"):
+            return []
+        start = datetime.fromtimestamp(int(since[1:])).strftime("%Y-%m-%d %H:%M:%S")
+        found: dict[str, int] = {}
+        d = log_dir or _LOG_DIR
+        # .1 too: a worker restarted mid-run may have rotated its log; the
+        # start-time filter drops older lines.
+        for path in sorted([*d.glob("celery_*.log"), *d.glob("celery_*.log.1")]):
+            with open(path, "rb") as f:
+                f.seek(0, 2)
+                f.seek(max(0, f.tell() - _WORKER_EXIT_TAIL_BYTES))
+                text = f.read().decode("utf-8", "replace")
+            for line in text.splitlines():
+                m = _WORKER_EXIT_RE.match(line)
+                if not m or m.group(1) < start or (m.group(3), m.group(4)) in _PLANNED_EXITS:
+                    continue
+                key = f"{path.name.split('.')[0]} {m.group(5) or m.group(3) + ' ' + m.group(4)}"
+                found[key] = found.get(key, 0) + 1
+        if not found:
+            return []
+        n = sum(found.values())
+        what = ", ".join(f"{k} x{v}" for k, v in sorted(found.items()))
+        return [f"{n} pool worker crash(es) since {service} started ({what})"]
+    except Exception as e:
+        _say(f"worker crash check failed: {e}")
+        return []
+
+
+_CHAT_MISS_STATE_FILE = _BASE_DIR / "logs" / ".watchdog_chat_listener_misses"
+_CHAT_UNITS = ("helios-local.service", "helios-standby.service")
+
+
+def _check_chat_listener(state=_service_state, path: Path = _CHAT_MISS_STATE_FILE) -> list[str]:
+    """One problem line when neither helios-local nor helios-standby is up
+    on two checks in a row, so nothing answers Telegram chat: helios-standby
+    is disabled and only the 19:00 evening stop starts it, so a reboot left
+    11-08 without one for ~9 h (roadmap 04f). A unit in transition or a
+    planned restart counts as up; two checks in a row ride out the 05:00 and
+    19:00 handovers. Never raises."""
+    try:
+        states = {u: state(u) for u in _CHAT_UNITS}
+        up = (_planned_restart_in_progress()
+              or any(v == "active" or v in _TRANSITIONAL_STATES for v in states.values()))
+        if _count_in_a_row(path, not up) < 2:
+            return []
+        return ["No Telegram chat listener: helios-local and helios-standby are both down "
+                "(start helios-standby, or helios-local in trading hours)"]
+    except Exception as e:
+        _say(f"chat listener check failed: {e}")
+        return []
 
 
 def _check_snapshot_freshness() -> list[str]:
@@ -487,6 +597,41 @@ def _check_snapshot_freshness() -> list[str]:
                 f"(expected every 5 min) — IBKR/TWS port is reachable, so "
                 f"the ops worker itself may be stuck or dead"]
     return []
+
+
+# Below this share of the analyst model's bytes in VRAM, the watchdog logs a
+# line. At 78/81 layers on the GPU (10-25 on) decode ran at p50 9.5 tokens/s;
+# at 64/81 (08-27 to 10-24) 3.6 tokens/s with 46 timeouts (audit 2026-11-07
+# 09:07 #2, #8). Nothing else in the repo watches the split.
+_ANALYST_VRAM_SHARE_FLOOR = 0.90
+
+
+def _analyst_gpu_split_note(timeout: float = 3.0) -> str | None:
+    """A watchdog.log line when the analyst model is loaded with less than
+    _ANALYST_VRAM_SHARE_FLOOR of its bytes in VRAM (/api/ps), else None (also
+    when it isn't loaded or the read fails). Log-only: no Telegram, no heal.
+    Never raises."""
+    host = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+    model = os.getenv("ANALYST_MODEL", "qwen2.5:72b")
+    try:
+        models = requests.get(f"{host}/api/ps", timeout=timeout).json().get("models") or []
+        # A tag-less name ("qwen2.5" is listed as "qwen2.5:latest")
+        # matches its :latest form, so a name-form mismatch can't silence it.
+        names = {model, model if ":" in model.split("/")[-1] else f"{model}:latest"}
+        m = next((m for m in models if names & {m.get("name"), m.get("model")}), None)
+        if m is None:
+            return None
+        size, vram = m.get("size"), m.get("size_vram")
+        if not isinstance(size, (int, float)) or size <= 0 or not isinstance(vram, (int, float)):
+            return None
+        share = vram / size
+        if share >= _ANALYST_VRAM_SHARE_FLOOR:
+            return None
+        return (f"analyst model {model} has {share:.0%} of its bytes in VRAM "
+                f"(floor {_ANALYST_VRAM_SHARE_FLOOR:.0%}, context {m.get('context_length')}): "
+                f"part of it runs on the CPU, so verdicts slow and may time out")
+    except Exception:
+        return None
 
 
 def _heal_history() -> list[datetime]:
@@ -539,6 +684,9 @@ def _heal_allowed() -> tuple[bool, str]:
     return True, ""
 
 
+_HEAL_START_TIMEOUT_S = 320.0   # helios-local's TimeoutStartSec=300, plus margin
+
+
 def _sudo_systemctl(verb: str, unit: str, timeout: float = 90.0) -> tuple[bool, str]:
     """Privileged systemctl via the NOPASSWD rules in
     /etc/sudoers.d/helios-claude. Those rules match the command line
@@ -585,7 +733,11 @@ def _attempt_heal(trigger: str) -> list[str]:
     if not ok:
         notes.append(f"• reset-failed failed: {err or 'unknown error'}")
 
-    ok, err = _sudo_systemctl("start", _HELIOS_SERVICE)
+    # The start blocks through ExecStartPre's 180 s gateway wait; with the
+    # unit's TimeoutStartSec=300 the default 90 s here gave up on a start
+    # still in progress and paged "still DOWN" (audit 2026-11-08 15:08 #4).
+    # sudoers allows the exact command only, so no --no-block.
+    ok, err = _sudo_systemctl("start", _HELIOS_SERVICE, timeout=_HEAL_START_TIMEOUT_S)
     if not ok:
         notes.append(f"• ❌ start failed: {err or 'unknown error'}")
         notes.append("• Helios is still DOWN — manual intervention needed")
@@ -632,6 +784,120 @@ def _emit(problems: list[str], throttle_key: str) -> None:
         _say("OK")
 
 
+_BOOT_NOTICE_MARKER = _BASE_DIR / "logs" / ".watchdog_boot_id"
+
+
+def _boot_facts(run=subprocess.run) -> dict | None:
+    """This boot and the one before it, from the journal: when each started
+    and ended, and whether the previous one ended with a clean shutdown
+    (systemd-shutdown lines in its last 40 entries; a power loss or hard
+    lock leaves none). None when the journal can't be read."""
+    import json as _json
+    try:
+        boots = _json.loads(run(["journalctl", "--list-boots", "-o", "json", "--no-pager"],
+                                capture_output=True, text=True, timeout=15).stdout)
+        by_index = {b["index"]: b for b in boots}
+        cur, prev = by_index.get(0), by_index.get(-1)
+        if not cur:
+            return None
+        facts = {"boot_id": cur["boot_id"], "started": cur["first_entry"] / 1e6}
+        if prev:
+            tail = run(["journalctl", "-b", "-1", "-n", "40", "--no-pager"],
+                       capture_output=True, text=True, timeout=15).stdout
+            facts.update(prev_ended=prev["last_entry"] / 1e6,
+                         prev_clean="systemd-shutdown" in tail)
+        return facts
+    except Exception as e:
+        _say(f"boot facts unavailable: {e}")
+        return None
+
+
+_REPO_UNITS = Path(__file__).resolve().parent / "systemd"
+_SYSTEM_UNITS = Path("/etc/systemd/system")
+
+
+def _unit_lines(text: str, user: str | None = None) -> list[str]:
+    out = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        out.append(line.replace("YOUR_USER", user) if user else line)
+    return out
+
+
+def _unit_drift(repo: Path = _REPO_UNITS, installed: Path = _SYSTEM_UNITS,
+                user: str | None = None) -> list[str]:
+    """Installed units (and their .d drop-ins) that differ from the repo's
+    copies, as "name (Key, Key)": key names only, never values (audit
+    2026-11-08 11:07 #8: TimeoutStartSec=300 was in the repo but not
+    installed). Comments, blank lines and the YOUR_USER placeholder are
+    ignored; units that aren't installed are skipped. Never raises."""
+    user = user or Path.home().name
+    out = []
+    try:
+        for f in sorted([*repo.glob("*.service"), *repo.glob("*.timer"),
+                         *repo.glob("*.service.d/*.conf")]):
+            rel = f.relative_to(repo)
+            target = installed / rel
+            if not target.is_file():
+                if f.suffix == ".conf":
+                    out.append(f"{rel} (not installed)")
+                continue
+            want = _unit_lines(f.read_text(), user)
+            have = _unit_lines(target.read_text())
+            if want == have:
+                continue
+            changed = sorted({ln.split("=", 1)[0] for ln in set(want) ^ set(have) if "=" in ln})
+            out.append(f"{rel} ({', '.join(changed) or 'order'})")
+    except Exception as e:
+        _say(f"unit drift check failed: {e}")
+    return out
+
+
+def _boot_notice(facts: dict | None, marker: Path = _BOOT_NOTICE_MARKER) -> str | None:
+    """One message per machine boot (limitations audit 2026-11-08 11:07
+    #5): the 11-07 22:58 power loss went unnoticed for ~11 h, and the first
+    message after it ("systemd unit failed: helios-local") pointed at the
+    wrong cause. Says when the box came back, whether the previous run ended
+    cleanly and how long it was down, and which Helios units are up. None
+    when this boot was already announced or the journal can't be read."""
+    if not facts:
+        return None
+    try:
+        if marker.exists() and marker.read_text().strip() == facts["boot_id"]:
+            return None
+    except OSError:
+        pass
+    from zoneinfo import ZoneInfo
+    et = ZoneInfo("America/New_York")
+    fmt = lambda ts: datetime.fromtimestamp(ts, et).strftime("%a %m-%d %H:%M ET")
+    lines = [f"ℹ️ <b>Helios box restarted</b> {fmt(facts['started'])}"]
+    if "prev_ended" in facts:
+        down_h = max(0.0, facts["started"] - facts["prev_ended"]) / 3600
+        how = "clean shutdown" if facts["prev_clean"] else "NOT a clean shutdown (power loss or crash)"
+        lines.append(f"Previous run ended {fmt(facts['prev_ended'])}: {how}; down {down_h:.1f} h")
+    states = ", ".join(f"{u} {'up' if _service_is_active(u + '.service') else 'down'}"
+                       for u in ("ibc-live", "helios-local", "helios-standby"))
+    lines.append(f"Now: {states}")
+    drift = _unit_drift()
+    if drift:
+        lines.append("Installed units differ from the repo: " + "; ".join(drift))
+    return "\n".join(lines)
+
+
+def _send_boot_notice() -> None:
+    """Send _boot_notice once; the marker is written only after Telegram
+    accepts it, so a failed send retries on the next run. Never raises."""
+    try:
+        facts = _boot_facts()
+        text = _boot_notice(facts)
+        if text and _send_telegram(text):
+            _BOOT_NOTICE_MARKER.write_text(facts["boot_id"])
+    except Exception as e:
+        _say(f"boot notice failed: {e}")
+
+
 def main() -> None:
     # --gateway-only: just the "gateway up but API port dead" check. Runs on
     # its own 7-day/5-min timer (helios-gateway-watchdog.timer) so the
@@ -640,8 +906,11 @@ def main() -> None:
     # weekday trading window and would false-alarm there. Its own throttle
     # key so a gateway alert is never swallowed by an unrelated pipeline one.
     gateway_only = "--gateway-only" in sys.argv[1:]
+    _send_boot_notice()
     if gateway_only:
-        _emit(_check_gateway_login(), "watchdog_gateway_alert_at")
+        # The gateway timer runs all week, so it also covers the chat
+        # listener on weekends and nights (roadmap 04f).
+        _emit(_check_gateway_login() + _check_chat_listener(), "watchdog_gateway_alert_at")
         return
 
     # Full check: scoped by helios-watchdog.timer to weekday market hours,
@@ -664,6 +933,7 @@ def main() -> None:
     problems = ([f"{_HELIOS_SERVICE} is not active"] if service_down else []) \
         + proc_problems + _check_snapshot_freshness()
     if not service_down:
+        problems += _check_worker_crashes()
         problems += _check_orders_worker_responds(proc_problems)
         problems += _check_orders_task_not_stuck(proc_problems)
 
@@ -682,6 +952,10 @@ def main() -> None:
         heal_notes = _attempt_heal(trigger)
 
     _emit(problems, "watchdog_alert_at")
+
+    gpu_note = _analyst_gpu_split_note()
+    if gpu_note:
+        _say(gpu_note)
 
     # Sent outside _emit's throttle on purpose: the alert about the outage
     # may well be suppressed as a repeat, but the fact that the watchdog

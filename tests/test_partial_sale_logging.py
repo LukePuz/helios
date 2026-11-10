@@ -45,7 +45,7 @@ def test_partial_sale_logs_trade_and_order_with_fill():
     kw = log_trade.call_args.kwargs
     assert kw["side"] == "SELL" and kw["quantity"] == 30 and kw["price"] == 125.5
     assert log_order.call_args.kwargs["decision_price"] == 126.0
-    fill.assert_called_once_with(11, 125.5, 30.0, "filled", filled_at=None)
+    fill.assert_called_once_with(11, 125.5, 30.0, "filled", filled_at=None, filled_at_source=None)
 
 
 def test_logging_failure_does_not_block_stop_replacement():
@@ -120,5 +120,5 @@ def test_short_fill_is_left_partial_for_reconcile():
          patch("db.log_order", return_value=11) as log_order, \
          patch("db.update_order_fill") as fill:
         _rm()._partial_sell_and_resize_stop("NVDA", 100, 30, 100.0, decision_price=126.0)
-    fill.assert_called_once_with(11, 125.5, 20.0, "partial", filled_at=None)
+    fill.assert_called_once_with(11, 125.5, 20.0, "partial", filled_at=None, filled_at_source=None)
     assert log_order.call_args.kwargs["intent"] == "PROFIT_TARGET"

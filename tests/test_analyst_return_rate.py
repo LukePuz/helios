@@ -583,8 +583,11 @@ class TestHeldSellLoweredToWatchAlerts:
             runs[name] = (send.call_count, call.call_args, kwargs["prompt"],
                           kwargs["provenance"]["brief_exposure"]["held_at_gate"],
                           {k: v for k, v in kwargs["decision"].items()
-                           if k not in ("malformed_sell_alert", "held_review", "latency_ms")},
-                          kwargs["decision"]["held_review"])
+                           if k not in ("malformed_sell_alert", "held_review", "review_session", "latency_ms")},
+                          kwargs["decision"]["held_review"], kwargs["decision"]["review_session"])
+        # A held review labels its market session; the rest read None.
+        assert runs["held"][6] in ("pre_open", "rth", "after_close", "closed_day")
+        assert runs["unheld"][6] is None
         assert runs["held"][0] == 1 and runs["unheld"][0] == 0
         assert runs["held"][1] == runs["unheld"][1]
         assert runs["held"][2] == runs["unheld"][2]

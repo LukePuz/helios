@@ -6,6 +6,8 @@ import logging
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
+import pytest
+
 import config
 import test_new_fact_gate as nfg
 from agents import crew, screener
@@ -35,6 +37,20 @@ def test_third_fallback_in_15_min_alerts_once_per_hour():
         assert n("no_json", now=T0 + timedelta(minutes=71)) is True       # 3rd, an hour later
     assert send.call_count == 2
     assert "keyword fallback" in send.call_args_list[0].args[0]
+
+
+@pytest.mark.parametrize("window,words", [("24h", "from the last 24 h exists"),
+                                          ("3d", "from the last 3 d exists"),
+                                          ("same_run", "from the same run exists"),
+                                          ("2w", "from the last 2w exists")])
+def test_fallback_alert_names_the_configured_window(window, words):
+    state = {}
+    get, put = _state(state)
+    with patch("alerts._send", return_value=7) as send, get, put, \
+         patch("config.BUY_NEW_FACT_WINDOW", window):
+        for i in range(3):
+            screener._note_keyword_fallback("no_json", now=T0 + timedelta(minutes=i))
+    assert words in send.call_args.args[0]
 
 
 def test_spread_out_fallbacks_do_not_alert():

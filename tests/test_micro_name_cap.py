@@ -586,3 +586,21 @@ def test_other_errored_cases_send_no_stop_record_alert():
     with patch("alerts._send") as send:
         assert rm.micro_name_cap("MSFT", 1, 100.0)["held_source"] == "error"
     send.assert_not_called()
+
+
+def test_bucket_maximum_flag_gets_a_binding_limit_note_on_the_micro_tier():
+    """Audit 11-06 21:36 #9: the 40% bucket flag can't describe the 30% name cap."""
+    from unittest.mock import MagicMock
+    from agents import crew
+    rec = {"cap_pct": 30.0, "held_pct": 0.0, "shares_after": 5, "outcome": "within_cap"}
+    rm = MagicMock()
+    rm.micro_name_cap.return_value = rec
+    sizing = {"shares_initial": 5, "flags": ["Size capped at 40% bucket maximum"], "position_size_pct": 0.2}
+    assert crew._apply_micro_name_cap(rm, "NVDA", sizing, 100.0, {}) is False
+    assert sizing["flags"][0] == "Size capped at 40% bucket maximum"
+    assert sizing["flags"][1] == ("Micro tier: the 30% name cap is below the 40% bucket maximum, "
+                                  "so the bucket maximum can't bind")
+    rm.micro_name_cap.return_value = None   # not micro: no note
+    sizing = {"shares_initial": 5, "flags": ["Size capped at 40% bucket maximum"]}
+    crew._apply_micro_name_cap(rm, "NVDA", sizing, 100.0, {})
+    assert sizing["flags"] == ["Size capped at 40% bucket maximum"]

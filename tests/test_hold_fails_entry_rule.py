@@ -48,6 +48,7 @@ def test_held_hold_under_the_floor_is_a_would_trim_and_routes_nothing():
     assert s["fails"] is True and s["would_trim"] is True
     assert s["udr"] == 1.1 and s["udr_floor"] == 2.0 and s["held_at_gate"] is True
     assert s["checks"] == "udr_floor_only" and isinstance(s["conviction"], int)   # m270
+    assert isinstance(s["source_count"], int) and isinstance(s["sources_ok"], bool)   # audit 0931 #2
     assert result["action"] == "HOLD" and result["pass_to_risk"] is False
     assert d["final_action"] == "HOLD" and d["gates"] == []
 
@@ -73,3 +74,11 @@ def test_missing_udr_reads_as_the_gate_reads_it():
 def test_swallows_its_own_errors():
     assert "error" in _hold_fails_entry_rule("HOLD", object(), {}, {})
     assert _hold_fails_entry_rule("HOLD", float("nan"), {}, {})["fails"] is None
+
+
+def test_records_the_corroboration_clause():
+    """Audit 11-06 09:31 #2: the full entry rule can be read from the row."""
+    s = _hold_fails_entry_rule("HOLD", 2.5, {}, {}, conviction=7, source_count=1)
+    assert s["source_count"] == 1 and s["sources_ok"] is False and s["fails"] is False
+    assert _hold_fails_entry_rule("HOLD", 2.5, {}, {}, source_count=2)["sources_ok"] is True
+    assert _hold_fails_entry_rule("HOLD", 2.5, {}, {})["sources_ok"] is None

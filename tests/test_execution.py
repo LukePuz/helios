@@ -11,6 +11,15 @@ import execution
 
 
 @pytest.fixture(autouse=True)
+def _no_exit_benchmark_stamp(monkeypatch):
+    """These tests count the close's own SQL; the post-commit
+    exit_benchmark_at stamp is tested in test_exit_benchmark_at.py."""
+    import db
+    monkeypatch.setattr(db, "_stamp_exit_benchmark_at", lambda *a, **k: None)
+
+
+
+@pytest.fixture(autouse=True)
 def _gap_check_reads_no_gap(monkeypatch):
     """The gap check now returns "unreadable" without bars (M148), which
     blocks a BUY; tests that aren't about it get "no_gap". Tests that are
@@ -298,6 +307,7 @@ class TestMarketHoursGate:
              patch("market_data.is_market_hours", return_value=False), \
              patch("market_data.next_market_open", return_value=fake_eta), \
              patch("tasks.retry_deferred_entry") as mock_retry_task, \
+             patch("tasks.stale_quote_fallback_shadow"), \
              patch("alerts._send"):
             mock_rm_cls.return_value.is_halted.return_value = False
             result = execution.execute_approved(approval)
@@ -398,6 +408,104 @@ class TestStalePriceBuyGuard:
         mock_retry_task.apply_async.assert_called_once()
         _, kwargs = mock_retry_task.apply_async.call_args
         assert kwargs["args"] == [approval["id"], 1, 2]  # gap unchanged, price attempt 1 -> 2
+
+    def test_later_checks_of_the_same_wait_send_no_notice(self):
+        """Only the first check of a wait sends WAITING (audit 2026-11-07
+        19:07 #7); check 2 still defers and reschedules, silently."""
+        approval = _approval(action="ADD", price_at_sizing=100.0)
+
+        with patch("ibkr.get_ib"), \
+             patch("ibkr.get_client"), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("ibkr.place_market_order") as mock_order, \
+             patch("market_data.get_priced_quote", return_value=self._stale_quote()), \
+             patch("market_data.is_market_hours", return_value=True), \
+             patch("tasks.retry_deferred_entry") as mock_retry_task, \
+             patch("tasks.stale_quote_fallback_shadow"), \
+             patch("time.sleep"), \
+             patch("alerts._send") as mock_alert:
+            mock_rm_cls.return_value.is_halted.return_value = False
+            result = execution.execute_approved(approval, price_retry_attempt=2)
+
+        assert result is False
+        mock_order.assert_not_called()
+        assert not any("WAITING" in c[0][0] for c in mock_alert.call_args_list)
+        mock_retry_task.apply_async.assert_called_once()
+
+    def test_none_on_the_last_recheck_keeps_the_stale_quote(self):
+        """A stale first quote, then None on all three re-checks, must still
+        defer: the None used to replace the stale quote, which skipped both
+        the stale guard and the drift check, and the BUY went ahead."""
+        approval = _approval(action="ADD", price_at_sizing=100.0)
+
+        with patch("ibkr.get_ib"), \
+             patch("ibkr.get_client"), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("ibkr.place_market_order") as mock_order, \
+             patch("market_data.get_priced_quote",
+                   side_effect=[self._stale_quote(), None, None, None]), \
+             patch("market_data.is_market_hours", return_value=True), \
+             patch("tasks.retry_deferred_entry") as mock_retry_task, \
+             patch("tasks.stale_quote_fallback_shadow"), \
+             patch("time.sleep"), \
+             patch("alerts._send") as mock_alert:
+            mock_rm_cls.return_value.is_halted.return_value = False
+            result = execution.execute_approved(approval, price_retry_attempt=1)
+
+        assert result is False
+        mock_order.assert_not_called()
+        assert "WAITING FOR FRESH PRICE" in mock_alert.call_args[0][0]
+        mock_retry_task.apply_async.assert_called_once()
+
+    def test_no_quote_at_all_still_runs_the_drift_check(self):
+        """With no priced quote the drift check uses the latest price, so a
+        BUY that moved more than 8% since sizing is aborted."""
+        approval = _approval(action="ADD", price_at_sizing=100.0)
+
+        with patch("ibkr.get_ib"), \
+             patch("ibkr.get_client"), \
+             patch("risk_manager.RiskManager") as mock_rm_cls, \
+             patch("ibkr.place_market_order") as mock_order, \
+             patch("ibkr.get_latest_price", return_value=115.0), \
+             patch("market_data.get_priced_quote", return_value=None), \
+             patch("market_data.is_market_hours", return_value=True), \
+             patch("time.sleep"), \
+             patch("alerts._send"):
+            mock_rm_cls.return_value.is_halted.return_value = False
+            result = execution.execute_approved(approval)
+
+        assert result is False
+        mock_order.assert_not_called()
+
+    def test_stale_warning_names_the_price_source(self, caplog):
+        """The STALE log line carries the quote's price_source (record only:
+        the retry is the same as without it); a quote without the key logs
+        source=None."""
+        import logging
+        for quote, want in [({**self._stale_quote(), "price_source": "daily_fallback"},
+                             "source=daily_fallback"),
+                            (self._stale_quote(), "source=None")]:
+            approval = _approval(action="ADD", price_at_sizing=100.0)
+            caplog.clear()
+            with patch("ibkr.get_ib"), \
+                 patch("ibkr.get_client"), \
+                 patch("risk_manager.RiskManager") as mock_rm_cls, \
+                 patch("ibkr.place_market_order") as mock_order, \
+                 patch("market_data.get_priced_quote", return_value=quote), \
+                 patch("market_data.is_market_hours", return_value=True), \
+                 patch("tasks.retry_deferred_entry") as mock_retry_task, \
+                 patch("tasks.stale_quote_fallback_shadow"), \
+                 patch("time.sleep"), \
+                 patch("alerts._send"), \
+                 caplog.at_level(logging.WARNING, logger="execution"):
+                mock_rm_cls.return_value.is_halted.return_value = False
+                result = execution.execute_approved(approval, price_retry_attempt=1)
+            assert result is False
+            mock_order.assert_not_called()
+            mock_retry_task.apply_async.assert_called_once()
+            line = next(r.getMessage() for r in caplog.records
+                        if "Price is STALE" in r.getMessage())
+            assert "age=2251.0min, market_open=True, " + want in line
 
     def test_buy_aborts_when_price_stays_stale_after_max_retries(self):
         """Once STALE_PRICE_MAX_RETRIES is reached, give up for good rather
@@ -542,6 +650,7 @@ class TestGapConfirmationGuard:
                                  "open_price": 110.0, "prior_close": 100.0, "current_price": 108.0}), \
              patch("market_data.is_market_hours", return_value=True), \
              patch("tasks.retry_deferred_entry") as mock_retry_task, \
+             patch("tasks.stale_quote_fallback_shadow"), \
              patch("alerts._send") as mock_alert:
             mock_rm_cls.return_value.is_halted.return_value = False
             result = execution.execute_approved(approval, gap_retry_attempt=1)
@@ -566,6 +675,7 @@ class TestGapConfirmationGuard:
                                  "open_price": 110.0, "prior_close": 100.0, "current_price": 108.0}), \
              patch("market_data.is_market_hours", return_value=True), \
              patch("tasks.retry_deferred_entry") as mock_retry_task, \
+             patch("tasks.stale_quote_fallback_shadow"), \
              patch("alerts._send") as mock_alert:
             mock_rm_cls.return_value.is_halted.return_value = False
             result = execution.execute_approved(approval, gap_retry_attempt=3)
@@ -585,6 +695,7 @@ class TestGapConfirmationGuard:
              (gap_patch or patch("market_data.check_gap_confirmation", side_effect=RuntimeError("no bars"))), \
              patch("market_data.is_market_hours", return_value=True), \
              patch("tasks.retry_deferred_entry") as mock_retry_task, \
+             patch("tasks.stale_quote_fallback_shadow"), \
              patch("alerts._send") as mock_alert:
             mock_rm_cls.return_value.is_halted.return_value = False
             result = execution.execute_approved(approval, gap_retry_attempt=attempt)
@@ -746,6 +857,39 @@ class TestAddStopsWholePosition:
         assert (stop, add) == (95.0, None)
         cancel.assert_not_called()
 
+    def test_stale_record_at_entry_is_recorded(self):
+        """Audit 11-06 03:34 #5: a record exists but nothing was held before
+        the fill. Unchanged stop handling, plus one log-only activity row."""
+        from datetime import datetime, timezone
+        opened = datetime(2026, 10, 1, tzinfo=timezone.utc)
+        with patch("db.log_activity_direct", return_value=True) as act, \
+             patch("db.get_all_position_stops",
+                   return_value=[{"ticker": "AMD", "broker_order_id": 1},
+                                 {"ticker": "NVDA", "broker_order_id": 4242}]):
+            (stop, add), cancel = self._run({"stop_price": 98.0, "opened_at": opened, "entry_price": 110.0,
+                                             "stop_method": "atr", "thesis_bucket": "Compounder"},
+                                            pos_qty=5, filled=5)
+        assert (stop, add) == (95.0, None)
+        cancel.assert_not_called()
+        stage, ticker, _, _, extra = act.call_args.args
+        assert (stage, ticker) == ("stale_record_at_entry", "NVDA")
+        assert extra["prior_opened_at"] == opened.isoformat() and extra["broker_qty"] == 5
+        assert extra["prior_broker_order_id"] == 4242 and extra["prior_entry_price"] == 110.0
+        assert extra["prior_order_read"] == "ok" and extra["decision_basis"] == "post_fill_read"
+
+    def test_stale_record_row_survives_a_failed_order_id_read(self):
+        with patch("db.log_activity_direct", return_value=True) as act, \
+             patch("db.get_all_position_stops", side_effect=RuntimeError("pool exhausted")):
+            self._run({"stop_price": 98.0}, pos_qty=5, filled=5)
+        assert act.call_args.args[4]["prior_broker_order_id"] is None
+        assert act.call_args.args[4]["prior_order_read"] == "error"
+
+    def test_stale_record_row_failure_never_blocks_the_stop(self):
+        with patch("db.log_activity_direct", side_effect=RuntimeError("db down")), \
+             patch("db.get_all_position_stops", return_value=[]):
+            (stop, add), _ = self._run({"stop_price": 98.0}, pos_qty=5, filled=5)
+        assert (stop, add) == (95.0, None)
+
     def test_broker_lookup_failure_falls_back_to_added_shares_only(self):
         with patch("db.get_position_stop", return_value={"stop_price": 98.0}), \
              patch("ibkr.get_client", side_effect=RuntimeError("down")), \
@@ -822,8 +966,28 @@ def test_close_trade_outcome_records_the_exit_price_source():
         assert db.close_trade_outcome("NVDA", exit_price=110.0, exit_source="model_exit",
                                       exit_price_source="quote", exit_fill_at="T") is True
     upd = [c[0] for c in cur.execute.call_args_list if c[0][0].startswith("UPDATE")][0]
-    assert "exit_price_source=%s" in upd[0] and upd[1][-4:] == ("model_exit", "quote", "T", 11)
+    assert "exit_price_source=%s" in upd[0] and upd[1][-5:] == ("model_exit", "quote", "T", None, 11)
     assert "exit_fill_at=%s" in upd[0]
+
+
+@pytest.mark.parametrize("fill_at,source,stored", [("T", "receipt", "receipt"),
+                                                   ("T", "execution", "execution"),
+                                                   (None, "receipt", None)])
+def test_close_trade_outcome_records_the_fill_time_source_only_with_a_fill_time(fill_at, source, stored):
+    import db
+    cur = MagicMock()
+    cur.fetchall.return_value = [(11, 100.0, None)]
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    with patch("db._get_conn", return_value=conn), patch("db._put_conn"), \
+         patch("yfinance.Ticker"):
+        assert db.close_trade_outcome("NVDA", exit_price=110.0, exit_fill_at=fill_at,
+                                      exit_fill_at_source=source) is True
+    upd = [c[0] for c in cur.execute.call_args_list if c[0][0].startswith("UPDATE")][0]
+    assert "exit_fill_at=%s, exit_fill_at_source=%s WHERE id=%s" in upd[0]
+    assert upd[1][-3:] == (fill_at, stored, 11)
+    assert (81, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS exit_fill_at_source VARCHAR(20);") \
+        in db._MIGRATIONS
 
 
 def test_backfill_never_overwrites_an_entry_time_snapshot():
@@ -1280,7 +1444,7 @@ def test_manual_orders_get_an_orders_row():
     assert kw.get("decision_price") is None and not fill.called
     r, log_order, fill = run({"order_id": 78, "fill_price": 100.0, "filled_qty": 2})
     assert r["success"] and log_order.call_args.kwargs["status"] == "submitted"
-    fill.assert_called_once_with(5, 100.0, 2.0, "partial", filled_at=None)
+    fill.assert_called_once_with(5, 100.0, 2.0, "partial", filled_at=None, filled_at_source=None)
 
 
 def test_manual_buy_intent_says_open_when_nothing_held():
@@ -1371,7 +1535,7 @@ def test_manual_fill_without_a_price_still_marks_the_order_filled():
         rm_cls.return_value.is_halted.return_value = False
         rm_cls.return_value.calculate_stop.return_value = (92.0, "ATR")
         execution.execute_manual("ZZZ", "BUY", 2, "test")
-    fill.assert_called_once_with(5, None, 2.0, "filled", filled_at=None)
+    fill.assert_called_once_with(5, None, 2.0, "filled", filled_at=None, filled_at_source=None)
 
 
 def test_portfolio_updates_are_dropped_from_the_ib_async_log_but_order_status_is_kept():
@@ -1469,3 +1633,112 @@ def test_failed_unconfirmed_order_row_is_kept_for_reconcile_and_alerted():
     assert log_order.call_args.kwargs["perm_id"] == 3100
     assert not list(stop_lock._redis().scan_iter("helios:untracked_order:*"))
     assert json.loads(states["untracked_orders"]) == {}
+
+
+class TestLateBuyStaleRecord:
+    """Professor m586: reconcile's late BUYs also record stale_record_at_entry,
+    and _late_buy_is_fresh returns what the old inline condition did."""
+
+    def _run(self, rec, action):
+        import tasks
+        with patch("db.get_position_stop", return_value=rec), \
+             patch("execution._record_stale_entry") as stale:
+            return tasks._late_buy_is_fresh("NVDA", 5, action, "reconcile"), stale
+
+    def test_no_record_is_fresh_and_writes_no_row(self):
+        fresh, stale = self._run(None, "OPEN")
+        assert fresh is True and not stale.called
+
+    def test_leftover_record_on_an_open_is_fresh_and_recorded(self):
+        rec = {"stop_price": 98.0}
+        fresh, stale = self._run(rec, "OPEN")
+        assert fresh is True
+        stale.assert_called_once_with("NVDA", rec, 5, None, path="reconcile", decision_basis="approval_action")
+
+    def test_record_on_an_add_is_kept_and_writes_no_row(self):
+        fresh, stale = self._run({"stop_price": 98.0}, "ADD")
+        assert fresh is False and not stale.called
+
+    def test_manual_late_buy_records_the_broker_read(self):
+        import tasks
+        client = MagicMock()
+        client.get_all_positions.return_value = [MagicMock(symbol="NVDA", qty=5)]
+        with patch("db.get_position_stop", return_value={"stop_price": 98.0}), \
+             patch("ibkr.get_client", return_value=client), \
+             patch("execution._record_stale_entry") as stale:
+            assert tasks._late_buy_is_fresh("NVDA", 5, None, "reconcile_manual") is True
+        assert stale.call_args.args[3] == 5.0 and stale.call_args.kwargs == {"path": "reconcile_manual", "decision_basis": "position_read"}
+
+    def test_unreadable_record_on_an_add_is_kept(self, caplog):
+        import tasks
+        with patch("db.get_position_stop", side_effect=RuntimeError("pool exhausted")), \
+             patch("execution._record_stale_entry") as stale, caplog.at_level("WARNING"):
+            assert tasks._late_buy_is_fresh("NVDA", 5, "ADD", "reconcile") is False
+        assert not stale.called and "keeping any existing record" in caplog.text
+
+    def test_unreadable_record_on_an_open_or_no_action_is_written_fresh(self, caplog):
+        """Professor 58c: a late OPEN must still get a record and a stop."""
+        import tasks
+        for action in ("OPEN", None):
+            with patch("db.get_position_stop", side_effect=RuntimeError("pool exhausted")), \
+                 patch("execution._record_stale_entry") as stale, caplog.at_level("WARNING"):
+                assert tasks._late_buy_is_fresh("NVDA", 5, action, "reconcile") is True
+            assert not stale.called
+        assert "writing it as a fresh position" in caplog.text
+
+    def test_row_carries_the_path(self):
+        with patch("db.log_activity_direct", return_value=True) as act, \
+             patch("db.get_all_position_stops", return_value=[]):
+            execution._record_stale_entry("NVDA", {"stop_price": 98.0}, 5, None, path="reconcile")
+        extra = act.call_args.args[4]
+        assert extra["path"] == "reconcile" and extra["broker_qty"] is None
+
+
+class TestNoteStaleRecord:
+    """Professor m586: the bracket and manual BUY paths also record
+    stale_record_at_entry, decided as on the late-fill path."""
+
+    def _run(self, rec, action, positions=None, **kw):
+        client = MagicMock()
+        client.get_all_positions.return_value = positions or []
+        with patch("db.get_position_stop", return_value=rec), \
+             patch("ibkr.get_client", return_value=client), \
+             patch("execution._record_stale_entry") as stale:
+            execution._note_stale_record("NVDA", 5, action, **kw)
+        return stale
+
+    def test_no_record_writes_no_row(self):
+        assert not self._run(None, "OPEN", path="bracket").called
+
+    def test_leftover_record_on_an_open_is_recorded(self):
+        rec = {"stop_price": 98.0}
+        stale = self._run(rec, "OPEN", path="bracket")
+        stale.assert_called_once_with("NVDA", rec, 5, None, path="bracket", decision_basis="approval_action")
+
+    def test_add_writes_no_row(self):
+        assert not self._run({"stop_price": 98.0}, "ADD", path="bracket").called
+
+    def test_manual_open_names_the_pre_order_read(self):
+        stale = self._run({"stop_price": 98.0}, "OPEN", path="manual", decision_basis="pre_order_read")
+        assert stale.call_args.kwargs == {"path": "manual", "decision_basis": "pre_order_read"}
+
+    def test_no_action_falls_back_to_the_position_read(self):
+        stale = self._run({"stop_price": 98.0}, None, positions=[MagicMock(symbol="NVDA", qty=5)],
+                          path="manual")
+        assert stale.call_args.args[3] == 5.0
+        assert stale.call_args.kwargs == {"path": "manual", "decision_basis": "position_read"}
+
+    def test_no_action_with_more_held_than_the_fill_writes_no_row(self):
+        assert not self._run({"stop_price": 98.0}, None, positions=[MagicMock(symbol="NVDA", qty=12)],
+                             path="manual").called
+
+    def test_unreadable_record_writes_no_row_and_never_raises(self, caplog):
+        with patch("db.get_position_stop", side_effect=RuntimeError("pool exhausted")), \
+             patch("execution._record_stale_entry") as stale, caplog.at_level("WARNING"):
+            execution._note_stale_record("NVDA", 5, "OPEN", path="bracket")
+        assert not stale.called and "stale-record check skipped" in caplog.text
+
+    def test_a_failure_inside_never_raises(self):
+        with patch("db.get_position_stop", return_value={"stop_price": 98.0}), \
+             patch("tasks._held_before_fill", side_effect=RuntimeError("boom")):
+            execution._note_stale_record("NVDA", 5, "OPEN", path="bracket")

@@ -46,6 +46,10 @@ WorkingDirectory=/home/YOUR_USER/Desktop/trading_bot
 # "research everything, trade nothing" rather than trading blind -- and it
 # recovers on its own the moment the gateway is back, with no restart.
 ExecStartPre=-/home/YOUR_USER/Desktop/trading_bot/deploy/systemd/wait-for-ibkr.sh 180
+# The start timeout must outlast that wait (limitations audit 2026-11-08
+# 11:07 #1): the 90 s default killed the 180 s wait, so a down gateway still
+# failed the start and the "-" above never helped.
+TimeoutStartSec=300
 ExecStart=/home/YOUR_USER/Desktop/trading_bot/venv/bin/python /home/YOUR_USER/Desktop/trading_bot/main.py
 Restart=on-failure
 RestartSec=30

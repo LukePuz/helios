@@ -18,11 +18,15 @@ _8K = {"ticker": "PLTR", "source": "sec_filing", "form": "8-K", "type": "8-K",
        "text": "8-K items: 2.02 (results of operations), 9.01 (exhibits)\n\nEX-99.1: ..."}
 
 
+_WATCHLIST = {"PLTR": {"tier": "Core"}, "ANET": {"tier": "Watch"}}
+
+
 class _Env:
     def __init__(self, earnings=date(2026, 11, 2), write_ok=True):
         self.state = {}
         self.log_activity = MagicMock(return_value=write_ok)
-        self.around = MagicMock(return_value={"PLTR": earnings} if earnings else {})
+        self.around = MagicMock(side_effect=lambda tks, **kw: (
+            {t: earnings for t in tks} if earnings else {}))
         self.set_state = MagicMock(side_effect=lambda k, v: self.state.__setitem__(k, v))
 
     def __enter__(self):
@@ -30,7 +34,8 @@ class _Env:
         for p in (patch("db.get_earnings_around", self.around),
                   patch("db.get_state", side_effect=lambda k, d=None: self.state.get(k, d)),
                   patch("db.set_state", self.set_state),
-                  patch("db.log_activity", self.log_activity)):
+                  patch("db.log_activity", self.log_activity),
+                  patch("knowledge_loader.load_watchlist", return_value=_WATCHLIST)):
             self._stack.enter_context(p)
         return self
 
@@ -52,7 +57,7 @@ def test_item_202_after_the_close_logs_one_row():
         _run()
     (stage, ticker, _msg, _sent, extra), = env.rows()
     assert (stage, ticker) == ("screener_shadow", "PLTR")
-    assert extra["would_bypass_post_print"] is True
+    assert extra["would_bypass_post_print"] is True and extra["held"] is True
     assert extra["shadow_key"] == "PLTR:2026-11-02" and extra["earnings_date"] == "2026-11-02"
     assert extra["earnings_like"] == "8k_item_2_02" and extra["window"] == "after_close"
     assert extra["item_id"] == "urn:filing:1" and extra["source"] == "sec_filing"
@@ -102,6 +107,43 @@ def test_later_items_only_raise_the_count():
     book = json.loads(env.state["would_bypass_post_print_" + __import__("config").TRADING_ENV])
     entry = book["PLTR:2026-11-02"]
     assert entry["count"] == 3 and entry["logged"] and entry["first_item_id"] == "urn:filing:1"
+    assert entry["held"] is True
+    assert set(entry) == {"earnings_date", "count", "logged", "held", "last_at", "first_item_id"}
+
+
+_ANET = {"ticker": "ANET", "source": "news", "url": "u-anet-1",
+         "title": "Arista Earnings, Revenue Outlook Handily Top Estimates"}
+
+
+def test_unheld_watchlist_name_logs_with_held_false_in_its_own_book():
+    env_name = __import__("config").TRADING_ENV
+    with _Env(earnings=date(2026, 11, 3)) as env:            # Tue print, Tue 16:35 ET
+        _run(_ANET, held=False, now=datetime(2026, 11, 3, 21, 35, tzinfo=timezone.utc))
+        _run({**_ANET, "url": "u-anet-2", "title": "Revenue reached $3.66B, expects $3.9B"},
+             held=False, now=datetime(2026, 11, 3, 22, 5, tzinfo=timezone.utc))
+    (stage, ticker, msg, _sent, extra), = env.rows()
+    assert (stage, ticker) == ("screener_shadow", "ANET") and "watchlist ANET" in msg
+    assert extra["held"] is False and extra["would_bypass_post_print"] is True
+    assert extra["window"] == "after_close" and extra["shadow_key"] == "ANET:2026-11-03"
+    assert extra["count_state_key"] == f"would_bypass_post_print_unheld_{env_name}"
+    assert f"would_bypass_post_print_{env_name}" not in env.state      # held book untouched
+    entry = json.loads(env.state[f"would_bypass_post_print_unheld_{env_name}"])["ANET:2026-11-03"]
+    assert entry["held"] is False and entry["count"] == 2
+
+
+def test_unheld_rows_carry_the_same_fields_as_held_rows():
+    with _Env() as env:
+        _run()
+        _run({**_8K, "ticker": "ANET"}, held=False)
+    held_row, unheld_row = (r[4] for r in env.rows())
+    assert set(held_row) == set(unheld_row)
+    assert held_row["held"] is True and unheld_row["held"] is False
+
+
+def test_unheld_non_watchlist_ticker_reads_nothing():
+    with _Env() as env:
+        _run({**_8K, "ticker": "ZZZZ"}, held=False)
+    assert env.rows() == [] and not env.around.called and env.set_state.call_count == 0
 
 
 def test_a_failed_write_lets_the_next_item_log():
@@ -116,7 +158,7 @@ def test_a_failed_write_lets_the_next_item_log():
 
 def test_non_triggers_write_nothing():
     cases = [
-        dict(held=False),
+        dict(held=False, event={**_8K, "ticker": "ZZZZ"}),     # unheld, not on the watchlist
         dict(result={**_NO, "relevant": True}),
         dict(now=MIDDAY),
         dict(event={"ticker": "PLTR", "source": "news", "title": "Palantir CEO to speak"}),
@@ -166,5 +208,23 @@ def test_the_screener_decision_and_prompt_do_not_change():
 
     hit, env = run(lambda *a: real(*a, now=AFTER_CLOSE))
     assert len(env.rows()) == 1
+    off, _ = run(lambda *a: None)
+    assert hit == off
+
+
+def test_the_screener_decision_does_not_change_for_an_unheld_watchlist_name():
+    real = screener._log_would_bypass_post_print
+    ev = {**_ANET, "text": "x"}
+
+    def run(shadow):
+        with _Env() as env, \
+             patch("agents.screener._call_ollama", return_value=json.dumps(_NO)), \
+             patch("db.get_position_stop", return_value=None), \
+             patch("stop_lock._redis", side_effect=RuntimeError("no redis")), \
+             patch.object(screener, "_log_would_bypass_post_print", shadow):
+            return screener.screen(dict(ev)), env
+
+    hit, env = run(lambda *a: real(*a, now=AFTER_CLOSE))
+    assert len(env.rows()) == 1 and env.rows()[0][4]["held"] is False
     off, _ = run(lambda *a: None)
     assert hit == off

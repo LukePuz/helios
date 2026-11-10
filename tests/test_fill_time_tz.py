@@ -173,6 +173,20 @@ def _broker_with_live_fill(t, receipt, filled_qty=42.0, price=101.5):
     return place
 
 
+class TestFillTimeSource:
+    def test_the_source_is_that_of_the_latest_time(self):
+        t = _true_time()
+        later = t + timedelta(seconds=30)
+        out = ibkr._with_fill_time({}, [_live_fill(_mislabelled(t), t + timedelta(milliseconds=5)),
+                                        _req_fill(later)])
+        assert out["fill_time"] == later and out["fill_time_source"] == "execution"
+        out = ibkr._with_fill_time({}, [_req_fill(t), _live_fill(t, later)])
+        assert out["fill_time"] == later and out["fill_time_source"] == "receipt"
+
+    def test_no_time_means_no_source(self):
+        assert ibkr._with_fill_time({}, [SimpleNamespace(execution=SimpleNamespace(time=None))]) == {}
+
+
 class TestCallerPaths:
     def test_execution_exit_writes_the_receipt_time_to_the_order_and_outcome(self):
         t = _true_time(5)
@@ -183,7 +197,9 @@ class TestCallerPaths:
         with patch("execution._remaining_after_sell", return_value=0.0):
             _fw._run_exit(fake, _broker_with_live_fill(t, receipt))
         assert fake.mark_submitted_order_fill.call_args.kwargs["filled_at"] == receipt
+        assert fake.mark_submitted_order_fill.call_args.kwargs["filled_at_source"] == "receipt"
         assert fake.mocks["close_trade_outcome"].call_args.kwargs["exit_fill_at"] == receipt
+        assert fake.mocks["close_trade_outcome"].call_args.kwargs["exit_fill_at_source"] == "receipt"
 
     def test_reconcile_writes_the_corrected_req_executions_time(self):
         t = _true_time()
@@ -200,6 +216,8 @@ class TestCallerPaths:
         assert fill["fill_time"] == t
         _fw._reconcile(fake, fill)
         assert fake.update_order_fill.call_args.kwargs["filled_at"] == t
+        assert fill["fill_time_source"] == "execution"
+        assert fake.update_order_fill.call_args.kwargs["filled_at_source"] == "execution"
 
     def test_partial_sale_writes_the_receipt_time(self, monkeypatch):
         import market_data
@@ -220,6 +238,7 @@ class TestCallerPaths:
             object.__new__(risk_manager.RiskManager)._partial_sell_and_resize_stop(
                 "NVDA", 100, 30, 100.0, decision_price=126.0)
         assert fill.call_args.kwargs["filled_at"] == receipt
+        assert fill.call_args.kwargs["filled_at_source"] == "receipt"
 
 
 class TestPreviewScript:

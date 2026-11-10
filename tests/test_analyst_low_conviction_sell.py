@@ -89,3 +89,37 @@ def test_stale_confirming_verdict_does_not_count():
            "timestamp": datetime.now(timezone.utc) - timedelta(days=20)}
     with patch("db.get_latest_signal_for", return_value=old):
         assert _low_conviction_sell("QBTS", "TRIM", 3)[:2] == ("TRIM", False)
+
+
+def test_sell_confirm_record_measures_spacing_item_and_position():
+    """Audit 11-06 23:24 #4: record-only fields on the confirming verdict."""
+    from datetime import datetime, timedelta, timezone
+    from agents.analyst import _sell_confirm_record
+    ts = datetime.now(timezone.utc) - timedelta(seconds=90)
+    prev = {"timestamp": ts, "id": 77, "confidence": 0.3,
+            "trigger": {"path": "headline", "url": "https://x/a", "title": "T"}}
+    with patch("db.get_position_stop", return_value={"opened_at": ts + timedelta(seconds=30)}):
+        rec = _sell_confirm_record("QBTS", prev, {"path": "headline", "url": "https://x/a", "title": "U"})
+    assert rec["prev_signal_id"] == 77 and rec["prev_trigger_path"] == "headline"
+    assert 85 <= rec["confirm_gap_s"] <= 120
+    assert rec["confirm_same_item"] is True and rec["confirm_before_open"] is True
+    with patch("db.get_position_stop", side_effect=RuntimeError("pool")):
+        rec = _sell_confirm_record("QBTS", {**prev, "trigger": None}, None)
+    assert rec["confirm_same_item"] is None and rec["confirm_before_open"] is None
+    assert _sell_confirm_record("QBTS", None, None)["confirm_gap_s"] is None
+
+
+def test_low_conviction_sell_fills_the_record_and_reads_the_trigger():
+    rec = {}
+    with patch("db.get_latest_signal_for", return_value=_prev(3)) as get, \
+         patch("db.get_position_stop", return_value=None):
+        _low_conviction_sell("QBTS", "TRIM", 3, {"path": "scheduled"}, rec)
+    assert get.call_args.kwargs == {"with_trigger": True}
+    assert set(rec) >= {"confirm_gap_s", "confirm_same_item", "confirm_before_open"}
+
+
+def test_sell_confirm_stays_on_the_verdict_row():
+    from agents import crew
+    fields = crew._route_row_fields({"provenance": {"sell_confirm": {"confirm_gap_s": 1.0}, "model": "m"}},
+                                    "SELL_NO_POSITION")
+    assert "sell_confirm" not in (fields.get("provenance") or {})

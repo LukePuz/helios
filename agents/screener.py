@@ -335,6 +335,13 @@ try:
 except Exception:
     _OPINION_PATTERNS_SHA = None
 
+# The same hash over title_tone's two word lists, so tone tags from
+# different lists can be told apart (professor m583).
+try:
+    TONE_SHA = _opinion_patterns_sha([("pos", _TONE_POS), ("neg", _TONE_NEG)])
+except Exception:
+    TONE_SHA = None
+
 
 def _opinion_headlines(title) -> list[str]:
     """Names of every _OPINION_PATTERNS entry the title matches, in list order."""
@@ -348,6 +355,40 @@ def _opinion_headline(title) -> str | None:
     return names[0] if names else None
 
 
+def _readthrough_record(result: dict, ticker: str) -> dict:
+    """Log-only (audit 2026-11-07 15:07 #5): the reply's affected_tickers
+    and indirect_effects, which were only in the log line, so read-through
+    to other names can be counted from the signal rows. Changes nothing in
+    result; never raises."""
+    try:
+        raw = result.get("affected_tickers")
+        names = None
+        if isinstance(raw, list):
+            names = []
+            for t in raw:
+                t = str(t or "").strip().upper()[:12]
+                if t and t not in names:
+                    names.append(t)
+            names = names[:20]
+        others = [t for t in names if t != str(ticker).upper()] if names is not None else None
+        ie = result.get("indirect_effects")
+        ie = None if ie is None or str(ie).strip().lower() in ("", "null", "none") else str(ie)[:300]
+        rec = {"affected_tickers": names,
+               "affected_others": others,
+               "affected_others_on_watchlist": [t for t in others if t in SYMBOLS] if others is not None else None,
+               "indirect_effects": ie}
+        if raw is not None and names is None:
+            # Not a list (e.g. "NVDA, AMD"): the reply's type, so how often
+            # can be counted (SEF 154d). Not parsed.
+            rec["affected_tickers_type"] = type(raw).__name__
+        return rec
+    except Exception as e:
+        log.debug(f"[{ticker}] readthrough record failed: {e}")
+        return {"affected_tickers": None, "affected_others": None,
+                "affected_others_on_watchlist": None, "indirect_effects": None,
+                "readthrough_error": type(e).__name__}
+
+
 _HELD_OVERRIDE_COOLDOWN_S = 4 * 3600
 
 
@@ -357,6 +398,21 @@ def _is_held(ticker: str) -> bool:
         return db.get_position_stop(ticker) is not None
     except Exception:
         return False
+
+
+def _title_names_ticker(ticker: str, title: str) -> bool | None:
+    """Log-only (audit 11-06 09:31 #3): does the title name the ticker or its
+    watchlist company, by the news fetcher's own test (mentions_company)?
+    The held-negative override fires on tone alone, so a market-wide recap
+    tagged to a held ticker reaches a full review. None when it can't be
+    read. Never raises."""
+    try:
+        from ingestion.news import mentions_company
+        from knowledge_loader import load_watchlist
+        company = (load_watchlist().get(ticker) or {}).get("company", "")
+        return mentions_company(ticker, company, title or "")
+    except Exception:
+        return None
 
 
 def _held_negative_override(result: dict, ticker: str, source: str, title: str, held: bool) -> None:
@@ -424,6 +480,9 @@ _EARNINGS_TITLE = re.compile(
     r"\b(earnings|results|Q[1-4]|guidance|outlook|beats?|miss(?:es)?|EPS|revenues?)\b", re.I)
 _ITEM_202 = re.compile(r"Item\s+2\.02|8-K items:[^\n]*\b2\.02\b", re.I)
 _POST_PRINT_KEY = "would_bypass_post_print_{env}"
+# Unheld watchlist names keep their own book, so the held book's counts mean
+# what they meant before unheld names were logged.
+_POST_PRINT_UNHELD_KEY = "would_bypass_post_print_unheld_{env}"
 _POST_PRINT_KEEP_DAYS = 14
 
 
@@ -449,18 +508,20 @@ def _next_trading_day(day):
 
 def _log_would_bypass_post_print(result: dict, event: dict, ticker: str, source: str,
                                  title: str, held: bool, now=None) -> None:
-    """Log-only: a held name's earnings item that the screener drops in the
-    post-print window: from 16:00 ET on the report day until 09:30 ET on the
-    next trading day, weekends and holidays included. A held name's earnings
-    items can all be screened out; _held_negative_override covers only
-    negative tone and ratings. The earnings calendar has no before/after-open
+    """Log-only: a held or watchlist name's earnings item that the screener
+    drops in the post-print window: from 16:00 ET on the report day until
+    09:30 ET on the next trading day, weekends and holidays included. A
+    name's earnings items can all be screened out; _held_negative_override
+    covers only negative tone and ratings, and only held names. Rows and book
+    entries carry "held"; unheld names (watchlist only, any other ticker is
+    skipped) count in _POST_PRINT_UNHELD_KEY, held names in _POST_PRINT_KEY. The earnings calendar has no before/after-open
     timing, so a before-open report's own morning is not covered. One activity_feed row (stage screener_shadow) for the first
     such item per (ticker, earnings date); later ones only raise the count
     kept in system_state. The screener's decision never reads it. DB reads
-    only inside the window, on a held, dropped, earnings-like item. Never
-    raises."""
+    only outside 09:30-16:00 on a session day, on a dropped, earnings-like
+    item of a held or watchlist name. Never raises."""
     try:
-        if not held or result.get("relevant"):
+        if result.get("relevant"):
             return
         kind = _earnings_like(event, source, title)
         if kind is None:
@@ -473,6 +534,11 @@ def _log_would_bypass_post_print(result: dict, event: dict, ticker: str, source:
         in_session_day = today.weekday() < 5 and today not in NYSE_HOLIDAYS
         if in_session_day and dtime(9, 30) <= et_now.time() < dtime(16, 0):
             return
+        held = bool(held)
+        if not held:
+            from knowledge_loader import load_watchlist
+            if str(ticker or "").upper() not in load_watchlist():
+                return
         import db
         ed = db.get_earnings_around([ticker], days_ahead=1, days_back=5).get(ticker)
         if ed is None:
@@ -488,7 +554,7 @@ def _log_would_bypass_post_print(result: dict, event: dict, ticker: str, source:
         import json as _json
         from config import TRADING_ENV
         from agents.analyst import shadow_versions
-        key = _POST_PRINT_KEY.format(env=TRADING_ENV)
+        key = (_POST_PRINT_KEY if held else _POST_PRINT_UNHELD_KEY).format(env=TRADING_ENV)
         try:
             book = _json.loads(db.get_state_strict(key, "") or "{}")
         except ValueError:
@@ -501,18 +567,20 @@ def _log_would_bypass_post_print(result: dict, event: dict, ticker: str, source:
                 if isinstance(v, dict) and str(v.get("earnings_date") or "") >= keep_from}
         sk = f"{ticker}:{ed.isoformat()}"
         entry = book.get(sk) or {"earnings_date": ed.isoformat(), "count": 0, "logged": False}
+        entry["held"] = held
         entry["count"] = int(entry.get("count") or 0) + 1
         entry["last_at"] = et_now.isoformat()
         if not entry.get("logged"):
             item_id = event.get("_seen_key") or event.get("url") or event.get("id")
             entry["logged"] = bool(db.log_activity(
                 "screener_shadow", ticker,
-                f"would bypass (post-print): held {ticker} reported {ed}, screener dropped "
+                f"would bypass (post-print): {'held' if held else 'watchlist'} {ticker} reported {ed}, screener dropped "
                 f"{source} item: {str(title)[:80]}", "neutral",
-                {"would_bypass_post_print": True, "shadow_key": sk,
+                {"would_bypass_post_print": True, "held": held, "shadow_key": sk,
                  "item_id": str(item_id)[:300] if item_id else None,
                  "title": str(title)[:200], "source": source,
                  "form": event.get("form") or event.get("type"),
+                 "actual_form": event.get("actual_form"),
                  "earnings_like": kind, "earnings_date": ed.isoformat(), "window": window,
                  "screener_reason": str(result.get("reason") or "")[:200],
                  "screener_model": result.get("model_used"),
@@ -533,6 +601,20 @@ def _log_would_bypass_post_print(result: dict, event: dict, ticker: str, source:
 _FALLBACK_ALERT_COUNT = 3            # the 3rd fallback ...
 _FALLBACK_ALERT_WINDOW_S = 15 * 60   # ... within 15 minutes ...
 _FALLBACK_ALERT_THROTTLE_S = 3600    # ... alerts, at most once an hour
+
+
+def _new_fact_window_phrase() -> str:
+    """BUY_NEW_FACT_WINDOW as the fallback alert words it: "24h" -> "the
+    last 24 h", "3d" -> "the last 3 d", same_run -> "the same run". A value
+    that doesn't parse is shown as set."""
+    import config
+    raw = getattr(config, "BUY_NEW_FACT_WINDOW", "")
+    m = re.fullmatch(r"\s*(\d+)\s*([hd])\s*", str(raw))
+    if m:
+        return f"the last {int(m.group(1))} {m.group(2)}"
+    if str(raw).strip() == "same_run":
+        return "the same run"
+    return f"the last {raw}"
 
 
 def _note_keyword_fallback(reason: str, now=None) -> bool:
@@ -576,7 +658,7 @@ def _note_keyword_fallback(reason: str, now=None) -> bool:
         if alerts._send(f"Screener on the keyword fallback: {len(recent)} screens in "
                         f"{_FALLBACK_ALERT_WINDOW_S // 60} min (last: {reason}). Its new_fact "
                         f"is empty, so the new-fact gate blocks news-path OPEN/ADD unless a "
-                        f"new-fact item from the last 24 h exists; "
+                        f"new-fact item from {_new_fact_window_phrase()} exists; "
                         f"check the 7B model server") is None:
             return False
         db.set_state(alert_key, now.isoformat())
@@ -699,14 +781,26 @@ def screen(event: dict) -> dict:
             "prompt_template_sha": hashlib.sha256(_SCREENER_PROMPT.encode()).hexdigest()[:12],
             "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:12],
             "title_tone": title_tone(title),
+            # The event's source and form, so pass rates can be counted by
+            # source from the rows (SEF, packet G54).
+            "source": source,
+            "form": event.get("form") or event.get("type"),
+            # EDGAR only: the filing's own form; form is the matched prefix.
+            "actual_form": event.get("actual_form"),
             "new_fact": result.get("new_fact"),
             "override": result.get("override"),
+            "title_names_ticker": _title_names_ticker(ticker, title),
             "would_pass_held_negative": held_negative_shadow,
+            "opinion_shadow": opinion_shadow,
             # How much of the event text the 7B saw (audit 2026-11-05-0725 #10;
             # G54). Log-only.
             "content_len": len(event.get("text") or ""),
             "content_cut": len(event.get("text") or "") > SCREENER_CONTENT_CAP,
-            "opinion_shadow": opinion_shadow,
+            # The tier and held flag the prompt was given, so pass rates can
+            # be split by them as of the screen (audit 2026-11-07 15:07 #1).
+            "tier": tier,
+            "held": held,
+            **_readthrough_record(result, ticker),
         }
         if fallback_reason:
             result["provenance"]["fallback_reason"] = fallback_reason

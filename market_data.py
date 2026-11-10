@@ -64,6 +64,30 @@ def is_market_hours(now_utc: datetime | None = None) -> bool:
 _is_market_hours = is_market_hours
 
 
+def minutes_since_open(now_utc: datetime | None = None) -> float | None:
+    """Minutes since today's 09:30 ET open, or None outside a trading day or
+    before the open. For records; nothing gates on it."""
+    now = (now_utc or datetime.now(timezone.utc)).astimezone(_ET)
+    sess = _session(now.date())
+    if sess is None or now.time() < sess[0]:
+        return None
+    opened = now.replace(hour=sess[0].hour, minute=sess[0].minute, second=0, microsecond=0)
+    return round((now - opened).total_seconds() / 60, 1)
+
+
+def market_session(now_utc: datetime | None = None) -> str:
+    """Where `now` falls in the NYSE day: "rth" (as is_market_hours),
+    "pre_open", "after_close", or "closed_day" (weekend or holiday). For
+    records; nothing gates on it."""
+    now = (now_utc or datetime.now(timezone.utc)).astimezone(_ET)
+    sess = _session(now.date())
+    if sess is None:
+        return "closed_day"
+    if now.time() < sess[0]:
+        return "pre_open"
+    return "rth" if now.time() <= sess[1] else "after_close"
+
+
 def next_market_open(now_utc: datetime | None = None) -> datetime:
     """Next regular-session open (09:30 ET on a trading day) at or after
     `now`, in UTC. Added 2026-07-28 alongside the move to a 5:00 AM ET wake --
@@ -87,13 +111,20 @@ def next_market_open(now_utc: datetime | None = None) -> datetime:
 
 def get_priced_quote(ticker: str) -> dict | None:
     """
-    Returns {price, bar_time, age_minutes, is_stale, market_open} or None.
+    Returns {price, bar_time, age_minutes, is_stale, market_open,
+    price_source} or None.
     price comes from the last 1-min bar (RTH); is_stale is True whenever the
     bar is older than STALE_AFTER_MINUTES — i.e. always true outside RTH.
+    price_source says which bars the price came from: "1min", or
+    "daily_fallback" when there were no 1-min bars and the last 2-day daily
+    bar was used (its date-only time is aged from midnight UTC, so it is
+    always stale during RTH). Record only: nothing decides on it.
     """
     try:
+        price_source = "1min"
         bars = get_historical_bars(ticker, duration="1 D", bar_size="1 min")
         if not bars:
+            price_source = "daily_fallback"
             bars = get_historical_bars(ticker, duration="2 D", bar_size="1 day")
         if not bars:
             return None
@@ -142,6 +173,7 @@ def get_priced_quote(ticker: str) -> dict | None:
             "age_minutes": round(age_min, 1) if age_min is not None else None,
             "is_stale":    is_stale,
             "market_open": market_open,
+            "price_source": price_source,
         }
     except Exception as e:
         log.warning(f"get_priced_quote({ticker}) failed: {e}")

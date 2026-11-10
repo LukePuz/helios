@@ -63,6 +63,26 @@ class TestSellRouting:
         mock_rm_cls.return_value.size_position.assert_not_called()
         mock_execute.assert_called_once()
 
+    def test_trim_records_whole_share_granularity(self):
+        """Record-only: a TRIM of a 1-share position sells the whole position."""
+        for held, want_qty, want_full in ((1.0, 1, True), (90.0, 29, False)):
+            client = MagicMock()
+            client.get_all_positions.return_value = [MagicMock(
+                symbol="NVDA", qty=held, avg_entry_price=100.0, current_price=100.0,
+                market_value=held * 100.0)]
+            with patch("db.has_active_approval", return_value=False), \
+                 patch("db.log_pending_approval", return_value=10) as lpa, \
+                 patch("db.claim_approval_for_execution", return_value=True), \
+                 patch("db.get_approval_by_id", return_value={"id": 10}), \
+                 patch("db.update_approval_status"), \
+                 patch("execution.execute_approved", return_value=True), \
+                 patch("agents.crew._get_price", return_value=100.0), \
+                 patch("risk_manager.RiskManager"), \
+                 patch("config.AUTO_EXECUTE", True):
+                crew._route_to_approval(_analyst_result(action="TRIM"), {"regime": "Neutral"}, client)
+            rec = lpa.call_args.kwargs["risk_json"]["trim_granularity"]
+            assert rec["sell_qty"] == want_qty and rec["full_exit"] is want_full and rec["owned"] == held
+
     def test_exit_with_no_position_logs_signal_and_returns(self):
         """EXIT recommended on a ticker we don't actually hold must not
         fall through to buy sizing — just log and stop."""

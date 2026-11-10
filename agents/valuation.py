@@ -414,7 +414,7 @@ def compute_dcf_fair_value(ticker: str, fund: dict) -> float | None:
     return equity_value / shares
 
 
-def compute_comps_fair_value(ticker: str, fund: dict) -> float | None:
+def compute_comps_fair_value(ticker: str, fund: dict, meta: dict | None = None) -> float | None:
     """Peer-median P/S x this ticker's own trailing revenue / shares
     outstanding. Prefers the broadened S&P-500-scale industry search
     (ingestion.fundamentals.get_industry_peer_median, added 2026-09-13 --
@@ -424,7 +424,13 @@ def compute_comps_fair_value(ticker: str, fund: dict) -> float | None:
     compute (no industry classification cached yet, or the broader pool
     itself is too thin/dispersed). Both fail closed on <3-5 peers or
     excessive dispersion rather than force a number (see either
-    function's docstring for the concrete LUNR/RKLB/ASTS case)."""
+    function's docstring for the concrete LUNR/RKLB/ASTS case).
+
+    When `meta` is a dict and a value is returned, meta["peer_source"] is
+    "industry" (the broad pool's median was used) or "watchlist_fallback"
+    (the watchlist-only sector median was), and meta["peer_count"] is how
+    many values that median was taken over. Log-only: the return value is
+    the same either way."""
     price_to_sales = fund.get("price_to_sales")
     market_cap = fund.get("market_cap")
     shares = fund.get("shares_outstanding")
@@ -432,21 +438,28 @@ def compute_comps_fair_value(ticker: str, fund: dict) -> float | None:
         return None
 
     peer_median_ps = None
+    source, pool = None, {}
     try:
         from ingestion.fundamentals import get_industry_peer_median
-        peer_median_ps = get_industry_peer_median(ticker, "price_to_sales")
+        peer_median_ps = get_industry_peer_median(ticker, "price_to_sales", out=pool)
+        source = "industry"
     except Exception as e:
         log.debug(f"[{ticker}] comps: broad industry peer median lookup failed: {e}")
 
     if not peer_median_ps:
+        source, pool = None, {}
         try:
             from ingestion.fundamentals import get_sector_peer_median
-            peer_median_ps = get_sector_peer_median(ticker, "price_to_sales")
+            peer_median_ps = get_sector_peer_median(ticker, "price_to_sales", out=pool)
+            source = "watchlist_fallback"
         except Exception as e:
             log.debug(f"[{ticker}] comps: narrow sector peer median lookup failed: {e}")
 
     if not peer_median_ps:
         return None
+    if meta is not None:
+        meta["peer_source"] = source
+        meta["peer_count"] = pool.get("peer_count")
     revenue = market_cap / price_to_sales
     return (peer_median_ps * revenue) / shares
 
@@ -571,6 +584,7 @@ def compute_valuation_ensemble(ticker: str, current_price: float | None = None) 
         "valuation_pct_of_fair": None, "valuation_tier": None, "valuation_outlier": False,
         "street_target_low": None, "street_target_high": None, "street_consensus_target": None,
         "implied_growth_rate": None, "growth_gap_vs_actual": None, "growth_assumption_flag": None,
+        "comps_peer_source": None, "comps_peer_count": None,
     }
 
     fund = db.get_fundamentals(ticker)
@@ -588,6 +602,7 @@ def compute_valuation_ensemble(ticker: str, current_price: float | None = None) 
     # reverse DCF is a plausibility judgment, not a price, so it's not
     # blend-eligible either (2026-09-13 user decision).
     methods: dict[str, float] = {}
+    comps_meta: dict = {}
     for name, fn in (
         ("dcf", compute_dcf_fair_value),
         ("comps", compute_comps_fair_value),
@@ -595,7 +610,7 @@ def compute_valuation_ensemble(ticker: str, current_price: float | None = None) 
         ("justified_multiple", compute_justified_multiple_fair_value),
     ):
         try:
-            value = fn(ticker, fund)
+            value = fn(ticker, fund, meta=comps_meta) if name == "comps" else fn(ticker, fund)
             if value and value > 0:
                 methods[name] = value
         except Exception as e:
@@ -604,6 +619,9 @@ def compute_valuation_ensemble(ticker: str, current_price: float | None = None) 
     result["dcf_fair_value"] = round(methods["dcf"], 2) if "dcf" in methods else None
     result["comps_fair_value"] = round(methods["comps"], 2) if "comps" in methods else None
     result["peer_implied_fair_value"] = result["comps_fair_value"]
+    if "comps" in methods:   # which peer pool comps rests on (log-only)
+        result["comps_peer_source"] = comps_meta.get("peer_source")
+        result["comps_peer_count"] = comps_meta.get("peer_count")
     result["residual_income_fair_value"] = round(methods["residual_income"], 2) if "residual_income" in methods else None
     result["justified_multiple_fair_value"] = round(methods["justified_multiple"], 2) if "justified_multiple" in methods else None
     result["valuation_methods_used"] = sorted(methods.keys())

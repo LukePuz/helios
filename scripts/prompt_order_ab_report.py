@@ -24,6 +24,9 @@ test and intervals; the other three follow under "secondary":
 Intervals are seeded percentile bootstraps over pairs (90/95/99%);
 permutation tests are exact up to 16 pairs, else seeded Monte Carlo.
 
+Printed first: the sha256 of this report script and the runner tool_sha
+values found on the run lines.
+
 Printed per configuration:
   - denominators: signals in the sample, skip lines by reason, signals
     attempted, last attempt complete or with a failed arm, not attempted;
@@ -37,8 +40,9 @@ Printed per configuration:
     either arm was salvaged or num_predict-cut:
       the primary metric, the secondary metrics, and the conviction
       distributions and c7+ by run position;
-  - bounds over every attempted signal with a missing conviction counted
-    as c7+ and as not c7+;
+  - the two bounds over every attempted signal, a failed or cut-off reply
+    (no conviction, or done_reason "length" even with a conviction) either
+    dropped with its pair ("dropped") or counted as not c7+ ("not-c7");
   - with arm A2 (--repeat-arm), the A-vs-A2 c7+ and action discordance as
     the run-to-run noise floor, next to the same figures for the
     comparison on the same signals.
@@ -48,6 +52,7 @@ Printed per configuration:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import random
@@ -258,20 +263,36 @@ def summarize(pairs: list[dict], reps: int, seed: int, x: str = "A", y: str = "B
     }
 
 
+def _failed_or_cut(r, arm) -> bool:
+    """No conviction (call error, timeout, parse failure, no conviction), or
+    cut off by the output limit (done_reason "length") even with a conviction."""
+    a = (r.get("arms") or {}).get(arm) or {}
+    return a.get("conviction") is None or a.get("done_reason") == "length"
+
+
 def bounds(last: list[dict], x: str, y: str) -> dict:
-    """c7+ shares over every attempted signal, a missing conviction counted
-    as c7+ (high) and as not (low); the difference y - x at its extremes."""
+    """The two bounds of design item 2 over every attempted signal, with
+    failed or cut-off replies (_failed_or_cut):
+      dropped  pairs where either arm failed or was cut off are left out;
+               c7+ shares and y - x over the remaining pairs;
+      not_c7   every attempted signal kept, a failed or cut-off reply
+               counted as not c7+; c7+ shares and y - x over all of them."""
     n = len(last)
     if not n:
         return {"n": 0}
 
-    def arm(a):
-        yes = sum(1 for r in last if _conv(r, a) is not None and _conv(r, a) >= 7)
-        miss = sum(1 for r in last if _conv(r, a) is None)
-        return yes / n, (yes + miss) / n, miss
-    xl, xh, xm = arm(x)
-    yl, yh, ym = arm(y)
-    return {"n": n, "x": (xl, xh, xm), "y": (yl, yh, ym), "diff": (yl - xh, yh - xl)}
+    def c7(r, a):
+        return not _failed_or_cut(r, a) and _conv(r, a) >= 7
+    fx = sum(1 for r in last if _failed_or_cut(r, x))
+    fy = sum(1 for r in last if _failed_or_cut(r, y))
+    kept = [r for r in last if not _failed_or_cut(r, x) and not _failed_or_cut(r, y)]
+    k = len(kept)
+    dx, dy = sum(c7(r, x) for r in kept), sum(c7(r, y) for r in kept)
+    nx, ny = sum(c7(r, x) for r in last), sum(c7(r, y) for r in last)
+    return {"n": n, "failed_or_cut": {x: fx, y: fy},
+            "dropped": {"n": k, "x": dx / k if k else None, "y": dy / k if k else None,
+                        "diff": (dy - dx) / k if k else None},
+            "not_c7": {"n": n, "x": nx / n, "y": ny / n, "diff": (ny - nx) / n}}
 
 
 # -- rendering -------------------------------------------------------------------
@@ -475,10 +496,13 @@ def noise_floor_lines(last: list[dict], x: str, y: str, clean: bool) -> list[str
 def render_bounds(b: dict, x: str, y: str) -> str:
     if not b["n"]:
         return "bounds: no attempted signals"
-    return (f"bounds over {b['n']} attempted signals (missing conviction as not c7+ / as c7+): "
-            f"{x} [{_f(b['x'][0])}, {_f(b['x'][1])}] ({b['x'][2]} missing), "
-            f"{y} [{_f(b['y'][0])}, {_f(b['y'][1])}] ({b['y'][2]} missing), "
-            f"{y} - {x} [{_f(b['diff'][0])}, {_f(b['diff'][1])}]")
+    d, z = b["dropped"], b["not_c7"]
+    return (f"bounds over {b['n']} attempted signals; failed or cut-off replies (no conviction, "
+            f"or done_reason length): {x} {b['failed_or_cut'][x]}, {y} {b['failed_or_cut'][y]}\n"
+            f"  bound 'dropped' (pairs with a failed or cut-off arm left out, {d['n']} pairs): "
+            f"c7+ {x} {_f(d['x'])}, {y} {_f(d['y'])}, {y} - {x} {_f(d['diff'])}\n"
+            f"  bound 'not-c7' (failed or cut-off replies counted as not c7+, {z['n']} signals): "
+            f"c7+ {x} {_f(z['x'])}, {y} {_f(z['y'])}, {y} - {x} {_f(z['diff'])}")
 
 
 FAIL_COLS = ("ok", "timeout", "call_error", "parse_failed", "no_conviction", "not_called",
@@ -527,6 +551,22 @@ def report_group(g: dict, skips: dict, reps: int, seed: int, primary: str) -> st
     return "\n".join(out)
 
 
+def report_sha() -> str:
+    """sha256 of this report script, so a report ties to the code that produced it."""
+    try:
+        with open(__file__, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return "unknown"
+
+
+def provenance_line(data: dict) -> str:
+    """The report script's sha256 and the runner tool_sha values on the run lines."""
+    shas = sorted({str(r.get("tool_sha")) for r in data["runs"] if r.get("tool_sha")})
+    return (f"report_sha256: {report_sha()}; runner tool_sha on run lines: "
+            + (", ".join(shas) if shas else "none recorded"))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Summarise a prompt_order_ab.py JSONL (no threshold applied).")
     ap.add_argument("path")
@@ -538,6 +578,7 @@ def main(argv=None):
     ap.add_argument("--boot-seed", type=int, default=0)
     args = ap.parse_args(argv)
     data = load(args.path)
+    print(provenance_line(data))
     gs = groups(data)
     if not gs:
         print("no run or pair lines")

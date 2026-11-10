@@ -18,6 +18,18 @@ from pathlib import Path as _Path
 from dotenv import load_dotenv as _load_dotenv
 _load_dotenv(dotenv_path=_Path(__file__).parent / ".env")
 
+
+# pyarrow's default memory pool (mimalloc in this build) segfaulted when
+# pandas allocated from a daemon thread with the agent stack loaded
+# (vix-live / earnings-timing, libarrow AllocateResizableBuffer, 2026-11-08);
+# the system allocator didn't. Set by environment, not by importing pyarrow
+# here: an import would load numpy and start its BLAS threads in every
+# process before Celery forks its pool (audit 2026-11-08 15:08 #2).
+# process_manager sets it for the workers too; a value already set wins.
+import os as _os
+_os.environ.setdefault("ARROW_DEFAULT_MEMORY_POOL", "system")
+ARROW_MEMORY_POOL = _os.environ["ARROW_DEFAULT_MEMORY_POOL"]
+
 # ---------------------------------------------------------------------------
 # Symbol universe — derived from watchlist at import time
 # Keep SYMBOLS for any module that still references it directly.
@@ -53,6 +65,13 @@ import os
 TRADING_ENV = os.getenv("TRADING_ENV", "paper").strip().lower()
 if TRADING_ENV not in ("paper", "live"):
     raise ValueError(f"TRADING_ENV must be 'paper' or 'live', got {TRADING_ENV!r}")
+
+# The Streamlit dashboard's bind address. Streamlit's default is every
+# interface, which put the Manual Trade tab (live MARKET orders, no login) on
+# the home network (audit 2026-11-07 03:08 #4). Loopback by default; set
+# HELIOS_DASHBOARD_ADDRESS to this box's Tailscale IP to reach it from the
+# tailnet.
+DASHBOARD_ADDRESS = os.getenv("HELIOS_DASHBOARD_ADDRESS", "").strip() or "127.0.0.1"
 
 # Belt-and-suspenders on top of TRADING_ENV: auto-execution
 # (agents/crew.py:_route_to_approval) only fires without a human tap when
@@ -316,6 +335,12 @@ GAP_CONFIRMATION_RETRY_MINUTES = 5
 # gives up rather than deferring forever.
 STALE_PRICE_MAX_RETRIES = 4
 STALE_PRICE_RETRY_MINUTES = 3
+# crew._get_price's last fallback (yfinance) reaches the analyst brief's
+# current price. Off: the old order (after-hours, pre-market, regular) at all
+# hours. On: regular first during RTH; pre-market first before noon ET and
+# after-hours first after it outside RTH. An analyst-input change, so off by
+# default until Luke decides (packet G50).
+PRICE_FALLBACK_SESSION_ORDER = os.getenv("PRICE_FALLBACK_SESSION_ORDER", "false").lower() == "true"
 
 # ---------------------------------------------------------------------------
 # Sell behaviour
@@ -549,6 +574,54 @@ ETF_FUNDAMENTALS_CAP_EXEMPT = os.getenv("ETF_FUNDAMENTALS_CAP_EXEMPT", "true").l
 # that position instead of only logging PLAN_LEVEL_HIT. Off until Luke turns
 # it on: it adds analyst runs and a new trigger (audit A0903-1 step 3).
 PLAN_LEVEL_REVIEW_ENABLED = os.getenv("PLAN_LEVEL_REVIEW_ENABLED", "false").lower() == "true"
+
+# Analyst add-ons (Luke, 2026-11-08 evening). All analyst input, so all off
+# until Luke turns them on (live or as an A/B arm); with all three off the
+# rendered prompt and brief are byte-identical to before.
+# Scenarios: the model adds up to three "if X happens -> action, at what
+# level" lines to every verdict (agents.analyst._addon_instructions).
+ANALYST_SCENARIOS_ENABLED = os.getenv("ANALYST_SCENARIOS_ENABLED", "false").lower() == "true"
+# Earnings plan: on a held name's pre-print earnings review the model also
+# fills event_plan (hold through / trim before / exit before, expected move,
+# what result breaks the thesis, what it does after the print).
+ANALYST_EVENT_PLAN_ENABLED = os.getenv("ANALYST_EVENT_PLAN_ENABLED", "false").lower() == "true"
+# PRICE HISTORY brief section: recent daily closes, weekly closes, distance
+# from the 20-day and 52-week highs, today's move and volume against average
+# (context_engine._price_history_section).
+BRIEF_PRICE_HISTORY = os.getenv("BRIEF_PRICE_HISTORY", "false").lower() == "true"
+# Drop watch (tasks.dip_watch): a held or watchlist name that falls hard with
+# no headline. Off: shadow rows (DIP_WATCH_SHADOW) only. On: one analyst
+# review per ticker per day, through the normal event path and every
+# existing gate, so the model can judge a buying chance against a breakdown.
+# A name qualifies when today's move is at or below -DIP_REVIEW_MIN_DROP_PCT
+# or at or below -DIP_REVIEW_MIN_ATR times ATR(14). The thresholds are
+# Luke's; these defaults only set the shadow rows' would_review flag.
+DIP_REVIEW_ENABLED = os.getenv("DIP_REVIEW_ENABLED", "false").lower() == "true"
+DIP_REVIEW_MIN_DROP_PCT = float(os.getenv("DIP_REVIEW_MIN_DROP_PCT", "5.0"))
+DIP_REVIEW_MIN_ATR = float(os.getenv("DIP_REVIEW_MIN_ATR", "2.0"))
+# A drop review has no news item, so under BUY_REQUIRES_NEW_FACT its OPEN/ADD
+# passes only if some new-fact news on the ticker landed within the window.
+# True lets the drop itself count as the new fact. A buy-gate change: Luke's.
+DIP_REVIEW_COUNTS_AS_NEW_FACT = os.getenv("DIP_REVIEW_COUNTS_AS_NEW_FACT", "false").lower() == "true"
+
+# A sub-score the model wrote as text ("4/5") or as a decimal string ("4.0")
+# reads as an imputed 3 (or the number) instead of failing the verdict as
+# ANALYST_FAILED (audit 2026-11-07 09:07 #9). Off until Luke turns it on: a
+# reply that never routed could then route, and the imputed 3 reaches
+# trade_outcomes and the prompt's sub-score track record.
+SUBSCORE_TEXT_IMPUTE_ENABLED = os.getenv("SUBSCORE_TEXT_IMPUTE_ENABLED", "false").lower() == "true"
+
+# An analyst shadow plan whose position has since closed (stop, EXIT,
+# profit-take) is closed before the next verdict, so a re-entry starts a new
+# plan. Off: the plan stays active and exited_since_plan records the exit.
+# Which one the plan metrics use is packet G75, so this stays off until then.
+PLAN_CLOSE_ON_EXIT = os.getenv("PLAN_CLOSE_ON_EXIT", "false").lower() == "true"
+
+# The prompt's YOUR TRACK RECORD block counts closed trades entered on or after
+# this date (YYYY-MM-DD). Empty, the default, keeps the current behaviour: all
+# closed trades, so 2027 verdicts would see pilot outcomes (professor C35). It
+# is analyst input; whether and when to set it is Luke's.
+TRACK_RECORD_SINCE = os.getenv("TRACK_RECORD_SINCE", "").strip()
 
 # A deferred entry past tasks.DEFERRED_ENTRY_MAX_AGE_HOURS is expired either
 # way; with this on it is only expired, with no fresh analysis queued. Off

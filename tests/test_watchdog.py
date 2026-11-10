@@ -10,7 +10,15 @@ hung/down broker apart from a genuinely stuck ops worker.
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from deploy import watchdog
+
+
+@pytest.fixture(autouse=True)
+def _unsent_ping_count_in_tmp(tmp_path, monkeypatch):
+    """The unsent-ping count file defaults to the repo's logs/; keep tests off it."""
+    monkeypatch.setattr(watchdog, "_ORDERS_PING_UNSENT_STATE_FILE", tmp_path / "unsent")
 
 
 def _fake_conn(snapshot_age_minutes):
@@ -188,9 +196,26 @@ class TestOrdersWorkerPing:
     def test_an_answer_resets_the_count(self, tmp_path, monkeypatch):
         assert self._check(tmp_path, monkeypatch, [False, True, False]) == [[], [], []]
 
-    def test_an_unsendable_ping_counts_nothing(self, tmp_path, monkeypatch):
-        assert self._check(tmp_path, monkeypatch, [False, None, None]) == [[], [], []]
+    def test_an_unsendable_ping_counts_nothing_toward_misses(self, tmp_path, monkeypatch):
+        assert self._check(tmp_path, monkeypatch, [False, None]) == [[], []]
         assert (tmp_path / "misses").read_text() == "1"
+
+    def test_two_unsendable_pings_in_a_row_say_the_broker_is_down(self, tmp_path, monkeypatch):
+        """Audit 2026-11-07 05:07 #5: a Redis outage left no problem line."""
+        out = self._check(tmp_path, monkeypatch, [None, None, True, None])
+        assert out[0] == [] and out[2] == [] and out[3] == []
+        assert out[1][0].startswith("Celery broker (Redis) unreachable, or the ping could not be built")
+        assert "on 2 checks in a row" in out[1][0]
+        assert (tmp_path / "unsent").read_text() == "1"
+
+    def test_a_stale_unsent_count_restarts(self, tmp_path, monkeypatch):
+        import os
+        f = tmp_path / "unsent"
+        f.write_text("5")
+        old = f.stat().st_mtime - watchdog._ORDERS_PING_STALE_S - 60
+        os.utime(f, (old, old))
+        assert self._check(tmp_path, monkeypatch, [None]) == [[]]
+        assert f.read_text() == "1"
 
     def test_a_dead_worker_is_not_pinged(self, tmp_path, monkeypatch):
         monkeypatch.setattr(watchdog, "_ORDERS_PING_STATE_FILE", tmp_path / "misses")

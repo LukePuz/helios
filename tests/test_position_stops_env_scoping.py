@@ -39,7 +39,7 @@ class TestPositionStopsEnvScoping:
         with _mocked_conn() as cur, patch("db.TRADING_ENV", "live"):
             db.upsert_position_stop("NVDA", 100.0, 90.0, "ATR", "Accelerator", 7)
 
-        sql, params = cur.execute.call_args[0]
+        sql, params = next(c[0] for c in cur.execute.call_args_list if "INSERT INTO position_stops" in c[0][0])
         assert "trading_env" in sql
         assert "ON CONFLICT (ticker, trading_env)" in sql
         assert "live" in params

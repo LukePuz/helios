@@ -164,7 +164,9 @@ def test_decision_inputs_record_regime_row_and_implied_growth():
                                                     "computed_at": "2026-10-28 22:00"}):
         rec = analyst._decision_inputs_record("MSFT", rp)
     assert rec["regime_used"] == {"label": "Risk-Off", "score": 36.0, "source": "gics_sector:XLK",
-                                  "timestamp": "2026-10-29 13:31:18", "last_bar_date": "2026-10-29"}
+                                  "timestamp": "2026-10-29 13:31:18", "last_bar_date": "2026-10-29",
+                                  "vix_regime": None, "vix_live": None, "vix_live_at": rec["regime_used"]["vix_live_at"],
+                                  "vix_gap": None, "vix_live_status": "no_cache"}
     assert rec["implied_growth"]["implied_growth_rate"] == 0.18
     assert rec["implied_growth"]["as_of"] == "2026-10-28 22:00"
 
@@ -259,7 +261,8 @@ def test_trigger_record_and_every_analyze_call_passes_one():
                                            "timestamp": "2026-10-29T11:02"})
     assert rec == {"path": "event", "source": "analyst_ratings", "type": "pt_raise",
                    "title": "Stifel raises MSFT", "url": "u", "published_at": "2026-10-29T11:02",
-                   "event_time": "2026-10-29T11:02", "event_time_source": "timestamp", "title_tone": "pos"}
+                   "event_time": "2026-10-29T11:02", "event_time_source": "timestamp", "title_tone": "pos",
+                   "title_tone_sha": __import__("agents.screener", fromlist=["TONE_SHA"]).TONE_SHA}
     assert "trigger" not in inspect.getsource(analyst._build_prompt)
     for mod in (analyst, crew):
         src = inspect.getsource(mod)
@@ -277,7 +280,7 @@ def test_buy_stop_record_clears_trail_params_and_target_flag():
     conn.cursor.return_value.__enter__.return_value = cur
     with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
         db.upsert_position_stop("NVDA", 180.0, 160.0, "atr", "Accelerator", 7)
-    sql = cur.execute.call_args[0][0]
+    sql = next(c[0][0] for c in cur.execute.call_args_list if "INSERT INTO position_stops" in c[0][0])
     for frag in ("trail_amount      = NULL", "trail_percent     = NULL", "profit_target_taken = FALSE"):
         assert frag in sql
 

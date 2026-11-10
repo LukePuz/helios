@@ -535,6 +535,7 @@ def run_scan(regime_packet: dict | None = None) -> dict:
                 "ticker": ticker,
                 "reason": reason,
                 "composite_score": composite,
+                "priority": "PASS",     # other entries are skips (no price, blackout)
             })
         else:
             candidates.append(candidate)

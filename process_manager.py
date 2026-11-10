@@ -314,6 +314,18 @@ def start(name: str) -> str:
         # A value already set in the environment wins.
         if _is_celery_worker(name) and "MALLOC_ARENA_MAX" not in __import__("os").environ:
             extra["MALLOC_ARENA_MAX"] = "2"
+        # Native-library settings for every Celery worker (audit 2026-11-08
+        # 15:08 #2/#3), each only if not already set: pyarrow's system
+        # allocator (the default segfaulted on threaded pandas work);
+        # one OpenBLAS thread, so the master isn't multi-threaded when it
+        # forks its pool; and Python's fault handler, so a native crash
+        # leaves a stack in the worker log.
+        if _is_celery_worker(name):
+            for k, v in (("ARROW_DEFAULT_MEMORY_POOL", "system"),
+                         ("OPENBLAS_NUM_THREADS", "1"),
+                         ("PYTHONFAULTHANDLER", "1")):
+                if k not in __import__("os").environ:
+                    extra[k] = v
         env      = {**__import__("os").environ, **extra}
         _rotate_log_if_large(svc["log"])
         log_file = open(svc["log"], "a", encoding="utf-8")
@@ -340,11 +352,15 @@ def start(name: str) -> str:
 # on every pool child killed whatever task was running (21 WorkerLostError on
 # 10-28, all at restarts). SIGTERM to the worker's main process alone makes
 # Celery stop taking tasks and wait for the running ones; after the grace
-# period the rest is killed. The LLM worker gets the 72B timeout (400 s) plus
-# margin; the others' tasks are short, except the ingestion worker's ~2.5 h
+# period the rest is killed. The LLM worker gets 390 s, so the whole stop fits
+# TimeoutStopSec=480: beat 5 + LLM 390 + orders 60 = 455, plus margin for
+# psutil and the dashboard (audit 2026-11-08 15:08 #5; at 420 it was 485 and
+# the orders worker could be SIGKILLed by systemd). main's Telegram join
+# overlaps this. A 72B call that started more than 390 s before the stop is near
+# its own 400 s timeout anyway. The others' tasks are short, except the ingestion worker's ~2.5 h
 # S&P refresh, which still gets cut off; it resumes on the next run and the
 # weekday catch-up (tasks.refresh_sp500_history_catchup).
-_CELERY_GRACE_S = {"celery_llm_worker": 420}
+_CELERY_GRACE_S = {"celery_llm_worker": 390}
 _DEFAULT_CELERY_GRACE_S = 60
 _OTHER_GRACE_S = 5
 
@@ -419,10 +435,13 @@ def stop(name: str) -> str:
     return result
 
 
-def stop_all() -> dict[str, str]:
+def stop_all(before_orders=None) -> dict[str, str]:
     """Stop every service: beat first (no new tasks), then everything else
     asked at once and waited on in parallel, so the whole stop takes about
-    the longest grace period rather than the sum."""
+    the longest grace period rather than the sum. before_orders, if given,
+    runs just before the orders worker is stopped (main waits there for a
+    Telegram approval, whose stop goes through the orders worker); its
+    errors are ignored."""
     import time
     results = {}
     if "celery_beat" in _load():
@@ -439,6 +458,11 @@ def stop_all() -> dict[str, str]:
             results[name] = str(e)
     for name, (proc, deadline) in pending.items():
         results[name] = _finish_stop(name, proc, deadline)
+    if before_orders is not None:
+        try:
+            before_orders()
+        except Exception:
+            pass
     if "celery_orders_worker" in _load():
         results["celery_orders_worker"] = stop("celery_orders_worker")
     pids = _load()

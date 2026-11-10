@@ -78,13 +78,11 @@ _LEAD_DAYS = 7
 
 def verdict_query(since: datetime | None):
     """SQL and params for the verdict read; the filter mirrors
-    db.get_recent_verdicts without the per-ticker and time-window terms."""
-    import db
-    from config import TRADING_ENV
-    sql = ("SELECT id, symbol, timestamp, signal, confidence FROM signals "
-           "WHERE signal NOT IN %s AND symbol IS NOT NULL AND timestamp IS NOT NULL "
-           "AND (trading_env=%s OR (trading_env IS NULL AND COALESCE(reasoning, '') NOT LIKE %s)) ")
-    params = [db._NON_ANALYST_SIGNALS, TRADING_ENV, db.DEGRADED_SIGNAL_PREFIX + "%"]
+    db.get_recent_verdicts without the per-ticker and time-window terms
+    (verdict_rows.LABELS_RULE)."""
+    from helios3d.record.verdict_rows import LABELS_RULE, labels_rule_params
+    sql = "SELECT id, symbol, timestamp, signal, confidence FROM signals WHERE " + LABELS_RULE
+    params = list(labels_rule_params())
     if since is not None:
         sql += "AND timestamp >= %s "
         params.append(since)

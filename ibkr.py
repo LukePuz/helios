@@ -18,6 +18,7 @@ Set in .env:
   IB_PORT=7497                # optional override; normally derived from TRADING_ENV
   IB_CLIENT_ID=1               # optional override; normally derived from TRADING_ENV
 """
+import copy
 import logging
 import os
 from pathlib import Path
@@ -130,6 +131,177 @@ def get_account_stock_value() -> float:
     raise RuntimeError("no GrossPositionValue or StockMarketValue in the account view")
 
 
+def _commission_record(trade, fill, report) -> dict:
+    """The fields of one execution's commission report for its activity row.
+    Missing fields read None."""
+    def g(obj, *names):
+        for n in names:
+            obj = getattr(obj, n, None) if obj is not None else None
+        return obj
+    commission = g(report, "commission")
+    try:
+        commission = float(commission) if commission is not None else None
+    except (TypeError, ValueError):
+        commission = None
+    return {"exec_id": g(report, "execId") or g(fill, "execution", "execId"),
+            "order_id": g(trade, "order", "orderId"),
+            "perm_id": g(trade, "order", "permId") or g(fill, "execution", "permId") or None,
+            "side": g(fill, "execution", "side"),
+            "shares": g(fill, "execution", "shares"),
+            "price": g(fill, "execution", "price"),
+            "commission": commission,
+            "currency": g(report, "currency"),
+            # The execution's own time; with the row's time it tells a live
+            # report from one replayed at connect (SEF 148).
+            "exec_time": (lambda t: t.isoformat() if hasattr(t, "isoformat") else None)(
+                g(fill, "execution", "time"))}
+
+
+# TWS re-sends every execution of the day, with its commission report, on
+# each connect (ib_async's startup fetch calls reqExecutions) and on each
+# reconcile reqExecutions, so the same report arrives many times (professor
+# 64o). A row is written once per exec_id: a per-process seen set, then a
+# Redis SET NX shared by all processes. One writer thread per process drains
+# a queue, so a burst opens one DB session at a time.
+_COMMISSION_SEEN: set = set()
+_COMMISSION_QUEUE: "queue.Queue | None" = None
+_COMMISSION_WRITER = None      # (pid, thread): a forked child starts its own
+_COMMISSION_REDIS = None
+_COMMISSION_KEY = "helios:commission:"
+_COMMISSION_KEY_TTL_S = 5 * 86400
+# TWS sends a placeholder (UNSET_DOUBLE, about 1.8e308) before the real
+# commission is known; ib_async passes it through.
+_COMMISSION_PLACEHOLDER = 1e300
+# Rows waiting for the writer thread. A stalled DB must not grow memory
+# without limit; when full, new rows are dropped with a warning, since a
+# put here runs on the ib_async event loop and must never block (audit
+# 2026-11-08 15:08 #6).
+_COMMISSION_QUEUE_MAX = 500
+
+
+def _commission_redis():
+    """Short-timeout Redis client for the exec_id claim, cached per process."""
+    global _COMMISSION_REDIS
+    if _COMMISSION_REDIS is None:
+        import redis
+        _COMMISSION_REDIS = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+                                                 socket_timeout=0.5, socket_connect_timeout=0.5)
+    return _COMMISSION_REDIS
+
+
+def _claim_commission(exec_id: str) -> bool:
+    """True the first time any process claims this exec_id (Redis SET NX).
+    Redis down: True, so the per-process set alone decides (rows can then
+    repeat across processes). Called from the writer thread, never the
+    ib_async event loop (professor 64p)."""
+    try:
+        return bool(_commission_redis().set(_COMMISSION_KEY + exec_id, "1", nx=True,
+                                            ex=_COMMISSION_KEY_TTL_S))
+    except Exception as e:
+        log.debug(f"commission claim: Redis unavailable ({e}); per-process dedup only")
+        return True
+
+
+def _unclaim_commission(exec_id: str) -> None:
+    """Releases a claim whose row was not written, so another process can."""
+    try:
+        _commission_redis().delete(_COMMISSION_KEY + exec_id)
+    except Exception:
+        pass
+
+
+def _write_commission(symbol: str, rec: dict) -> None:
+    """Claims the exec_id, then writes its row. A write that raises releases
+    the claim; one that returns False was spilled, and the spill replay is its
+    retry, so the claim stays (professor 64q). Never raises."""
+    exec_id = str(rec["exec_id"])
+    try:
+        if not _claim_commission(exec_id):
+            return
+        import db
+        db.log_activity_direct(
+            "order_commission", symbol,
+            f"Commission {rec['commission']} {rec['currency'] or ''} on {rec['side'] or '?'} "
+            f"{rec['shares']} {symbol} (exec {exec_id})", "neutral",
+            {**rec, "env": db.TRADING_ENV})
+    except Exception as e:
+        _unclaim_commission(exec_id)
+        log.warning(f"[{symbol}] commission record failed: {e}")
+
+
+def _commission_writer(q) -> None:
+    while True:
+        symbol, rec = q.get()
+        try:
+            _write_commission(symbol, rec)
+        finally:
+            q.task_done()
+
+
+def drain_commission_queue(timeout_s: float = 10.0) -> None:
+    """Waits, at most timeout_s, for this process's writer to finish the rows
+    it has, so a pool child exiting through os._exit doesn't drop a row it
+    already claimed (audit 2026-11-08 15:08 #6). Never raises."""
+    try:
+        import time as _time
+        w, q = _COMMISSION_WRITER, _COMMISSION_QUEUE
+        if q is None or w is None or w[0] != os.getpid() or not w[1].is_alive():
+            return
+        deadline = _time.monotonic() + timeout_s
+        while q.unfinished_tasks and _time.monotonic() < deadline:
+            _time.sleep(0.05)
+        if q.unfinished_tasks:
+            # Rows still queued are not claimed yet, so TWS's replay of
+            # commission reports at the next connect can still write them.
+            log.warning(f"commission queue: {q.unfinished_tasks} row(s) not written at exit; "
+                        f"unclaimed ones are written from the next replay")
+    except Exception as e:
+        log.debug(f"commission drain failed: {e}")
+
+
+def _enqueue_commission(symbol: str, rec: dict) -> None:
+    """Queues a row for this process's writer thread, starting one when there
+    is none, when it died, or in a forked child (the parent's thread does not
+    run there)."""
+    global _COMMISSION_QUEUE, _COMMISSION_WRITER
+    import queue
+    import threading
+    w = _COMMISSION_WRITER
+    if _COMMISSION_QUEUE is None or w is None or w[0] != os.getpid() or not w[1].is_alive():
+        _COMMISSION_QUEUE = queue.Queue(maxsize=_COMMISSION_QUEUE_MAX)
+        t = threading.Thread(target=_commission_writer, args=(_COMMISSION_QUEUE,),
+                             name="order-commission", daemon=True)
+        t.start()
+        _COMMISSION_WRITER = (os.getpid(), t)
+    try:
+        _COMMISSION_QUEUE.put_nowait((symbol, rec))
+    except queue.Full:
+        log.warning(f"[{symbol}] commission queue full ({_COMMISSION_QUEUE_MAX}); "
+                    f"row for exec {rec.get('exec_id')} not recorded")
+
+
+def _on_commission_report(trade, fill, report) -> None:
+    """commissionReportEvent handler: one activity row (stage
+    order_commission) per execution, so costs can be counted (audit
+    2026-11-07 07:07 #4: no commission was recorded anywhere). TWS sends the
+    report after the fill, sometimes much later (MSFT 11-03: 43 min), so it
+    can't be read when place_market_order returns. Placeholder reports are
+    skipped and not claimed, so the real one is still written. Never raises."""
+    try:
+        rec = _commission_record(trade, fill, report)
+        c = rec["commission"]
+        if c is None or not (abs(c) < _COMMISSION_PLACEHOLDER):
+            return
+        exec_id = str(rec["exec_id"] or "")
+        if not exec_id or exec_id in _COMMISSION_SEEN:
+            return
+        _COMMISSION_SEEN.add(exec_id)
+        symbol = getattr(getattr(trade, "contract", None), "symbol", None) or "?"
+        _enqueue_commission(symbol, rec)
+    except Exception as e:
+        log.warning(f"commission report handler failed: {e}")
+
+
 def get_ib(max_attempts: int = 3) -> ibi.IB:
     global _ib, _last_heartbeat, _client_id, _connected_at, _last_connectivity_error_at
     import asyncio
@@ -142,6 +314,10 @@ def get_ib(max_attempts: int = 3) -> ibi.IB:
                     _ib.errorEvent += _on_ib_error
                 except Exception as e:
                     log.warning(f"could not attach the IBKR error handler: {e}")
+                try:
+                    _ib.commissionReportEvent += _on_commission_report
+                except Exception as e:
+                    log.warning(f"could not attach the IBKR commission handler: {e}")
             if not _ib.isConnected():
                 cid = _get_client_id()
                 try:
@@ -206,19 +382,24 @@ def disconnect() -> None:
         log.info("Disconnected from IBKR TWS.")
 
 
-def _bounded_req(ib: ibi.IB, what: str, fn, *args):
+def _bounded_req(ib: ibi.IB, what: str, fn, *args, drop_session: bool = True):
     """Runs one IB read with a bound. ib_async waits for the reply with no
     timeout by default (RequestTimeout 0), so a read TWS never answers hangs
     the task. On a timeout the session is dropped before raising: open
     orders, completed orders and positions share one fixed request key, so
     a late reply to the timed-out read would end the next one early and it
-    would come back short (a resting stop read as missing)."""
+    would come back short (a resting stop read as missing). Requests with
+    their own reqId (contract details) pass drop_session=False: a late reply
+    to those can't be mistaken for another one."""
     global _ib, _last_heartbeat
     prev = ib.RequestTimeout
     ib.RequestTimeout = _REQ_TIMEOUT_S
     try:
         return fn(*args)
     except TimeoutError:
+        if not drop_session:
+            log.warning(f"IBKR {what} got no reply in {_REQ_TIMEOUT_S}s")
+            raise TimeoutError(f"IBKR {what} timed out after {_REQ_TIMEOUT_S}s") from None
         log.warning(f"IBKR {what} got no reply in {_REQ_TIMEOUT_S}s; dropping the session")
         try:
             ib.disconnect()
@@ -232,13 +413,28 @@ def _bounded_req(ib: ibi.IB, what: str, fn, *args):
         ib.RequestTimeout = prev
 
 
+# Qualified contracts by ticker, per process. A conId doesn't change, so
+# after the first lookup _stock needs no request, and a cancel-then-place
+# sequence can't stall on contract details while the position has no stop
+# (audit 2026-11-08 17:17 #6).
+_QUALIFIED: dict[str, ibi.Contract] = {}
+
+
 def _stock(ib: ibi.IB, ticker: str) -> ibi.Stock:
     # Must be qualified (conId populated) before use — ib_async hashes
     # Contract objects internally (market data/order tracking dicts), which
     # raises "can't be hashed because no 'conId' value exists" on a bare
     # Stock(). ib_insync tolerated this; ib_async does not.
+    # Bounded like the other reads: an unanswered contract-details request
+    # hung the task with no timeout (audit 2026-11-08 15:08 #8). Its reply has
+    # its own reqId, so a timeout keeps the session.
+    cached = _QUALIFIED.get(ticker)
+    if cached is not None:
+        return copy.copy(cached)
     contract = ibi.Stock(ticker, "SMART", "USD")
-    ib.qualifyContracts(contract)
+    _bounded_req(ib, f"qualify {ticker}", ib.qualifyContracts, contract, drop_session=False)
+    if getattr(contract, "conId", 0):
+        _QUALIFIED[ticker] = copy.copy(contract)
     return contract
 
 
@@ -357,6 +553,67 @@ def get_fresh_stock_positions() -> dict[str, float]:
     return out
 
 
+_MD_TYPE_LABELS = {1: "live", 2: "frozen", 3: "delayed", 4: "delayed_frozen"}
+
+
+def _quote_snapshot(td) -> dict:
+    """The quote a market order was sent on: its data type (TWS marketDataType:
+    live, frozen, delayed, delayed_frozen) and its age when the order went
+    (audit 2026-11-07 01:08 #6: every placed order ran on delayed quotes, and
+    no order row said so). Fields TWS didn't send are None. Never raises."""
+    import datetime as _dt
+    import math
+    out = {"md_type": None, "md_type_label": None, "bid": None, "ask": None,
+           "last": None, "quote_time": None, "quote_age_s": None}
+    try:
+        md_type = getattr(td, "marketDataType", None)
+        if isinstance(md_type, int):
+            out["md_type"], out["md_type_label"] = md_type, _MD_TYPE_LABELS.get(md_type)
+        for k in ("bid", "ask", "last"):
+            v = getattr(td, k, None)
+            if isinstance(v, (int, float)) and math.isfinite(v) and v > 0:
+                out[k] = float(v)
+        t = getattr(td, "time", None)
+        if isinstance(t, _dt.datetime):
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=_dt.timezone.utc)
+            out["quote_time"] = t.isoformat()
+            out["quote_age_s"] = round((_dt.datetime.now(_dt.timezone.utc) - t).total_seconds(), 1)
+    except Exception as e:
+        log.warning(f"quote snapshot failed: {e}")
+    return out
+
+
+def _record_order_quote(ticker: str, side: str, result: dict):
+    """Writes the order's quote snapshot to an activity row (stage order_quote)
+    keyed by broker order id; the orders table has no column for it. On a
+    daemon thread, so a slow DB (log_activity_direct's own connection, up to
+    ~10 s of timeouts) can't delay the return, and with it a BUY's stop
+    (professor 63q). Returns the thread. Never raises."""
+    import threading
+    try:
+        t = threading.Thread(target=_write_order_quote, args=(ticker, side, dict(result)),
+                             name="order-quote", daemon=True)
+        t.start()
+        return t
+    except Exception as e:
+        log.warning(f"[{ticker}] order quote record failed: {e}")
+        return None
+
+
+def _write_order_quote(ticker: str, side: str, result: dict) -> None:
+    try:
+        import db
+        q = result.get("quote") or {}
+        db.log_activity_direct(
+            "order_quote", ticker,
+            f"{side} market order sent on a {q.get('md_type_label') or 'unknown'} quote"
+            f" (age {q.get('quote_age_s')}s)", "neutral",
+            {**q, "order_id": result.get("order_id"), "side": side, "env": db.TRADING_ENV})
+    except Exception as e:
+        log.warning(f"[{ticker}] order quote record failed: {e}")
+
+
 def place_market_order(ticker: str, side: str, qty: float, fill_timeout: float = 30.0,
                        on_submitted=None) -> dict:
     """
@@ -393,6 +650,7 @@ def place_market_order(ticker: str, side: str, qty: float, fill_timeout: float =
     ib.reqMarketDataType(3)
     td = ib.reqMktData(contract, "", False, False)
     ib.sleep(1)
+    quote = _quote_snapshot(td)
 
     order = ibi.MarketOrder(side.upper(), qty)
     order.tif = "DAY"  # market orders must not persist across sessions
@@ -456,7 +714,7 @@ def place_market_order(ticker: str, side: str, qty: float, fill_timeout: float =
 
     # fill_time from the executions, so an immediate close records when it
     # filled, not only problem orders that reconcile later (professor m128).
-    return _with_fill_time({
+    result = _with_fill_time({
         "order_id":   trade.order.orderId,
         # Assigned by TWS after placeOrder, so 0 until its first status
         # message; read after the fill wait (professor M127). openOrder sets
@@ -469,7 +727,10 @@ def place_market_order(ticker: str, side: str, qty: float, fill_timeout: float =
         "filled_qty": filled_qty,
         "fill_price": fill_price,
         "status":     status,
+        "quote":      quote,
     }, getattr(trade, "fills", None) or [])
+    _record_order_quote(ticker, side.upper(), result)
+    return result
 
 
 def _compute_marketable_limit(ib: ibi.IB, contract: ibi.Stock, side: str,
@@ -991,10 +1252,12 @@ def _weighted_exec_price(fills, total_qty: float) -> float:
 
 def _with_fill_time(result: dict, records) -> dict:
     """Adds fill_time, the last execution's time, when the executions carry
-    one (professor M110: a late close otherwise has only its recording time)."""
+    one (professor M110: a late close otherwise has only its recording time),
+    and fill_time_source, that time's source from _fill_time_and_source
+    ("receipt" or "execution"; orders.filled_at_source)."""
     timed = [(t, src) for t, src in (_fill_time_and_source(r) for r in records) if t is not None]
     if timed:
-        result["fill_time"] = max(t for t, _ in timed)
+        result["fill_time"], result["fill_time_source"] = max(timed, key=lambda ts: ts[0])
         n_receipt = sum(1 for _, src in timed if src == "receipt")
         log.info(f"fill_time from {len(timed)} record(s): {n_receipt} receipt time, "
                  f"{len(timed) - n_receipt} execution-time fallback")

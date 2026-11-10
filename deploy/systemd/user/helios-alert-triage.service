@@ -1,0 +1,14 @@
+[Unit]
+Description=Helios Telegram outbox triage (scripts/alert_triage.py)
+
+# Read-only apart from logs/.alert_triage_cursor.json. Output goes to
+# logs/alert_triage.log; a new critical alert type, or a failed run, adds an
+# ERROR line there for whoever reads the logs. Nothing is sent anywhere.
+# Exit 2 is read as a new critical type; argparse usage errors also exit 2,
+# so check any flag added to ExecStart by hand first.
+[Service]
+Type=oneshot
+TimeoutStartSec=120
+WorkingDirectory=%h/Desktop/trading_bot
+ExecStart=/bin/sh -c 'echo "== $$(date -Is)" >> logs/alert_triage.log; venv/bin/python scripts/alert_triage.py >> logs/alert_triage.log 2>&1; rc=$$?; if [ $$rc -eq 2 ]; then echo "$$(date -Is) ERROR alert_triage: new critical alert type in the Telegram outbox" >> logs/alert_triage.log; elif [ $$rc -ne 0 ]; then echo "$$(date -Is) ERROR alert_triage: exited $$rc" >> logs/alert_triage.log; fi; exit 0'
+Nice=10

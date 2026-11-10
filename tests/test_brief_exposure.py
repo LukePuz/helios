@@ -12,9 +12,12 @@ def test_records_the_verdicts_shown_and_broker_held():
     with patch("db.get_position_stop", return_value={"stop_price": 160.0}), \
          patch("tasks._snapshot_positions_or_none", return_value={"NVDA": {"qty": 1, "market_value": 200}}):
         out = analyst._brief_exposure("NVDA", _PROMPT)
-    assert out == {"position_context_shown": True,
+    assert isinstance(out.pop("read_at"), str)
+    assert out == {"position_context_shown": True, "position_context_status": None,
+                   "stop_shown": 160.0, "stop_shown_pct": None,
                    "prior_verdicts_shown": ["2026-10-30 HOLD c6", "2026-10-30 HOLD c7", "2026-10-30 HOLD c6"],
-                   "has_stop_row": True, "held_broker": True, "held_broker_reason": "snapshot"}
+                   "has_stop_row": True, "prior_verdicts_before_open": None,
+                   "held_broker": True, "held_broker_reason": "snapshot"}
 
 
 def test_broker_position_without_a_stop_row_is_visible():
@@ -89,3 +92,92 @@ def test_held_at_gate_records_the_read_time_and_age():
         "held_at_gate": True, "held_at_gate_as_of": "2026-11-02T14:01:30+00:00", "held_at_gate_age_s": 210}
     assert analyst._held_at_gate({"held": None}, now=now) == {
         "held_at_gate": None, "held_at_gate_as_of": None, "held_at_gate_age_s": None}
+
+
+def test_counts_shown_verdicts_from_before_the_position_opened():
+    """Audit 11-06 05:33 #2d: after a re-entry the section can show the
+    earlier position's verdicts."""
+    from datetime import datetime, timezone
+    opened = datetime(2026, 11, 5, 16, 8, tzinfo=timezone.utc)
+    verdicts = [{"timestamp": datetime(2026, 11, 6, 11, 38, tzinfo=timezone.utc)},
+                {"timestamp": datetime(2026, 11, 5, 14, 0, tzinfo=timezone.utc)},
+                {"timestamp": datetime(2026, 11, 4, 15, 0, tzinfo=timezone.utc)}]
+    with patch("db.get_position_stop", return_value={"stop_price": 160.0, "opened_at": opened}), \
+         patch("db.get_position_context", return_value={"recent_verdicts": verdicts}), \
+         patch("tasks._snapshot_positions_or_none", return_value={}):
+        assert analyst._brief_exposure("NVDA", _PROMPT)["prior_verdicts_before_open"] == 2
+
+
+def test_before_open_count_is_none_when_unreadable_and_absent_without_a_section():
+    from datetime import datetime, timezone
+    rec = {"stop_price": 160.0, "opened_at": datetime(2026, 11, 5, tzinfo=timezone.utc)}
+    with patch("db.get_position_stop", return_value=rec), \
+         patch("db.get_position_context", side_effect=RuntimeError("pool exhausted")), \
+         patch("tasks._snapshot_positions_or_none", return_value={}):
+        assert analyst._brief_exposure("NVDA", _PROMPT)["prior_verdicts_before_open"] is None
+        assert "prior_verdicts_before_open" not in analyst._brief_exposure("NVDA", "no section")
+    with patch("db.get_position_stop", side_effect=RuntimeError("db down")), \
+         patch("tasks._snapshot_positions_or_none", return_value={}):
+        assert analyst._brief_exposure("NVDA", _PROMPT)["prior_verdicts_before_open"] is None
+
+
+def test_before_open_count_is_none_when_the_context_query_failed():
+    """get_position_context returns {} on a query error (professor 58m)."""
+    from datetime import datetime, timezone
+    rec = {"stop_price": 160.0, "opened_at": datetime(2026, 11, 5, tzinfo=timezone.utc)}
+    with patch("db.get_position_stop", return_value=rec), \
+         patch("db.get_position_context", return_value={}), \
+         patch("tasks._snapshot_positions_or_none", return_value={}):
+        assert analyst._brief_exposure("NVDA", _PROMPT)["prior_verdicts_before_open"] is None
+    with patch("db.get_position_stop", return_value=rec), \
+         patch("db.get_position_context", return_value={"recent_verdicts": []}), \
+         patch("tasks._snapshot_positions_or_none", return_value={}):
+        assert analyst._brief_exposure("NVDA", _PROMPT)["prior_verdicts_before_open"] == 0
+
+
+def test_records_the_stop_shown_and_the_downside_against_it():
+    prompt = ("=== POSITION CONTEXT — NVDA (held) ===\n"
+              "Entry $180.00; protective stop $165.50 (-8.1% from current price) [atr]\n=== X ===")
+    with patch("db.get_position_stop", return_value=None), \
+         patch("tasks._snapshot_positions_or_none", return_value={}):
+        out = analyst._brief_exposure("NVDA", prompt)
+    assert out["stop_shown"] == 165.5 and out["stop_shown_pct"] == -8.1
+    assert analyst._downside_vs_stop_shown({"valuation": {"downside_scenario": "$165.50"}}, 165.5) == 0.0
+    assert analyst._downside_vs_stop_shown({"valuation": {"downside_scenario": "$150"}}, 165.5) == -0.0937
+    assert analyst._downside_vs_stop_shown({"valuation": {"downside_scenario": "Unknown"}}, 165.5) is None
+    assert analyst._downside_vs_stop_shown({}, None) is None
+
+
+def test_position_context_status_says_why_the_section_is_out():
+    """Audit 11-06 23:24 #10: a DB error no longer reads as "not held"; the
+    brief is unchanged and the status records why."""
+    from unittest.mock import patch
+    import context_engine
+    context_engine._POSITION_CONTEXT_STATUS.clear()
+    with patch("config.BRIEF_POSITION_CONTEXT", True):
+        with patch("db.get_position_stop", side_effect=RuntimeError("pool")) as gs:
+            assert context_engine._position_context_section("NVDA", 100.0) == ""
+        assert gs.call_args.kwargs == {"strict": True}
+        assert context_engine.position_context_status("NVDA") == "error:RuntimeError"
+        with patch("db.get_position_stop", return_value=None):
+            context_engine._position_context_section("AMD", 100.0)
+        assert context_engine.position_context_status("AMD") == "not_held"
+        stop = {"entry_price": 90.0, "stop_price": 80.0, "opened_at": None}
+        with patch("db.get_position_stop", return_value=stop), \
+             patch("db.get_position_context", side_effect=RuntimeError("pool")):
+            assert "protective stop $80.00" in context_engine._position_context_section("TSM", 100.0)
+        assert context_engine.position_context_status("TSM") == "shown_partial:RuntimeError"
+        import pytest
+        with patch("db.get_position_stop", return_value={"entry_price": None, "stop_price": 80.0}), \
+             patch("db.get_position_context", return_value={}):
+            with pytest.raises(TypeError):
+                context_engine._position_context_section("ARM", 100.0)
+        assert context_engine.position_context_status("ARM") == "error:TypeError"
+    with patch("config.BRIEF_POSITION_CONTEXT", False):
+        context_engine._position_context_section("MU", 100.0)
+    assert context_engine.position_context_status("MU") == "off"
+    assert context_engine.position_context_status("QQQ") is None
+    from agents.analyst import _brief_exposure
+    with patch("db.get_position_stop", return_value=None):
+        assert _brief_exposure("NVDA", "")["position_context_status"] == "error:RuntimeError"
+    context_engine._POSITION_CONTEXT_STATUS.clear()

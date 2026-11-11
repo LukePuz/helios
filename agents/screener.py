@@ -342,6 +342,59 @@ try:
 except Exception:
     TONE_SHA = None
 
+# Log-only (audit 2026-11-10 10:53 #5): headline forms of a hard company
+# catalyst. The 7B dropped RKLB/ASTS/QUBT Q3 results and TER guidance on
+# 11-10. catalyst_shadow records whether a deterministic rule would pass the
+# item; nothing reads it back. All matches are recorded, in this order.
+_CATALYST_PATTERNS = [
+    ("earnings_results", re.compile(
+        r"\b(?:q[1-4]|(?:first|second|third|fourth)[-\s]quarter|quarterly|fiscal)\b[^.]{0,40}?"
+        r"\b(?:results?|earnings|loss(?:es)?|profits?|revenues?|sales|eps)\b"
+        r"|\b(?:earnings|eps|revenues?|sales)\s+(?:beats?|miss(?:es)?|tops?|tops|falls?\s+short)\b"
+        r"|\b(?:beats?|miss(?:es)?|tops)\s+(?:[\w-]+\s+){0,3}?(?:estimates|expectations|consensus)\b", re.I)),
+    ("guidance", re.compile(
+        r"\b(?:raises?|raised|cuts?|lowers?|lowered|boosts?|lifts?|reaffirms?|projects?|issues?|"
+        r"withdraws?|hikes?|trims?|ups)\s+(?:[\w$%.-]+\s+){0,4}?(?:guidance|outlook|forecasts?)\b"
+        r"|\b(?:guidance|outlook|forecast)\s+(?:raise|cut|hike|boost)\b", re.I)),
+    ("contract", re.compile(
+        r"\b(?:wins?|won|awarded|secures?|secured|lands?|landed|signs?|signed|inks?|inked)\b"
+        r"[^.]{0,50}?\b(?:contracts?|awards?|deals?|orders?|agreements?)\b", re.I)),
+    ("rating_change", re.compile(
+        r"\b(?:upgrades?|upgraded|downgrades?|downgraded|initiates?|initiated)\b"
+        r"|\bprice\s+targets?\b|\bPT\s+(?:raised|cut|lowered|to)\b", re.I)),
+]
+
+# An earnings preview names the results it is waiting for; not a catalyst yet.
+_CATALYST_PREVIEW = re.compile(
+    r"\b(?:preview|what\s+to\s+expect|ahead\s+of|on\s+deck|upcoming|before\s+(?:its\s+|the\s+)?"
+    r"(?:q[1-4]\s+)?(?:results|earnings|report)|(?:set|due|scheduled|expected)\s+to\s+report|"
+    r"to\s+report\s+(?:q[1-4]|earnings|results))\b", re.I)
+
+try:
+    _CATALYST_PATTERNS_SHA = _opinion_patterns_sha(_CATALYST_PATTERNS + [("preview", _CATALYST_PREVIEW)])
+except Exception:
+    _CATALYST_PATTERNS_SHA = None
+
+
+def _catalyst_shadow(ticker: str, title: str, relevant, opinion_match) -> dict:
+    """Log-only record of what a deterministic catalyst rule would do: pass
+    when the title names the ticker or its company and matches a catalyst
+    form, unless it is an opinion headline or an earnings preview. would_rescue: the rule would
+    pass what the screener did not. Never raises."""
+    rec = {"matches": [], "preview": False, "names_ticker": None, "would_pass": False,
+           "would_rescue": False, "patterns_sha": _CATALYST_PATTERNS_SHA, "error": None}
+    try:
+        text = title or ""
+        rec["matches"] = [name for name, pat in _CATALYST_PATTERNS if pat.search(text)]
+        rec["preview"] = bool(_CATALYST_PREVIEW.search(text))
+        rec["names_ticker"] = _title_names_ticker(ticker, text)
+        rec["would_pass"] = (bool(rec["matches"]) and rec["names_ticker"] is True
+                             and not opinion_match and not rec["preview"])
+        rec["would_rescue"] = rec["would_pass"] and relevant is not True
+    except Exception as e:
+        rec["error"] = type(e).__name__
+    return rec
+
 
 def _opinion_headlines(title) -> list[str]:
     """Names of every _OPINION_PATTERNS entry the title matches, in list order."""
@@ -762,6 +815,8 @@ def screen(event: dict) -> dict:
         log.debug(f"[{ticker}] opinion_shadow failed: {e}")
         opinion_shadow = {"match": None, "matches": [], "would_drop": False,
                           "patterns_sha": _OPINION_PATTERNS_SHA, "error": type(e).__name__}
+    catalyst_shadow = _catalyst_shadow(ticker, title, result.get("relevant"),
+                                       opinion_shadow.get("match"))
 
     # Provenance for the SCREENED_OUT signal row (SEF run 7, 2026-10-28):
     # those rows had no model or code version, so screener rejections couldn't
@@ -792,6 +847,7 @@ def screen(event: dict) -> dict:
             "title_names_ticker": _title_names_ticker(ticker, title),
             "would_pass_held_negative": held_negative_shadow,
             "opinion_shadow": opinion_shadow,
+            "catalyst_shadow": catalyst_shadow,
             # How much of the event text the 7B saw (audit 2026-11-05-0725 #10;
             # G54). Log-only.
             "content_len": len(event.get("text") or ""),

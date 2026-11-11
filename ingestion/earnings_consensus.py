@@ -104,9 +104,15 @@ def _yf_version() -> str | None:
 def _trend_end_dates(yf_ticker) -> dict:
     """{period: endDate} from the earningsTrend items yfinance already
     fetched (Ticker._analysis._earnings_trend; its _get_periodic_df drops
-    endDate). {} when they aren't there. Never raises."""
+    endDate). {} when they aren't there. Never raises. yfinance <= 1.5 keeps
+    the trend list itself; 1.8 keeps {methodology: module} with the list
+    under 'trend', where None is Yahoo's default methodology (the one
+    earnings_estimate / revenue_estimate read)."""
     try:
         trend = getattr(getattr(yf_ticker, "_analysis", None), "_earnings_trend", None)
+        if isinstance(trend, dict):
+            module = trend.get(None)
+            trend = module.get("trend") if isinstance(module, dict) else None
         out = {}
         for item in trend if isinstance(trend, list) else []:
             if not isinstance(item, dict) or item.get("period") not in QUARTER_PERIODS:

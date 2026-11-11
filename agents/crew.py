@@ -1985,6 +1985,49 @@ def _atr_brief(ticker: str) -> dict | None:
     except Exception:
         return None
 
+def _add_context(ticker: str, price, sizing: dict, trading_client) -> dict:
+    """Log-only (audit 2026-11-10 16:53 #2): where an ADD buys relative to
+    the position it adds to. kept_stop is max(sizing's new stop, the stop
+    record), the whole-position level an add keeps (execution.
+    _whole_position_stop); stop_distance_atr is (price - kept_stop) / the
+    sizing ATR; below_avg_cost compares the price with the broker's average
+    cost (portfolio cache, may lag). NVDA 11-10 15:07 bought 0.35 ATR above
+    its kept stop, ~10% below average cost. Never raises."""
+    rec = {"price": None, "new_stop": None, "record_stop": None, "kept_stop": None,
+           "atr": None, "stop_distance_atr": None, "avg_cost": None, "below_avg_cost": None,
+           "pct_vs_avg_cost": None, "error": None}
+    try:
+        import db
+        px = float(price) if price else None
+        rec["price"] = px
+        new_stop = sizing.get("stop_loss_price")
+        rec["new_stop"] = float(new_stop) if new_stop else None
+        try:
+            prior = db.get_position_stop(ticker, strict=True)
+            rec["record_stop"] = float(prior["stop_price"]) if prior and prior.get("stop_price") else None
+        except Exception as e:
+            rec["error"] = f"stop record: {type(e).__name__}"
+        stops = [x for x in (rec["new_stop"], rec["record_stop"]) if x]
+        rec["kept_stop"] = max(stops) if stops else None
+        atr = sizing.get("atr_stop")
+        rec["atr"] = float(atr) if atr else None
+        if px and rec["kept_stop"] and rec["atr"]:
+            rec["stop_distance_atr"] = round((px - rec["kept_stop"]) / rec["atr"], 2)
+        try:
+            pos = trading_client.get_open_position(ticker)
+            avg = float(pos.avg_entry_price)
+            if avg > 0:
+                rec["avg_cost"] = round(avg, 4)
+                if px:
+                    rec["below_avg_cost"] = px < avg
+                    rec["pct_vs_avg_cost"] = round((px / avg - 1) * 100, 2)
+        except Exception as e:
+            rec["error"] = (rec["error"] + "; " if rec["error"] else "") + f"position: {type(e).__name__}"
+    except Exception as e:
+        rec["error"] = type(e).__name__
+    return rec
+
+
 def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
     """
     Run risk sizing on an analyst recommendation and auto-execute it (paper
@@ -2453,6 +2496,9 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
         _attach_gap_risk_shadow(rm, ticker, sizing, price, action)   # log-only, final shares
         sizing["udr_at_sizing"] = _udr_at_sizing(result, price)      # log-only
         sizing["tighten_sizing_shadow"] = _tighten_sizing_shadow(ticker)   # log-only
+        sizing["regime_score"] = regime.get("score")                     # log-only, beside the label
+        if result.get("action") == "ADD":
+            sizing["add_context"] = _add_context(ticker, price, sizing, trading_client)   # log-only
 
         entry_strategy = (
             f"{sizing['initial_entry_pct']:.0%} initial ({sizing['shares_initial']} shares @ ~${price:.2f}). "

@@ -138,7 +138,7 @@ CREATE TABLE IF NOT EXISTS position_stops (
 CREATE TABLE IF NOT EXISTS activity_feed (
     id          SERIAL PRIMARY KEY,
     ts          TIMESTAMPTZ DEFAULT NOW(),
-    stage       VARCHAR(20),
+    stage       VARCHAR(40),
     ticker      VARCHAR(10),
     message     TEXT,
     sentiment   VARCHAR(10) DEFAULT 'neutral',
@@ -911,6 +911,12 @@ _MIGRATIONS: list[tuple[int, str]] = [
     # failed stamp (logged). The quote's own time isn't available from
     # fast_info; exit_benchmark_at is the fetch time.
     (88, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS exit_benchmark_status VARCHAR(16);"),
+    # Three stage names are 21 characters (stale_record_at_entry,
+    # candidate_scan_funnel, quote_fallback_shadow), so their rows failed
+    # ("value too long for type character varying(20)") and went to the
+    # spill file (audit 2026-11-10 16:53 #11). Widening a varchar doesn't
+    # rewrite the table.
+    (89, "ALTER TABLE activity_feed ALTER COLUMN stage TYPE VARCHAR(40);"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -2883,6 +2889,29 @@ def outcome_closed_since(ticker: str, since, entered_since=None) -> dict | None:
             )
             row = cur.fetchone()
         return {"id": row[0], "exit_date": row[1]} if row else None
+    finally:
+        _put_conn(conn)
+
+
+def last_closed_outcome(ticker: str) -> dict | None:
+    """The newest closed trade_outcomes row on the ticker (this environment),
+    by the exit fill time where known, else exit_date: {"id", "entry_date",
+    "exit_at", "outcome_pct", "exit_source"}, or None. Raises on a DB error."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, entry_date, COALESCE(exit_fill_at, exit_date), outcome_pct, exit_source "
+                "FROM trade_outcomes WHERE ticker=%s AND trading_env=%s AND exit_date IS NOT NULL "
+                "ORDER BY COALESCE(exit_fill_at, exit_date) DESC LIMIT 1",
+                (ticker, TRADING_ENV),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return {"id": row[0], "entry_date": row[1], "exit_at": row[2],
+                "outcome_pct": float(row[3]) if row[3] is not None else None,
+                "exit_source": row[4]}
     finally:
         _put_conn(conn)
 

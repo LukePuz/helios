@@ -2165,6 +2165,36 @@ def _regime_entry_record(ticker: str, regime_str: str, model_action: str | None,
     return rec
 
 
+def _last_exit_record(ticker: str, now=None) -> dict:
+    """Record-only (audit 2026-11-10 10:53 #7): the ticker's last closed
+    position on a buy-side verdict, so a re-entry soon after an exit (NVDA
+    11-05: stopped out 09:45, bought back 11:08) can be counted. The brief
+    does not show it. {"exited": False} when none, {"error": <type>} on a
+    read error. Never raises."""
+    from datetime import datetime, timezone
+    try:
+        import db
+        row = db.last_closed_outcome(ticker)
+    except Exception as e:
+        return {"error": type(e).__name__}
+    if not row:
+        return {"exited": False}
+    try:
+        now = now or datetime.now(timezone.utc)
+        exit_at = row["exit_at"]
+        hours = None
+        if isinstance(exit_at, datetime):
+            if exit_at.tzinfo is None:
+                exit_at = exit_at.replace(tzinfo=timezone.utc)
+            hours = round((now - exit_at).total_seconds() / 3600, 2)
+        return {"exited": True, "outcome_id": row["id"],
+                "exit_at": exit_at.isoformat() if hasattr(exit_at, "isoformat") else exit_at,
+                "hours_since_exit": hours, "outcome_pct": row["outcome_pct"],
+                "exit_source": row["exit_source"]}
+    except Exception as e:
+        return {"error": type(e).__name__}
+
+
 _SCAN_REASON_KEYS = ("scan_type", "priority", "composite_score", "technical_score", "momentum_score",
                      "catalyst_score", "thesis_alignment_score", "catalyst_detail",
                      "technical_notes", "momentum_notes", "thesis_notes")
@@ -3088,6 +3118,7 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
     if model_action in ("OPEN", "ADD"):
         provenance["regime_entry"] = _regime_entry_record(ticker, regime_str, model_action,
                                                           regime_rule_fired)
+        provenance["last_exit"] = _last_exit_record(ticker)
     if (trigger or {}).get("path") == "daily_scan":
         # Why the scanner picked it; the prompt shows only the composite
         # (audit 11-07 01:08 #3). Record-only.

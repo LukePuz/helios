@@ -833,14 +833,104 @@ class TestAddStopsWholePosition:
     """2026-10-27 (audit finding 5): an ADD used to overwrite entry_price with
     the add's fill and stop only the added shares."""
 
-    def _run(self, prior, pos_qty=15, avg=105.0, new_stop=95.0, filled=5):
+    def _run(self, prior, pos_qty=15, avg=105.0, new_stop=95.0, filled=5, fresh=None, action=None,
+             status=None, cache_error=None):
+        """fresh: what the fresh reqPositions() read returns, (qty, avg_cost)
+        or an exception; default the same as the portfolio cache."""
         client = MagicMock()
-        client.get_open_position.return_value = MagicMock(qty=pos_qty, avg_entry_price=avg)
+        if cache_error is not None:
+            client.get_open_position.side_effect = cache_error
+        else:
+            client.get_open_position.return_value = MagicMock(qty=pos_qty, avg_entry_price=avg)
+        fresh = (pos_qty, avg) if fresh is None else fresh
+        fresh_kw = ({"side_effect": fresh} if isinstance(fresh, Exception) else {"return_value": fresh})
         with patch("db.get_position_stop", return_value=prior), \
              patch("ibkr.get_client", return_value=client), \
+             patch("ibkr.get_fresh_stock_position", **fresh_kw) as fresh_read, \
              patch("tasks.manage_cancel_stop_orders_for") as cancel:
-            result = execution._whole_position_stop("NVDA", new_stop, filled)
+            result = execution._whole_position_stop("NVDA", new_stop, filled, status=status,
+                                                    action=action)
+        self.fresh_read = fresh_read
         return result, cancel
+
+    def test_lagging_cache_on_an_add_is_corrected_by_the_fresh_read(self):
+        """NVDA 2026-11-10: the portfolio cache still showed the pre-fill
+        quantity, so a 1-share ADD to 1 held share got its own looser stop
+        and the record was rewritten for the new share only."""
+        with patch("db.log_activity_direct") as act:
+            (stop, add), cancel = self._run({"stop_price": 163.68}, pos_qty=1, avg=183.39,
+                                            new_stop=146.24, filled=1, fresh=(2.0, 174.98),
+                                            action="ADD")
+        assert stop == 163.68                 # never below the old stop
+        assert add == (174.98, 2.0)           # the fresh read's quantity and cost
+        cancel.assert_called_once_with("NVDA")
+        act.assert_not_called()               # not a stale record
+
+    def test_cache_without_the_ticker_on_an_add_uses_the_fresh_read(self):
+        (stop, add), cancel = self._run({"stop_price": 98.0}, filled=5, fresh=(15.0, 104.0),
+                                        action="ADD", cache_error=Exception("No open position in NVDA"))
+        assert (stop, add) == (98.0, (104.0, 15.0))
+        cancel.assert_called_once_with("NVDA")
+
+    def test_cache_without_the_ticker_on_an_open_keeps_the_old_fallback(self):
+        (stop, add), cancel = self._run({"stop_price": 98.0}, filled=5,
+                                        cache_error=Exception("No open position in NVDA"), action="OPEN")
+        assert (stop, add) == (95.0, None)
+        cancel.assert_not_called()
+        self.fresh_read.assert_not_called()
+
+    def test_open_never_takes_the_fresh_read(self):
+        """A partial fill can show more shares in a fresh read than the
+        filled count; only an ADD is reclassified (review 15:2x #4)."""
+        with patch("db.log_activity_direct") as act, patch("db.get_all_position_stops", return_value=[]):
+            (stop, add), cancel = self._run({"stop_price": 98.0}, pos_qty=5, filled=5,
+                                            fresh=(8.0, 100.0), action="OPEN")
+        assert (stop, add) == (95.0, None)
+        cancel.assert_not_called()
+        self.fresh_read.assert_not_called()
+        assert act.call_args.args[0] == "stale_record_at_entry"
+
+    def test_short_fresh_read_is_not_an_add(self):
+        with patch("db.log_activity_direct") as act, patch("db.get_all_position_stops", return_value=[]):
+            (stop, add), cancel = self._run({"stop_price": 98.0}, pos_qty=1, filled=1,
+                                            fresh=(-2.0, 50.0), action="ADD")
+        assert (stop, add) == (95.0, None)
+        cancel.assert_not_called()
+        assert act.call_args.args[0] == "stale_record_at_entry"
+
+    def test_fresh_read_equal_to_the_fill_is_a_stale_record(self):
+        with patch("db.log_activity_direct") as act, patch("db.get_all_position_stops", return_value=[]):
+            (stop, add), cancel = self._run({"stop_price": 98.0}, pos_qty=5, filled=5,
+                                            fresh=(5.0, 100.0), action="ADD")
+        assert (stop, add) == (95.0, None)
+        assert act.call_args.args[4]["decision_basis"] == "post_fill_read"
+
+    def test_fresh_read_without_a_cost_keeps_the_cache_cost(self):
+        (stop, add), _ = self._run({"stop_price": 98.0}, pos_qty=5, avg=105.0, filled=5,
+                                   fresh=(15.0, None), action="ADD")
+        assert add == (105.0, 15.0)
+
+    def test_fresh_read_without_any_cost_keeps_the_old_record(self):
+        status = {}
+        (stop, add), cancel = self._run({"stop_price": 98.0}, filled=5, fresh=(15.0, None), action="ADD",
+                                        cache_error=Exception("No open position in NVDA"), status=status)
+        assert (stop, add) == (95.0, None) and status.get("prior_unreadable") is True
+        cancel.assert_not_called()
+
+    def test_fresh_read_failure_keeps_the_old_record_and_stop(self):
+        """Review 15:2x #1: a failed read must not let the caller write the
+        new share's looser level over the record."""
+        status = {}
+        (stop, add), cancel = self._run({"stop_price": 98.0}, pos_qty=5, filled=5,
+                                        fresh=TimeoutError("reqPositions"), action="ADD", status=status)
+        assert (stop, add) == (95.0, None)
+        assert status.get("prior_unreadable") is True
+        assert "fresh position read" in status.get("unknown_reason", "")
+        cancel.assert_not_called()
+
+    def test_cache_showing_the_add_needs_no_fresh_read(self):
+        self._run({"stop_price": 98.0}, action="ADD")
+        self.fresh_read.assert_not_called()
 
     def test_add_stops_the_whole_position_at_the_tighter_stop(self):
         (stop, add), cancel = self._run({"stop_price": 98.0})
@@ -1742,3 +1832,44 @@ class TestNoteStaleRecord:
         with patch("db.get_position_stop", return_value={"stop_price": 98.0}), \
              patch("tasks._held_before_fill", side_effect=RuntimeError("boom")):
             execution._note_stale_record("NVDA", 5, "OPEN", path="bracket")
+
+
+class TestFreshStockPosition:
+    def _pos(self, sym, qty, avg, sec="STK"):
+        from types import SimpleNamespace
+        return SimpleNamespace(contract=SimpleNamespace(symbol=sym, secType=sec), position=qty, avgCost=avg)
+
+    def test_sums_the_symbol_and_weights_cost(self):
+        import ibkr
+        rows = [self._pos("NVDA", 1, 183.39), self._pos("NVDA", 1, 166.57), self._pos("AMD", 3, 100.0),
+                self._pos("NVDA", 2, 1.0, sec="OPT")]
+        with patch("ibkr.get_ib"), patch("ibkr._bounded_req", return_value=rows):
+            qty, cost = ibkr.get_fresh_stock_position("NVDA")
+        assert qty == 2.0 and cost == pytest.approx(174.98)
+
+    def test_not_held(self):
+        import ibkr
+        with patch("ibkr.get_ib"), patch("ibkr._bounded_req", return_value=[self._pos("AMD", 3, 100.0)]):
+            assert ibkr.get_fresh_stock_position("NVDA") == (0.0, None)
+
+    def test_missing_cost_is_none(self):
+        import ibkr
+        with patch("ibkr.get_ib"), patch("ibkr._bounded_req", return_value=[self._pos("NVDA", 2, None)]):
+            assert ibkr.get_fresh_stock_position("NVDA") == (2.0, None)
+
+
+class TestPriorUnreadAlertReason:
+    def test_reason_names_the_cause(self):
+        sent, actions = [], []
+        with patch("alerts._send", side_effect=lambda t: sent.append(t)), \
+             patch("tasks.open_manual_action", side_effect=lambda t, msg, **k: actions.append(msg)):
+            execution._alert_prior_stop_unread("NVDA", 1, 146.24, "placed", {"stop_price": 163.68},
+                                               reason="a fresh position read failed")
+        assert "When this BUY filled, a fresh position read failed" in sent[0]
+        assert "a fresh position read failed" in actions[0]
+
+    def test_default_reason_is_the_unreadable_record(self):
+        sent = []
+        with patch("alerts._send", side_effect=lambda t: sent.append(t)), patch("tasks.open_manual_action"):
+            execution._alert_prior_stop_unread("NVDA", 1, 146.24, "placed", "unknown")
+        assert "the prior stop record could not be read" in sent[0]

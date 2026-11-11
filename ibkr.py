@@ -553,6 +553,28 @@ def get_fresh_stock_positions() -> dict[str, float]:
     return out
 
 
+def get_fresh_stock_position(symbol: str) -> tuple[float, float | None]:
+    """(qty, avg_cost) of one stock position from a fresh reqPositions()
+    request; (0.0, None) when it isn't held. The portfolio cache lags a fill,
+    so a post-fill check that must tell an ADD from a fresh entry reads this
+    (NVDA 2026-11-10: the cache still showed the pre-fill quantity). avg_cost
+    is None when TWS sends none. Raises on any read failure."""
+    ib = get_ib()
+    qty, cost_total, cost_known = 0.0, 0.0, True
+    for p in _bounded_req(ib, "reqPositions", ib.reqPositions):
+        if (getattr(p.contract, "secType", "STK") != "STK" or p.contract.symbol != symbol
+                or float(p.position) == 0):
+            continue
+        qty += float(p.position)
+        avg = getattr(p, "avgCost", None)
+        if isinstance(avg, (int, float)) and avg > 0:
+            cost_total += float(avg) * float(p.position)
+        else:
+            cost_known = False
+    avg_cost = (cost_total / qty) if (qty and cost_known) else None
+    return qty, avg_cost
+
+
 _MD_TYPE_LABELS = {1: "live", 2: "frozen", 3: "delayed", 4: "delayed_frozen"}
 
 

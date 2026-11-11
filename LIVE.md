@@ -5,9 +5,9 @@ pushed here. So this branch can be ahead of, or differ from, the code that is ru
 
 | | |
 |---|---|
-| Live since | 2026-11-09 16:19 ET (loaded and restarted after the close; database schema 88); `9fbe88f` pulled 19:08 ET while stopped, running from the 2026-11-10 05:00 boot |
-| Local deploy tag | `deploy-2026-11-09b` (local commit `9fbe88f`: `6b56ff1` plus log-only new-fact tone fields and a news-feed outage alert) |
-| Previous load | 2026-11-07 (`deploy-2026-11-07-hotfix`, local commit `2f3b3eb`) |
+| Live since | 2026-11-10 19:08 ET (pulled while stopped; runs from the 2026-11-11 05:00 boot, which applies database migration 89) |
+| Local deploy tag | `deploy-2026-11-10` (local commit `a7f301c`: `9fbe88f` plus yfinance 1.8.0, the ADD whole-position stop fix, activity stage width, and log-only last-exit, catalyst-rule and ADD-context fields) |
+| Previous load | 2026-11-09 (`deploy-2026-11-09b`, local commit `9fbe88f`) |
 
 Commits on this branch that aren't in the deploy commit above aren't live yet (for example the held-move shadow);
 they go live with a later load listed here. Updated at each deploy.

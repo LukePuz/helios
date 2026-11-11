@@ -406,8 +406,8 @@ def test_buy_add_passes_the_fill_price_to_the_whole_position_stop():
                               "stop_loss_price": 90.0}}
     seen = {}
 
-    def whole(ticker, stop, filled, status=None, market_price=None):
-        seen["market_price"] = market_price
+    def whole(ticker, stop, filled, status=None, market_price=None, action=None):
+        seen["market_price"], seen["action"] = market_price, action
         raise RuntimeError("stop here")
     with patch("ibkr.get_ib"), patch("ibkr.get_client"), \
          patch("risk_manager.RiskManager") as rm_cls, \
@@ -424,6 +424,7 @@ def test_buy_add_passes_the_fill_price_to_the_whole_position_stop():
         rm_cls.return_value.is_halted.return_value = False
         execution.execute_approved(approval)
     assert seen.get("market_price") == 101.5
+    assert seen.get("action") == "ADD"
 
 
 # ── 5. Profit-target mark guard ─────────────────────────────────────────

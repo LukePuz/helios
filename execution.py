@@ -882,7 +882,7 @@ def _alert_stop_record_missing(ticker: str, qty: float, stop_price: float, outco
 
 
 def _alert_prior_stop_unread(ticker: str, qty: float, stop_price: float, outcome: str,
-                             prior) -> None:
+                             prior, reason: str | None = None) -> None:
     """A BUY that may have added to a position whose prior stop record could
     not be read. The record write was skipped (an overwrite would hand the
     trail and ladder code the new shares' level for the whole position), the
@@ -895,7 +895,8 @@ def _alert_prior_stop_unread(ticker: str, qty: float, stop_price: float, outcome
     import alerts as alert_module
     import tasks
     how, todo = _stop_outcome_text(outcome)
-    lines = [f"The prior stop record could not be read when this BUY filled, so the old stop "
+    cause = reason or "the prior stop record could not be read"
+    lines = [f"When this BUY filled, {cause}, so the old stop "
              f"was left in place and only the {qty:g} new shares got their own stop "
              f"@ ${stop_price:.2f}, which {how}.{todo}"]
     lower = (" A later trail or ratchet works from that record and cancels every stop "
@@ -915,7 +916,7 @@ def _alert_prior_stop_unread(ticker: str, qty: float, stop_price: float, outcome
                      f"trails or re-places these stops.")
     lines.append(f"Check every stop on this position in TWS and fix the record by hand. "
                  f"{_MANUAL_ACTION_CLEARS}")
-    log.error(f"[{ticker}] prior stop record unreadable on a possible add; record write "
+    log.error(f"[{ticker}] possible add with an unknown prior position ({cause}); record write "
               f"skipped, {qty:g} new shares stopped @ ${stop_price:.2f} ({outcome})")
     try:
         alert_module._send(f"⚠️ CHECK STOPS — {ticker}\n" + " ".join(lines))
@@ -923,7 +924,7 @@ def _alert_prior_stop_unread(ticker: str, qty: float, stop_price: float, outcome
         pass
     try:
         tasks.open_manual_action(ticker, f"check the stops and fix the stop record by hand "
-                                         f"after an add whose prior record could not be read",
+                                         f"after an add where {cause}",
                                  clear_on_flat=True)
     except Exception as e:
         log.error(f"[{ticker}] could not open the manual action: {e}")
@@ -1108,7 +1109,8 @@ def _note_stale_record(ticker: str, filled_qty: float, action: str | None, path:
 
 
 def _whole_position_stop(ticker: str, new_stop: float, filled_qty: float,
-                         status: dict | None = None, market_price: float | None = None):
+                         status: dict | None = None, market_price: float | None = None,
+                         action: str | None = None):
     """Stop handling when a BUY adds to a position that already has a stop.
 
     Before 2026-10-27 an ADD overwrote entry_price with the add's fill price
@@ -1150,8 +1152,43 @@ def _whole_position_stop(ticker: str, new_stop: float, filled_qty: float,
         total_qty = round(abs(float(pos.qty)), 4)
         avg_cost = float(pos.avg_entry_price)
     except Exception as e:
-        log.warning(f"[{ticker}] ADD: position lookup failed, stopping only the added shares: {e}")
-        return new_stop, None
+        if not (action == "ADD" and str(e).startswith("No open position")):
+            log.warning(f"[{ticker}] ADD: position lookup failed, stopping only the added shares: {e}")
+            return new_stop, None
+        # An ADD the cache doesn't show at all (it can read empty after a
+        # reconnect): the fresh read below decides.
+        total_qty, avg_cost = 0.0, None
+    if total_qty <= filled_qty and action == "ADD":
+        # The portfolio cache lags a fill: on 2026-11-10 an NVDA ADD read the
+        # pre-fill quantity here, so the add got its own looser stop and the
+        # record was rewritten for the new share only. For an ADD (the
+        # analyst saw the ticker held; an unheld ADD is routed as OPEN), a
+        # fresh reqPositions() read decides. Only a long quantity above the
+        # fill counts. A failed read stops only the filled shares, leaves the
+        # old stop working and keeps the old record (prior_unreadable: the
+        # caller doesn't write the new level over it, and alerts).
+        try:
+            fresh_qty, fresh_cost = ibkr.get_fresh_stock_position(ticker)
+            fresh_qty = round(float(fresh_qty), 4)
+        except Exception as e:
+            log.warning(f"[{ticker}] ADD check: fresh position read failed ({e}); "
+                        f"stopping only the {filled_qty:g} filled shares and keeping the old record")
+            if status is not None:
+                status["prior_unreadable"] = True
+                status["unknown_reason"] = ("a fresh position read (to tell an ADD from a fresh "
+                                            "entry) failed")
+            return new_stop, None
+        if fresh_qty > filled_qty:
+            log.warning(f"[{ticker}] position cache showed {total_qty:g} after a {filled_qty:g}-share "
+                        f"ADD fill, a fresh read shows {fresh_qty:g}: one stop for the whole position")
+            total_qty = fresh_qty
+            if fresh_cost:
+                avg_cost = float(fresh_cost)
+            elif avg_cost is None:
+                if status is not None:
+                    status["prior_unreadable"] = True
+                    status["unknown_reason"] = "the position's average cost could not be read"
+                return new_stop, None
     if total_qty <= filled_qty:
         # Nothing was held before this fill, yet a stop record exists: the
         # old position's exit isn't booked yet, so this entry keeps its
@@ -2326,7 +2363,8 @@ def execute_approved(
             prior_info: dict = {}
             stop_price, add_to_existing = _whole_position_stop(ticker, float(stop_price), filled_qty,
                                                                status=prior_info,
-                                                               market_price=current_price)
+                                                               market_price=current_price,
+                                                               action=action)
             entry_source = price_source
             if add_to_existing:
                 entry_for_stops, stop_qty = add_to_existing
@@ -2409,7 +2447,7 @@ def execute_approved(
                                                    stop_outcome)
                 else:
                     _alert_prior_stop_unread(ticker, stop_qty, float(stop_price), stop_outcome,
-                                             prior_now)
+                                             prior_now, reason=prior_info.get("unknown_reason"))
             elif not record_ok:
                 _alert_stop_record_missing(
                     ticker, stop_qty, float(stop_price), stop_outcome,

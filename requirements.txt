@@ -6,7 +6,9 @@ polygon-api-client>=1.13.0
 # Python 3.13+ asyncio). Same API, imported as `ib_async` in ibkr.py.
 # nest_asyncio removed for the same reason — broken on 3.13+, not needed.
 ib_async>=2.0.0
-yfinance>=0.2.40
+# 1.8.0+: the 1.5.1 Ticker.news endpoint raised "Yahoo finance is down" from
+# 2026-11-09 while every other endpoint worked.
+yfinance>=1.8.0
 
 # Environment & config
 python-dotenv>=1.0.0

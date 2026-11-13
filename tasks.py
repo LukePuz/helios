@@ -8801,6 +8801,200 @@ def _run_singleton(name: str, fn, max_hold_s: float = 1800) -> None:
             pass
 
 
+_PARTIAL_STOP_BOOKED_KEY = "partial_stop_booked_{env}"   # {"day": ET date, "perms": {permId: shares}}
+_PARTIAL_STOP_BOOKED_MAX = 200   # most recent permIds kept
+_PARTIAL_STOP_MIN_AGE_S = 300    # a younger execution may be a bot SELL not logged yet
+
+
+def _et_today():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+
+
+def _partial_booked_read() -> dict:
+    """{permId (int): shares booked today} by _book_partial_stop_fills. Only
+    today's (ET) bookings count: the execution lookups reach only the current
+    day, so an older state reads as empty. Raises on a failed or unparseable
+    read, so callers wait a cycle rather than book an execution twice; corrupt
+    content also alerts (throttled), since it holds stale-stop cleanup back."""
+    import db
+    from config import TRADING_ENV
+    raw = db.get_state_strict(_PARTIAL_STOP_BOOKED_KEY.format(env=TRADING_ENV), "") or ""
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict) or not isinstance(data.get("perms", {}), dict):
+            raise ValueError("partial stop booked state is not a mapping")
+        if data.get("day") != _et_today():
+            return {}
+        return {int(k): float(v) for k, v in data.get("perms", {}).items()}
+    except (ValueError, TypeError) as e:
+        try:
+            if _reconcile_alert_due("partial_booked_state_bad"):
+                import alerts
+                alerts._send(f"🚨 STOP RECONCILE — system_state "
+                             f"{_PARTIAL_STOP_BOOKED_KEY.format(env=TRADING_ENV)} is unreadable "
+                             f"({e}); stale-stop exits wait until it is fixed or cleared")
+        except Exception:
+            pass
+        raise ValueError(f"partial stop booked state unreadable: {e}")
+
+
+def _net_of_partial_bookings(fill: dict | None, booked: dict) -> dict | None:
+    """get_recent_sell_fill's result minus the shares _book_partial_stop_fills
+    already booked under each permId, so a later lookup (the stale-stop exit,
+    or this helper's next cycle) doesn't count them again (review B1). Price and
+    quantity are rebuilt from the remaining per-order rows. None when nothing
+    unbooked is left. Raises when booked shares are present but the per-order
+    split is missing, so the caller retries instead of double counting."""
+    if not fill or not booked:
+        return fill
+    rows = fill.get("by_order")
+    if not isinstance(rows, list):
+        raise ValueError("fill has no per-order split to net booked shares from")
+    kept = []
+    for o in rows:
+        left = round(float(o["qty"]) - booked.get(int(o.get("perm_id") or 0), 0.0), 4)
+        if left > 0:
+            kept.append({**o, "qty": left})
+    if len(kept) == len(rows) and all(not booked.get(int(o.get("perm_id") or 0)) for o in rows):
+        return fill
+    total = sum(o["qty"] for o in kept)
+    if total <= 0:
+        return None
+    out = {**fill, "filled_qty": total,
+           "fill_price": sum(o["qty"] * float(o["price"]) for o in kept) / total,
+           "by_order": kept, "order_ids": sorted({o["order_id"] for o in kept})}
+    out.pop("fill_time", None)
+    out.pop("fill_time_source", None)
+    timed = [o for o in kept if o.get("fill_time") is not None]
+    if timed:
+        last = max(timed, key=lambda o: o["fill_time"])
+        out["fill_time"], out["fill_time_source"] = last["fill_time"], last.get("fill_time_source")
+    return out
+
+
+def _book_partial_stop_fills(held_long: dict, records: list[dict], pending_sell_tickers,
+                             skip=frozenset(), now=None) -> list[str]:
+    """Record a SELL that closed only part of a long that is still held (roadmap
+    04z). On 11-12 the first of NVDA's two stop lots filled at the open and
+    nothing was written: the stale-stop path books an exit only once the whole
+    position is gone, and the ledger reconcile is log-only.
+
+    A ticker qualifies when the broker still holds it (qty > 0), the trade
+    ledger's net is above that qty, no bot SELL for it is pending
+    (pending_sell_tickers, as the stale path uses; None skips every ticker), and
+    it is not in skip (position reads disagree). Today's SELL executions not
+    logged as bot orders (recorded_sell_order_ids) and not already booked here
+    are booked per order: only an order's whole unbooked remainder, only when it
+    fits in the ledger gap, only after the ticker's latest ledger BUY, and only
+    once the execution is _PARTIAL_STOP_MIN_AGE_S old. The booked shares per
+    permId are written and verified before the trade row (nothing is booked if
+    that write fails, and a spilled trade row keeps the booking); the
+    stale-stop path nets them out (_net_of_partial_bookings). Each booking gets
+    one Telegram message. No stop_slippage row: that table keeps one row per
+    whole exit, written by the stale-stop path. The trade outcome stays open
+    until the final exit. Nothing is sent to the broker. Never raises; returns
+    the messages for the reconcile log."""
+    msgs: list[str] = []
+    try:
+        import db
+        import ibkr
+        from datetime import datetime, timezone
+        from config import TRADING_ENV
+        if not held_long or pending_sell_tickers is None:
+            return msgs
+        now = now or datetime.now(timezone.utc)
+        trades = db.get_ledger_trades()
+        if trades is None:
+            return msgs
+        net: dict = {}
+        last_buy: dict = {}
+        for t in trades:
+            if t["side"] == "BUY":
+                net[t["symbol"]] = net.get(t["symbol"], 0.0) + float(t["quantity"])
+                ts = t.get("timestamp")
+                if isinstance(ts, datetime):
+                    ts = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+                    if t["symbol"] not in last_buy or ts > last_buy[t["symbol"]]:
+                        last_buy[t["symbol"]] = ts
+            elif t["side"] == "SELL":
+                net[t["symbol"]] = net.get(t["symbol"], 0.0) - float(t["quantity"])
+        key = _PARTIAL_STOP_BOOKED_KEY.format(env=TRADING_ENV)
+        try:
+            booked = _partial_booked_read()
+        except Exception as e:
+            log.warning(f"partial stop fills: booked state unreadable ({e}); waiting a cycle")
+            return msgs
+        rec_by = {r.get("ticker"): r for r in records or ()}
+        for ticker, qty in sorted(held_long.items()):
+            gap = round(net.get(ticker, 0.0) - float(qty), 4)
+            if float(qty) <= 0 or gap <= 0 or ticker in pending_sell_tickers or ticker in skip:
+                continue
+            recorded = db.recorded_sell_order_ids(ticker)
+            if recorded is None:
+                continue
+            order_ids, perm_ids = recorded
+            try:
+                fill = _net_of_partial_bookings(
+                    ibkr.get_recent_sell_fill(ticker, frozenset(order_ids), frozenset(perm_ids)), booked)
+            except Exception as e:
+                log.warning(f"[{ticker}] partial stop fill lookup failed; retrying next cycle: {e}")
+                continue
+            for o in (fill or {}).get("by_order") or []:
+                perm = int(o.get("perm_id") or 0)
+                q = round(float(o["qty"]), 4)
+                if not perm or q <= 0 or q > gap:
+                    continue   # no permId to dedupe on, or more than the ledger gap: not ours to book
+                ft = o.get("fill_time")
+                if not (isinstance(ft, datetime) and ft.tzinfo is not None):
+                    continue   # no reliable time: can't tell it from a SELL before the entry
+                if (now - ft).total_seconds() < _PARTIAL_STOP_MIN_AGE_S:
+                    continue   # may be a bot SELL whose rows aren't written yet
+                if ticker in last_buy and ft <= last_buy[ticker]:
+                    continue   # sold before the current position's latest BUY (review SF1)
+                booked[perm] = booked.get(perm, 0.0) + q
+                while len(booked) > _PARTIAL_STOP_BOOKED_MAX:
+                    booked.pop(next(iter(booked)))
+                state = json.dumps({"day": _et_today(),
+                                    "perms": {str(k): v for k, v in booked.items()}})
+                if db.set_state_verified([(key, state)]):
+                    log.warning(f"[{ticker}] partial stop fill: booked state write failed; retrying")
+                    return msgs
+                ok = db.log_trade(
+                    symbol=ticker, side="SELL", quantity=q, price=o["price"],
+                    reason=("Partial exit: a SELL the bot did not place (a resting stop "
+                            "fill or a manual sale) closed part of the position while the "
+                            "rest is still held; matched to today's broker execution (orderId "
+                            f"{o.get('order_id')}, permId {perm})"),
+                    price_source="fill",
+                )
+                if not ok:
+                    # log_trade spilled the row (replay_spill.py writes it later):
+                    # the booking stands, or the replay would double it (review SF2).
+                    log.warning(f"[{ticker}] partial exit SELL {q:g} spilled to the DB write "
+                                f"spill file; booked, not re-tried")
+                    gap = round(gap - q, 4)
+                    continue
+                gap = round(gap - q, 4)
+                # No stop_slippage row here: those rows carry all of the day's
+                # unrecorded sells (their documented meaning), which the stale
+                # path's row still does. A per-lot row is Luke's call (04z).
+                msg = (f"Untracked partial exit for {ticker} (resting stop or manual): SELL {q:g} "
+                       f"@ ${float(o['price']):.2f}; {float(qty):g} still held")
+                msgs.append(msg)
+                try:
+                    import alerts
+                    alerts._send(f"🛑 PARTIAL EXIT — <b>{ticker}</b>\n{msg}")
+                except Exception as e:
+                    log.error(f"[{ticker}] partial stop fill alert failed: {e}")
+    except Exception as e:
+        log.warning(f"partial stop fills: skipped this cycle ({e})")
+    return msgs
+
+
 def _reconcile_stop_orders_body(self):
     """
     Safety net: diff broker-side sell-stop orders against actual positions.
@@ -9201,7 +9395,12 @@ def _reconcile_stop_orders_body(self):
                                 f"next cycle")
                     continue
                 try:
-                    fill = ibkr.get_recent_sell_fill(ticker, *recorded)
+                    fill_all = ibkr.get_recent_sell_fill(ticker, *recorded)
+                    # The trade row leaves out what _book_partial_stop_fills already
+                    # booked today (04z review B1); the outcome keeps the price of
+                    # all today's unrecorded sells, as before (review SF4).
+                    fill = (_net_of_partial_bookings(fill_all, _partial_booked_read())
+                            if fill_all else fill_all)
                 except Exception as e:
                     # Unknown is not "no SELL": keep the record and the marker and
                     # look again next cycle, or a real exit is labelled no_fill
@@ -9211,33 +9410,37 @@ def _reconcile_stop_orders_body(self):
                     continue
                 db.set_state(pending_key, "")
 
-                if fill:
-                    ok = db.log_trade(
-                        symbol=ticker, side="SELL", quantity=fill["filled_qty"],
-                        price=fill["fill_price"],
-                        reason="Reconciled exit — position closed at the broker with no "
-                               "bot-initiated sell on record (resting stop fill or manual "
-                               "close); matched to today's broker execution history during "
-                               "stale-stop cleanup",
-                        price_source="fill",
-                    )
+                if fill or fill_all:
+                    ok = False
+                    if fill:
+                        ok = db.log_trade(
+                            symbol=ticker, side="SELL", quantity=fill["filled_qty"],
+                            price=fill["fill_price"],
+                            reason="Reconciled exit — position closed at the broker with no "
+                                   "bot-initiated sell on record (resting stop fill or manual "
+                                   "close); matched to today's broker execution history during "
+                                   "stale-stop cleanup",
+                            price_source="fill",
+                        )
                     try:
-                        db.close_trade_outcome(ticker, exit_price=fill["fill_price"], exit_source="broker_exit",
-                                               exit_price_source="fill", exit_fill_at=fill.get("fill_time"),
-                                               exit_fill_at_source=fill.get("fill_time_source"))
+                        db.close_trade_outcome(ticker, exit_price=fill_all["fill_price"], exit_source="broker_exit",
+                                               exit_price_source="fill", exit_fill_at=fill_all.get("fill_time"),
+                                               exit_fill_at_source=fill_all.get("fill_time_source"))
                     except Exception as e:
                         log.error(f"[{ticker}] close_trade_outcome failed after reconciling "
                                   f"exit: {e}")
                     try:   # log-only: stop price vs fill, once the trade row is written
                         if ok:
-                            _log_stop_slippage(ticker, rec.get("stop_price"), fill,
+                            _log_stop_slippage(ticker, rec.get("stop_price"), fill_all,
                                                "reconcile_stale_stop", rec.get("broker_order_id"),
                                                trailing_active=rec.get("trailing_active"),
                                                stop_method=rec.get("stop_method"))
                     except Exception:
                         pass
                     msg = (f"Reconciled untracked exit for {ticker}: SELL "
-                           f"{fill['filled_qty']:g} @ ${fill['fill_price']:.2f}")
+                           f"{fill['filled_qty']:g} @ ${fill['fill_price']:.2f}" if fill else
+                           f"Reconciled exit for {ticker}: its sells were already booked as "
+                           f"partial exits; outcome closed")
                     all_actions.append(msg)
                     new_actions.append(msg)
                 else:
@@ -9465,6 +9668,13 @@ def _reconcile_stop_orders_body(self):
                             )
                         except Exception as e:
                             log.error(f"[{ticker}] Could not send unprotected-position alert: {e}")
+
+        # Part of a held long sold by a resting stop (04z); alerts on its own.
+        partial = _book_partial_stop_fills(
+            {t: q for t, q in cache_qty.items() if q > 0}, records,
+            pending_sell_tickers, skip=set(disagree))
+        all_actions.extend(partial)
+        new_actions.extend(partial)
 
         if all_actions:
             log.info("Stop reconciliation status: " + " | ".join(all_actions))

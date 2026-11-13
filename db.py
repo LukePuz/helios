@@ -4485,7 +4485,7 @@ def adopt_orphaned_submitted_orders(min_age_minutes: int = 10) -> list[dict] | N
 # order: backstop, profit-target and stale-stop sells, and reconcile's own
 # late-fill bookings.
 _NOT_EXECUTION_TRADE_REASONS = ("Backstop%", "Profit target%", "Reconciled exit%",
-                                "%Late-fill reconciled%")
+                                "%Late-fill reconciled%", "Partial exit%")
 
 
 # trade_logged_near's window: from TRADE_MATCH_BEFORE_S before the order row

@@ -948,13 +948,14 @@ def test_trade_logged_near_sql_matches_the_rule():
         db.trade_logged_near("NVDA", "SELL", at, intent="TRIM")
     sql, params = cur.execute.call_args.args
     assert params[:7] == ("NVDA", "SELL", db.TRADING_ENV, at, 5, at, 20)
-    assert params[7:11] == ("Backstop%", "Profit target%", "Reconciled exit%", "%Late-fill reconciled%")
-    assert sql.count("NOT LIKE %s") == 4 and sql.rstrip().endswith("AND COALESCE(reason, '') LIKE %s")
-    assert params[11] == "TRIM % (conviction=%"
+    assert params[7:12] == ("Backstop%", "Profit target%", "Reconciled exit%",
+                            "%Late-fill reconciled%", "Partial exit%")
+    assert sql.count("NOT LIKE %s") == 5 and sql.rstrip().endswith("AND COALESCE(reason, '') LIKE %s")
+    assert params[12] == "TRIM % (conviction=%"
     with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
         db.trade_logged_near("ZZZ", "BUY", at, intent="MANUAL_OPEN")
     sql, params = cur.execute.call_args.args
-    assert sql.count("NOT LIKE %s") == 5 and params[-1] == "%(conviction=%/10)%"
+    assert sql.count("NOT LIKE %s") == 6 and params[-1] == "%(conviction=%/10)%"
 
 
 def _like(pattern, text):

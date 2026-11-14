@@ -406,8 +406,9 @@ def test_buy_add_passes_the_fill_price_to_the_whole_position_stop():
                               "stop_loss_price": 90.0}}
     seen = {}
 
-    def whole(ticker, stop, filled, status=None, market_price=None, action=None):
+    def whole(ticker, stop, filled, status=None, market_price=None, action=None, held_before=None):
         seen["market_price"], seen["action"] = market_price, action
+        seen["held_before"] = held_before
         raise RuntimeError("stop here")
     with patch("ibkr.get_ib"), patch("ibkr.get_client"), \
          patch("risk_manager.RiskManager") as rm_cls, \
@@ -420,11 +421,13 @@ def test_buy_add_passes_the_fill_price_to_the_whole_position_stop():
          patch("db.log_trade"), patch("db.log_order", return_value=1), \
          patch("db.update_order_fill"), patch("db.log_trade_outcome"), \
          patch("execution._whole_position_stop", side_effect=whole), \
+         patch("execution._held_before_order", return_value=5.0), \
          patch("alerts._send"), patch("alerts.send_trade_alert"):
         rm_cls.return_value.is_halted.return_value = False
         execution.execute_approved(approval)
     assert seen.get("market_price") == 101.5
     assert seen.get("action") == "ADD"
+    assert seen.get("held_before") == 5.0   # the ADD's pre-order count is passed through (04af)
 
 
 # ── 5. Profit-target mark guard ─────────────────────────────────────────
@@ -1227,3 +1230,43 @@ def test_failed_sell_restore_floor_at_the_market_uses_the_record():
         execution._restore_stop_after_failed_sell("NVDA", floor=101.0)
     place.assert_called_once_with("NVDA", 3.0, 90.0)
     update.assert_not_called()
+
+
+def test_add_with_disagreeing_reads_keeps_the_record_and_stops_only_the_fill():
+    """04af caller path: _whole_position_stop says the prior position is
+    unknown (reads disagree). The record is not rewritten, the kept record's
+    order id isn't repointed, only the filled shares get a stop, and the
+    check-stops alert names the reason."""
+    approval = {"id": 1, "ticker": "NVDA", "action": "ADD", "conviction": 7,
+                "thesis_bucket": "Accelerator", "stop_loss_price": 90.0,
+                "risk_json": {"shares_initial": 2, "price_at_sizing": 100.0,
+                              "stop_loss_price": 90.0}}
+    reason = "the broker's position reads disagree (5 fresh, 7 cached) right after the fill"
+
+    def whole(ticker, stop, filled, status=None, market_price=None, action=None, held_before=None):
+        status["prior_unreadable"] = True
+        status["unknown_reason"] = reason
+        return stop, None
+    with patch("ibkr.get_ib"), patch("ibkr.get_client"), \
+         patch("risk_manager.RiskManager") as rm_cls, \
+         patch("market_data.check_gap_confirmation", return_value={"status": "no_gap"}), \
+         patch("ibkr.place_market_order",
+               return_value={"order_id": 1, "fill_price": 101.5, "filled_qty": 2.0}), \
+         patch("ibkr.get_latest_price", return_value=100.0), \
+         patch("market_data.get_priced_quote", return_value=None), \
+         patch("config.USE_BRACKET_ORDERS", False), \
+         patch("db.log_trade"), patch("db.log_order", return_value=1), \
+         patch("db.update_order_fill"), patch("db.log_trade_outcome"), \
+         patch("db.get_position_stop", return_value={"stop_price": 95.0}), \
+         patch("execution._whole_position_stop", side_effect=whole), \
+         patch("execution._write_stop_record") as write, \
+         patch("execution._set_stop_order_id") as set_id, \
+         patch("execution._alert_prior_stop_unread") as alert, \
+         patch("tasks.manage_stop_place", return_value={"order_id": 77}) as place, \
+         patch("alerts._send"), patch("alerts.send_trade_alert"):
+        rm_cls.return_value.is_halted.return_value = False
+        execution.execute_approved(approval)
+    write.assert_not_called()
+    set_id.assert_not_called()
+    assert place.call_args.args[1] == 2.0
+    assert alert.call_args.kwargs["reason"] == reason

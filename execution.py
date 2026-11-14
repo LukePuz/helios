@@ -899,8 +899,12 @@ def _alert_prior_stop_unread(ticker: str, qty: float, stop_price: float, outcome
     lines = [f"When this BUY filled, {cause}, so the old stop "
              f"was left in place and only the {qty:g} new shares got their own stop "
              f"@ ${stop_price:.2f}, which {how}.{todo}"]
-    lower = (" A later trail or ratchet works from that record and cancels every stop "
-             "for one whole-position stop, so it could LOWER the new shares' stop")
+    # Trail, ladder, breakeven and profit-target moves floor at the highest
+    # resting stop; reconcile's coverage fix (_fix_overstop) places at the
+    # record's level with no floor, so it is the one that can lower the new
+    # shares' stop (third review of 04af).
+    lower = (" If reconcile later resizes this position's stops, it places them at the record's "
+             "level, which could LOWER the new shares' stop")
     if isinstance(prior, dict):
         old = prior.get("stop_price")
         old_txt = f"${float(old):.2f}" if old is not None else "its old level"
@@ -911,11 +915,15 @@ def _alert_prior_stop_unread(ticker: str, qty: float, stop_price: float, outcome
     else:
         lines.append(f"Whether a record exists is unknown (the read failed again). If one "
                      f"exists, it was KEPT, not overwritten; if the new stop is above its old "
-                     f"stop, a later trail or ratchet from it could LOWER the new shares' stop "
+                     f"stop, a later resize by reconcile from it could LOWER the new shares' stop "
                      f"below ${stop_price:.2f}. If none exists, STOP RECORD MISSING: nothing "
                      f"trails or re-places these stops.")
-    lines.append(f"Check every stop on this position in TWS and fix the record by hand. "
-                 f"{_MANUAL_ACTION_CLEARS}")
+    if isinstance(prior, dict):
+        lines.append(f"The record is right for the old shares. Check in TWS that both stops rest "
+                     f"(old shares and new shares). {_MANUAL_ACTION_CLEARS}")
+    else:
+        lines.append(f"Check every stop on this position in TWS and fix the record by hand. "
+                     f"{_MANUAL_ACTION_CLEARS}")
     log.error(f"[{ticker}] possible add with an unknown prior position ({cause}); record write "
               f"skipped, {qty:g} new shares stopped @ ${stop_price:.2f} ({outcome})")
     try:
@@ -923,8 +931,9 @@ def _alert_prior_stop_unread(ticker: str, qty: float, stop_price: float, outcome
     except Exception:
         pass
     try:
-        tasks.open_manual_action(ticker, f"check the stops and fix the stop record by hand "
-                                         f"after an add where {cause}",
+        what = ("check in TWS that both stops rest" if isinstance(prior, dict)
+                else "check the stops and fix the stop record by hand")
+        tasks.open_manual_action(ticker, f"{what} after an add where {cause}",
                                  clear_on_flat=True)
     except Exception as e:
         log.error(f"[{ticker}] could not open the manual action: {e}")
@@ -1108,9 +1117,22 @@ def _note_stale_record(ticker: str, filled_qty: float, action: str | None, path:
         log.warning(f"[{ticker}] stale-record check failed: {e}")
 
 
+def _held_before_order(ticker: str) -> float | None:
+    """The long quantity the portfolio cache shows just before an ADD's order
+    goes out (nothing of this order is in flight yet), for
+    _whole_position_stop's check that the post-fill reads include the new
+    shares. None when it can't be read: the check is then skipped."""
+    try:
+        import ibkr
+        return max(0.0, float(ibkr.get_client().get_open_position(ticker).qty))
+    except Exception as e:
+        log.info(f"[{ticker}] held count before the ADD order unreadable: {e}")
+        return None
+
+
 def _whole_position_stop(ticker: str, new_stop: float, filled_qty: float,
                          status: dict | None = None, market_price: float | None = None,
-                         action: str | None = None):
+                         action: str | None = None, held_before: float | None = None):
     """Stop handling when a BUY adds to a position that already has a stop.
 
     Before 2026-10-27 an ADD overwrote entry_price with the add's fill price
@@ -1158,37 +1180,74 @@ def _whole_position_stop(ticker: str, new_stop: float, filled_qty: float,
         # An ADD the cache doesn't show at all (it can read empty after a
         # reconnect): the fresh read below decides.
         total_qty, avg_cost = 0.0, None
-    if total_qty <= filled_qty and action == "ADD":
+    if action == "ADD":
         # The portfolio cache lags a fill: on 2026-11-10 an NVDA ADD read the
         # pre-fill quantity here, so the add got its own looser stop and the
         # record was rewritten for the new share only. For an ADD (the
         # analyst saw the ticker held; an unheld ADD is routed as OPEN), a
-        # fresh reqPositions() read decides. Only a long quantity above the
-        # fill counts. A failed read stops only the filled shares, leaves the
-        # old stop working and keeps the old record (prior_unreadable: the
-        # caller doesn't write the new level over it, and alerts).
+        # fresh reqPositions() read decides. It runs on every ADD, not only
+        # when the cache shows no more than the fill: with 5 held and the
+        # cache still at 5 after an ADD of 2, the stop was sized for 5 and the
+        # 2 new shares went unstopped (review of roadmap 04ae, 2026-11-13).
+        # Which count wins (review of 04af, 2026-11-13): the old stop is
+        # cancelled only when the whole position is known. A fresh read at
+        # or above the cache is taken (the cache is the source that lags a
+        # fill). A fresh read below the cache is ambiguous: a stale-high
+        # cache (a stop fill or manual sale it hasn't caught up with), or a
+        # fresh read that ended before the post-fill row arrived. Either way
+        # one of the two counts leaves shares bare after the cancel, so the
+        # old stop and record are kept and only the filled shares get a stop
+        # (prior_unreadable; the caller alerts). Reconcile counts both stops
+        # as coverage; they merge at the next trail, ladder, breakeven or
+        # profit-target move, which cancels all and places one stop: trail
+        # and ladder skip a level below the highest resting stop, breakeven
+        # and profit-target floor at it. A failed fresh read does the same,
+        # whatever the cache shows: a lagging cache above the fill (5 held,
+        # ADD 2, cache 5) would size the stop for 5 (third review of 04af).
+        # Known gap (roadmap 04af): both reads stale at the pre-fill count
+        # (F == C > fill) still look whole; closing it needs the held count
+        # read before the order, as the manual BUY path does (held_before).
+        def _ambiguous(reason):
+            if status is not None:
+                status["prior_unreadable"] = True
+                status["unknown_reason"] = reason
+            return new_stop, None
         try:
             fresh_qty, fresh_cost = ibkr.get_fresh_stock_position(ticker)
             fresh_qty = round(float(fresh_qty), 4)
         except Exception as e:
             log.warning(f"[{ticker}] ADD check: fresh position read failed ({e}); "
                         f"stopping only the {filled_qty:g} filled shares and keeping the old record")
-            if status is not None:
-                status["prior_unreadable"] = True
-                status["unknown_reason"] = ("a fresh position read (to tell an ADD from a fresh "
-                                            "entry) failed")
-            return new_stop, None
-        if fresh_qty > filled_qty:
+            return _ambiguous("a fresh position read (to tell an ADD from a fresh entry) failed")
+        if fresh_qty < total_qty and total_qty > filled_qty:
+            log.warning(f"[{ticker}] ADD check: a fresh read shows {fresh_qty:g}, the cache "
+                        f"{total_qty:g}, after a {filled_qty:g}-share fill; keeping the old stop "
+                        f"and stopping only the filled shares")
+            return _ambiguous(f"the broker's position reads disagree ({fresh_qty:g} fresh, "
+                              f"{total_qty:g} cached) right after the fill")
+        if fresh_qty > total_qty and fresh_qty > filled_qty:
             log.warning(f"[{ticker}] position cache showed {total_qty:g} after a {filled_qty:g}-share "
                         f"ADD fill, a fresh read shows {fresh_qty:g}: one stop for the whole position")
             total_qty = fresh_qty
             if fresh_cost:
                 avg_cost = float(fresh_cost)
             elif avg_cost is None:
-                if status is not None:
-                    status["prior_unreadable"] = True
-                    status["unknown_reason"] = "the position's average cost could not be read"
-                return new_stop, None
+                return _ambiguous("the position's average cost could not be read")
+    if (action == "ADD" and held_before is not None and held_before > 1e-6
+            and total_qty + 1e-6 < held_before + filled_qty):
+        # Both reads can still show the pre-fill count (a fresh read that
+        # ended before the fill's row, with a lagging cache): 5 held, ADD 2,
+        # both reads 5. The count read before the order says 7 should be
+        # there, so the whole position isn't known yet (third review of 04af).
+        log.warning(f"[{ticker}] ADD check: reads show {total_qty:g} but {held_before:g} were held "
+                    f"before this {filled_qty:g}-share fill; keeping the old stop and stopping "
+                    f"only the filled shares")
+        if status is not None:
+            status["prior_unreadable"] = True
+            status["unknown_reason"] = (f"the broker's position reads ({total_qty:g}) don't yet show "
+                                        f"the {filled_qty:g} new shares on top of the {held_before:g} "
+                                        f"held before the order")
+        return new_stop, None
     if total_qty <= filled_qty:
         # Nothing was held before this fill, yet a stop record exists: the
         # old position's exit isn't booked yet, so this entry keeps its
@@ -2047,6 +2106,7 @@ def execute_approved(
             USE_BRACKET_ORDERS = False
 
         bracket_used = False
+        held_before_order = None   # an ADD's held count before its order (_whole_position_stop)
         early = {"id": None, "perm_id": None}   # the row written before the fill wait
         submitted_at = _now_utc()   # record-keeping only (orders.submitted_at)
         if side == "BUY" and USE_BRACKET_ORDERS and stop_price_for_entry:
@@ -2080,6 +2140,8 @@ def execute_approved(
                 decision_price=price_at_sizing, approval_id=approval["id"], intent=action,
                 submitted_at=submitted_at, submit_price=current_price_pre,
             )
+            if side == "BUY" and action == "ADD":
+                held_before_order = _held_before_order(ticker)
             try:
                 order_result = ibkr.place_market_order(ticker, side, shares,
                                                        on_submitted=on_submitted)
@@ -2364,7 +2426,8 @@ def execute_approved(
             stop_price, add_to_existing = _whole_position_stop(ticker, float(stop_price), filled_qty,
                                                                status=prior_info,
                                                                market_price=current_price,
-                                                               action=action)
+                                                               action=action,
+                                                               held_before=held_before_order)
             entry_source = price_source
             if add_to_existing:
                 entry_for_stops, stop_qty = add_to_existing
@@ -2387,11 +2450,16 @@ def execute_approved(
             _capture_original_thesis_if_new(ticker, approval)
             stop_placed = False
             stop_outcome = "failed"   # for the record-missing alert
+            placed_order_id = None
             for stop_attempt in range(1, 4):
                 try:
                     stop_result = tasks.manage_stop_place(ticker, stop_qty, float(stop_price),
                                                          market_price=current_price)
-                    _set_stop_order_id(ticker, stop_result["order_id"])
+                    placed_order_id = stop_result["order_id"]
+                    if not prior_unread:
+                        # A kept record still points at the old shares' stop;
+                        # it is set below if no record turns out to exist.
+                        _set_stop_order_id(ticker, placed_order_id)
                     stop_placed, stop_outcome = True, "placed"
                     break
                 except Exception as e:
@@ -2445,6 +2513,8 @@ def execute_approved(
                     if not record_ok:
                         _alert_stop_record_missing(ticker, stop_qty, float(stop_price),
                                                    stop_outcome)
+                    elif placed_order_id is not None:
+                        _set_stop_order_id(ticker, placed_order_id)
                 else:
                     _alert_prior_stop_unread(ticker, stop_qty, float(stop_price), stop_outcome,
                                              prior_now, reason=prior_info.get("unknown_reason"))

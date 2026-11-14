@@ -834,7 +834,7 @@ class TestAddStopsWholePosition:
     the add's fill and stop only the added shares."""
 
     def _run(self, prior, pos_qty=15, avg=105.0, new_stop=95.0, filled=5, fresh=None, action=None,
-             status=None, cache_error=None):
+             status=None, cache_error=None, held_before=None):
         """fresh: what the fresh reqPositions() read returns, (qty, avg_cost)
         or an exception; default the same as the portfolio cache."""
         client = MagicMock()
@@ -849,7 +849,7 @@ class TestAddStopsWholePosition:
              patch("ibkr.get_fresh_stock_position", **fresh_kw) as fresh_read, \
              patch("tasks.manage_cancel_stop_orders_for") as cancel:
             result = execution._whole_position_stop("NVDA", new_stop, filled, status=status,
-                                                    action=action)
+                                                    action=action, held_before=held_before)
         self.fresh_read = fresh_read
         return result, cancel
 
@@ -928,10 +928,128 @@ class TestAddStopsWholePosition:
         assert "fresh position read" in status.get("unknown_reason", "")
         cancel.assert_not_called()
 
-    def test_cache_showing_the_add_needs_no_fresh_read(self):
-        self._run({"stop_price": 98.0}, action="ADD")
-        self.fresh_read.assert_not_called()
+    def test_cache_showing_the_add_still_reads_fresh_and_agrees(self):
+        (stop, add), _ = self._run({"stop_price": 98.0}, action="ADD")
+        self.fresh_read.assert_called_once_with("NVDA")
+        assert (stop, add) == (98.0, (105.0, 15.0))
 
+    def test_cache_lagging_above_the_fill_is_corrected_by_the_fresh_read(self):
+        """Review of 04ae: 5 held, ADD of 2, the cache still shows 5. The stop
+        was sized for 5 and the 2 new shares went unstopped."""
+        (stop, add), cancel = self._run({"stop_price": 98.0}, pos_qty=5, avg=100.0, filled=2,
+                                        fresh=(7.0, 101.0), action="ADD")
+        assert (stop, add) == (98.0, (101.0, 7.0))
+        cancel.assert_called_once_with("NVDA")
+
+    def test_fresh_read_below_the_cache_keeps_the_old_stop(self):
+        """Review of 04af: a fresh read below the cache is ambiguous (a stale
+        high cache, or a read that ended before the fill's row). Either count
+        can leave shares bare after the cancel, so the old stop and record
+        stay and only the filled shares get a stop."""
+        status = {}
+        (stop, add), cancel = self._run({"stop_price": 98.0}, pos_qty=15, filled=5,
+                                        fresh=(10.0, 99.0), action="ADD", status=status)
+        assert (stop, add) == (95.0, None) and status.get("prior_unreadable")
+        cancel.assert_not_called()
+
+    def test_fresh_read_showing_only_the_fill_keeps_the_old_stop(self):
+        status = {}
+        (stop, add), cancel = self._run({"stop_price": 98.0}, pos_qty=15, filled=5,
+                                        fresh=(5.0, 99.0), action="ADD", status=status)
+        assert (stop, add) == (95.0, None) and status.get("prior_unreadable")
+        cancel.assert_not_called()
+
+    @pytest.mark.parametrize("fresh", [(0.0, None), (1.0, 100.0)])
+    def test_fresh_read_below_the_fill_is_not_trusted(self, fresh):
+        status = {}
+        (stop, add), cancel = self._run({"stop_price": 98.0}, pos_qty=7, filled=2, fresh=fresh,
+                                        action="ADD", status=status)
+        assert (stop, add) == (95.0, None) and status.get("prior_unreadable")
+        cancel.assert_not_called()
+
+    def test_pre_fill_fresh_snapshot_keeps_the_old_stop(self):
+        """Cache 7 (correct), fill 2, fresh 5 (read ended before the fill's row)."""
+        status = {}
+        (stop, add), cancel = self._run({"stop_price": 98.0}, pos_qty=7, filled=2, fresh=(5.0, 100.0),
+                                        action="ADD", status=status)
+        assert (stop, add) == (95.0, None) and status.get("prior_unreadable")
+        cancel.assert_not_called()
+
+    def test_both_reads_at_the_pre_fill_count_keep_the_old_stop(self):
+        """Third review of 04af: 5 held, ADD 2, cache and fresh read both 5."""
+        status = {}
+        (stop, add), cancel = self._run({"stop_price": 98.0}, pos_qty=5, filled=2, fresh=(5.0, 100.0),
+                                        action="ADD", status=status, held_before=5.0)
+        assert (stop, add) == (95.0, None) and status.get("prior_unreadable")
+        assert "held before the order" in status["unknown_reason"]
+        cancel.assert_not_called()
+
+    def test_reads_that_include_the_fill_stop_the_whole_position(self):
+        (stop, add), cancel = self._run({"stop_price": 98.0}, pos_qty=7, avg=101.0, filled=2,
+                                        fresh=(7.0, 101.0), action="ADD", held_before=5.0)
+        assert (stop, add) == (98.0, (101.0, 7.0))
+        cancel.assert_called_once_with("NVDA")
+
+    def test_unknown_held_before_skips_the_check(self):
+        (stop, add), _ = self._run({"stop_price": 98.0}, pos_qty=5, filled=2, fresh=(5.0, 100.0),
+                                   action="ADD", held_before=None)
+        assert add == (105.0, 5.0)   # reads agree at 5: the old behaviour
+
+    def test_held_before_order_reads_the_cache_and_never_raises(self):
+        client = MagicMock()
+        client.get_open_position.return_value = MagicMock(qty=3)
+        with patch("ibkr.get_client", return_value=client):
+            assert execution._held_before_order("NVDA") == 3.0
+        client.get_open_position.side_effect = Exception("No open position in NVDA")
+        with patch("ibkr.get_client", return_value=client):
+            assert execution._held_before_order("NVDA") is None
+
+    @pytest.mark.parametrize("pos_qty,fresh", [(0, (0.0, None)), (0, (2.0, 100.0))])
+    def test_known_holding_with_reads_at_or_below_the_fill_is_unknown(self, pos_qty, fresh):
+        """Fourth review of 04af: 5 held before the order, the reads show at
+        most the fill (cache emptied after a reconnect): don't book a fresh
+        entry over the record."""
+        status = {}
+        (stop, add), cancel = self._run({"stop_price": 98.0}, pos_qty=pos_qty, filled=2, fresh=fresh,
+                                        action="ADD", status=status, held_before=5.0)
+        assert (stop, add) == (95.0, None) and status.get("prior_unreadable")
+        cancel.assert_not_called()
+
+    def test_nvda_11_13_after_the_dedupe(self):
+        (stop, add), cancel = self._run({"stop_price": 146.24}, pos_qty=1, avg=186.96, filled=1,
+                                        new_stop=137.15, fresh=(2.0, 193.70), action="ADD")
+        assert (stop, add) == (146.24, (193.70, 2.0))
+        cancel.assert_called_once_with("NVDA")
+
+    def test_fresh_above_the_cache_without_a_fresh_cost_uses_the_cache_cost(self):
+        (stop, add), _ = self._run({"stop_price": 98.0}, pos_qty=5, avg=100.0, filled=2,
+                                   fresh=(7.0, None), action="ADD")
+        assert add == (100.0, 7.0)
+
+    def test_fresh_above_the_cache_with_no_cost_anywhere_is_unknown(self):
+        status = {}
+        (stop, add), cancel = self._run({"stop_price": 98.0}, filled=1, fresh=(2.0, None),
+                                        action="ADD", status=status,
+                                        cache_error=Exception("No open position in NVDA"))
+        assert (stop, add) == (95.0, None) and status.get("prior_unreadable")
+        cancel.assert_not_called()
+
+    def test_failed_fresh_read_keeps_the_old_stop_even_with_the_cache_above_the_fill(self):
+        """Third review of 04af: 5 held, ADD 2, cache lagging at 5, read times
+        out: sizing from the cache left 2 shares bare after the cancel."""
+        status = {}
+        (stop, add), cancel = self._run({"stop_price": 98.0}, pos_qty=5, filled=2,
+                                        fresh=RuntimeError("timeout"), action="ADD", status=status)
+        assert (stop, add) == (95.0, None) and status.get("prior_unreadable")
+        cancel.assert_not_called()
+
+    def test_fresh_below_a_cache_that_is_not_above_the_fill_is_a_stale_entry(self):
+        with patch("db.log_activity_direct") as act, patch("db.get_all_position_stops", return_value=[]):
+            (stop, add), cancel = self._run({"stop_price": 98.0}, pos_qty=2, filled=2,
+                                            fresh=(1.0, 100.0), action="ADD")
+        assert (stop, add) == (95.0, None)
+        cancel.assert_not_called()
+        assert act.call_args.args[0] == "stale_record_at_entry"
     def test_add_stops_the_whole_position_at_the_tighter_stop(self):
         (stop, add), cancel = self._run({"stop_price": 98.0})
         assert stop == 98.0            # old stop was higher: never loosen

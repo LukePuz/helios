@@ -529,7 +529,7 @@ def _refuse_sell_on_short(ib, ticker: str, qty: float | None = None) -> None:
     bad, held = short_of(ib.positions())
     if bad:
         try:
-            bad, held = short_of(_bounded_req(ib, "reqPositions", ib.reqPositions))
+            bad, held = short_of(_latest_positions(_bounded_req(ib, "reqPositions", ib.reqPositions)))
         except Exception:
             pass
     if bad:
@@ -546,11 +546,31 @@ def get_fresh_stock_positions() -> dict[str, float]:
     2026-11-02 #6). Raises on any read failure."""
     ib = get_ib()
     out: dict[str, float] = {}
-    for p in _bounded_req(ib, "reqPositions", ib.reqPositions):
+    for p in _latest_positions(_bounded_req(ib, "reqPositions", ib.reqPositions)):
         if getattr(p.contract, "secType", "STK") != "STK" or float(p.position) == 0:
             continue
         out[p.contract.symbol] = out.get(p.contract.symbol, 0.0) + float(p.position)
     return out
+
+
+def _latest_positions(rows) -> list:
+    """One row per (account, conId), the last one received. ib_async appends
+    every position message that arrives during a reqPositions() request to
+    its result, so a position that updates mid-request (TWS sends the old
+    and the new average cost after a fill) comes back twice: NVDA 2026-11-13
+    14:28, 2 shares held read as 4, and the whole-position stop for 4 was
+    refused. Rows without a conId are kept as they are."""
+    latest: dict = {}
+    rest: list = []
+    for p in rows or []:
+        con_id = getattr(getattr(p, "contract", None), "conId", None)
+        if not con_id:
+            rest.append(p)
+            continue
+        key = (getattr(p, "account", None), con_id)
+        latest.pop(key, None)   # re-insert so order follows the last message
+        latest[key] = p
+    return rest + list(latest.values())
 
 
 def get_fresh_stock_position(symbol: str) -> tuple[float, float | None]:
@@ -561,7 +581,7 @@ def get_fresh_stock_position(symbol: str) -> tuple[float, float | None]:
     is None when TWS sends none. Raises on any read failure."""
     ib = get_ib()
     qty, cost_total, cost_known = 0.0, 0.0, True
-    for p in _bounded_req(ib, "reqPositions", ib.reqPositions):
+    for p in _latest_positions(_bounded_req(ib, "reqPositions", ib.reqPositions)):
         if (getattr(p.contract, "secType", "STK") != "STK" or p.contract.symbol != symbol
                 or float(p.position) == 0):
             continue

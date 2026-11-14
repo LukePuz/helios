@@ -61,7 +61,10 @@ def _entry(upsert=None, set_id=None, prior=None, place_effect=None, positions=()
          patch("tasks.manage_cancel_stop_orders_for") as cancel, \
          patch("tasks._queue_reprotect") as queued, \
          patch("tasks.open_manual_action") as action, \
+         patch("execution._held_before_order", return_value=None), \
          patch("alerts._send") as send:
+        # held_before None: these tests cover the record write, on the
+        # cache-only stop path (an OPEN on a held ticker: test_execution).
         if positions:
             qty, avg = positions
             client.return_value.get_open_position.return_value = MagicMock(qty=qty, avg_entry_price=avg)

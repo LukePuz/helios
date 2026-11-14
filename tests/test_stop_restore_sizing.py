@@ -399,8 +399,9 @@ def test_add_floor_at_or_above_the_market_is_not_used():
     assert _add(100.0) == 98.0
 
 
-def test_buy_add_passes_the_fill_price_to_the_whole_position_stop():
-    approval = {"id": 1, "ticker": "NVDA", "action": "ADD", "conviction": 7,
+@pytest.mark.parametrize("action", ["ADD", "OPEN"])
+def test_buy_add_passes_the_fill_price_to_the_whole_position_stop(action):
+    approval = {"id": 1, "ticker": "NVDA", "action": action, "conviction": 7,
                 "thesis_bucket": "Accelerator", "stop_loss_price": 90.0,
                 "risk_json": {"shares_initial": 5, "price_at_sizing": 100.0,
                               "stop_loss_price": 90.0}}
@@ -426,8 +427,8 @@ def test_buy_add_passes_the_fill_price_to_the_whole_position_stop():
         rm_cls.return_value.is_halted.return_value = False
         execution.execute_approved(approval)
     assert seen.get("market_price") == 101.5
-    assert seen.get("action") == "ADD"
-    assert seen.get("held_before") == 5.0   # the ADD's pre-order count is passed through (04af)
+    assert seen.get("action") == action
+    assert seen.get("held_before") == 5.0   # the pre-order count is passed through (04af)
 
 
 # ── 5. Profit-target mark guard ─────────────────────────────────────────

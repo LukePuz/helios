@@ -1118,15 +1118,19 @@ def _note_stale_record(ticker: str, filled_qty: float, action: str | None, path:
 
 
 def _held_before_order(ticker: str) -> float | None:
-    """The long quantity the portfolio cache shows just before an ADD's order
+    """The long quantity the portfolio cache shows just before a BUY's order
     goes out (nothing of this order is in flight yet), for
-    _whole_position_stop's check that the post-fill reads include the new
-    shares. None when it can't be read: the check is then skipped."""
+    _whole_position_stop: an ADD's check that the post-fill reads include the
+    new shares; a count above 0 also has an OPEN's stop handled as an ADD's
+    (the ticker was already held). 0.0 when the cache
+    has no position; None when it can't be read: the checks are then skipped."""
     try:
         import ibkr
         return max(0.0, float(ibkr.get_client().get_open_position(ticker).qty))
     except Exception as e:
-        log.info(f"[{ticker}] held count before the ADD order unreadable: {e}")
+        if str(e).startswith("No open position"):
+            return 0.0
+        log.info(f"[{ticker}] held count before the BUY order unreadable: {e}")
         return None
 
 
@@ -1156,6 +1160,17 @@ def _whole_position_stop(ticker: str, new_stop: float, filled_qty: float,
     import db
     import ibkr
     import tasks
+    reclassified_open = False
+    if action == "OPEN" and held_before is not None and held_before > 1e-6:
+        # An OPEN on a ticker the broker already held before the order (the
+        # analyst saw it unheld: a stale view or a lagging cache) is an add:
+        # stopping it from the cache alone left the same unstopped windows an
+        # ADD had (roadmap 04af). Only a held count read before the order
+        # decides, never a post-fill read: a still-filling OPEN can show more
+        # shares than its fill (review 15:2x #4).
+        log.warning(f"[{ticker}] OPEN filled on a ticker that held {held_before:g} before the "
+                    f"order; handling its stop as an ADD")
+        action, reclassified_open = "ADD", True
     try:
         prior = db.get_position_stop(ticker, strict=True)   # a query error is "unknown", not "none"
     except Exception as e:
@@ -1233,8 +1248,18 @@ def _whole_position_stop(ticker: str, new_stop: float, filled_qty: float,
                 avg_cost = float(fresh_cost)
             elif avg_cost is None:
                 return _ambiguous("the position's average cost could not be read")
-    if (action == "ADD" and held_before is not None and held_before > 1e-6
-            and total_qty + 1e-6 < held_before + filled_qty):
+    # A reclassified OPEN whose reads agree on exactly the fill, with a
+    # different count held before the order: the earlier shares are gone (a
+    # stop fill the pre-order cache hadn't dropped yet), so this is a fresh
+    # entry over a leftover record, not an add with lagging reads. A lagging
+    # read shows the pre-fill count, which equals the fill only when
+    # held_before == filled_qty; that case stays unknown (review of the
+    # OPEN-on-held change, 2026-11-14).
+    # Reads below the fill haven't caught up with it: that stays unknown too.
+    open_over_leftover = (reclassified_open and abs(total_qty - filled_qty) <= 1e-6
+                          and abs(held_before - filled_qty) > 1e-6)
+    if (action == "ADD" and not open_over_leftover and held_before is not None
+            and held_before > 1e-6 and total_qty + 1e-6 < held_before + filled_qty):
         # Both reads can still show the pre-fill count (a fresh read that
         # ended before the fill's row, with a lagging cache): 5 held, ADD 2,
         # both reads 5. The count read before the order says 7 should be
@@ -2140,7 +2165,7 @@ def execute_approved(
                 decision_price=price_at_sizing, approval_id=approval["id"], intent=action,
                 submitted_at=submitted_at, submit_price=current_price_pre,
             )
-            if side == "BUY" and action == "ADD":
+            if side == "BUY" and action in ("ADD", "OPEN"):
                 held_before_order = _held_before_order(ticker)
             try:
                 order_result = ibkr.place_market_order(ticker, side, shares,

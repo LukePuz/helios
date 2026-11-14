@@ -5,9 +5,9 @@ pushed here. So this branch can be ahead of, or differ from, the code that is ru
 
 | | |
 |---|---|
-| Live since | 2026-11-13 17:28 ET (drained restart after the close) |
-| Local deploy tag | `deploy-2026-11-13b` (local commit `b0ddb02`: `7ba0857` plus the ADD whole-position stop keeping the old stop unless the whole position is known) |
-| Previous load | 2026-11-13 16:11 (`deploy-2026-11-13`, local commit `7ba0857`) |
+| Live since | 2026-11-14 05:00 ET pulled while stopped for the weekend; the bot loads it at its next start (Mon 2026-11-16 ~05:00) |
+| Local deploy tag | `deploy-2026-11-14` (local commit `2b0d52c`: `b0ddb02` plus an OPEN on an already-held ticker taking the ADD stop path) |
+| Previous load | 2026-11-13 17:28 (`deploy-2026-11-13b`, local commit `b0ddb02`) |
 
 Commits on this branch that aren't in the deploy commit above aren't live yet (for example the held-move shadow);
 they go live with a later load listed here. Updated at each deploy.

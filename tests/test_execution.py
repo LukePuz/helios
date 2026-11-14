@@ -1002,7 +1002,90 @@ class TestAddStopsWholePosition:
             assert execution._held_before_order("NVDA") == 3.0
         client.get_open_position.side_effect = Exception("No open position in NVDA")
         with patch("ibkr.get_client", return_value=client):
+            assert execution._held_before_order("NVDA") == 0.0   # flat, not unknown
+        client.get_open_position.side_effect = ConnectionError("not connected")
+        with patch("ibkr.get_client", return_value=client):
             assert execution._held_before_order("NVDA") is None
+
+    def test_open_on_a_ticker_held_before_the_order_is_stopped_as_an_add(self):
+        """Roadmap 04af: an OPEN that fills on a ticker already held (stale
+        analyst view) with a lagging cache got a stop for the fill only."""
+        with patch("db.log_activity_direct") as act:
+            (stop, add), cancel = self._run({"stop_price": 163.68}, pos_qty=1, avg=183.39,
+                                            new_stop=146.24, filled=1, fresh=(2.0, 174.98),
+                                            action="OPEN", held_before=1.0)
+        assert (stop, add) == (163.68, (174.98, 2.0))
+        cancel.assert_called_once_with("NVDA")
+        self.fresh_read.assert_called_once()
+        act.assert_not_called()
+
+    def test_open_on_a_held_ticker_with_reads_short_of_the_fill_keeps_the_old_stop(self):
+        status = {}
+        (stop, add), cancel = self._run({"stop_price": 98.0}, pos_qty=5, filled=2,
+                                        fresh=(5.0, 100.0), action="OPEN", held_before=5.0,
+                                        status=status)
+        assert (stop, add) == (95.0, None)
+        cancel.assert_not_called()
+        assert status.get("prior_unreadable") is True
+
+    def test_open_on_a_held_ticker_with_a_failed_fresh_read_keeps_the_old_stop(self):
+        status = {}
+        (stop, add), cancel = self._run({"stop_price": 98.0}, pos_qty=7, filled=2,
+                                        fresh=ConnectionError("down"), action="OPEN",
+                                        held_before=5.0, status=status)
+        assert (stop, add) == (95.0, None)
+        cancel.assert_not_called()
+        assert status.get("prior_unreadable") is True
+
+    def test_open_after_a_stop_fill_the_cache_had_not_dropped_is_a_fresh_entry(self):
+        """Review 11-14 #1: 5 sold by a stop fill, the pre-order cache still at
+        5, the record not yet deleted; an OPEN of 3 fills and both reads show
+        3. That's a fresh entry over a leftover record, not an unknown add."""
+        status = {}
+        with patch("db.log_activity_direct") as act, patch("db.get_all_position_stops", return_value=[]):
+            (stop, add), cancel = self._run({"stop_price": 98.0}, pos_qty=3, filled=3,
+                                            fresh=(3.0, 100.0), action="OPEN", held_before=5.0,
+                                            status=status)
+        assert (stop, add) == (95.0, None)
+        cancel.assert_not_called()
+        assert not status.get("prior_unreadable")
+        assert act.call_args.args[0] == "stale_record_at_entry"
+
+    def test_open_on_a_held_ticker_with_reads_at_the_pre_fill_count_equal_to_the_fill_stays_unknown(self):
+        """5 held, OPEN of 5, both reads still 5: the old shares may be the
+        ones showing. Not booked as fresh."""
+        status = {}
+        (stop, add), cancel = self._run({"stop_price": 98.0}, pos_qty=5, filled=5,
+                                        fresh=(5.0, 100.0), action="OPEN", held_before=5.0,
+                                        status=status)
+        assert (stop, add) == (95.0, None)
+        cancel.assert_not_called()
+        assert status.get("prior_unreadable") is True
+
+    @pytest.mark.parametrize("fresh", [(0.0, None), (1.0, 100.0)])
+    def test_open_on_a_held_ticker_with_reads_below_the_fill_stays_unknown(self, fresh):
+        """Second review 11-14: 5 held, OPEN of 2, the cache empty after a
+        reconnect and a fresh read below the fill: not caught up, so not
+        booked as a fresh entry over the record."""
+        status = {}
+        (stop, add), cancel = self._run({"stop_price": 98.0}, filled=2, fresh=fresh,
+                                        action="OPEN", held_before=5.0, status=status,
+                                        cache_error=Exception("No open position in NVDA"))
+        assert (stop, add) == (95.0, None)
+        cancel.assert_not_called()
+        assert status.get("prior_unreadable") is True
+
+    @pytest.mark.parametrize("held_before", [0.0, None])
+    def test_open_with_nothing_held_before_never_takes_the_fresh_read(self, held_before):
+        """A flat or unreadable pre-order count keeps an OPEN on the cache
+        path (a still-filling OPEN can show more than its fill)."""
+        with patch("db.log_activity_direct"), patch("db.get_all_position_stops", return_value=[]):
+            (stop, add), cancel = self._run({"stop_price": 98.0}, pos_qty=5, filled=5,
+                                            fresh=(8.0, 100.0), action="OPEN",
+                                            held_before=held_before)
+        assert (stop, add) == (95.0, None)
+        cancel.assert_not_called()
+        self.fresh_read.assert_not_called()
 
     @pytest.mark.parametrize("pos_qty,fresh", [(0, (0.0, None)), (0, (2.0, 100.0))])
     def test_known_holding_with_reads_at_or_below_the_fill_is_unknown(self, pos_qty, fresh):

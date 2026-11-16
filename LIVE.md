@@ -5,7 +5,7 @@ pushed here. So this branch can be ahead of, or differ from, the code that is ru
 
 | | |
 |---|---|
-| Live since | 2026-11-14 05:00 ET pulled while stopped for the weekend; the bot loads it at its next start (Mon 2026-11-16 ~05:00) |
+| Live since | 2026-11-16 05:00 ET (pulled 2026-11-14 while stopped; first loaded at the Monday start) |
 | Local deploy tag | `deploy-2026-11-14` (local commit `2b0d52c`: `b0ddb02` plus an OPEN on an already-held ticker taking the ADD stop path) |
 | Previous load | 2026-11-13 17:28 (`deploy-2026-11-13b`, local commit `b0ddb02`) |
 

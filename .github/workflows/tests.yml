@@ -30,7 +30,9 @@ jobs:
           # 1.16.3 beside certifi 2026.x, so install the rest first and then
           # polygon without its pins, as the box has it.
           grep -v '^polygon-api-client' requirements.txt > /tmp/requirements-ci.txt
-          pip install -r /tmp/requirements-ci.txt
+          # celery<5.7 as on the box (5.6.3): 5.7 also calls on_failure on a
+          # hard time limit, which tests/test_event_lost.py pins against.
+          pip install -r /tmp/requirements-ci.txt 'celery<5.7'
           pip install --no-deps 'polygon-api-client==1.16.3'
 
       - name: Run test suite

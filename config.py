@@ -477,6 +477,21 @@ REGIME_COMPLETED_BARS = os.getenv("REGIME_COMPLETED_BARS", "true").lower() == "t
 # signals.trend.shadow_200. The live request, score, label, sizing and
 # prompts are the same either way; false skips the second request.
 REGIME_SHADOW_200_ENABLED = os.getenv("REGIME_SHADOW_200_ENABLED", "true").lower() == "true"
+# Stop-out re-entry shadow (record only): an OPEN/ADD that has passed the
+# rebuy cooldown, on a ticker whose last exit the bot did not place (a resting
+# stop fill or a manual sale) is under 10 days old, gets one
+# STOPOUT_REENTRY_SHADOW signals row saying which re-entry cooldowns
+# (1, 3, 5 and 10 days) would have blocked it. Routing, sizing and prompts are
+# the same either way; false skips the read. Not read from .env.
+STOPOUT_REENTRY_SHADOW_ENABLED = True
+# Entry-quality shadow (record only): an OPEN/ADD that has passed the rebuy
+# cooldown gets one ENTRY_QUALITY_SHADOW signals row with the triggering
+# item's screener new_fact, the last completed close against the 50- and
+# 200-day averages and its distance below the 20-day high in ATR14 units (from
+# the cached price_history bars, no fetch), and which fixed illustrative trend
+# filters would have blocked it. Routing, sizing and prompts are the same
+# either way; false skips the read. Not read from .env.
+ENTRY_QUALITY_SHADOW_ENABLED = True
 # When a monitored stop level is breached and NO protective stop exists at
 # the broker, execute a market sell of the full position instead of only
 # alerting. Only ever reduces exposure; set False to fall back to alert-only.

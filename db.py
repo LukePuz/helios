@@ -1368,7 +1368,8 @@ _NON_ANALYST_SIGNALS = ("SCREENED_OUT", "CATALYST_BLOCKED", "COOLDOWN_SKIPPED", 
                         # Trim/exit rule row (agents/trim_exit.py), one per held
                         # review: kept out of the verdict reads, so it confirms
                         # nothing and never reaches the brief.
-                        "TRIM_EXIT_RULE")
+                        "TRIM_EXIT_RULE", "STOPOUT_REENTRY_SHADOW",
+                        "ENTRY_QUALITY_SHADOW")
 
 
 def get_latest_signal_for(ticker: str, with_trigger: bool = False,
@@ -1431,7 +1432,8 @@ def get_latest_signal_for(ticker: str, with_trigger: bool = False,
 # (HELD_MOVE_SHADOW); later the trim/exit rule's row (TRIM_EXIT_RULE).
 _RECORD_ONLY_SIGNALS = ("ANALYST_FAILED", "NO_VERDICT", "ROUTE_NO_BROKER", "ROUTE_RISK_INIT_FAILED",
                         "ROUTE_ERROR", "SCREENED_IN", "EVENT_LOST", "REVIEW_SKIPPED", "HELD_MOVE_SHADOW",
-                        "DIP_WATCH_SHADOW", "TRIM_EXIT_RULE")
+                        "DIP_WATCH_SHADOW", "TRIM_EXIT_RULE", "STOPOUT_REENTRY_SHADOW",
+                        "ENTRY_QUALITY_SHADOW")
 
 
 def get_recent_signals(limit: int = 50) -> list[dict]:
@@ -1686,6 +1688,63 @@ def get_last_executed_approval(ticker: str, hours: int, strict: bool = False) ->
     finally:
         _put_conn(conn)
 
+
+
+def get_last_broker_exit(ticker: str, days: int, strict: bool = False) -> dict | None:
+    """The newest exit the bot did not place on this ticker (trade_outcomes
+    exit_source 'broker_exit': a resting stop fill, or a sale made at the
+    broker; the bot's own backstop_sell and manual_sell are not included)
+    within `days`, or None. The lots closed at that same time are grouped:
+    hours_since (from the fill time when known, else the reconcile time),
+    lots, lot_outcome_pct and lot_alpha_pct (percent, from the stored
+    fractions; None when not stored) and lot_convictions.
+    entries_since_exit counts the OPEN/ADD approvals decided (APPROVED or
+    FAILED, as the rebuy cooldown counts them) after that exit, so a reader
+    can tell the first buy back from later ones. Read by the
+    stop-out re-entry shadow only, never by routing or sizing. A stop fill
+    is reconciled up to ~20 min after it fills, so a buy in that gap sees
+    no exit. strict: raise on a DB error instead of returning None."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COALESCE(exit_fill_at, exit_date) AS t, "
+                "EXTRACT(EPOCH FROM (NOW() - COALESCE(exit_fill_at, exit_date))) / 3600.0, "
+                "outcome_pct, alpha_pct, conviction "
+                "FROM trade_outcomes WHERE ticker=%s AND trading_env=%s "
+                "AND exit_source='broker_exit' "
+                "AND COALESCE(exit_fill_at, exit_date) > NOW() - (%s || ' days')::interval "
+                "ORDER BY t DESC LIMIT 20",
+                (ticker, TRADING_ENV, int(days)),
+            )
+            rows = cur.fetchall()
+            if not rows:
+                return None
+            cur.execute(
+                "SELECT COUNT(*) FROM pending_approvals "
+                "WHERE ticker=%s AND trading_env=%s AND action IN ('OPEN','ADD') "
+                "AND status IN ('APPROVED','FAILED') AND decided_at > %s",
+                (ticker, TRADING_ENV, rows[0][0]),
+            )
+            since = cur.fetchone()
+        lots = [r for r in rows if r[0] == rows[0][0]]
+
+        def _pct(v):
+            return round(float(v) * 100, 2) if v is not None else None
+        return {"exit_at": rows[0][0].isoformat() if hasattr(rows[0][0], "isoformat") else str(rows[0][0]),
+                "hours_since": round(float(rows[0][1]), 2),
+                "lots": len(lots),
+                "lot_outcome_pct": [_pct(r[2]) for r in lots],
+                "lot_alpha_pct": [_pct(r[3]) for r in lots],
+                "lot_convictions": [int(r[4]) if r[4] is not None else None for r in lots],
+                "entries_since_exit": int(since[0]) if since and since[0] is not None else None}
+    except Exception as e:
+        logging.error(f"get_last_broker_exit failed: {e}")
+        if strict:
+            raise
+        return None
+    finally:
+        _put_conn(conn)
 
 # Account-level figures left out of a spilled approval (the spill keeps no
 # account values, as with log_signal's prompt). Trade-level sizing stays.

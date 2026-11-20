@@ -2283,6 +2283,268 @@ def _add_exit_state(ticker: str, px, sizing, prior, held_qty, avg) -> dict:
     return out
 
 
+_STOPOUT_WINDOWS_DAYS = (1, 3, 5, 10)
+
+
+def _stopout_reentry_shadow(ticker: str, result: dict) -> None:
+    """Stop-out re-entry shadow (config STOPOUT_REENTRY_SHADOW_ENABLED). Called
+    for an OPEN/ADD once it has passed the rebuy cooldown. When the ticker's
+    newest exit the bot did not place (db.get_last_broker_exit: a resting
+    stop fill, or a sale made at the broker; not the bot's own backstop or
+    manual sells) is under 10 days old, writes one
+    STOPOUT_REENTRY_SHADOW row: hours since that exit, its lots' outcomes, and
+    would_block per re-entry cooldown window (1, 3, 5, 10 days). No row when
+    there is no such exit. A failed read writes a row with read "error:
+    <class>" and would_block None. Record only: nothing routes, sizes or
+    prompts on it, and the buy goes on either way. Never raises."""
+    try:
+        try:
+            from config import STOPOUT_REENTRY_SHADOW_ENABLED
+        except ImportError:
+            return
+        if not STOPOUT_REENTRY_SHADOW_ENABLED or result.get("action") not in ("OPEN", "ADD"):
+            return
+        import db
+        kind = "STOPOUT_REENTRY_SHADOW"
+        try:
+            ex = db.get_last_broker_exit(ticker, max(_STOPOUT_WINDOWS_DAYS), strict=True)
+            read = "ok"
+        except Exception as e:
+            ex, read = None, f"error: {type(e).__name__}"
+        if ex is None and read == "ok":
+            return
+        rec = {"read": read, "lookback_days": max(_STOPOUT_WINDOWS_DAYS),
+               "windows_days": list(_STOPOUT_WINDOWS_DAYS), "would_block": None}
+        if ex:
+            rec.update(ex)
+            hrs = ex.get("hours_since")
+            if isinstance(hrs, (int, float)):
+                rec["would_block"] = {f"{d}d": hrs < d * 24 for d in _STOPOUT_WINDOWS_DAYS}
+            outs = [v for v in ex.get("lot_outcome_pct") or [] if isinstance(v, (int, float))]
+            rec["worst_lot_outcome_pct"] = min(outs) if outs else None
+            convs = [v for v in ex.get("lot_convictions") or [] if isinstance(v, int)]
+            conv = result.get("conviction")
+            rec["conviction_above_lots"] = (conv > max(convs)
+                                            if convs and isinstance(conv, (int, float)) else None)
+            reason = (f"{result.get('action')} {hrs} h after an exit the bot did not place "
+                      f"(worst lot {rec['worst_lot_outcome_pct']}%); record only")
+        else:
+            reason = f"{result.get('action')}: stop-out read failed ({read}); record only"
+        # route_exit stays: it marks the row's provenance as a copy of the
+        # verdict's (db._VERDICT_COPY_KEY), as on SHADOW_SWAP rows, so readers
+        # that count provenance or LLM calls skip it. The buy goes on.
+        fields = _route_row_fields(result, kind)
+        fields["decision"]["shadow"] = kind
+        fields["decision"]["stopout_reentry"] = rec
+        db.log_signal(ticker, kind, 0.0, reason[:500], **fields)
+    except Exception as e:
+        log.warning(f"[{ticker}] stop-out re-entry shadow failed: {type(e).__name__}: {e}")
+
+
+# Entry-quality shadow (_entry_quality_shadow). One price_history read of this
+# many rows (the brief and the trade ladder read 260); the 20-day high and the
+# swing window of agents.price_action.compute_price_action (last 60 bars).
+_ENTRY_QUALITY_BAR_ROWS = 260
+_ENTRY_QUALITY_HIGH_DAYS = 20
+_ENTRY_QUALITY_SWING_BARS = 60
+_ENTRY_QUALITY_DRAWDOWN_ATR = 3.0
+
+
+def _entry_opinion_trigger(result: dict) -> dict:
+    """What started the analysis behind this verdict, from the trigger its
+    provenance already carries (analyst.trigger_record plus the screener's
+    new_fact on the news path). new_fact is the screener's flag on the item
+    (None when not a bool: not judged, or not the news path); new_fact_false
+    is True only when the screener said False. Never raises."""
+    out = {"trigger_present": False, "path": None, "source": None, "type": None,
+           "new_fact": None, "new_fact_false": None, "screener_fallback_reason": None}
+    try:
+        prov = result.get("provenance")
+        trig = prov.get("trigger") if isinstance(prov, dict) else None
+        if not isinstance(trig, dict):
+            return out
+        nf = trig.get("new_fact")
+        nf = nf if isinstance(nf, bool) else None
+        out.update(trigger_present=True, path=trig.get("path"), source=trig.get("source"),
+                   type=trig.get("type"), new_fact=nf,
+                   new_fact_false=(nf is False) if nf is not None else None,
+                   screener_fallback_reason=trig.get("screener_fallback_reason"))
+    except Exception as e:
+        out["error"] = type(e).__name__
+    return out
+
+
+def _entry_trend_check(ticker: str, now=None) -> dict:
+    """Price structure on completed daily bars for _entry_quality_shadow. One
+    read of the nightly price_history cache (db.get_price_history, a database
+    read: nothing is fetched from a data vendor or the broker, and an empty
+    cache records read "no_cached_bars"). Today's unfinished bar is dropped
+    as the regime code drops it (market_regime.completed_bars); non-finite
+    bars are carried forward as the trade ladder does (_sanitize_bars), and
+    an inf it leaves is dropped (nonfinite_dropped). bar_age_days is the
+    calendar age of the last bar.
+
+    Records the last close against the 50- and 200-day simple averages of the
+    last 50 and 200 completed closes (None, with a reason, under that many
+    bars); the distance below the 20-day high in percent and in ATR14 units
+    (trade_ladder._compute_atr14); and, on the last 60 bars, the brief's swing
+    structure label (price_action._swing_structure) with whether the last
+    swing high is under the one before it, from the same fractal swings
+    collapsed the same way. read is "ok" with 200+ bars, "insufficient_bars"
+    under that, "no_cached_bars" or "error: <class>". Never raises."""
+    rec = {"read": None, "source": "price_history", "rows_read": None, "bars": 0,
+           "partial_bar_dropped": None, "nonfinite_bars": None, "last_bar_date": None,
+           "last_close": None}
+    for n in (50, 200):
+        rec.update({f"sma{n}": None, f"above_sma{n}": None, f"below_sma{n}": None,
+                    f"pct_vs_sma{n}": None, f"sma{n}_reason": None})
+    rec.update({"atr14": None, "high_20d": None, "high_20d_date": None,
+                "drawdown_from_20d_high_pct": None, "drawdown_from_20d_high_atr": None,
+                "drawdown_reason": None, "swing_bars": _ENTRY_QUALITY_SWING_BARS,
+                "swing_structure": None, "swing_highs": None, "last_swing_high_lower": None,
+                "swing_reason": None})
+    try:
+        import math
+        import db
+        try:
+            raw = db.get_price_history(ticker, days=_ENTRY_QUALITY_BAR_ROWS, strict=True)
+        except Exception as e:
+            rec["read"] = f"error: {type(e).__name__}"
+            return rec
+        raw = list(raw or [])
+        rec["rows_read"] = len(raw)
+        if not raw:
+            rec["read"] = "no_cached_bars"
+            return rec
+        from agents.market_regime import completed_bars
+        from agents.trade_ladder import _compute_atr14, _sanitize_bars
+        bars = completed_bars(raw, now=now)
+        rec["partial_bar_dropped"] = len(bars) < len(raw)
+
+        def finite(v):
+            return isinstance(v, (int, float)) and math.isfinite(v)
+        rec["nonfinite_bars"] = sum(1 for b in bars if not all(
+            finite(b.get(k)) for k in ("open", "high", "low", "close")))
+        bars = _sanitize_bars(bars)
+        # _sanitize_bars carries only NaN/None forward; an inf left over is
+        # dropped here so no number or label is computed from it.
+        kept = [b for b in bars if all(finite(b.get(k)) for k in ("open", "high", "low", "close"))]
+        rec["nonfinite_dropped"] = len(bars) - len(kept)
+        bars = kept
+        rec["bars"] = len(bars)
+        if not bars:
+            rec["read"] = "no_cached_bars"
+            return rec
+        rec["last_bar_date"] = str(bars[-1].get("date"))
+        # Calendar days from the last bar to today (ET): a name whose nightly
+        # refresh failed shows its age here, as read stays "ok".
+        try:
+            from datetime import date as _date
+            from zoneinfo import ZoneInfo
+            today = (now or datetime.now(ZoneInfo("America/New_York")))
+            today = today.astimezone(ZoneInfo("America/New_York")).date() if today.tzinfo else today.date()
+            rec["bar_age_days"] = (today - _date.fromisoformat(str(bars[-1].get("date"))[:10])).days
+        except Exception:
+            rec["bar_age_days"] = None
+        closes = [float(b["close"]) for b in bars]
+        last = closes[-1]
+        rec["last_close"] = round(last, 4)
+        for n in (50, 200):
+            if len(closes) < n:
+                rec[f"sma{n}_reason"] = f"{len(closes)} completed bars, {n} needed"
+                continue
+            sma = sum(closes[-n:]) / n
+            rec[f"sma{n}"] = round(sma, 4)
+            rec[f"above_sma{n}"] = last > sma
+            rec[f"below_sma{n}"] = last < sma
+            rec[f"pct_vs_sma{n}"] = round((last / sma - 1) * 100, 2) if sma else None
+        if len(bars) < _ENTRY_QUALITY_HIGH_DAYS:
+            rec["drawdown_reason"] = (f"{len(bars)} completed bars, "
+                                      f"{_ENTRY_QUALITY_HIGH_DAYS} needed")
+        else:
+            top = max(bars[-_ENTRY_QUALITY_HIGH_DAYS:], key=lambda b: b["high"])
+            hi = float(top["high"])
+            rec["high_20d"], rec["high_20d_date"] = round(hi, 4), str(top.get("date"))
+            rec["drawdown_from_20d_high_pct"] = round((last / hi - 1) * 100, 2) if hi else None
+            atr = _compute_atr14(bars)
+            if atr and atr > 0:
+                rec["atr14"] = round(atr, 4)
+                # Unrounded, so a threshold read off it matches the label.
+                rec["drawdown_from_20d_high_atr"] = (hi - last) / atr
+            else:
+                rec["drawdown_reason"] = "no ATR14"
+        if len(bars) < _ENTRY_QUALITY_SWING_BARS:
+            rec["swing_reason"] = (f"{len(bars)} completed bars, "
+                                   f"{_ENTRY_QUALITY_SWING_BARS} needed")
+        else:
+            from agents.price_action import _find_swings, _swing_structure
+            window = bars[-_ENTRY_QUALITY_SWING_BARS:]
+            rec["swing_structure"] = _swing_structure(window)[0]
+            swings = _find_swings(window)
+            # Collapsed as price_action._swing_structure and
+            # trade_ladder.compute_base_contraction collapse them.
+            collapsed = []
+            for s in swings:
+                if collapsed and collapsed[-1][2] == s[2]:
+                    if (s[2] == "high" and s[1] > collapsed[-1][1]) or \
+                            (s[2] == "low" and s[1] < collapsed[-1][1]):
+                        collapsed[-1] = s
+                else:
+                    collapsed.append(s)
+            highs = [s[1] for s in collapsed if s[2] == "high"][-2:]
+            if len(swings) < 4 or len(highs) < 2:
+                rec["swing_reason"] = "fewer than 4 swings or 2 swing highs"
+            else:
+                rec["swing_highs"] = [round(float(h), 4) for h in highs]
+                rec["last_swing_high_lower"] = highs[1] < highs[0]
+        rec["read"] = "ok" if len(bars) >= 200 else "insufficient_bars"
+    except Exception as e:
+        rec["read"] = f"error: {type(e).__name__}"
+    return rec
+
+
+def _entry_quality_shadow(ticker: str, result: dict, now=None) -> None:
+    """Entry-quality shadow (config ENTRY_QUALITY_SHADOW_ENABLED). Called for
+    an OPEN/ADD once it has passed the rebuy cooldown, right after
+    _stopout_reentry_shadow. Writes one ENTRY_QUALITY_SHADOW row:
+    opinion_trigger (_entry_opinion_trigger), trend_check (_entry_trend_check,
+    one cached-bar read) and would_block_trend, fixed illustrative labels
+    (below_200dma, below_50dma, drawdown_gt_3atr; None when the number is
+    missing) that trend_check's raw numbers let anyone rescore. Record only:
+    nothing routes, sizes or prompts on it, result is not changed, and the
+    buy goes on either way. Never raises."""
+    try:
+        try:
+            from config import ENTRY_QUALITY_SHADOW_ENABLED
+        except ImportError:
+            return
+        if not ENTRY_QUALITY_SHADOW_ENABLED or result.get("action") not in ("OPEN", "ADD"):
+            return
+        import db
+        kind = "ENTRY_QUALITY_SHADOW"
+        trig = _entry_opinion_trigger(result)
+        trend = _entry_trend_check(ticker, now=now)
+
+        dd = trend.get("drawdown_from_20d_high_atr")
+        would = {"below_200dma": trend.get("below_sma200"), "below_50dma": trend.get("below_sma50"),
+                 "drawdown_gt_3atr": (dd > _ENTRY_QUALITY_DRAWDOWN_ATR)
+                 if isinstance(dd, (int, float)) else None}
+        reason = (f"{result.get('action')}: trend read {trend.get('read')}; "
+                  + ", ".join(f"{k}={v}" for k, v in would.items())
+                  + f"; new_fact={trig.get('new_fact')}; record only")
+        # route_exit stays: it marks the row's provenance as a copy of the
+        # verdict's (db._VERDICT_COPY_KEY), as on SHADOW_SWAP rows, so readers
+        # that count provenance or LLM calls skip it. The buy goes on.
+        fields = _route_row_fields(result, kind)
+        fields["decision"]["shadow"] = kind
+        fields["decision"]["opinion_trigger"] = trig
+        fields["decision"]["trend_check"] = trend
+        fields["decision"]["would_block_trend"] = would
+        db.log_signal(ticker, kind, 0.0, reason[:500], **fields)
+    except Exception as e:
+        log.warning(f"[{ticker}] entry-quality shadow failed: {type(e).__name__}: {e}")
+
+
 def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
     """
     Run risk sizing on an analyst recommendation and auto-execute it (paper
@@ -2348,6 +2610,8 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
             except Exception as e:
                 log.warning(f"[{ticker}] COOLDOWN_SKIPPED signal log failed: {e}")
             return
+        _stopout_reentry_shadow(ticker, result)
+        _entry_quality_shadow(ticker, result)
 
     if action in ("TRIM", "EXIT"):
         # Risk-reducing sells are sized from the held position, never through

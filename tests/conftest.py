@@ -170,6 +170,26 @@ def _no_regime_shadow_fetch(monkeypatch):
     monkeypatch.setattr(market_regime, "_fetch_shadow_bars", lambda ticker: None)
 
 
+
+@pytest.fixture(autouse=True)
+def _no_stopout_reentry_read(monkeypatch):
+    """Each OPEN/ADD past the rebuy cooldown reads the last exit the bot did
+    not place, for its record-only stop-out re-entry shadow. Stubbed as "no
+    such exit" (no row) unless a test patches it itself."""
+    import db
+    monkeypatch.setattr(db, "get_last_broker_exit", lambda *a, **k: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_entry_quality_row(monkeypatch):
+    """Each OPEN/ADD past the rebuy cooldown writes a record-only
+    ENTRY_QUALITY_SHADOW row from a price_history read. Off here so existing
+    tests see no new row or read; tests/test_entry_quality_shadow.py turns it
+    on."""
+    import config
+    monkeypatch.setattr(config, "ENTRY_QUALITY_SHADOW_ENABLED", False)
+
+
 @pytest.fixture(autouse=True)
 def _no_kombu_publish(monkeypatch):
     """Backstop for the send_task trap: any message published through kombu

@@ -44,6 +44,11 @@ def _no_prior_stop():
         yield
 
 
+# A fresh quote for BUY tests that aren't about the pre-order price check: a
+# BUY with no quote at all takes the stale branch and defers.
+_FRESH = {"price": 100.0, "is_stale": False, "age_minutes": 1.0, "market_open": True}
+
+
 def _approval(action="TRIM", shares_initial=100, price_at_sizing=100.0, stop_loss_price=90.0):
     return {
         "id": 1,
@@ -264,7 +269,7 @@ class TestPhantomFills:
              patch("risk_manager.RiskManager") as mock_rm_cls, \
              patch("ibkr.place_market_order") as mock_order, \
              patch("ibkr.get_latest_price", return_value=100.0), \
-             patch("market_data.get_priced_quote", return_value=None), \
+             patch("market_data.get_priced_quote", return_value=dict(_FRESH)), \
              patch("market_data.is_market_hours", return_value=True), \
              patch("config.USE_BRACKET_ORDERS", False), \
              patch("db.log_trade") as mock_log_trade, \
@@ -343,6 +348,64 @@ class TestMarketHoursGate:
         # Log-only record of the skipped sell (audit A0903-4)
         assert log_signal.call_args.args[1] == "SELL_SKIPPED_CLOSED"
         assert log_signal.call_args.kwargs["provenance"]["price_at_skip"] == 101.5
+
+    def test_rule_sell_recheck_skips_before_stop_cancel(self):
+        """A sale the trim/exit rule routed is skipped, stop untouched, when
+        the sell switch is off by execution time, the ticker is now exempt,
+        its context is no longer live, a TRIM would leave fewer than the
+        minimum shares, a one-share EXIT now has a partial sale (shares
+        bought since) or TRIM_EXIT_ONE_SHARE_TRIM is no longer "exit", or
+        the recheck raises. An untagged sell is not rechecked."""
+        cases = [
+            ("EXIT", 5, {"TRIM_EXIT_LIVE": False}, "switched off since routing", None),
+            ("TRIM", 1, {"TRIM_EXIT_EXEMPT_TICKERS": ("NVDA",)}, "ticker exempt since routing", None),
+            ("TRIM", 1, {"TRIM_EXIT_LIVE_CONTEXTS": ()}, "context not live", None),
+            ("TRIM", 5, {}, "trim would leave too few shares", None),     # 5 of the 5 still held
+            ("EXIT", 1, {"TRIM_EXIT_ONE_SHARE_TRIM": "exit"},
+             "one-share exit, but a partial sale exists now", "trim_one_share_exit"),
+            ("EXIT", 1, {"TRIM_EXIT_ONE_SHARE_TRIM": "hold"},
+             "one-share exit no longer enabled", "trim_one_share_exit"),
+            ("TRIM", 1, {"TRIM_EXIT_MIN_REMAINING_SHARES": "x"}, "recheck failed", None),
+        ]
+        base = {"TRIM_EXIT_ENABLED": True, "TRIM_EXIT_LIVE": True, "TRIM_EXIT_EXEMPT_TICKERS": (),
+                "TRIM_EXIT_LIVE_CONTEXTS": ("earnings_pre",), "TRIM_EXIT_MIN_REMAINING_SHARES": 1,
+                "TRIM_EXIT_FRACTION": 0.33}
+        for action, shares, flags, why, reason in cases:
+            approval = _approval(action=action, shares_initial=shares)
+            approval["risk_json"]["trim_exit"] = {"row_id": 55, "action": action,
+                                                  "context": "earnings_pre", "reason": reason}
+            with patch("ibkr.get_ib"), \
+                 patch("ibkr.get_client") as mock_client, \
+                 patch("ibkr.place_market_order") as mock_order, \
+                 patch("ibkr.cancel_stop_orders_for") as ibkr_cancel, \
+                 patch("tasks.manage_cancel_stop_orders_for") as cancel, \
+                 patch("db.log_signal"), patch("alerts._send"), \
+                 patch.multiple("config", create=True, **{**base, **flags}):
+                mock_client.return_value.get_open_position.return_value = MagicMock(qty=5)
+                assert execution.execute_approved(approval) is False
+            reason = execution.last_outcome_reason()
+            assert reason.startswith(f"skipped: trim/exit rule {why}") and reason.endswith("(stop kept)")
+            mock_order.assert_not_called()
+            cancel.assert_not_called()
+            ibkr_cancel.assert_not_called()
+        # The same TRIM without the tag goes on to the sale.
+        approval = _approval(action="TRIM", shares_initial=5)
+        with patch("ibkr.get_ib"), \
+             patch("ibkr.get_client") as mock_client, \
+             patch("ibkr.cancel_stop_orders_for", return_value=0), \
+             patch("ibkr.place_market_order",
+                   return_value={"order_id": 1, "fill_price": 100.0, "filled_qty": 5.0}) as mock_order, \
+             patch("ibkr.get_latest_price", return_value=100.0), \
+             patch("market_data.get_priced_quote", return_value=None), \
+             patch("config.USE_BRACKET_ORDERS", False), \
+             patch("config.TRIM_EXIT_LIVE", False), \
+             patch("db.log_trade"), patch("db.log_order", return_value=1), \
+             patch("db.update_order_fill"), patch("db.delete_position_stop"), \
+             patch("db.log_trade_outcome"), patch("db.close_trade_outcome"), \
+             patch("alerts.send_trade_alert"), patch("alerts._send"):
+            mock_client.return_value.get_open_position.return_value = MagicMock(qty=5)
+            execution.execute_approved(approval)
+        assert mock_order.call_args[0][2] == 5
 
     def test_sell_cancelled_unfilled_restores_stop(self):
         approval = _approval(action="TRIM", shares_initial=40)
@@ -457,25 +520,127 @@ class TestStalePriceBuyGuard:
         assert "WAITING FOR FRESH PRICE" in mock_alert.call_args[0][0]
         mock_retry_task.apply_async.assert_called_once()
 
-    def test_no_quote_at_all_still_runs_the_drift_check(self):
-        """With no priced quote the drift check uses the latest price, so a
-        BUY that moved more than 8% since sizing is aborted."""
+    def _buy(self, quote=None, quote_exc=None, attempt=1, latest=100.0):
+        """execute_approved on an ADD with get_priced_quote returning quote (or
+        raising quote_exc); returns (result, order, retry, shadow, alert, latest)."""
         approval = _approval(action="ADD", price_at_sizing=100.0)
-
+        kw = {"side_effect": quote_exc} if quote_exc else {"return_value": quote}
         with patch("ibkr.get_ib"), \
              patch("ibkr.get_client"), \
              patch("risk_manager.RiskManager") as mock_rm_cls, \
              patch("ibkr.place_market_order") as mock_order, \
-             patch("ibkr.get_latest_price", return_value=115.0), \
-             patch("market_data.get_priced_quote", return_value=None), \
+             patch("ibkr.get_latest_price", return_value=latest) as mock_latest, \
+             patch("market_data.get_priced_quote", **kw), \
              patch("market_data.is_market_hours", return_value=True), \
+             patch("tasks.retry_deferred_entry") as mock_retry_task, \
+             patch("tasks.stale_quote_fallback_shadow") as mock_shadow, \
              patch("time.sleep"), \
-             patch("alerts._send"):
+             patch("alerts._send") as mock_alert:
             mock_rm_cls.return_value.is_halted.return_value = False
-            result = execution.execute_approved(approval)
+            result = execution.execute_approved(approval, price_retry_attempt=attempt)
+        return result, mock_order, mock_retry_task, mock_shadow, mock_alert, mock_latest
 
+    def test_no_quote_at_all_buy_defers_like_a_stale_quote(self):
+        """No priced quote at all used to run the drift check on the ageless
+        latest price and then buy; the BUY now takes the stale branch: a
+        bounded re-check, no order, no latest-price read."""
+        result, order, retry, shadow, alert, latest = self._buy(quote=None, latest=101.0)
         assert result is False
-        mock_order.assert_not_called()
+        order.assert_not_called()
+        latest.assert_not_called()
+        assert execution.last_outcome_reason() == "deferred: stale price, re-check scheduled"
+        assert retry.apply_async.call_args.kwargs["args"] == [1, 1, 2]
+        text = alert.call_args[0][0]
+        assert "WAITING FOR FRESH PRICE" in text and "No price could be read (check 1/4)" in text
+        args = shadow.apply_async.call_args.kwargs["args"]
+        assert args[3] is None and args[5:] == [100.0, "none"]
+
+    def test_a_raising_freshness_check_defers_the_buy(self):
+        result, order, retry, shadow, alert, latest = self._buy(quote_exc=RuntimeError("hmds"))
+        assert result is False
+        order.assert_not_called()
+        latest.assert_not_called()
+        assert execution.last_outcome_reason() == "deferred: stale price, re-check scheduled"
+        retry.apply_async.assert_called_once()
+        assert shadow.apply_async.call_args.kwargs["args"][6] == "error: RuntimeError"
+
+    def test_no_quote_on_the_last_check_skips_with_a_readable_alert(self):
+        from config import STALE_PRICE_MAX_RETRIES
+        result, order, retry, _, alert, _ = self._buy(quote=None, attempt=STALE_PRICE_MAX_RETRIES)
+        assert result is False
+        order.assert_not_called()
+        retry.apply_async.assert_not_called()
+        assert execution.last_outcome_reason() == "skipped: price still stale after retries"
+        text = alert.call_args[0][0]
+        assert "Price Unavailable" in text and "ADD: still no price after 4 checks" in text
+
+    def test_stale_alert_text_unchanged_for_a_stale_price(self):
+        _, _, _, _, alert, _ = self._buy(quote=self._stale_quote(price=100.0))
+        assert ("Only a stale price ($100.00) was available (check 1/4) — IBKR's intraday "
+                "feed usually catches up") in alert.call_args[0][0]
+        from config import STALE_PRICE_MAX_RETRIES
+        _, _, _, _, alert, _ = self._buy(quote=self._stale_quote(price=100.0),
+                                         attempt=STALE_PRICE_MAX_RETRIES)
+        assert ("<b>NVDA</b> ADD: still only a stale price ($100.00) after 4 checks over "
+                "~12 min — can't rule out") in alert.call_args[0][0]
+
+    def test_alert_text_with_a_none_price_does_not_raise(self):
+        """The trap: the stale branch formatted the price, and a None raised
+        into the outer except, which went on to buy."""
+        assert execution._price_text(None) is None and execution._price_text("x") is None
+        assert execution._price_text(12.345) == "$12.35"
+        from config import STALE_PRICE_MAX_RETRIES
+        for attempt in (1, STALE_PRICE_MAX_RETRIES):
+            with patch("tasks.retry_deferred_entry"), patch("tasks.stale_quote_fallback_shadow"), \
+                 patch("alerts._send") as send:
+                out = execution._stale_buy_outcome("NVDA", {"id": 1}, "ADD", None, None, 100.0,
+                                                   1, attempt, no_quote="none")
+            assert out is False and send.called
+        with patch("tasks.retry_deferred_entry"), patch("tasks.stale_quote_fallback_shadow"), \
+             patch("alerts._send"):
+            assert execution._stale_buy_outcome("NVDA", {"id": 1}, "ADD", self._stale_quote(),
+                                                "not-a-price", 100.0, 1, 1) is False
+
+    def test_a_raise_inside_the_stale_branch_fails_without_an_order_or_a_second_retry(self):
+        with patch("execution._stale_buy_outcome", side_effect=RuntimeError("boom")) as branch:
+            result, order, retry, _, _, latest = self._buy(quote=self._stale_quote())
+        assert result is False
+        order.assert_not_called()
+        latest.assert_not_called()
+        assert branch.call_count == 1
+        assert execution.last_outcome_reason() == "failed: stale-price check raised"
+        with patch("execution._stale_buy_outcome", side_effect=RuntimeError("boom")) as branch:
+            result, order, *_ = self._buy(quote_exc=ValueError("read"))
+        assert result is False and branch.call_count == 1
+        order.assert_not_called()
+        assert execution.last_outcome_reason() == "failed: stale-price check raised"
+
+    def test_sell_without_a_quote_or_with_a_raising_check_is_unchanged(self):
+        """A SELL with no quote, or a raising check, still reads the latest
+        price and sells; no stale branch, no re-check."""
+        for kw in ({"return_value": None}, {"side_effect": RuntimeError("hmds")}):
+            approval = _approval(action="EXIT", shares_initial=100)
+            ibkr_client = MagicMock()
+            ibkr_client.get_open_position.return_value = MagicMock(qty=42.0)
+            with patch("ibkr.get_ib"), \
+                 patch("ibkr.get_client", return_value=ibkr_client), \
+                 patch("ibkr.cancel_stop_orders_for", return_value=0), \
+                 patch("ibkr.place_market_order") as mock_order, \
+                 patch("ibkr.get_latest_price", return_value=100.0) as mock_latest, \
+                 patch("market_data.get_priced_quote", **kw), \
+                 patch("execution._stale_buy_outcome") as branch, \
+                 patch("config.USE_BRACKET_ORDERS", False), \
+                 patch("db.log_trade"), patch("db.log_order", return_value=1), \
+                 patch("db.update_order_fill"), patch("db.delete_position_stop"), \
+                 patch("db.close_trade_outcome"), patch("db.log_trade_outcome"), \
+                 patch("tasks.retry_deferred_entry") as mock_retry_task, \
+                 patch("alerts.send_trade_alert"):
+                mock_order.return_value = {"order_id": 1, "fill_price": 100.0, "filled_qty": 42.0}
+                execution.execute_approved(approval)
+            assert mock_order.call_args[0][2] == 42.0
+            mock_latest.assert_called_once_with("NVDA")
+            branch.assert_not_called()
+            mock_retry_task.apply_async.assert_not_called()
 
     def test_stale_warning_names_the_price_source(self, caplog):
         """The STALE log line carries the quote's price_source (record only:
@@ -1516,7 +1681,7 @@ def test_unknown_stop_result_is_not_retried():
          patch("ibkr.place_market_order", return_value={"filled_qty": 10, "fill_price": 100.0,
                                                         "order_id": 1, "status": "Filled"}), \
          patch("ibkr.get_latest_price", return_value=100.0), \
-         patch("market_data.get_priced_quote", return_value=None), \
+         patch("market_data.get_priced_quote", return_value=dict(_FRESH)), \
          patch("tasks.manage_stop_place", side_effect=tasks.OrdersCallUnknown("x")) as place, \
          patch("alerts._send") as send:
         client.return_value.get_open_position.side_effect = Exception("No open position")
@@ -1540,7 +1705,7 @@ def test_expired_stop_request_is_queued_not_retried():
          patch("ibkr.place_market_order", return_value={"filled_qty": 10, "fill_price": 100.0,
                                                         "order_id": 1, "status": "Filled"}), \
          patch("ibkr.get_latest_price", return_value=100.0), \
-         patch("market_data.get_priced_quote", return_value=None), \
+         patch("market_data.get_priced_quote", return_value=dict(_FRESH)), \
          patch("tasks.manage_stop_place", side_effect=tasks.OrdersCallExpired("x")) as place, \
          patch("tasks._queue_reprotect") as queued, \
          patch("alerts._send") as send:
@@ -1566,7 +1731,7 @@ def test_refused_stop_is_not_retried():
          patch("ibkr.place_market_order", return_value={"filled_qty": 10, "fill_price": 100.0,
                                                         "order_id": 1, "status": "Filled"}), \
          patch("ibkr.get_latest_price", return_value=100.0), \
-         patch("market_data.get_priced_quote", return_value=None), \
+         patch("market_data.get_priced_quote", return_value=dict(_FRESH)), \
          patch("tasks.manage_stop_place", side_effect=__import__("ibkr").SellExceedsPosition("NVDA: refused")) as place, \
          patch("tasks._queue_reprotect") as queued, \
          patch("alerts._send") as send:
@@ -1594,7 +1759,7 @@ def test_lock_lost_stop_is_queued_and_failed_stop_queued_too():
              patch("ibkr.place_market_order", return_value={"filled_qty": 10, "fill_price": 100.0,
                                                             "order_id": 1, "status": "Filled"}), \
              patch("ibkr.get_latest_price", return_value=100.0), \
-             patch("market_data.get_priced_quote", return_value=None), \
+             patch("market_data.get_priced_quote", return_value=dict(_FRESH)), \
              patch("tasks.manage_stop_place", side_effect=err) as place, \
              patch("tasks._queue_reprotect") as queued, \
              patch("time.sleep"), \
@@ -1894,7 +2059,7 @@ def test_failed_unconfirmed_order_row_is_kept_for_reconcile_and_alerted():
                return_value={"order_id": 31, "perm_id": 3100, "fill_price": None,
                              "filled_qty": 0.0, "status": "Submitted"}), \
          patch("ibkr.get_latest_price", return_value=100.0), \
-         patch("market_data.get_priced_quote", return_value={"price": 100.0}), \
+         patch("market_data.get_priced_quote", return_value=dict(_FRESH)), \
          patch("config.USE_BRACKET_ORDERS", False), \
          patch("db.log_order", side_effect=failing_log_order) as log_order, \
          patch("db._spill") as spill, \

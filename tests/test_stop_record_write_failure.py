@@ -36,6 +36,9 @@ def _approval():
                           "stop_loss_price": 90.0}}
 
 
+# A BUY with no quote at all takes the stale branch and defers, so the
+# entry tests read a fresh one.
+_FRESH = {"price": 100.0, "is_stale": False, "age_minutes": 1.0, "market_open": True}
 _LAST: dict = {}
 
 
@@ -55,7 +58,7 @@ def _entry(upsert=None, set_id=None, prior=None, place_effect=None, positions=()
          patch("ibkr.place_market_order", return_value={"filled_qty": 10, "fill_price": 100.0,
                                                         "order_id": 1, "status": "Filled"}), \
          patch("ibkr.get_latest_price", return_value=100.0), \
-         patch("market_data.get_priced_quote", return_value=None), \
+         patch("market_data.get_priced_quote", return_value=dict(_FRESH)), \
          patch("tasks.manage_stop_place", return_value={"order_id": 9},
                side_effect=place_effect) as place, \
          patch("tasks.manage_cancel_stop_orders_for") as cancel, \

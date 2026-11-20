@@ -461,8 +461,9 @@ class TestHeldSellLoweredToWatchAlerts:
         _, _, send = _run_with_alert_state(payload, "Compounder", caplog, True, state)
         assert send.call_count == 1
 
+    @pytest.mark.parametrize("shadow", [False, True], ids=["trim_exit_off", "trim_exit_shadow"])
     @pytest.mark.parametrize("earnings_date", [None, "2026-11-02"])
-    def test_review_held_position_alerts_on_a_malformed_exit(self, earnings_date, caplog):
+    def test_review_held_position_alerts_on_a_malformed_exit(self, earnings_date, shadow, caplog):
         """The scheduled and earnings reviews build a candidate without
         "held"; held_review makes the alert fire, and the held flag recorded
         for the gates stays None."""
@@ -481,7 +482,8 @@ class TestHeldSellLoweredToWatchAlerts:
              patch("agents.crew._route_to_approval") as route, \
              patch("db.get_state_strict", side_effect=lambda k, d=None: state.get(k, d)), \
              patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
-             patch("alerts._send", return_value=7) as send:
+             patch("alerts._send", return_value=7) as send, \
+             patch("config.TRIM_EXIT_ENABLED", shadow), patch("config.TRIM_EXIT_LIVE", False):
             result = crew.review_held_position(
                 "SNOW", None, {"SNOW": {"current_price": 100.0}}, {"regime": "Neutral"},
                 earnings_date=date.fromisoformat(earnings_date) if earnings_date else None)
@@ -490,9 +492,13 @@ class TestHeldSellLoweredToWatchAlerts:
         assert send.call_count == 1
         assert "SNOW: model said EXIT on a held position" in send.call_args.args[0]
         assert "malformed_sell_alert_at_SNOW_EXIT" in state
-        exposure = log_signal.call_args.kwargs["provenance"]["brief_exposure"]
+        # The verdict row; in shadow the trim/exit rule adds its own row after it.
+        calls = log_signal.call_args_list
+        verdicts = [c for c in calls if (c.args[1:2] or [c.kwargs.get("signal")])[0] != "TRIM_EXIT_RULE"]
+        assert len(calls) - len(verdicts) == (1 if shadow else 0)
+        exposure = verdicts[-1].kwargs["provenance"]["brief_exposure"]
         assert exposure["held_at_gate"] is None
-        assert log_signal.call_args.kwargs["decision"]["held_review"] is True
+        assert verdicts[-1].kwargs["decision"]["held_review"] is True
 
     def test_backfill_does_not_alert(self, caplog):
         import json

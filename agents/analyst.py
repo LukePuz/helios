@@ -913,7 +913,9 @@ def _treatment_config() -> dict:
         "DIP_REVIEW_COUNTS_AS_NEW_FACT",
         # Added 11-08 (audit 21:30 #8): the switches that decide routing.
         "BUY_REQUIRES_NEW_FACT", "BUY_NEW_FACT_SCOPE", "BUY_NEW_FACT_WINDOW",
-        "TRIM_FRACTION", "REBUY_COOLDOWN_HOURS")},
+        "TRIM_FRACTION", "REBUY_COOLDOWN_HOURS",
+        # The trim/exit rule's switches (agents/trim_exit.py).
+        "TRIM_EXIT_ENABLED", "TRIM_EXIT_LIVE")},
         # Added 11-03: fixed, not a switch (a malformed catalyst makes the
         # verdict WATCH); separates verdicts from before it. "watch" was
         # unscoped; "watch_rate_scoped" flags expected_return_pct only at
@@ -1141,8 +1143,14 @@ def _brief_exposure(ticker: str, prompt: str) -> dict:
     section's recent verdicts predate the stop record's opened_at, so a
     re-entry's brief showing the earlier position's verdicts can be counted
     (audit 11-06 05:33 #2d); None when it can't be read. stop_shown and
-    stop_shown_pct: the protective stop that section printed, when shown."""
+    stop_shown_pct: the protective stop that section printed, when shown.
+    conviction_shown (shown sections only): the "conviction at entry" that
+    section printed (the stop record's, which every BUY overwrites; None
+    for n/a), beside entry_conviction, the original thesis's, and
+    conviction_mismatch (None unless both are known); entry_conviction_read
+    is ok, no_thesis or "error: <class>". Record only."""
     out = {"position_context_shown": False, "prior_verdicts_shown": []}
+    shown_conv = None
     try:
         # Why the section is in or out (audit 11-06 23:24 #10); None when
         # the brief was built in another process or over 10 min ago.
@@ -1167,6 +1175,10 @@ def _brief_exposure(ticker: str, prompt: str) -> dict:
         elif in_section and line.startswith("Recent verdicts: "):
             out["prior_verdicts_shown"] = [v.strip() for v in line[len("Recent verdicts: "):].split(";")
                                            if v.strip()]
+        elif in_section and line.startswith("Held ") and shown_conv is None:
+            m = re.search(r"conviction at entry (\d+|n/a)", line)
+            if m:
+                shown_conv = int(m.group(1)) if m.group(1).isdigit() else "n/a"
     rec = None
     # When the post-call reads below ran (they follow the model call by its
     # run time, so a fill or stop-out in between shows here, m599).
@@ -1190,11 +1202,37 @@ def _brief_exposure(ticker: str, prompt: str) -> dict:
                         1 for v in ctx["recent_verdicts"] if v["timestamp"] < opened)
         except Exception:
             pass
+        out.update(_entry_conviction_record(ticker, shown_conv))
     try:
         import tasks
         out["held_broker"], out["held_broker_reason"], _ = tasks._broker_held(ticker)
     except Exception:
         out["held_broker"], out["held_broker_reason"] = None, "error"
+    return out
+
+
+def _entry_conviction_record(ticker: str, shown) -> dict:
+    """_brief_exposure's conviction fields (see there). shown is the
+    conviction parsed from the brief's "Held ..." line: an int, "n/a", or
+    None when the line was absent. Never raises."""
+    out = {"conviction_shown": shown if isinstance(shown, int) else None,
+           "entry_conviction": None, "conviction_mismatch": None, "entry_conviction_read": None}
+    try:
+        import db
+        ctx = db.get_position_context(ticker, strict=True) or {}
+        orig = ctx.get("original_thesis")
+        if not isinstance(orig, dict):
+            out["entry_conviction_read"] = "no_thesis"
+            return out
+        ec = orig.get("conviction")
+        out["entry_conviction"] = (int(ec) if isinstance(ec, (int, float))
+                                   and not isinstance(ec, bool) and float(ec).is_integer()
+                                   else ec)
+        out["entry_conviction_read"] = "ok"
+        if out["conviction_shown"] is not None and isinstance(out["entry_conviction"], int):
+            out["conviction_mismatch"] = out["conviction_shown"] != out["entry_conviction"]
+    except Exception as e:
+        out["entry_conviction_read"] = f"error: {type(e).__name__}"
     return out
 
 
@@ -2134,6 +2172,34 @@ def _sell_confirm_record(ticker: str, prev: dict | None, trigger: dict | None) -
             rec["confirm_before_open"] = ts < opened
     except Exception:
         pass
+    return rec
+
+
+def _buy_confirm_record(ticker: str, trigger: dict | None) -> dict:
+    """Record-only: the verdict before this OPEN/ADD on the ticker, so a
+    rule that needs two agreeing buy verdicts can be counted from data
+    before anyone sets one. prev_action and prev_conviction are that
+    verdict's final action and conviction; the rest is _sell_confirm_record's
+    (confirm_gap_s, confirm_same_item, ...). Read before this verdict is
+    logged, so it excludes itself. No agreement or gap rule is applied.
+    prev_read: ok, none (no earlier verdict) or "error: <class>". Never
+    raises."""
+    rec = {"prev_read": None, "prev_action": None, "prev_conviction": None}
+    try:
+        import db
+        prev = db.get_latest_signal_for(ticker, with_trigger=True, strict=True)
+    except Exception as e:
+        rec["prev_read"] = f"error: {type(e).__name__}"
+        return rec
+    try:
+        rec["prev_read"] = "ok" if prev else "none"
+        if prev:
+            rec["prev_action"] = prev.get("signal")
+            conf = prev.get("confidence")
+            rec["prev_conviction"] = round(float(conf) * 10) if conf is not None else None
+        rec.update(_sell_confirm_record(ticker, prev, trigger))
+    except Exception as e:
+        rec["error"] = type(e).__name__
     return rec
 
 
@@ -3125,6 +3191,8 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
         provenance["scan_reasons"] = {k: candidate.get(k) for k in _SCAN_REASON_KEYS}
     if sell_confirm is not None:
         provenance["sell_confirm"] = sell_confirm   # audit 11-06 23:24 #4, record-only
+    if model_action in ("OPEN", "ADD") or action in ("OPEN", "ADD"):
+        provenance["buy_confirm"] = _buy_confirm_record(ticker, trigger)   # record-only
     est = _estimate_tokens(prompt)
     llm = {**_LAST_CALL_STATS, "prompt_tokens_est": est,
            # The options actually sent, and the seed (None: none is sent) (M7).

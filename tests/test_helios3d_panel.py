@@ -403,6 +403,37 @@ def test_flatten_signals_is_bounded():
     assert roles.flatten_signals(json.loads(json.dumps(REAL_SIGNALS)))["trend.score"] == 72
 
 
+def test_regime_shadow_record_stays_out_of_the_macro_slice_and_prompt():
+    """signals.trend.shadow_200 is record-only (agents/market_regime.py): the
+    macro role's slice, prompt and prompt hash are the same with and without it."""
+    shadow = {"status": "ok", "calendar_days": 330, "bars_fetched": 226, "bars_used": 200,
+              "last_bar_date": "2026-10-30", "ma200": 512.3456, "trend_score": 0,
+              "breadth_score": 2, "breadth_rescored": True, "price_action_score": None,
+              "volatility_score": 0, "score": 41.0, "regime": "Neutral", "differs": True,
+              "regime_differs": True}
+    with_shadow = json.loads(json.dumps(REAL_SIGNALS))
+    with_shadow["trend"]["shadow_200"] = shadow
+    assert roles.flatten_signals(with_shadow) == roles.flatten_signals(REAL_SIGNALS)
+
+    trig = roles.trigger_text("event", {"trigger": {"title": "NVDA beats"}})
+    a = roles.build_slice("macro_regime", "NVDA", AS_OF, get=FakeFeatures(signals=with_shadow))
+    b = roles.build_slice("macro_regime", "NVDA", AS_OF, get=FakeFeatures())
+    assert a == b and "trend.score" in a["data"]["regime"]["signals"]
+    pa, pb = (roles.render_analyst("macro_regime", "NVDA", AS_OF, trig, s) for s in (a, b))
+    assert pa == pb and "shadow" not in pa and roles.prompt_sha(pa) == roles.prompt_sha(pb)
+
+    # At the key cap the record must not push another key out, or be counted.
+    full = {f"k{i:02d}": i for i in range(roles.SIGNALS_MAX_KEYS - 2)}
+    full["trend"] = {"score": 72, "notes": "x"}
+    flat = roles.flatten_signals(full)
+    assert len(flat) == roles.SIGNALS_MAX_KEYS and "_truncated" not in flat
+    full["trend"]["shadow_200"] = shadow
+    assert roles.flatten_signals(full) == flat
+    # Only that path is skipped: the same key elsewhere is ordinary data.
+    assert roles.flatten_signals({"shadow_200": 1, "volume": {"shadow_200": 2}}) == {
+        "shadow_200": 1, "volume.shadow_200": 2}
+
+
 def test_public_text_keeps_figures_but_not_account_ids():
     feats = FakeFeatures(headlines=[{"id": 1, "title": "NVDA $5,000 calls; acct DU1234567",
                                      "published_at": AS_OF - timedelta(hours=1)}])

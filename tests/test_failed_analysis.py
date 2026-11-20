@@ -124,7 +124,7 @@ def test_failed_rows_are_not_verdicts_for_readers():
     assert set(recent_params[0]) == {"ANALYST_FAILED", "NO_VERDICT", "ROUTE_NO_BROKER",
                                      "ROUTE_RISK_INIT_FAILED", "ROUTE_ERROR",
                                      "SCREENED_IN", "EVENT_LOST", "REVIEW_SKIPPED", "HELD_MOVE_SHADOW",
-                                     "DIP_WATCH_SHADOW"}
+                                     "DIP_WATCH_SHADOW", "TRIM_EXIT_RULE"}
     assert recent_params[1] == 10
     # Routing rows carry the verdict's trigger; they are not extra event verdicts.
     assert "signal NOT IN %s" in event_sql

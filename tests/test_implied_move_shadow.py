@@ -294,3 +294,141 @@ def test_poll_uses_the_options_flow_key_test_so_an_empty_key_takes_the_free_path
     paid.assert_not_called()
     assert "implied_sink" in free.call_args.kwargs
 
+
+
+# ── event-spanning and ~30-DTE straddles kept in the book ───────────────────
+
+_EVENT = {"implied_move_pct": 12.0, "straddle": 12.0, "underlying": 100.0, "atm_strike": 100.0,
+          "expiry": "2026-11-07", "dte": 4, "price_source": "mid"}
+_DTE30 = {"implied_move_pct": 15.0, "straddle": 15.0, "underlying": 100.0, "atm_strike": 100.0,
+          "expiry": "2026-12-04", "dte": 31, "price_source": "mid"}
+_OLD_KEYS = set(_MOVE) | {"et_date", "computed_at", "logged_et_date"}
+
+
+def _extras(event=_EVENT, dte30=_DTE30, earnings="2026-11-05"):
+    return lambda t, ed, today, deadline: {"fetched": True, "earnings_date": earnings,
+                                          "event_spanning": dict(event) if event else None,
+                                          "dte30": dict(dte30) if dte30 else None}
+
+
+def _run_x(fake, moves, at, extras=None, held=frozenset({"NVDA"})):
+    with patch("tasks._bounded_extra_expiries", side_effect=extras or _extras()):
+        return _run(fake, moves, at, held=held)
+
+
+def _book_of(fake):
+    return json.loads(next(iter(fake.state.values())))
+
+
+def test_book_keeps_the_days_event_and_dte30_moves_beside_the_nearest():
+    fake = _FakeDB()
+    moves = {"NVDA": dict(_MOVE)}
+    assert _run_x(fake, moves, datetime(2026, 11, 3, 9, 45, tzinfo=ET)) == 1
+    nv = _book_of(fake)["NVDA"]
+    assert nv["event_spanning"] == {"implied_move_pct": 12.0, "expiry": "2026-11-07", "dte": 4,
+                                    "earnings_date": "2026-11-05", "et_date": "2026-11-03",
+                                    "computed_at": "2026-11-03T09:45:00-05:00"}
+    assert nv["dte30"]["implied_move_pct"] == 15.0 and nv["dte30"]["dte"] == 31
+    assert nv["dte30"]["earnings_date"] == "2026-11-05"
+    # The nearest-expiry keys are what they were before: same keys, same values.
+    old = {k: v for k, v in nv.items() if k not in ("event_spanning", "dte30")}
+    assert set(old) == _OLD_KEYS
+    assert old == {**_MOVE, "et_date": "2026-11-03", "computed_at": "2026-11-03T09:45:00-05:00",
+                   "logged_et_date": "2026-11-03"}
+
+
+def test_book_carries_the_moves_through_the_day_and_drops_them_next_day():
+    fake = _FakeDB()
+    moves = {"NVDA": dict(_MOVE)}
+    _run_x(fake, moves, datetime(2026, 11, 3, 9, 45, tzinfo=ET))
+    first = _book_of(fake)["NVDA"]
+    later = dict(_MOVE, implied_move_pct=5.0)
+    # A later poll the same day prices only the nearest expiry; the day's
+    # event and dte30 moves are carried unchanged.
+    no_call = MagicMock(side_effect=AssertionError("no extra chain read after the daily row"))
+    with patch("tasks._bounded_extra_expiries", no_call):
+        _run(fake, {"NVDA": later}, datetime(2026, 11, 3, 14, 0, tzinfo=ET))
+    nv = _book_of(fake)["NVDA"]
+    assert nv["implied_move_pct"] == 5.0
+    assert nv["event_spanning"] == first["event_spanning"] and nv["dte30"] == first["dte30"]
+    # The next ET date's first poll (before the daily row) drops them.
+    with patch("tasks._bounded_extra_expiries", no_call):
+        _run(fake, moves, datetime(2026, 11, 4, 9, 35, tzinfo=ET))
+    nv = _book_of(fake)["NVDA"]
+    assert "event_spanning" not in nv and "dte30" not in nv
+    assert set(nv) == _OLD_KEYS and nv["et_date"] == "2026-11-04"
+    # Its daily row prices them again.
+    _run_x(fake, moves, datetime(2026, 11, 4, 9, 50, tzinfo=ET),
+           extras=_extras(event=dict(_EVENT, implied_move_pct=9.0)))
+    assert _book_of(fake)["NVDA"]["event_spanning"]["implied_move_pct"] == 9.0
+    assert _book_of(fake)["NVDA"]["event_spanning"]["et_date"] == "2026-11-04"
+
+
+def test_an_earlier_dates_moves_in_an_entry_are_not_carried():
+    """A book entry from an earlier ET date (written yesterday, event move
+    and all) loses the move on today's first poll."""
+    import config
+    fake = _FakeDB()
+    key = f"options_implied_move_{config.TRADING_ENV}"
+    fake.state[key] = json.dumps({
+        "NVDA": {**_MOVE, "et_date": "2026-11-02", "computed_at": "2026-11-02T10:00:00-05:00",
+                 "logged_et_date": "2026-11-02",
+                 "event_spanning": {"implied_move_pct": 11.0, "expiry": "2026-11-07", "dte": 5,
+                                    "earnings_date": "2026-11-05", "et_date": "2026-11-02"}}})
+    _run(fake, {"NVDA": dict(_MOVE)}, datetime(2026, 11, 3, 9, 35, tzinfo=ET))
+    nv = json.loads(fake.state[key])["NVDA"]
+    assert "event_spanning" not in nv and nv["et_date"] == "2026-11-03"
+
+
+def test_an_old_format_entry_reads_and_is_rewritten_with_the_moves():
+    import config
+    fake = _FakeDB()
+    key = f"options_implied_move_{config.TRADING_ENV}"
+    fake.state[key] = json.dumps({"NVDA": {**_MOVE, "et_date": "2026-11-03",
+                                           "computed_at": "2026-11-03T09:30:00-05:00",
+                                           "logged_et_date": None}})
+    assert _run_x(fake, {"NVDA": dict(_MOVE)}, datetime(2026, 11, 3, 9, 45, tzinfo=ET)) == 1
+    nv = json.loads(fake.state[key])["NVDA"]
+    assert nv["event_spanning"]["implied_move_pct"] == 12.0 and nv["logged_et_date"] == "2026-11-03"
+
+
+def test_a_missing_event_move_keeps_only_dte30_and_a_budget_miss_keeps_neither():
+    fake = _FakeDB()
+    _run_x(fake, {"NVDA": dict(_MOVE)}, datetime(2026, 11, 3, 9, 45, tzinfo=ET),
+           extras=_extras(event=None, earnings=None))
+    nv = _book_of(fake)["NVDA"]
+    assert "event_spanning" not in nv and nv["dte30"]["earnings_date"] is None
+    assert fake.rows[0][4]["event_move_over_stop"] is None
+    assert fake.rows[0][4]["implied_move_over_stop"] == 0.5          # unchanged
+    fake = _FakeDB()
+    _run_x(fake, {"NVDA": dict(_MOVE)}, datetime(2026, 11, 3, 9, 45, tzinfo=ET),
+           extras=lambda *a: {"fetched": False, "reason": "budget"})
+    nv = _book_of(fake)["NVDA"]
+    assert set(nv) == _OLD_KEYS
+    assert fake.rows[0][4]["event_move_over_stop"] is None
+
+
+def test_activity_row_has_event_move_over_stop_for_held_names_only():
+    fake = _FakeDB()
+    moves = {"NVDA": dict(_MOVE), "AMD": dict(_MOVE, implied_move_pct=6.0)}
+    with patch("db.get_earnings_around", return_value={"AMD": "2026-11-05"}):
+        _run_x(fake, moves, datetime(2026, 11, 3, 9, 45, tzinfo=ET))
+    by = {r[1]: r[4] for r in fake.rows}
+    # stop 92 under a 100 underlying: 8% away; event move 12% -> 1.5.
+    assert by["NVDA"]["stop_distance_pct"] == 8.0 and by["NVDA"]["implied_move_over_stop"] == 0.5
+    assert by["NVDA"]["event_move_over_stop"] == 1.5
+    assert by["NVDA"]["extra_expiries"]["event_spanning"]["implied_move_pct"] == 12.0
+    # AMD reports within the window but is not held: extras priced, no stop keys.
+    assert "event_move_over_stop" not in by["AMD"] and "implied_move_over_stop" not in by["AMD"]
+    assert _book_of(fake)["AMD"]["event_spanning"]["implied_move_pct"] == 12.0
+
+
+def test_event_move_over_stop_helpers_never_raise():
+    assert tasks._event_move_over_stop(None, 8.0) is None
+    assert tasks._event_move_over_stop({"event_spanning": {"implied_move_pct": "x"}}, 8.0) is None
+    assert tasks._event_move_over_stop({"event_spanning": {"implied_move_pct": float("nan")}}, 8.0) is None
+    assert tasks._event_move_over_stop({"event_spanning": {"implied_move_pct": 4.0}}, None) is None
+    assert tasks._event_move_over_stop({"event_spanning": {"implied_move_pct": 4.0}}, 0.0) is None
+    assert tasks._event_move_over_stop({"event_spanning": {"implied_move_pct": 4.0}}, 8.0) == 0.5
+    assert tasks._implied_move_book_extras("garbage", "2026-11-03", "t") == {}
+    assert tasks._implied_move_book_extras({"event_spanning": "x", "dte30": None}, "d", "t") == {}

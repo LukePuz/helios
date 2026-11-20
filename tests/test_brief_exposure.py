@@ -10,6 +10,7 @@ _PROMPT = ("intro\n=== POSITION CONTEXT — NVDA (held) ===\nEntry $180.00; prot
 
 def test_records_the_verdicts_shown_and_broker_held():
     with patch("db.get_position_stop", return_value={"stop_price": 160.0}), \
+         patch("db.get_position_context", return_value={}), \
          patch("tasks._snapshot_positions_or_none", return_value={"NVDA": {"qty": 1, "market_value": 200}}):
         out = analyst._brief_exposure("NVDA", _PROMPT)
     assert isinstance(out.pop("read_at"), str)
@@ -17,6 +18,8 @@ def test_records_the_verdicts_shown_and_broker_held():
                    "stop_shown": 160.0, "stop_shown_pct": None,
                    "prior_verdicts_shown": ["2026-10-30 HOLD c6", "2026-10-30 HOLD c7", "2026-10-30 HOLD c6"],
                    "has_stop_row": True, "prior_verdicts_before_open": None,
+                   "conviction_shown": None, "entry_conviction": None,
+                   "conviction_mismatch": None, "entry_conviction_read": "no_thesis",
                    "held_broker": True, "held_broker_reason": "snapshot"}
 
 
@@ -181,3 +184,46 @@ def test_position_context_status_says_why_the_section_is_out():
     with patch("db.get_position_stop", return_value=None):
         assert _brief_exposure("NVDA", "")["position_context_status"] == "error:RuntimeError"
     context_engine._POSITION_CONTEXT_STATUS.clear()
+
+
+# ── conviction shown as "at entry" vs the entry thesis (record only) ─────────
+
+_HELD = ("intro\n=== POSITION CONTEXT — NVDA (held) ===\nEntry $180.00; protective stop $160.00\n"
+         "Held 6 days; bucket Accelerator; conviction at entry {c}; trailing stop not active; "
+         "profit target not taken\nRecent verdicts: 2026-11-13 ADD c7\n=== NEXT ===\n"
+         "Held 9 days; conviction at entry 3\n")
+
+
+def _exposure(prompt, ctx=None, ctx_exc=None):
+    kw = {"side_effect": ctx_exc} if ctx_exc else {"return_value": ctx}
+    with patch("db.get_position_stop", return_value={"stop_price": 160.0}), \
+         patch("db.get_position_context", **kw), \
+         patch("tasks._snapshot_positions_or_none", return_value={}):
+        return analyst._brief_exposure("NVDA", prompt)
+
+
+def test_conviction_shown_after_an_add_differs_from_the_entry_thesis():
+    """After #173 the brief showed the ADD's 7; the first entry was a 6."""
+    out = _exposure(_HELD.format(c=7), {"original_thesis": {"conviction": 6}})
+    assert out["conviction_shown"] == 7 and out["entry_conviction"] == 6
+    assert out["conviction_mismatch"] is True and out["entry_conviction_read"] == "ok"
+
+
+def test_matching_unknown_and_failed_reads():
+    out = _exposure(_HELD.format(c=7), {"original_thesis": {"conviction": 7}})
+    assert out["conviction_mismatch"] is False
+    out = _exposure(_HELD.format(c="n/a"), {"original_thesis": {"conviction": 7}})
+    assert out["conviction_shown"] is None and out["conviction_mismatch"] is None
+    out = _exposure(_HELD.format(c=7), {"recent_verdicts": []})
+    assert out["entry_conviction_read"] == "no_thesis" and out["conviction_mismatch"] is None
+    out = _exposure(_HELD.format(c=7), ctx_exc=RuntimeError("db down"))
+    assert out["entry_conviction_read"] == "error: RuntimeError"
+    assert out["conviction_shown"] == 7 and out["entry_conviction"] is None
+    assert out["position_context_shown"] is True and out["stop_shown"] == 160.0   # row kept
+
+
+def test_no_conviction_keys_when_the_section_is_not_shown():
+    out = _exposure("Held 9 days; conviction at entry 3\n", {"original_thesis": {"conviction": 6}})
+    assert out["position_context_shown"] is False
+    assert not any(k in out for k in ("conviction_shown", "entry_conviction",
+                                      "conviction_mismatch", "entry_conviction_read"))

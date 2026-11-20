@@ -71,9 +71,13 @@ def test_process_candidates_routing_raise_routes_the_rest_and_is_not_retried():
     assert [c.args[0] for c in rows] == ["NVDA"]
 
 
+@pytest.mark.parametrize("shadow", [False, True], ids=["trim_exit_off", "trim_exit_shadow"])
 @pytest.mark.parametrize("fn", ["review_held_position", "review_plan_level"])
-def test_held_reviews_write_route_error(fn):
-    with patch("agents.crew._analyze_held_position", return_value=dict(_PASS)), \
+def test_held_reviews_write_route_error(fn, shadow):
+    """Also with the trim/exit rule in shadow (master on, live off): it adds
+    its own TRIM_EXIT_RULE row and changes nothing else."""
+    with patch("config.TRIM_EXIT_ENABLED", shadow), patch("config.TRIM_EXIT_LIVE", False), \
+         patch("agents.crew._analyze_held_position", return_value=dict(_PASS)), \
          patch("agents.crew._capture_latest_thesis"), \
          patch("ibkr.IBKRClient", return_value=MagicMock()), \
          patch("agents.crew._get_positions", return_value={"NVDA": {}}), \
@@ -86,7 +90,10 @@ def test_held_reviews_write_route_error(fn):
         else:
             out = crew.review_plan_level("NVDA", "stop", "90", 91.0)
     assert out["action"] == "OPEN"
-    assert [c.args[1] for c in log_signal.call_args_list] == ["ROUTE_ERROR"]
+    kinds = [c.args[1] for c in log_signal.call_args_list]
+    rule_rows = [k for k in kinds if k == "TRIM_EXIT_RULE"]
+    assert [k for k in kinds if k != "TRIM_EXIT_RULE"] == ["ROUTE_ERROR"]
+    assert len(rule_rows) == (1 if shadow else 0)
 
 
 def test_route_error_registered():

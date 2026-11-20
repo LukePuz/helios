@@ -1612,6 +1612,90 @@ def _send_wait_alert(text: str, attempt: int, ticker: str) -> None:
         pass
 
 
+def _price_text(price) -> str | None:
+    """"$12.34" for a usable price, else None: the stale-price alerts must
+    not raise on a BUY that has no quote at all."""
+    if price is None:
+        return None
+    try:
+        return f"${float(price):.2f}"
+    except (TypeError, ValueError):
+        return None
+
+
+def _stale_buy_outcome(ticker: str, approval: dict, action: str, pq: dict | None, price,
+                       price_at_sizing, gap_retry_attempt: int, price_retry_attempt: int,
+                       no_quote: str | None = None) -> bool:
+    """execute_approved's BUY branch when its pre-order quote can't guard
+    drift: a stale quote, no quote at all (no_quote="none"), or a quote check
+    that raised (no_quote="error: <class>"). Queues the log-only Yahoo
+    shadow, then re-checks on the bounded STALE_PRICE_* schedule and skips
+    after the last check. Sends no order. price is the stale price shown in
+    the alerts, None when there is none."""
+    import alerts as alert_module
+    from config import STALE_PRICE_MAX_RETRIES, STALE_PRICE_RETRY_MINUTES
+    shown = _price_text(price)
+    try:   # log-only: would a Yahoo quote have been fresh? (off the order path)
+        from datetime import datetime as _dt, timezone as _tz
+        from tasks import stale_quote_fallback_shadow
+        # retry=False: a slow broker must not hold the order path (m545)
+        stale_quote_fallback_shadow.apply_async(
+            args=[ticker, approval.get("id"), price_retry_attempt,
+                  pq.get("age_minutes") if pq else None, _dt.now(_tz.utc).isoformat(),
+                  price_at_sizing, pq.get("price_source") if pq else no_quote],
+            queue="ops", expires=600, retry=False)
+    except Exception as e:
+        log.debug(f"[{ticker}] quote fallback shadow not queued: {e}")
+    if price_retry_attempt < STALE_PRICE_MAX_RETRIES:
+        from datetime import datetime, timedelta, timezone
+        eta = datetime.now(timezone.utc) + timedelta(minutes=STALE_PRICE_RETRY_MINUTES)
+        log.warning(
+            f"[{ticker}] Could not get a fresh price "
+            f"(attempt {price_retry_attempt}/{STALE_PRICE_MAX_RETRIES}) — "
+            f"re-checking at {eta.isoformat()} rather than risk an unguarded gap"
+        )
+        scheduled = False
+        try:
+            from tasks import retry_deferred_entry
+            retry_deferred_entry.apply_async(
+                args=[approval["id"], gap_retry_attempt, price_retry_attempt + 1],
+                eta=eta, queue="ops",
+            )
+            scheduled = True
+        except Exception as e:
+            log.error(f"[{ticker}] Could not schedule stale-price re-check: {e}")
+        seen = (f"Only a stale price ({shown}) was available" if shown
+                else "No price could be read")
+        _send_wait_alert(
+            f"⏸️ WAITING FOR FRESH PRICE — {ticker}\n"
+            f"{seen} "
+            f"(check {price_retry_attempt}/{STALE_PRICE_MAX_RETRIES}) — IBKR's "
+            f"intraday feed usually catches up within a few minutes of the open. "
+            f"Will re-check in {STALE_PRICE_RETRY_MINUTES} min.",
+            price_retry_attempt, ticker)
+        if not scheduled:
+            return _outcome("failed: stale price, re-check not scheduled")
+        return _outcome("deferred: stale price, re-check scheduled")
+    log.error(
+        f"[{ticker}] Could not get a fresh price after "
+        f"{STALE_PRICE_MAX_RETRIES} checks — giving up rather than "
+        f"risk an unguarded gap"
+    )
+    try:
+        still = f"still only a stale price ({shown})" if shown else "still no price"
+        alert_module._send(
+            f"⚠️ ORDER ABORTED — Price Unavailable\n"
+            f"<b>{ticker}</b> {action}: {still} "
+            f"after {STALE_PRICE_MAX_RETRIES} "
+            f"checks over ~{STALE_PRICE_MAX_RETRIES * STALE_PRICE_RETRY_MINUTES} min "
+            f"— can't rule out a large gap since this was sized. "
+            f"Re-run analysis or check TWS."
+        )
+    except Exception:
+        pass
+    return _outcome("skipped: price still stale after retries")
+
+
 # The whole execution holds the ticker's stop lock: a SELL cancels the stop,
 # sells and re-places it; a BUY places the first stop (stop_lock).
 @locked_by_ticker(lambda approval, *a, **k: approval["ticker"],
@@ -1772,6 +1856,22 @@ def execute_approved(
                 log.error(f"[{ticker}] {action} requested but no position found")
                 return _outcome("failed: no position to sell")
             shares = owned if action == "EXIT" else min(shares, owned)
+            # A sale the trim/exit rule routed (agents/trim_exit.py): its
+            # switches, the exemption list, its context, the shares a TRIM
+            # leaves and whether a one-share EXIT is still one share are
+            # checked again before the stop is touched. A failed check is a
+            # skip too.
+            if risk_json.get("trim_exit"):
+                try:
+                    from agents import trim_exit
+                    rule_block = trim_exit.execution_block(ticker, action, shares, owned,
+                                                           risk_json["trim_exit"])
+                except Exception as e:
+                    rule_block = f"recheck failed ({type(e).__name__})"
+                if rule_block:
+                    log.warning(f"[{ticker}] {action} not sent: trim/exit rule {rule_block}; "
+                                f"stop left in place")
+                    return _outcome(f"skipped: trim/exit rule {rule_block} (stop kept)")
             # Outside regular hours ibkr.place_market_order cancels the DAY
             # order anyway, but the stop was already gone and was never put
             # back, so the position sat unprotected into the open (limitations
@@ -1803,6 +1903,7 @@ def execute_approved(
         # close can't masquerade as "no drift".
         price_at_sizing = risk_json.get("price_at_sizing")
         current_price_pre = None
+        stale_buy_entered = False   # the BUY stale branch below ran (never enter it twice)
         try:
             from market_data import get_priced_quote
             pq = get_priced_quote(ticker)
@@ -1827,6 +1928,15 @@ def execute_approved(
                     pq = get_priced_quote(ticker) or pq
                     if pq and not pq["is_stale"]:
                         break
+            if pq is None and side == "BUY":
+                # No 1-min or daily bar at all: the ageless latest price
+                # can't rule out a gap since sizing either, so a BUY takes
+                # the stale branch (bounded re-check, then skip). A SELL
+                # goes on as below.
+                log.warning(f"[{ticker}] No priced quote for the BUY; treated as stale")
+                stale_buy_entered = True
+                return _stale_buy_outcome(ticker, approval, action, None, None, price_at_sizing,
+                                          gap_retry_attempt, price_retry_attempt, no_quote="none")
             if pq is None:
                 # No 1-min or daily bar at all: use the latest price, as on
                 # an exception below, so the drift check still runs.
@@ -1861,62 +1971,10 @@ def execute_approved(
                         # Now retries on the same bounded, ever-later-eta
                         # shape as GAP_CONFIRMATION_* instead of giving up
                         # on the first miss.
-                        from config import STALE_PRICE_MAX_RETRIES, STALE_PRICE_RETRY_MINUTES
-                        try:   # log-only: would a Yahoo quote have been fresh? (off the order path)
-                            from datetime import datetime as _dt, timezone as _tz
-                            from tasks import stale_quote_fallback_shadow
-                            # retry=False: a slow broker must not hold the order path (m545)
-                            stale_quote_fallback_shadow.apply_async(
-                                args=[ticker, approval.get("id"), price_retry_attempt,
-                                      pq.get("age_minutes"), _dt.now(_tz.utc).isoformat()],
-                                queue="ops", expires=600, retry=False)
-                        except Exception as e:
-                            log.debug(f"[{ticker}] quote fallback shadow not queued: {e}")
-                        if price_retry_attempt < STALE_PRICE_MAX_RETRIES:
-                            from datetime import datetime, timedelta, timezone
-                            eta = datetime.now(timezone.utc) + timedelta(minutes=STALE_PRICE_RETRY_MINUTES)
-                            log.warning(
-                                f"[{ticker}] Could not get a fresh price "
-                                f"(attempt {price_retry_attempt}/{STALE_PRICE_MAX_RETRIES}) — "
-                                f"re-checking at {eta.isoformat()} rather than risk an unguarded gap"
-                            )
-                            scheduled = False
-                            try:
-                                from tasks import retry_deferred_entry
-                                retry_deferred_entry.apply_async(
-                                    args=[approval["id"], gap_retry_attempt, price_retry_attempt + 1],
-                                    eta=eta, queue="ops",
-                                )
-                                scheduled = True
-                            except Exception as e:
-                                log.error(f"[{ticker}] Could not schedule stale-price re-check: {e}")
-                            _send_wait_alert(
-                                f"⏸️ WAITING FOR FRESH PRICE — {ticker}\n"
-                                f"Only a stale price (${current_price_pre:.2f}) was available "
-                                f"(check {price_retry_attempt}/{STALE_PRICE_MAX_RETRIES}) — IBKR's "
-                                f"intraday feed usually catches up within a few minutes of the open. "
-                                f"Will re-check in {STALE_PRICE_RETRY_MINUTES} min.",
-                                price_retry_attempt, ticker)
-                            if not scheduled:
-                                return _outcome("failed: stale price, re-check not scheduled")
-                            return _outcome("deferred: stale price, re-check scheduled")
-                        log.error(
-                            f"[{ticker}] Could not get a fresh price after "
-                            f"{STALE_PRICE_MAX_RETRIES} checks — giving up rather than "
-                            f"risk an unguarded gap"
-                        )
-                        try:
-                            alert_module._send(
-                                f"⚠️ ORDER ABORTED — Price Unavailable\n"
-                                f"<b>{ticker}</b> {action}: still only a stale price "
-                                f"(${current_price_pre:.2f}) after {STALE_PRICE_MAX_RETRIES} "
-                                f"checks over ~{STALE_PRICE_MAX_RETRIES * STALE_PRICE_RETRY_MINUTES} min "
-                                f"— can't rule out a large gap since this was sized. "
-                                f"Re-run analysis or check TWS."
-                            )
-                        except Exception:
-                            pass
-                        return _outcome("skipped: price still stale after retries")
+                        stale_buy_entered = True
+                        return _stale_buy_outcome(ticker, approval, action, pq, current_price_pre,
+                                                  price_at_sizing, gap_retry_attempt,
+                                                  price_retry_attempt)
                     try:
                         alert_module._send(
                             f"⚠️ STALE PRICE — {ticker}\n"
@@ -1926,7 +1984,27 @@ def execute_approved(
                         )
                     except Exception:
                         pass
-        except Exception:
+        except Exception as e:
+            if side == "BUY":
+                # The check raised: a BUY takes the stale branch rather than
+                # proceed on the ageless latest price; one that raised inside
+                # that branch fails without an order (its re-check may
+                # already be queued, so it is not entered twice).
+                if stale_buy_entered:
+                    log.error(f"[{ticker}] Stale-price branch raised ({type(e).__name__}); "
+                              f"{action} not sent")
+                    return _outcome("failed: stale-price check raised")
+                log.warning(f"[{ticker}] Price freshness check raised ({type(e).__name__}); "
+                            f"BUY treated as stale")
+                try:
+                    return _stale_buy_outcome(ticker, approval, action, None, None,
+                                              price_at_sizing, gap_retry_attempt,
+                                              price_retry_attempt,
+                                              no_quote=f"error: {type(e).__name__}")
+                except Exception as e2:
+                    log.error(f"[{ticker}] Stale-price branch raised ({type(e2).__name__}); "
+                              f"{action} not sent")
+                    return _outcome("failed: stale-price check raised")
             current_price_pre = ibkr.get_latest_price(ticker)
         if price_at_sizing and current_price_pre:
             drift = abs(current_price_pre - price_at_sizing) / price_at_sizing

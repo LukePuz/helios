@@ -96,7 +96,8 @@ def test_amc_today_is_still_pre_print():
 def test_routing_switches_in_treatment_config():
     tc = analyst._treatment_config()
     for k in ("BUY_REQUIRES_NEW_FACT", "BUY_NEW_FACT_SCOPE", "BUY_NEW_FACT_WINDOW",
-              "TRIM_FRACTION", "REBUY_COOLDOWN_HOURS", "DIP_REVIEW_COUNTS_AS_NEW_FACT"):
+              "TRIM_FRACTION", "REBUY_COOLDOWN_HOURS", "DIP_REVIEW_COUNTS_AS_NEW_FACT",
+              "TRIM_EXIT_ENABLED", "TRIM_EXIT_LIVE"):
         assert k in tc
 
 

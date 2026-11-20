@@ -92,6 +92,43 @@ def test_classify_follow_diverge_invalidate():
     assert plans.classify(plan, "WATCH", None, 545.0, TODAY, held=False)["relation"] == "FOLLOW"
 
 
+def test_add_under_a_hold_plan_stays_follow_and_is_recorded():
+    """A held ADD while the plan says hold is FOLLOW ("adding within plan");
+    the record says so, with the plan's add_trigger and the price against it."""
+    plan = _plan(add_trigger=560.0)
+    r = plans.classify(plan, "ADD", dict(plan), 545.0, TODAY, held=True)
+    assert r["relation"] == "FOLLOW" and r["plan_says"] == "hold"
+    assert r["add_under_hold_plan"] is True and r["add_trigger"] == 560.0
+    assert r["price_vs_add_trigger_pct"] == -2.68
+    # a held_seed plan has no add_trigger
+    r = plans.classify(_plan(source="held_seed"), "ADD", None, 545.0, TODAY, held=True)
+    assert r["relation"] == "FOLLOW" and r["add_under_hold_plan"] is True
+    assert r["add_trigger"] is None and r["price_vs_add_trigger_pct"] is None
+    # not held, near the plan entry: the plan says buy, so not under a hold plan
+    r = plans.classify(plan, "OPEN", dict(plan), 545.0, TODAY, held=False)
+    assert r["relation"] == "FOLLOW" and r["add_under_hold_plan"] is False
+    # a HOLD verdict carries none of these keys
+    r = plans.classify(plan, "HOLD", None, 545.0, TODAY, held=True)
+    assert not any(k in r for k in ("add_under_hold_plan", "add_trigger", "price_vs_add_trigger_pct"))
+
+
+def test_add_plan_record_failure_keeps_the_relation(caplog):
+    plan = _plan(add_trigger="not a number")
+    with caplog.at_level("WARNING"):
+        r = plans.classify(plan, "ADD", dict(plan), 545.0, TODAY, held=True)
+    assert r["relation"] == "FOLLOW" and "add_under_hold_plan" not in r
+    assert "add record failed" in caplog.text
+
+
+def test_add_under_hold_plan_reaches_the_verdict_record():
+    plan = _plan(source="analyst", add_trigger=530.0)
+    with patch("db.get_position_stop", return_value={"entry_price": 500.0, "stop_price": 470.0}), \
+         patch("db.get_active_plan", return_value=plan), patch("db.touch_plan"):
+        out = plans.observe("NVDA", PARSED, "ADD", 7, "Current Price: $545.00", now=NOW)
+    assert out["relation"] == "FOLLOW" and out["add_under_hold_plan"] is True
+    assert out["add_trigger"] == 530.0 and out["price_vs_add_trigger_pct"] == 2.83
+
+
 def test_open_with_moved_target_is_a_revision():
     plan = _plan()
     new = plans.plan_from_verdict("NVDA", {**PARSED, "valuation": {
@@ -213,6 +250,13 @@ def test_classify_unchanged_apart_from_the_new_keys():
                             extra = {k: got.pop(k) for k in ("revise_triggers",
                                                              "catalyst_month_only_pair")
                                      if k in got}
+                            # OPEN/ADD-only log keys (_add_plan_record)
+                            add = {k: got.pop(k) for k in ("add_under_hold_plan", "add_trigger",
+                                                           "price_vs_add_trigger_pct") if k in got}
+                            assert bool(add) == (action in ("OPEN", "ADD"))
+                            if add:
+                                assert add["add_under_hold_plan"] == (
+                                    action == "ADD" and want["plan_says"] == plans._HOLD)
                             assert json.dumps(got, default=str) == json.dumps(want, default=str)
                             assert bool(extra) == (want["relation"] == "REVISE")
                             if extra:
@@ -432,6 +476,38 @@ def test_watcher_logs_once_per_plan_and_kind():
     # The row names its own code and config version (SEF run 100).
     prov = log_signal.call_args.kwargs["provenance"]
     assert "code_sha" in prov and "env_sha" in prov
+
+
+def _watch_rows(plan, held_prices):
+    import tasks
+    redis = MagicMock()
+    redis.set.return_value = True
+    with patch("market_data.is_market_hours", return_value=True), \
+         patch("db.get_active_plans", return_value=[plan]), \
+         patch("tasks._held_prices", return_value=held_prices), \
+         patch("stop_lock._redis", return_value=redis), \
+         patch("config.PLAN_LEVEL_REVIEW_ENABLED", False), \
+         patch("db.outcome_closed_since", return_value=None), \
+         patch("db.log_signal") as log_signal:
+        tasks.watch_plan_levels()
+    return [(c.args[3], c.kwargs["provenance"]) for c in log_signal.call_args_list]
+
+
+def test_level_hit_on_an_unheld_name_records_no_price_not_zero():
+    """Audit 2026-11-17 #11: an unheld name has no position price; its date
+    hits said "at $0.00". The text says "no price" and the price is null."""
+    plan = _plan(ticker="PLTR", catalyst_date=None, horizon_end=date(2026, 10, 1))
+    rows = _watch_rows(plan, {"NVDA": 470.0})
+    assert len(rows) == 1
+    text, prov = rows[0]
+    assert text == "plan 1: horizon_end (2026-10-01) no price; would re-review"
+    assert "$0.00" not in text and prov["price"] is None and prov["kind"] == "horizon_end"
+
+
+def test_level_hit_on_a_held_name_keeps_its_price_and_text():
+    rows = _watch_rows(_plan(catalyst_date=None), {"NVDA": 470.0})
+    assert len(rows) == 1 and rows[0][1]["price"] == 470.0
+    assert rows[0][0] == "plan 1: invalidation (480.0) at $470.00; would re-review"
 
 
 def test_watcher_says_when_price_checks_were_skipped(caplog):
@@ -1044,3 +1120,105 @@ def test_stop_read_is_strict_so_an_error_never_reads_as_not_held():
          patch("db.get_active_plan", return_value=None):
         plans.observe("MSFT", PARSED, "HOLD", 6, "Current Price: $540.00", now=NOW)
     assert gps.call_args.kwargs.get("strict") is True
+
+
+# ── invalidation loosening on a REVISE (record only) ─────────────────────────
+
+_REVISE_STOP = {"entry_price": 540.0, "stop_price": 480.0}
+
+
+def _observe_revise(downside, price, ladder=None, ladder_exc=None, plan=None, target="$650",
+                    action="ADD"):
+    """An OPEN/ADD verdict against _plan() (invalidation 480, target 650)."""
+    parsed = {**PARSED, "valuation": {"bull_case_target": target, "downside_scenario": downside}}
+    lad = (patch("db.get_trade_ladder", side_effect=ladder_exc) if ladder_exc
+           else patch("db.get_trade_ladder", return_value=ladder))
+    with patch("db.get_position_stop", return_value=_REVISE_STOP), \
+         patch("db.get_active_plan", return_value=plan or _plan()), \
+         patch("db.touch_plan") as touch, patch("db.insert_plan", return_value=8) as ins, \
+         lad as ladder_read, \
+         patch("tasks._broker_held", return_value=(None, "no_snapshot", {})) as broker:
+        r = plans.observe("NVDA", parsed, action, 8, f"Current Price: ${price:.2f}", now=NOW)
+    # The record reads nothing new: the one broker-snapshot read and the one
+    # ladder read (for the new revision's levels) are the ones there before.
+    assert broker.call_count == 1 and ladder_read.call_count == (1 if r["relation"] == "REVISE" else 0)
+    return r, ins, touch, broker
+
+
+def test_revise_that_lowers_invalidation_far_from_it_is_recorded():
+    r, ins, touch, _ = _observe_revise("$400", 545.0, ladder=_LADDER)
+    assert r["relation"] == "REVISE" and r["revise_triggers"] == ["invalidation"]
+    assert r["invalidation_prev"] == 480.0 and r["invalidation_new"] == 400.0
+    assert r["invalidation_loosened"] is True
+    assert r["ladder_atr"] == 10.0 and r["price_vs_prev_invalidation_atr"] == 6.5
+    assert r["add_near_invalidation"] is False                 # 65 above, 1 ATR is 10
+    assert ins.call_args.args[0]["invalidation_price"] == 400.0   # the row written is unchanged
+    touch.assert_called_once_with(1, "REVISE")
+
+
+def test_revise_within_one_atr_of_the_old_invalidation_is_near():
+    r, *_ = _observe_revise("$400", 485.0, ladder=_LADDER)
+    assert r["relation"] == "REVISE" and r["invalidation_loosened"] is True
+    assert r["add_near_invalidation"] is True and r["price_vs_prev_invalidation_atr"] == 0.5
+    edge, *_ = _observe_revise("$400", 490.0, ladder=_LADDER)     # exactly 1 ATR
+    assert edge["add_near_invalidation"] is True and edge["price_vs_prev_invalidation_atr"] == 1.0
+    opened, *_ = _observe_revise("$400", 485.0, ladder=_LADDER, action="OPEN")
+    assert opened["relation"] == "REVISE" and opened["add_near_invalidation"] is True
+
+
+def test_revise_that_raises_invalidation_is_not_loosened():
+    r, *_ = _observe_revise("$530", 545.0, ladder=_LADDER)      # 480 -> 530
+    assert r["relation"] == "REVISE" and r["invalidation_loosened"] is False
+    assert (r["invalidation_prev"], r["invalidation_new"]) == (480.0, 530.0)
+    assert r["add_near_invalidation"] is False
+
+
+def test_unknown_atr_price_or_level_gives_none():
+    no_ladder, *_ = _observe_revise("$400", 485.0)
+    assert no_ladder["invalidation_loosened"] is True
+    assert no_ladder["add_near_invalidation"] is None and no_ladder["ladder_atr"] is None
+    assert no_ladder["price_vs_prev_invalidation_atr"] is None
+    failed, ins, _, _ = _observe_revise("$400", 485.0, ladder_exc=RuntimeError("ladder down"))
+    assert failed["relation"] == "REVISE" and failed["new_plan_id"] == 8
+    assert failed["add_near_invalidation"] is None and failed["invalidation_loosened"] is True
+    zero_atr, *_ = _observe_revise("$400", 485.0, ladder={**_LADDER, "atr": 0})
+    assert zero_atr["add_near_invalidation"] is None
+    # A revision whose new invalidation is unknown (a "downside" above the
+    # price is dropped), revising on the target.
+    no_new, *_ = _observe_revise("$600", 545.0, ladder=_LADDER, target="$800")
+    assert no_new["relation"] == "REVISE" and no_new["revise_triggers"] == ["target"]
+    assert no_new["invalidation_new"] is None and no_new["invalidation_loosened"] is None
+    assert no_new["add_near_invalidation"] is False
+    # A plan with no invalidation of its own.
+    no_prev, *_ = _observe_revise("$400", 545.0, ladder=_LADDER, target="$800",
+                                  plan=_plan(invalidation_price=None))
+    assert no_prev["relation"] == "REVISE" and no_prev["invalidation_prev"] is None
+    assert no_prev["invalidation_loosened"] is None and no_prev["add_near_invalidation"] is None
+    # No price in the brief: no plan is proposed, so no REVISE and no record.
+    with patch("db.get_position_stop", return_value=_REVISE_STOP), \
+         patch("db.get_active_plan", return_value=_plan()), patch("db.touch_plan"):
+        r = plans.observe("NVDA", PARSED, "ADD", 8, "no price here", now=NOW)
+    assert r["relation"] != "REVISE" and "invalidation_loosened" not in r
+
+
+def test_invalidation_record_only_on_revise_and_never_raises():
+    follow, *_ = _observe_revise("$480", 545.0, ladder=_LADDER)    # same levels: FOLLOW
+    assert follow["relation"] == "FOLLOW"
+    assert not any(k in follow for k in plans._INVALIDATION_RECORD_KEYS)
+    bad = plans._invalidation_record(None, {}, 500.0, 10.0)
+    assert {k: bad[k] for k in plans._INVALIDATION_RECORD_KEYS} == \
+        {k: None for k in plans._INVALIDATION_RECORD_KEYS}
+    assert bad["invalidation_record_error"] == "AttributeError"
+    odd = plans._invalidation_record({"invalidation_price": "x"}, {"invalidation_price": float("nan")},
+                                     "y", "z")
+    assert set(odd) == set(plans._INVALIDATION_RECORD_KEYS) and not any(odd.values())
+
+
+def test_revise_relation_and_existing_keys_unchanged_by_the_record():
+    for downside, price in (("$400", 545.0), ("$400", 485.0), ("$530", 545.0)):
+        with_rec, ins_a, *_ = _observe_revise(downside, price, ladder=_LADDER)
+        with patch("agents.plans._invalidation_record", return_value={}):
+            without, ins_b, *_ = _observe_revise(downside, price, ladder=_LADDER)
+        assert {k: v for k, v in with_rec.items() if k not in plans._INVALIDATION_RECORD_KEYS} \
+            == without
+        assert ins_a.call_args.args[0] == ins_b.call_args.args[0]

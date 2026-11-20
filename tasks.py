@@ -1336,20 +1336,17 @@ def analyze_candidates(self, candidates: list, max_per_run: int = 5):
 def _yf_last_minute(ticker: str, at=None) -> tuple[float | None, str | None]:
     """The last 1-minute close Yahoo has for today that started at or before
     `at` (all bars when None), with its bar START time (ISO), including
-    pre/post-market bars; (None, None) when there is none."""
-    import yfinance as yf
-    df = yf.Ticker(ticker).history(period="1d", interval="1m", prepost=True)
-    if df is not None and not df.empty and at is not None:
-        df = df[df.index <= at]   # a bar that arrived after the stale quote was seen doesn't count
-    if df is None or df.empty:
-        return None, None
-    return float(df["Close"].iloc[-1]), df.index[-1].isoformat()
+    pre/post-market bars; (None, None) when there is none. The read lives in
+    quote_fallback (minute_bars, last_minute_close)."""
+    import quote_fallback
+    return quote_fallback.last_minute_close(quote_fallback.minute_bars(ticker), at)
 
 
 @app.task(name="tasks.stale_quote_fallback_shadow", ignore_result=True,
           soft_time_limit=20, time_limit=30)
 def stale_quote_fallback_shadow(ticker: str, approval_id, attempt: int, stale_age_min,
-                                seen_at: str | None = None) -> None:
+                                seen_at: str | None = None, price_at_sizing=None,
+                                ibkr_price_source: str | None = None) -> None:
     """Log-only (audit 2026-11-05-0725 #10/#13): when a BUY at the open finds
     only a stale IBKR quote (HMDS "no data" for the first minutes; ANET's
     11-04 08:33 OPEN was lost this way), record whether Yahoo had a recent
@@ -1360,30 +1357,47 @@ def stale_quote_fallback_shadow(ticker: str, approval_id, attempt: int, stale_ag
     about 1 min old. bar_in_rth says whether that bar started between 09:30
     and 16:00 ET: a pre-market print just before the open looks fresh but is
     thin trade (professor m545). Runs on ops, off the order path, with time
-    limits. One activity_feed row per check; never raises."""
-    from datetime import datetime, time, timezone
-    from zoneinfo import ZoneInfo
+    limits. One activity_feed row per check; never raises.
+
+    The counterfactual a Yahoo fallback would have run, read through
+    quote_fallback (record only, no IBKR call): yf_price, drift_pct (signed,
+    percent) against price_at_sizing and would_pass_drift under execution's
+    8% abort, ibkr_price_source (which IBKR bars the stale quote came from,
+    passed by execution; "none" when IBKR gave no quote at all, "error:
+    <class>" when the quote check raised) and yf_gap_status, the opening-gap check run on
+    Yahoo's regular-hours bars. No key applies an age bound to the Yahoo
+    bar: that bound is the owner's choice."""
+    from datetime import datetime, timezone
     import db
+    import quote_fallback
     now = datetime.now(timezone.utc)
     ref = datetime.fromisoformat(seen_at) if seen_at else now
+    bars, gap = None, None
     try:
-        price, bar_at = _yf_last_minute(ticker, ref)
-        bar = datetime.fromisoformat(bar_at) if bar_at else None
-        age = round((ref - bar).total_seconds() / 60, 1) if bar else None
-        # 09:30-16:00 ET; an early-close day's last hours read as in RTH (known limit).
-        in_rth = (time(9, 30) <= bar.astimezone(ZoneInfo("America/New_York")).time() < time(16, 0)
-                  if bar else None)
-        err = None
+        bars = quote_fallback.minute_bars(ticker)
     except Exception as e:
-        price, bar_at, age, in_rth, err = None, None, None, None, type(e).__name__
+        q = {"price": None, "bar_at": None, "age_min": None, "in_rth": None,
+             "error": type(e).__name__}
+        gap = f"error:{type(e).__name__}"
+    else:
+        q = quote_fallback.get_fallback_quote(ticker, ref, bars=bars)
+        gap = quote_fallback.fallback_gap_status(ticker, ref, bars=bars)
+    price, age = q.get("price"), q.get("age_min")
+    drift = quote_fallback.drift_record(price, price_at_sizing)
+    src = str(ibkr_price_source or "")
+    what = ("no IBKR quote" if src == "none" else "IBKR quote check raised"
+            if src.startswith("error") else "stale IBKR quote")
     try:
         db.log_activity("quote_fallback_shadow", ticker,
-                        f"stale IBKR quote (check {attempt}); Yahoo 1-min bar age "
+                        f"{what} (check {attempt}); Yahoo 1-min bar age "
                         f"{age if age is not None else 'n/a'} min", "neutral",
                         {"approval_id": approval_id, "attempt": attempt,
-                         "ibkr_age_min": stale_age_min, "seen_at": seen_at, "yf_bar_at": bar_at,
-                         "yf_age_min": age, "bar_in_rth": in_rth,
-                         "yf_price_found": price is not None, "error": err,
+                         "ibkr_age_min": stale_age_min, "seen_at": seen_at,
+                         "yf_bar_at": q.get("bar_at"), "yf_age_min": age,
+                         "bar_in_rth": q.get("in_rth"),
+                         "yf_price_found": price is not None, "error": q.get("error"),
+                         "yf_price": price, **drift,
+                         "ibkr_price_source": ibkr_price_source, "yf_gap_status": gap,
                          "checked_at": now.isoformat()})
     except Exception as e:
         log.warning(f"[{ticker}] quote fallback shadow row failed: {e}")
@@ -5386,6 +5400,47 @@ def _bounded_extra_expiries(ticker: str, earnings_date, today, deadline: float) 
     return box.get("v") or {"fetched": False, "reason": "no_result"}
 
 
+_IMPLIED_MOVE_EXTRA_BOOK_KEYS = ("event_spanning", "dte30")
+
+
+def _implied_move_book_extras(extras, et_date: str, computed_at: str) -> dict:
+    """The event_spanning and dte30 straddles of one extra_expiry_moves
+    result as the options_implied_move book keeps them: implied_move_pct,
+    expiry, dte (on the date priced), the earnings_date they were priced
+    against, and the ET date and time they were priced. A straddle with no
+    result is left out. Never raises."""
+    out: dict = {}
+    try:
+        if not isinstance(extras, dict):
+            return out
+        for name in _IMPLIED_MOVE_EXTRA_BOOK_KEYS:
+            mv = extras.get(name)
+            if isinstance(mv, dict) and mv.get("implied_move_pct") is not None:
+                out[name] = {"implied_move_pct": mv.get("implied_move_pct"),
+                             "expiry": mv.get("expiry"), "dte": mv.get("dte"),
+                             "earnings_date": extras.get("earnings_date"),
+                             "et_date": et_date, "computed_at": computed_at}
+    except Exception as e:
+        log.debug(f"implied move book extras not kept: {e}")
+        return {}
+    return out
+
+
+def _event_move_over_stop(extras, dist) -> float | None:
+    """The event-spanning straddle's implied move over the stop distance
+    (both percent), or None when either is missing. Never raises."""
+    try:
+        import math
+        ev = extras.get("event_spanning") if isinstance(extras, dict) else None
+        pct = float(ev["implied_move_pct"]) if isinstance(ev, dict) and \
+            ev.get("implied_move_pct") is not None else None
+        if pct is None or not math.isfinite(pct) or dist is None or not dist > 0:
+            return None
+        return round(pct / dist, 4)
+    except Exception:
+        return None
+
+
 def _log_implied_move_shadow(moves: dict, now=None) -> int:
     """Log-only: the nearest-expiry ATM straddle implied move per ticker,
     computed by ingestion.options_free from the chain poll_options_flow
@@ -5397,8 +5452,13 @@ def _log_implied_move_shadow(moves: dict, now=None) -> int:
     map (latest per ticker) and writes one activity_feed row per ticker
     per ET date (stage options_shadow), the first computation at or after
     09:45 ET. Held tickers also get stop_distance_pct and
-    implied_move_over_stop from position_stops (read only). Nothing reads
-    these rows back into a decision. Never raises; returns rows written."""
+    implied_move_over_stop from position_stops (read only), and
+    event_move_over_stop, the event-spanning straddle over the same stop
+    distance. Each book entry also keeps that day's event_spanning and dte30
+    straddles (_implied_move_book_extras), carried across the day's later
+    polls and dropped when the ET date changes; the nearest-expiry keys keep
+    their meaning. Nothing reads these rows back into a decision. Never
+    raises; returns rows written."""
     try:
         if not moves:
             return 0
@@ -5420,6 +5480,7 @@ def _log_implied_move_shadow(moves: dict, now=None) -> int:
         book = {t: v for t, v in book.items()
                 if isinstance(v, dict) and str(v.get("et_date") or "") >= keep_from}
         logged = 0
+        fresh_extras: dict = {}   # ticker -> today's event_spanning/dte30, for the book
         due = [t for t in sorted(moves) if (book.get(t) or {}).get("logged_et_date") != et_date]
         if due and (et_now.hour, et_now.minute) >= _IMPLIED_MOVE_LOG_AFTER:
             # Durable dedup (survives a lost state write); None (read failed):
@@ -5458,6 +5519,8 @@ def _log_implied_move_shadow(moves: dict, now=None) -> int:
                                     t, earn.get(t), et_now.date(), extra_deadline)
                                 extra["extra_expiries"]["earnings_window_days"] = \
                                     _IMPLIED_MOVE_EXTRA_EARNINGS_DAYS
+                                fresh_extras[t] = _implied_move_book_extras(
+                                    extra["extra_expiries"], et_date, et_now.isoformat())
                             else:
                                 extra["extra_expiries"] = {"fetched": False,
                                                            "reason": "not held, no print within 14 days"}
@@ -5471,6 +5534,8 @@ def _log_implied_move_shadow(moves: dict, now=None) -> int:
                                     round(m["implied_move_pct"] / dist, 4)
                                     if dist is not None and dist > 0
                                     and m.get("implied_move_pct") is not None else None)
+                                extra["event_move_over_stop"] = _event_move_over_stop(
+                                    extra.get("extra_expiries"), dist)
                             if not db.log_activity(
                                     "options_shadow", t,
                                     f"implied move {t}: {m['implied_move_pct']:.2f}% to {m.get('expiry')} "
@@ -5484,6 +5549,16 @@ def _log_implied_move_shadow(moves: dict, now=None) -> int:
             prev = book.get(t) or {}
             book[t] = {**m, "et_date": et_date, "computed_at": et_now.isoformat(),
                        "logged_et_date": prev.get("logged_et_date")}
+            # Record only: today's event_spanning/dte30 straddles, priced once
+            # on the daily row, carried until the ET date changes. New keys
+            # beside the nearest-expiry ones, which keep their meaning.
+            try:
+                for name in _IMPLIED_MOVE_EXTRA_BOOK_KEYS:
+                    kept = (fresh_extras.get(t) or {}).get(name) or prev.get(name)
+                    if isinstance(kept, dict) and kept.get("et_date") == et_date:
+                        book[t][name] = kept
+            except Exception as ex:
+                log.debug(f"[{t}] implied move book extras not carried: {ex}")
         db.set_state(key, json.dumps(book, default=str))
         return logged
     except Exception as e:
@@ -7266,7 +7341,7 @@ def watch_plan_levels():
                         f"date checks only")
         logged = 0
         for plan in plans_now:
-            price = held.get(plan["ticker"])
+            price = held.get(plan["ticker"])   # None when not held (no position price)
             for kind, level in level_hits(plan, price, today):
                 if not r.set(f"helios:plan_hit:{plan['id']}:{kind}", "1", nx=True, ex=86400):
                     continue
@@ -7276,8 +7351,11 @@ def watch_plan_levels():
                 # could stack sells).
                 queued = bool(PLAN_LEVEL_REVIEW_ENABLED and plan["ticker"] in held and r.set(
                     f"helios:plan_review:{plan['ticker']}:{today.isoformat()}", "1", nx=True, ex=86400))
+                # An unheld name has no snapshot price: "no price" and a null
+                # price, not "$0.00" (audit 2026-11-17 #11).
                 db.log_signal(plan["ticker"], "PLAN_LEVEL_HIT", 0.0,
-                              f"plan {plan['id']}: {kind} ({level}) at ${price or 0:.2f}; "
+                              f"plan {plan['id']}: {kind} ({level}) "
+                              + (f"at ${price:.2f}; " if price is not None else "no price; ")
                               + ("review queued" if queued else "would re-review"),
                               provenance={"plan_id": plan["id"], "kind": kind, "level": level,
                                           "price": price, "plan_source": plan.get("source"),

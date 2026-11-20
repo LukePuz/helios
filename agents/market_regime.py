@@ -9,6 +9,7 @@ Scoring follows knowledge/market_regime_rules.md exactly.
 import logging
 import re
 import os
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -612,14 +613,208 @@ def _fetch_spy_bars(days: int = 220) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Log-only shadow: the same scorers on a true 200-bar window
+# ---------------------------------------------------------------------------
+# The live request above spans 250 calendar days, about 173 completed bars,
+# so the "200DMA" in _score_trend, the ETF proxy in _score_breadth and the
+# sector price-action slope all work on fewer than 200 bars. The shadow makes
+# its own wider request and records what those scorers give with 200. It
+# never touches the live bars, score or label.
+#
+# The 5-second cap is per assessment, not per caller: a loop that assesses
+# several ETFs (the 11-ETF GICS sweep, or sector cache misses while a pass
+# walks held tickers) can wait up to 5 s more per ETF when the shadow request
+# alone stalls. When the live request has already failed, the shadow makes no
+# request at all (status "live_unscored").
+REGIME_SHADOW_CALENDAR_DAYS = 330   # about 226 completed bars
+REGIME_SHADOW_TIMEOUT_S = 5.0
+_SHADOW_MIN_BARS = 200
+# _score_trend scores nothing under this many bars ("Insufficient ...").
+_LIVE_TREND_MIN_BARS = 50
+# compute_price_action's 200-day slope compares ma200[-1] with
+# ma200[-TREND_LOOKBACK] (agents/price_action.py, lookback 20); the older one
+# averages a full 200 closes only from 199 + 20 completed bars on.
+_SHADOW_PRICE_ACTION_MIN_BARS = 219
+
+
+def _fetch_shadow_bars(ticker: str) -> list[dict] | None:
+    """The shadow's own daily-bar request: same endpoint, feed and bar shape
+    as _fetch_bars, REGIME_SHADOW_CALENDAR_DAYS back, with a
+    REGIME_SHADOW_TIMEOUT_S request timeout. None without credentials;
+    raises on a failed request (_shadow_bars_bounded records it)."""
+    api_key    = os.getenv("ALPACA_API_KEY", "")
+    api_secret = os.getenv("ALPACA_API_SECRET", "")
+    if not api_key or not api_secret:
+        return None
+
+    now = datetime.now(timezone.utc)
+    url = f"https://data.alpaca.markets/v2/stocks/{ticker}/bars"
+    headers = {"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": api_secret}
+    params  = {"timeframe": "1Day",
+               "start": (now - timedelta(days=REGIME_SHADOW_CALENDAR_DAYS)).strftime("%Y-%m-%d"),
+               "end": now.strftime("%Y-%m-%d"),
+               "limit": REGIME_SHADOW_CALENDAR_DAYS, "feed": "iex"}
+    resp = requests.get(url, headers=headers, params=params, timeout=REGIME_SHADOW_TIMEOUT_S)
+    resp.raise_for_status()
+    return [
+        {
+            "date":   b["t"][:10],
+            "open":   b["o"],
+            "high":   b["h"],
+            "low":    b["l"],
+            "close":  b["c"],
+            "volume": b["v"],
+        }
+        for b in resp.json().get("bars") or []
+    ]
+
+
+def _shadow_bars_bounded(ticker: str) -> tuple[list[dict] | None, str, str | None]:
+    """_fetch_shadow_bars on a daemon thread, joined for at most
+    REGIME_SHADOW_TIMEOUT_S: the request timeout alone does not cover a slow
+    DNS lookup or a connect followed by a slow read, and one assessment must
+    not wait longer than that for it. Returns (bars, status, error type name);
+    bars is None unless status is "ok". Never raises."""
+    box: dict = {}
+
+    def run():
+        try:
+            box["bars"] = _fetch_shadow_bars(ticker)
+        except Exception as e:
+            box["error"] = e
+
+    th = threading.Thread(target=run, name=f"regime-shadow-{ticker}", daemon=True)
+    th.start()
+    th.join(REGIME_SHADOW_TIMEOUT_S)
+    if th.is_alive():
+        return None, "timeout", None
+    err = box.get("error")
+    if err is not None:
+        status = "timeout" if isinstance(err, requests.exceptions.Timeout) else "fetch_failed"
+        return None, status, type(err).__name__
+    if box.get("bars") is None:
+        return None, "no_credentials", None
+    return box["bars"], "ok", None
+
+
+def _regime_shadow_200(ticker: str, live_raws: dict, live_score: float, live_regime: str, *,
+                       live_bars: list[dict], vix: float | None, breadth_proxy: bool,
+                       sector: bool = False) -> dict | None:
+    """Log-only record for signals.trend.shadow_200: the score and label this
+    assessment would have on REGIME_SHADOW_CALENDAR_DAYS of bars, where the
+    200DMA averages 200 completed bars.
+
+    Re-scored on the wider bars: trend; the ETF-proxy breadth fallback, only
+    when the live breadth came from it (breadth_proxy); for a sector, price
+    action, only from _SHADOW_PRICE_ACTION_MIN_BARS completed bars on
+    (price_action_rescored; otherwise its live raw score is kept). Volatility
+    is re-scored from the shadow trend and breadth with the live call's
+    arguments. Every other input keeps its live raw score (live_raws: signal
+    name -> raw score), and the weights are the live ones.
+
+    live_bars are the completed bars the live trend was scored on. Under
+    _LIVE_TREND_MIN_BARS the live trend was not scored (a failed or short
+    live request), so there is nothing to compare with: status
+    "live_unscored" and no request. same_last_bar says whether both windows
+    end on the same bar; False when the two requests straddle the 16:00 ET
+    close, so the two scores read different current prices.
+
+    Never raises. "status" is "ok" when scored; otherwise nothing is scored
+    and it says why: "live_unscored", "too_few_bars" (under 200 completed
+    bars), "timeout", "fetch_failed", "no_credentials" or "error". None when
+    REGIME_SHADOW_200_ENABLED is off, and then no request is made."""
+    rec = {"status": "error", "calendar_days": REGIME_SHADOW_CALENDAR_DAYS,
+           "live_bars": None, "bars_fetched": None, "bars_used": None,
+           "last_bar_date": None, "same_last_bar": None, "ma200": None,
+           "trend_score": None, "breadth_score": None, "breadth_rescored": None,
+           "price_action_score": None, "price_action_rescored": None, "volatility_score": None,
+           "score": None, "regime": None, "differs": None, "regime_differs": None}
+    try:
+        try:
+            from config import REGIME_SHADOW_200_ENABLED
+        except ImportError:
+            REGIME_SHADOW_200_ENABLED = True
+        if not REGIME_SHADOW_200_ENABLED:
+            return None
+
+        rec["live_bars"] = len(live_bars)
+        if len(live_bars) < _LIVE_TREND_MIN_BARS:
+            bars, status, error = None, "live_unscored", None
+        else:
+            bars, status, error = _shadow_bars_bounded(ticker)
+        if error:
+            rec["error"] = error
+        if bars is None:
+            rec["status"] = status
+        else:
+            bars = completed_bars(bars)
+            rec["bars_fetched"] = len(bars)
+            if len(bars) < _SHADOW_MIN_BARS:
+                rec["status"] = "too_few_bars"
+            else:
+                closes = [b["close"] for b in bars]
+                raws = dict(live_raws)
+                raws["trend"] = _score_trend(bars)[0]
+                if breadth_proxy:
+                    raws["breadth"] = _score_breadth(bars, [], proxy_label=ticker)[0]
+                price_action = price_action_rescored = None
+                if sector:
+                    raws["volatility"] = _score_volatility(vix, raws["trend"], None)[0]
+                    price_action_rescored = len(bars) >= _SHADOW_PRICE_ACTION_MIN_BARS
+                    if price_action_rescored:
+                        raws["price_action_volume"] = _score_price_action_volume(bars, ticker)[0]
+                    price_action = raws["price_action_volume"]
+                    weights, normalize = _SECTOR_WEIGHTS, _normalize_sector
+                else:
+                    raws["volatility"] = _score_volatility(vix, raws["trend"], raws["breadth"])[0]
+                    weights, normalize = _WEIGHTS, _normalize
+                score = normalize(sum(raws[name] * w for name, w in weights.items()))
+                regime = _regime_from_score(score)
+                rec.update({
+                    "status": "ok",
+                    "bars_used": min(len(closes), 200),
+                    "last_bar_date": bars[-1].get("date"),
+                    "same_last_bar": bars[-1].get("date") == live_bars[-1].get("date"),
+                    "ma200": round(sum(closes[-200:]) / 200, 4),
+                    "trend_score": raws["trend"],
+                    "breadth_score": raws["breadth"],
+                    "breadth_rescored": bool(breadth_proxy),
+                    "price_action_score": price_action,
+                    "price_action_rescored": price_action_rescored,
+                    "volatility_score": raws["volatility"],
+                    "score": score,
+                    "regime": regime,
+                    "differs": score != live_score,
+                    "regime_differs": regime != live_regime,
+                })
+    except Exception as e:
+        rec["status"], rec["error"] = "error", type(e).__name__
+
+    if rec["status"] == "ok":
+        log.info(f"{ticker} regime shadow_200: {rec['bars_fetched']} bars, trend {rec['trend_score']} "
+                 f"(live {live_raws.get('trend')}), score {rec['score']} {rec['regime']} "
+                 f"(live {live_score} {live_regime}), differs={rec['differs']}")
+    else:
+        log.info(f"{ticker} regime shadow_200: not scored, {rec['status']}"
+                 + (f" ({rec['error']})" if rec.get("error") else "")
+                 + (f", live {rec['live_bars']} bars" if rec["status"] == "live_unscored" else "")
+                 + (f", {rec['bars_fetched']} bars" if rec["bars_fetched"] is not None else ""))
+    return rec
+
+
+# ---------------------------------------------------------------------------
 # Main assessment function
 # ---------------------------------------------------------------------------
 
-def assess_regime() -> dict:
+def assess_regime(*, record_shadow: bool = True) -> dict:
     """
     Full macro + market regime scoring.
     Returns a structured regime packet (matches market_regime_agent.md spec).
     Persists to DB and updates in-memory cache.
+
+    record_shadow=False skips the log-only shadow_200 record and its extra
+    bar request: get_cached_regime's on-demand fallback passes it, so a
+    caller waiting on a cache miss never waits on the shadow.
     """
     global _regime_cache, _cache_ts
 
@@ -646,6 +841,7 @@ def assess_regime() -> dict:
     trade_style, efficiency_ratio, trade_style_notes = _score_trade_style(spy_bars)
 
     watchlist_bars = _fetch_watchlist_bars_for_breadth()
+    breadth_from_proxy = False   # log-only, for the shadow_200 record
     if watchlist_bars:
         breadth_raw, breadth_notes = _score_breadth(spy_bars, watchlist_bars)
     else:
@@ -655,6 +851,7 @@ def assess_regime() -> dict:
             breadth_raw, breadth_notes = _score_etf_flows(etf_flows)
         except Exception:
             breadth_raw, breadth_notes = _score_breadth(spy_bars, [])
+            breadth_from_proxy = True
 
     volatility_raw, volatility_notes = _score_volatility(vix, trend_raw, breadth_raw)
     liquidity_raw,  liquidity_notes  = _score_liquidity(macro)
@@ -796,6 +993,15 @@ def assess_regime() -> dict:
         "reasoning":   reasoning,
     }
 
+    # Log-only: what a true 200-bar window implies. The live packet above is
+    # final; this adds one key under signals.trend and nothing else (not in
+    # notes, reasoning, missing_inputs, drivers or risks).
+    shadow = _regime_shadow_200(
+        "SPY", {name: raw for name, (raw, _) in scores_map.items()}, score, regime,
+        live_bars=spy_bars, vix=vix, breadth_proxy=breadth_from_proxy) if record_shadow else None
+    if shadow is not None:
+        packet["signals"]["trend"]["shadow_200"] = shadow
+
     # --- Persist to DB ---
     try:
         import db
@@ -851,6 +1057,8 @@ def assess_sector_regime(
     breadth_tickers: list[str] | None = None,
     regime_type: str = "sector",
     db_regime_type: str | None = None,
+    *,
+    record_shadow: bool = True,
 ) -> dict:
     """
     Same regime classification as assess_regime(), scoped to one sector ETF
@@ -1037,6 +1245,18 @@ def assess_sector_regime(
         "reasoning": reasoning,
     }
 
+    # Log-only, as in assess_regime(): one key under signals.trend. The
+    # breadth figure is the ETF proxy exactly when the sample was empty.
+    # record_shadow=False (get_cached_sector_regime's cache miss) skips it:
+    # that path runs inside live loops (profit targets, setup gates), which
+    # must not wait on a log-only request.
+    shadow = _regime_shadow_200(
+        sector_etf, {name: raw for name, (raw, _) in scores_map.items()}, score, regime,
+        live_bars=sector_bars, vix=vix, breadth_proxy=not breadth_bars,
+        sector=True) if record_shadow else None
+    if shadow is not None:
+        packet["signals"]["trend"]["shadow_200"] = shadow
+
     try:
         import db
         db.log_regime(
@@ -1071,7 +1291,8 @@ def get_cached_sector_regime(sector_etf: str = "XLK", regime_type: str = "sector
     try:
         return assess_sector_regime(
             sector_etf, regime_type=regime_type,
-            db_regime_type="gics_sector_fallback" if regime_type == "gics_sector" else None)
+            db_regime_type="gics_sector_fallback" if regime_type == "gics_sector" else None,
+            record_shadow=False)
     except Exception as e:
         log.error(f"assess_sector_regime({sector_etf}, {regime_type}) failed: {e}")
         return {"available": False, "regime": "Neutral", "score": 50.0, "confidence": 0.0,
@@ -1192,8 +1413,9 @@ def get_cached_regime() -> dict:
     except Exception as e:
         log.debug(f"DB regime fallback failed: {e}")
 
-    # Nothing fresh — run fresh assessment
-    return assess_regime()
+    # Nothing fresh — run fresh assessment (no log-only shadow on this
+    # on-demand path; the scheduled runs record it)
+    return assess_regime(record_shadow=False)
 
 
 def get_intraday_vix() -> float | None:

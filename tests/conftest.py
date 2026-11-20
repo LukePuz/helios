@@ -162,6 +162,15 @@ def _no_live_vix(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_regime_shadow_fetch(monkeypatch):
+    """Each regime assessment makes a second, wider bar request for its
+    log-only shadow_200 record: no network in tests. Stubbed as "no
+    credentials" unless a test patches it itself."""
+    from agents import market_regime
+    monkeypatch.setattr(market_regime, "_fetch_shadow_bars", lambda ticker: None)
+
+
+@pytest.fixture(autouse=True)
 def _no_kombu_publish(monkeypatch):
     """Backstop for the send_task trap: any message published through kombu
     (control broadcasts, a second app, a raw Producer) fails the test."""
@@ -393,6 +402,17 @@ def _new_fact_gate_off(monkeypatch):
     Its own tests patch config.BUY_REQUIRES_NEW_FACT back on."""
     import config
     monkeypatch.setattr(config, "BUY_REQUIRES_NEW_FACT", False)
+
+
+@pytest.fixture(autouse=True)
+def _trim_exit_rule_off(monkeypatch):
+    """The trim/exit rule (agents/trim_exit.py) is off in tests whatever the
+    checkout's .env says: switched on, every held review writes one more
+    signals row, and tests that read log_signal's calls would see it. Its own
+    tests turn it on (tests/test_trim_exit.py:_flags)."""
+    import config
+    monkeypatch.setattr(config, "TRIM_EXIT_ENABLED", False)
+    monkeypatch.setattr(config, "TRIM_EXIT_LIVE", False)
 
 
 @pytest.fixture(autouse=True)

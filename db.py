@@ -1364,10 +1364,15 @@ _NON_ANALYST_SIGNALS = ("SCREENED_OUT", "CATALYST_BLOCKED", "COOLDOWN_SKIPPED", 
                         "HELD_MOVE_SHADOW",
                         # Drop watch row (tasks.dip_watch); a review it queues
                         # writes its own verdict row.
-                        "DIP_WATCH_SHADOW")
+                        "DIP_WATCH_SHADOW",
+                        # Trim/exit rule row (agents/trim_exit.py), one per held
+                        # review: kept out of the verdict reads, so it confirms
+                        # nothing and never reaches the brief.
+                        "TRIM_EXIT_RULE")
 
 
-def get_latest_signal_for(ticker: str, with_trigger: bool = False) -> dict | None:
+def get_latest_signal_for(ticker: str, with_trigger: bool = False,
+                          strict: bool = False) -> dict | None:
     """Most recent analysis result for a ticker, regardless of verdict —
     every call to agents.analyst.analyze() logs here (see analyst.py's
     db.log_signal call), including routine HOLDs on positions already
@@ -1383,7 +1388,9 @@ def get_latest_signal_for(ticker: str, with_trigger: bool = False) -> dict | Non
     2026-10-27 one screened-out headline made a healthy holding read as
     conviction 0, which passes the swap test.
     with_trigger: also return the row's id and its provenance trigger record
-    (for the low-conviction sell's confirmation record, audit 11-06 23:24 #4)."""
+    (for the low-conviction sell's confirmation record, audit 11-06 23:24 #4).
+    strict: raise on a DB error instead of returning None, for a caller that
+    must tell "no previous verdict" from "unknown"."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
@@ -1406,6 +1413,8 @@ def get_latest_signal_for(ticker: str, with_trigger: bool = False) -> dict | Non
             return out
     except Exception as e:
         logging.error(f"get_latest_signal_for({ticker}) failed: {e}")
+        if strict:
+            raise
         return None
     finally:
         _put_conn(conn)
@@ -1419,10 +1428,10 @@ def get_latest_signal_for(ticker: str, with_trigger: bool = False) -> dict | Non
 # (SCREENED_IN) and a lost screen or analysis task (EVENT_LOST); from 11-04
 # also a held-position review skipped for want of broker positions
 # (REVIEW_SKIPPED); from 11-05 a held name that moved 5%+ in a session
-# (HELD_MOVE_SHADOW).
+# (HELD_MOVE_SHADOW); later the trim/exit rule's row (TRIM_EXIT_RULE).
 _RECORD_ONLY_SIGNALS = ("ANALYST_FAILED", "NO_VERDICT", "ROUTE_NO_BROKER", "ROUTE_RISK_INIT_FAILED",
                         "ROUTE_ERROR", "SCREENED_IN", "EVENT_LOST", "REVIEW_SKIPPED", "HELD_MOVE_SHADOW",
-                        "DIP_WATCH_SHADOW")
+                        "DIP_WATCH_SHADOW", "TRIM_EXIT_RULE")
 
 
 def get_recent_signals(limit: int = 50) -> list[dict]:
@@ -6492,8 +6501,10 @@ def get_next_earnings_row(ticker: str) -> tuple | None:
         _put_conn(conn)
 
 
-def get_next_earnings(ticker: str):
-    """Returns the next upcoming earnings date for ticker, or None."""
+def get_next_earnings(ticker: str, strict: bool = False):
+    """Returns the next upcoming earnings date for ticker, or None.
+    strict: raise on a DB error instead of returning None, for a caller
+    that must tell "no row" from "unknown"."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
@@ -6507,6 +6518,8 @@ def get_next_earnings(ticker: str):
         return row[0] if row else None
     except Exception as e:
         logging.error(f"get_next_earnings failed: {e}")
+        if strict:
+            raise
         return None
     finally:
         _put_conn(conn)

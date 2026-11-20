@@ -11,6 +11,9 @@ ticker in trade_plans and checks every later verdict against it:
   DIVERGE     the verdict disagrees (e.g. TRIM while the plan says hold)
   REVISE      an OPEN/ADD moved the target or invalidation by >= 10%, or the
               catalyst date: the plan is superseded by a new revision
+              (recorded beside it: the old and new invalidation, whether it
+              was lowered, and whether the price was within 1 ATR of the
+              old one; _invalidation_record)
   INVALIDATE  price is at or below the invalidation level (plan closed)
   NO_PLAN     no plan and nothing to build one from
 
@@ -145,13 +148,67 @@ def _revise_triggers(plan: dict, new: dict) -> dict:
     return {"revise_triggers": fired, "catalyst_month_only_pair": pair}
 
 
+def _add_plan_record(plan: dict, action: str, says: str, price: float | None) -> dict:
+    """Log-only, on OPEN/ADD verdicts: add_under_hold_plan (an ADD while the
+    plan says hold, which classify counts as FOLLOW, "adding within plan"),
+    the plan's add_trigger (None on held_seed plans and plans without a
+    ladder), and price_vs_add_trigger_pct, the verdict's price over it in
+    percent. Nothing here sets the relation."""
+    trig = plan.get("add_trigger")
+    trig = float(trig) if trig is not None else None
+    return {"add_under_hold_plan": action == "ADD" and says == _HOLD,
+            "add_trigger": trig,
+            "price_vs_add_trigger_pct": (round((price - trig) / trig * 100, 2)
+                                         if trig and price is not None else None)}
+
+
+_INVALIDATION_RECORD_KEYS = ("invalidation_prev", "invalidation_new", "invalidation_loosened",
+                             "add_near_invalidation", "price_vs_prev_invalidation_atr", "ladder_atr")
+
+
+def _invalidation_record(plan: dict, new: dict, price, atr) -> dict:
+    """Log-only, on an OPEN/ADD that revises the plan: invalidation_prev
+    (the plan's level) and invalidation_new (the revision's);
+    invalidation_loosened, True when the new level is lower (plans are
+    long), None when either is missing; add_near_invalidation, the
+    verdict's price within 1 ATR of the previous level, None when the ATR,
+    the price or that level is unknown; price_vs_prev_invalidation_atr, the
+    price's distance above that level in ATRs; and ladder_atr, the trade
+    ladder's ATR(14) used. Nothing here sets the relation. Never raises."""
+    try:
+        prev, new_inv = _num(plan.get("invalidation_price")), _num(new.get("invalidation_price"))
+        prev = prev if prev and prev > 0 else None
+        new_inv = new_inv if new_inv and new_inv > 0 else None
+        p, a = _num(price), _num(atr)
+        p = p if p and p > 0 else None
+        a = a if a and a > 0 else None
+        near = p is not None and a is not None and prev is not None
+        return {"invalidation_prev": prev, "invalidation_new": new_inv,
+                "invalidation_loosened": (new_inv < prev) if prev and new_inv else None,
+                "add_near_invalidation": (abs(p - prev) <= a) if near else None,
+                "price_vs_prev_invalidation_atr": round((p - prev) / a, 3) if near else None,
+                "ladder_atr": a}
+    except Exception as e:
+        log.debug(f"plan {plan.get('id') if isinstance(plan, dict) else None} "
+                  f"invalidation record failed: {e}")
+        return {**{k: None for k in _INVALIDATION_RECORD_KEYS},
+                "invalidation_record_error": type(e).__name__}
+
+
 def classify(plan: dict, action: str, new: dict | None, price: float | None,
              today: date, held: bool) -> dict:
     """Relation of one verdict to an active plan. `new` is the plan this
-    verdict would write (OPEN/ADD only), used to detect a revision."""
+    verdict would write (OPEN/ADD only), used to detect a revision.
+    OPEN/ADD verdicts also carry _add_plan_record's log-only keys, on every
+    relation; a failure there drops them, never the relation."""
     says, why = plan_says(plan, price, today, held)
     out = {"plan_id": plan["id"], "plan_says": says, "plan_why": why,
            "verdict_dir": _DIRECTION.get(action, _HOLD)}
+    if action in ("OPEN", "ADD"):
+        try:   # log-only: a surprise here must not cost the observation
+            out.update(_add_plan_record(plan, action, says, price))
+        except Exception as e:
+            log.warning(f"plan {plan.get('id')} add record failed: {e}")
     if why == "price at or below invalidation":
         out["relation"] = "INVALIDATE"
         # Log-only (audit 2026-11-08 21:30 #3g): a buy below the plan's own
@@ -197,14 +254,18 @@ def _would_revise(plan: dict, parsed: dict, conviction: int, price: float, today
     return {"would_revise": bool(why), "would_revise_why": why}
 
 
-def _with_levels(plan: dict, parsed: dict, price: float, ticker: str, today: date) -> dict:
+def _with_levels(plan: dict, parsed: dict, price: float, ticker: str, today: date,
+                 seen: dict | None = None) -> dict:
     """The plan to insert, with compile_plan's named levels (migration 82),
     each level's source and the ladder's computed_at (migration 84) added:
     record only, nothing reads them for trading. On any failure the
-    plan is returned without them."""
+    plan is returned without them. seen, when given, gets the ladder's
+    "atr" (None without a ladder row; unset when the read fails)."""
     try:
         import db
         ladder = db.get_trade_ladder(ticker)
+        if seen is not None:
+            seen["atr"] = (ladder or {}).get("atr")
         lv = compile_plan(parsed, price, ladder, None, today)
         return {**plan, "structural_stop": lv.get("structural_stop"), "t1": lv.get("t1"),
                 "t2": lv.get("t2"), "add_trigger": lv.get("add_trigger"),
@@ -432,7 +493,12 @@ def _observe(ticker: str, parsed: dict, action: str, conviction: int, brief: str
         if out["relation"] == "REVISE":
             new.update(revision=(plan.get("revision") or 0) + 1, replaces_id=plan["id"])
             db.touch_plan(plan["id"], "REVISE")
-            out["new_plan_id"] = db.insert_plan(_with_levels(new, parsed, price, ticker, today))
+            seen: dict = {}
+            out["new_plan_id"] = db.insert_plan(_with_levels(new, parsed, price, ticker, today, seen))
+            # Log-only (audit 2026-11-17 #4): whether the revision lowered the
+            # line in the sand, and how close to it the buy came, from the
+            # levels already here and the ladder read for the new revision.
+            out.update(_invalidation_record(plan, new, price, seen.get("atr")))
         elif out["relation"] == "INVALIDATE":
             db.touch_plan(plan["id"], "INVALIDATE", close_reason="price at or below invalidation")
         else:

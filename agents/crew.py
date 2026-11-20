@@ -227,6 +227,11 @@ def deep_analyze(event: dict, screening: dict | None = None) -> dict:
             "reasoning": f"Analysis failed with exception: {exc}",
         }
 
+    # Trim/exit rule, record only here: a row for a TRIM/EXIT verdict, never
+    # a routing change. Never raises.
+    from agents import trim_exit
+    trim_exit.apply(result, path="event", event=event, positions=positions, observe=True)
+
     # ── Route to approval queue if actionable ─────────────────────────────────
     if result.get("pass_to_risk"):
         _route_guarded(result, regime, client)
@@ -266,7 +271,7 @@ def _log_route_exit(ticker: str, kind: str, result: dict, reason: str,
 
 
 _VERDICT_ONLY_PROVENANCE = ("plan", "brief_exposure", "gate_flags", "tighten_sizing_shadow",
-                            "sell_confirm", "scan_reasons", "regime_entry")
+                            "sell_confirm", "buy_confirm", "scan_reasons", "regime_entry")
 
 
 def _route_row_fields(result: dict, kind: str) -> dict:
@@ -278,18 +283,26 @@ def _route_row_fields(result: dict, kind: str) -> dict:
     if prov and any(k in prov for k in _VERDICT_ONLY_PROVENANCE):
         # The plan observation belongs to the verdict row only; copied onto
         # routing rows it was counted 2-3 times (pre-pull review 10-29).
-        # brief_exposure, gate_flags, tighten_sizing_shadow and sell_confirm likewise.
+        # brief_exposure, gate_flags, tighten_sizing_shadow, sell_confirm and
+        # buy_confirm likewise.
         prov = {k: v for k, v in prov.items() if k not in _VERDICT_ONLY_PROVENANCE}
     if prov and isinstance(prov.get("track_record"), dict) and "by_position" in prov["track_record"]:
         # The per-position track record is the verdict's alone (m607); the
         # rest of track_record stays on routing rows as before.
         prov = {**prov, "track_record": {k: v for k, v in prov["track_record"].items()
                                          if k != "by_position"}}
+    decision = {"route_exit": kind, "verdict_action": result.get("action"),
+                "verdict_conviction": result.get("conviction")}
+    rule = result.get("trim_exit")
+    if isinstance(rule, dict):
+        # A copy the trim/exit rule routed (agents/trim_exit.py): the model's
+        # action stays verdict_action, the rule's goes beside it with the tag.
+        decision.update(verdict_action=rule.get("verdict_action"),
+                        rule_action=result.get("action"), trim_exit=rule)
     return {
         "model": (prov or {}).get("model"),
         "provenance": prov,
-        "decision": {"route_exit": kind, "verdict_action": result.get("action"),
-                     "verdict_conviction": result.get("conviction")},
+        "decision": decision,
     }
 
 
@@ -741,10 +754,15 @@ def review_held_position(ticker: str, client, positions: dict, regime: dict,
                                     held_review=True)
     _capture_latest_thesis(ticker, result)
 
-    if result.get("pass_to_risk"):
-        _route_guarded(result, regime, client)
+    # Trim/exit rule (agents/trim_exit.py): off, it returns `result` itself;
+    # otherwise it records the review and may route a copy. Never raises.
+    from agents import trim_exit
+    routed = trim_exit.apply(result, path="earnings_review" if event is not None else "scheduled_review",
+                             event=event, earnings_date=earnings_date, positions=positions)
+    if routed.get("pass_to_risk"):
+        _route_guarded(routed, regime, client)
     else:
-        _c6_bar_unrouted(result, regime, client)   # log-only
+        _c6_bar_unrouted(routed, regime, client)   # log-only
 
     return result
 
@@ -782,10 +800,13 @@ def review_plan_level(ticker: str, kind: str, level, price: float | None) -> dic
         db.set_state("position_review_last_reviewed", json.dumps(last))
     except Exception as e:
         log.warning(f"[{ticker}] Plan-level review: rotation cursor not updated: {e}")
-    if result.get("pass_to_risk"):
-        _route_guarded(result, regime, client)
+    # Trim/exit rule, as in review_held_position.
+    from agents import trim_exit
+    routed = trim_exit.apply(result, path="plan_level_review", event=event, positions=positions)
+    if routed.get("pass_to_risk"):
+        _route_guarded(routed, regime, client)
     else:
-        _c6_bar_unrouted(result, regime, client)   # log-only
+        _c6_bar_unrouted(routed, regime, client)   # log-only
     return result
 
 
@@ -1131,7 +1152,10 @@ def process_candidates(candidates: list[dict], max_per_run: int = 5) -> list[dic
                 _c6_bar_unrouted(result, regime, client)   # log-only
         return results
 
+    from agents import trim_exit
     for result in results:
+        # Trim/exit rule, record only here (TRIM/EXIT verdicts). Never raises.
+        trim_exit.apply(result, path="daily_scan", positions=positions, observe=True)
         if result.get("pass_to_risk") and client:
             _route_guarded(result, regime, client)
         else:
@@ -1384,6 +1408,98 @@ def _r_shadow(result: dict, price: float, stop) -> dict | None:
         return {"error": str(e)[:200]}
 
 
+def _read_implied_move(ticker: str, today, out: dict) -> None:
+    """The options poll's stored implied move for ticker (db.get_state of
+    options_implied_move_<TRADING_ENV>; no broker or network call), written
+    into `out` as it is read: implied_move_last_pct/_last_date/_last_dte from
+    the stored move whatever its date (not after `today`, an ET date), and
+    implied_move_pct/_dte when the stored move is today's, and the
+    implied_move_event_* keys from the entry's event-spanning straddle
+    (_read_event_move; record only, the keys above keep the nearest
+    expiry). Keys it can't fill are left as they are. Raises when the state
+    can't be read or parsed. Shared by _gap_risk_shadow and the trim/exit
+    rule's record."""
+    import json
+    import math
+    from datetime import date
+    import db
+    from config import TRADING_ENV
+
+    def num(v):
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        return f if math.isfinite(f) else None
+
+    book = json.loads(db.get_state(f"options_implied_move_{TRADING_ENV}") or "{}")
+    m = book.get(ticker) if isinstance(book, dict) else None
+    last_date = str(m.get("et_date") or "") if isinstance(m, dict) else ""
+    if last_date and last_date <= today.isoformat():
+        last = num(m.get("implied_move_pct"))
+        if last is not None and last >= 0:
+            out["implied_move_last_pct"] = last
+            out["implied_move_last_date"] = last_date
+            try:   # the straddle's days to expiry on its own date
+                exp = date.fromisoformat(str(m.get("expiry"))[:10]) if m.get("expiry") else None
+                out["implied_move_last_dte"] = (exp - date.fromisoformat(last_date[:10])).days if exp else None
+            except ValueError:
+                pass
+    if isinstance(m, dict) and str(m.get("et_date") or "") == today.isoformat():
+        mv = num(m.get("implied_move_pct"))
+        out["implied_move_pct"] = mv if mv is not None and mv >= 0 else None
+        try:   # days to the straddle's expiry, when the record has one
+            exp = date.fromisoformat(str(m.get("expiry"))[:10]) if m.get("expiry") else None
+            out["implied_move_dte"] = (exp - today).days if exp else None
+        except ValueError:
+            pass
+    if isinstance(m, dict):
+        _read_event_move(m.get("event_spanning"), today, out)
+
+
+def _read_event_move(ev, today, out: dict) -> None:
+    """The book entry's event-spanning straddle (tasks._implied_move_book_extras)
+    into `out` when it was priced on a date not after `today`:
+    implied_move_event_pct, _expiry, _dte (days to its expiry on the date it
+    was priced), _earnings_date (the print it was priced against) and _date
+    (the ET date it was priced). An entry without one (written before it was
+    kept) fills nothing. Never raises: a malformed one fills nothing."""
+    import math
+    from datetime import date
+
+    def day(v):
+        try:
+            return date.fromisoformat(str(v)[:10]).isoformat() if v else None
+        except ValueError:
+            return None
+
+    try:
+        if not isinstance(ev, dict):
+            return
+        ev_date = day(ev.get("et_date"))
+        if not ev_date or ev_date > today.isoformat():
+            return
+        try:
+            pct = float(ev.get("implied_move_pct"))
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(pct) or pct < 0:
+            return
+        expiry = day(ev.get("expiry"))
+        try:
+            dte = float(ev.get("dte"))
+            dte = int(dte) if math.isfinite(dte) else None
+        except (TypeError, ValueError):
+            dte = None
+        if dte is None and expiry:
+            dte = (date.fromisoformat(expiry) - date.fromisoformat(ev_date)).days
+        out.update(implied_move_event_pct=pct, implied_move_event_expiry=expiry,
+                   implied_move_event_dte=dte, implied_move_event_earnings_date=day(ev.get("earnings_date")),
+                   implied_move_event_date=ev_date)
+    except Exception as e:
+        log.debug(f"event implied move read failed: {e}")
+
+
 def _gap_risk_shadow(ticker: str, shares, price, stop, equity, setup_gate_path: bool = False,
                      bucket: str | None = None, regime_multiplier=None, today=None,
                      held_shares=None) -> dict:
@@ -1401,19 +1517,25 @@ def _gap_risk_shadow(ticker: str, shares, price, stop, equity, setup_gate_path: 
     on that date): the stored move whatever its date, so
     a pre-open or Monday verdict (today's poll not run yet) still has one;
     gap_risk_pct_of_equity_last uses it when today's is missing (m604).
-    implied_move_pct and status keep their today-only meaning."""
+    implied_move_pct and status keep their today-only meaning.
+    implied_move_event_pct/_expiry/_dte/_earnings_date/_date: the stored
+    event-spanning straddle (_read_event_move), and
+    gap_risk_pct_of_equity_event the same cost through max(stop distance,
+    that move) when there is one; the other keys never read it."""
     out = {"implied_move_pct": None, "implied_move_dte": None, "stop_distance_pct": None,
            "implied_move_last_pct": None, "implied_move_last_date": None,
            "implied_move_last_dte": None, "gap_risk_pct_of_equity_last": None,
            "gap_risk_pct_of_equity": None, "gap_risk_pct_of_equity_position": None,
-           "cap_pct": None, "would_exceed": None, "next_earnings_days": None, "status": "error"}
+           "cap_pct": None, "would_exceed": None, "next_earnings_days": None, "status": "error",
+           "implied_move_event_pct": None, "implied_move_event_expiry": None,
+           "implied_move_event_dte": None, "implied_move_event_earnings_date": None,
+           "implied_move_event_date": None, "gap_risk_pct_of_equity_event": None}
     try:
-        import json
         import math
-        from datetime import date, datetime
+        from datetime import datetime
         from zoneinfo import ZoneInfo
         import db
-        from config import (TRADING_ENV, RISK_PCT_PER_TRADE, CATEGORY_RISK_PCT_PER_TRADE)
+        from config import (RISK_PCT_PER_TRADE, CATEGORY_RISK_PCT_PER_TRADE)
         today = today or datetime.now(ZoneInfo("America/New_York")).date()
 
         def num(v):
@@ -1435,27 +1557,7 @@ def _gap_risk_shadow(ticker: str, shares, price, stop, equity, setup_gate_path: 
         except Exception as e:
             log.debug(f"[{ticker}] gap risk shadow earnings read failed: {e}")
         try:
-            book = json.loads(db.get_state(f"options_implied_move_{TRADING_ENV}") or "{}")
-            m = book.get(ticker) if isinstance(book, dict) else None
-            last_date = str(m.get("et_date") or "") if isinstance(m, dict) else ""
-            if last_date and last_date <= today.isoformat():
-                last = num(m.get("implied_move_pct"))
-                if last is not None and last >= 0:
-                    out["implied_move_last_pct"] = last
-                    out["implied_move_last_date"] = last_date
-                    try:   # the straddle's days to expiry on its own date
-                        exp = date.fromisoformat(str(m.get("expiry"))[:10]) if m.get("expiry") else None
-                        out["implied_move_last_dte"] = (exp - date.fromisoformat(last_date[:10])).days if exp else None
-                    except ValueError:
-                        pass
-            if isinstance(m, dict) and str(m.get("et_date") or "") == today.isoformat():
-                mv = num(m.get("implied_move_pct"))
-                out["implied_move_pct"] = mv if mv is not None and mv >= 0 else None
-                try:   # days to the straddle's expiry, when the record has one
-                    exp = date.fromisoformat(str(m.get("expiry"))[:10]) if m.get("expiry") else None
-                    out["implied_move_dte"] = (exp - today).days if exp else None
-                except ValueError:
-                    pass
+            _read_implied_move(ticker, today, out)
         except Exception as e:
             log.debug(f"[{ticker}] gap risk shadow implied move read failed: {e}")
 
@@ -1479,6 +1581,12 @@ def _gap_risk_shadow(ticker: str, shares, price, stop, equity, setup_gate_path: 
         if out["implied_move_pct"] is None and out["implied_move_last_pct"] is not None:
             gap_last = max(dist, out["implied_move_last_pct"])
             out["gap_risk_pct_of_equity_last"] = round(shares * price * gap_last / equity, 4)
+        try:   # record only: a failure here leaves it None, never the row's status
+            ev = num(out["implied_move_event_pct"])
+            if ev is not None:
+                out["gap_risk_pct_of_equity_event"] = round(shares * price * max(dist, ev) / equity, 4)
+        except Exception as e:
+            log.debug(f"[{ticker}] gap risk shadow event move failed: {e}")
         out["would_exceed"] = risk > cap * 100
         out["status"] = "ok" if out["implied_move_pct"] is not None else "no_implied_move"
         return out
@@ -1916,6 +2024,38 @@ def _c6_bar_no_new_fact(result: dict, regime_str: str) -> None:
         log.warning(f"[{result.get('ticker')}] c6 bar shadow failed: {e}")
 
 
+def _add_guard_record(ticker: str, result: dict, sizing: dict | None,
+                      today=None) -> dict | None:
+    """decision_extra for an ADD that dies in routing after the price read
+    (ROUTE_ZERO_SHARES, ROUTE_CONCENTRATION_ZERO, ROUTE_MICRO_NAME_CAP):
+    the add-to-loser shadow sizing already holds, and next_earnings_days,
+    the raw calendar days from today (ET) to the next earnings date, as
+    _gap_risk_shadow counts them, with no window applied. next_earnings_read
+    says what that read returned: ok, no_row, or "error: <class>" (the plain
+    db.get_next_earnings reads a failed query as no row). None for any other
+    action. Record only: read by nothing that routes or sizes. Never raises."""
+    try:
+        if result.get("action") != "ADD":
+            return None
+        rec = {"add_to_loser": (sizing or {}).get("add_to_loser"),
+               "next_earnings_days": None, "next_earnings_read": None}
+        try:
+            import db
+            from zoneinfo import ZoneInfo
+            today = today or datetime.now(ZoneInfo("America/New_York")).date()
+            er = db.get_next_earnings(ticker, strict=True)
+            if er is None:
+                rec["next_earnings_read"] = "no_row"
+            else:
+                rec["next_earnings_days"] = int((er - today).days)
+                rec["next_earnings_read"] = "ok"
+        except Exception as e:
+            rec["next_earnings_read"] = f"error: {type(e).__name__}"
+        return rec
+    except Exception as e:
+        return {"add_guard_error": type(e).__name__}
+
+
 def _apply_micro_name_cap(rm, ticker: str, sizing: dict, price: float, result: dict) -> bool:
     """Micro-tier per-name cap on an OPEN/ADD (RiskManager.micro_name_cap):
     cuts sizing in place and records the decision in sizing["micro_name_cap"].
@@ -1949,7 +2089,8 @@ def _apply_micro_name_cap(rm, ticker: str, sizing: dict, price: float, result: d
                         decision_extra={"micro_name_cap": rec,
                                         "theme_group_shadow": sizing.get("theme_group_shadow"),
                                         "concentration_inflight_shadow":
-                                            sizing.get("concentration_inflight_shadow")})
+                                            sizing.get("concentration_inflight_shadow"),
+                                        **(_add_guard_record(ticker, result, sizing) or {})})
         return True
     new = rec["shares_after"]
     sizing["shares_initial"] = new
@@ -1985,17 +2126,40 @@ def _atr_brief(ticker: str) -> dict | None:
     except Exception:
         return None
 
-def _add_context(ticker: str, price, sizing: dict, trading_client) -> dict:
+def _add_context(ticker: str, price, sizing: dict, trading_client, rm=None) -> dict:
     """Log-only (audit 2026-11-10 16:53 #2): where an ADD buys relative to
     the position it adds to. kept_stop is max(sizing's new stop, the stop
     record), the whole-position level an add keeps (execution.
     _whole_position_stop); stop_distance_atr is (price - kept_stop) / the
     sizing ATR; below_avg_cost compares the price with the broker's average
     cost (portfolio cache, may lag). NVDA 11-10 15:07 bought 0.35 ATR above
-    its kept stop, ~10% below average cost. Never raises."""
+    its kept stop, ~10% below average cost.
+    The exit state the ADD's stop-record write resets, read before it
+    (record only): trailing_active and record_conviction from the stop
+    record, entry_conviction (original_thesis) and profit_target_taken from
+    the position context, and whether the gain over the estimated post-ADD
+    average (held shares at the broker's average cost plus this order at
+    this price) still meets the bucket's trail activation gain
+    (trail_gain_qualifies_post_add; None where the gain rule does not apply
+    or an input is unknown). state_error names a failed read of these fields
+    alone; error keeps its old meaning.
+    position_risk_pct_at_kept_stop: held plus new shares times (price -
+    kept_stop), over equity (rm.portfolio_value(), read for the ratio and not
+    stored), in percent; the per-trade cap counts the new order alone
+    against its own stop. over_per_trade_cap compares it with
+    per_trade_cap_pct (the gap-risk shadow's cap_pct, else
+    RISK_PCT_PER_TRADE). Negative when the kept stop is above the price.
+    position_risk_status says why it is missing. Never raises."""
     rec = {"price": None, "new_stop": None, "record_stop": None, "kept_stop": None,
            "atr": None, "stop_distance_atr": None, "avg_cost": None, "below_avg_cost": None,
-           "pct_vs_avg_cost": None, "error": None}
+           "pct_vs_avg_cost": None, "error": None,
+           "trailing_active": None, "record_conviction": None, "entry_conviction": None,
+           "profit_target_taken": None, "held_qty": None, "post_add_avg_est": None,
+           "gain_vs_post_add_avg_pct": None, "trail_activate_pct": None,
+           "trail_gain_qualifies_post_add": None, "state_error": None,
+           "position_risk_pct_at_kept_stop": None, "per_trade_cap_pct": None,
+           "over_per_trade_cap": None, "position_risk_status": None}
+    prior, held_qty, avg = None, None, None
     try:
         import db
         px = float(price) if price else None
@@ -2021,11 +2185,102 @@ def _add_context(ticker: str, price, sizing: dict, trading_client) -> dict:
                 if px:
                     rec["below_avg_cost"] = px < avg
                     rec["pct_vs_avg_cost"] = round((px / avg - 1) * 100, 2)
+            try:
+                held_qty = abs(float(getattr(pos, "qty", None)))
+            except (TypeError, ValueError):
+                held_qty = None
         except Exception as e:
             rec["error"] = (rec["error"] + "; " if rec["error"] else "") + f"position: {type(e).__name__}"
     except Exception as e:
         rec["error"] = type(e).__name__
+    rec.update(_add_exit_state(ticker, rec.get("price"), sizing, prior, held_qty, avg))
+    rec.update(_add_position_risk(rec.get("price"), rec.get("kept_stop"), sizing, held_qty, rm))
     return rec
+
+
+def _add_position_risk(px, kept_stop, sizing, held_qty, rm) -> dict:
+    """_add_context's whole-position risk at the kept stop (see there).
+    Never raises."""
+    out = {"position_risk_pct_at_kept_stop": None, "per_trade_cap_pct": None,
+           "over_per_trade_cap": None, "position_risk_status": "error"}
+    try:
+        import math
+        from config import RISK_PCT_PER_TRADE
+        cap = ((sizing or {}).get("gap_risk_shadow") or {}).get("cap_pct")
+        if not isinstance(cap, (int, float)) or isinstance(cap, bool) or not math.isfinite(cap):
+            cap = RISK_PCT_PER_TRADE * 100
+        out["per_trade_cap_pct"] = round(float(cap), 4)
+        shares = float((sizing or {}).get("shares_initial") or 0)
+        if not (px and kept_stop):
+            out["position_risk_status"] = "no_stop"
+            return out
+        if not (held_qty and held_qty > 0 and shares > 0):
+            out["position_risk_status"] = "no_shares"
+            return out
+        if rm is None:
+            out["position_risk_status"] = "no_equity"
+            return out
+        try:
+            equity = float(rm.portfolio_value())
+        except Exception as e:
+            out["position_risk_status"] = f"equity: {type(e).__name__}"
+            return out
+        if not (math.isfinite(equity) and equity > 0):
+            out["position_risk_status"] = "no_equity"
+            return out
+        risk = (held_qty + shares) * (float(px) - float(kept_stop)) / equity * 100
+        out["position_risk_pct_at_kept_stop"] = round(risk, 4)
+        out["over_per_trade_cap"] = risk > cap
+        out["position_risk_status"] = "ok"
+    except Exception as e:
+        out["position_risk_status"] = f"error: {type(e).__name__}"
+    return out
+
+
+def _add_exit_state(ticker: str, px, sizing, prior, held_qty, avg) -> dict:
+    """_add_context's exit-state fields (see there). prior is the stop record
+    _add_context read (None when absent or unreadable), held_qty and avg the
+    broker position's. Never raises."""
+    out, errs = {}, []
+    try:
+        # The broker share count _add_position_risk also uses, recorded
+        # whether or not the post-ADD average below can be estimated.
+        out["held_qty"] = held_qty
+        if isinstance(prior, dict):
+            ta = prior.get("trailing_active")
+            out["trailing_active"] = bool(ta) if ta is not None else None
+            out["record_conviction"] = prior.get("conviction")
+        try:
+            import db
+            ctx = db.get_position_context(ticker, strict=True) or {}
+            orig = ctx.get("original_thesis")
+            if isinstance(orig, dict):
+                out["entry_conviction"] = orig.get("conviction")
+            ptt = ctx.get("profit_target_taken")
+            out["profit_target_taken"] = bool(ptt) if ptt is not None else None
+        except Exception as e:
+            errs.append(f"position context: {type(e).__name__}")
+        try:
+            import risk_manager as _rm
+            bucket = (sizing or {}).get("bucket")
+            ladder = bool(_rm.SETUP_GATES_ENABLED) and bucket in _rm.CATEGORY_RISK_PCT_PER_TRADE
+            activate = None if ladder else _rm.TRAILING_STOP_ACTIVATE.get(bucket)
+            out["trail_activate_pct"] = round(activate * 100, 2) if activate else None
+            shares = float((sizing or {}).get("shares_initial") or 0)
+            px = float(px) if px else None
+            if px and avg and avg > 0 and held_qty and held_qty > 0 and shares > 0:
+                post = (held_qty * avg + shares * px) / (held_qty + shares)
+                out["post_add_avg_est"] = round(post, 4)
+                gain = (px - post) / post
+                out["gain_vs_post_add_avg_pct"] = round(gain * 100, 2)
+                if activate:
+                    out["trail_gain_qualifies_post_add"] = gain >= activate
+        except Exception as e:
+            errs.append(f"trail rule: {type(e).__name__}")
+    except Exception as e:
+        errs.append(type(e).__name__)
+    out["state_error"] = "; ".join(errs) or None
+    return out
 
 
 def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
@@ -2136,7 +2391,39 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
             from config import TRIM_FRACTION
         except ImportError:
             TRIM_FRACTION = 0.33
-        sell_qty = owned if action == "EXIT" else min(owned, max(1, int(owned * TRIM_FRACTION)))
+        rule = result.get("trim_exit")
+        fraction = TRIM_FRACTION
+        if rule and action == "TRIM":
+            # A TRIM the trim/exit rule routed (agents/trim_exit.py) sells
+            # TRIM_EXIT_FRACTION and keeps TRIM_EXIT_MIN_REMAINING_SHARES
+            # under a resized stop.
+            from config import TRIM_EXIT_FRACTION
+            from agents import trim_exit
+            fraction = float(TRIM_EXIT_FRACTION)
+            sell_qty = trim_exit.trim_qty(owned)
+            if sell_qty <= 0:
+                log.info(f"[{ticker}] trim/exit rule TRIM: no partial sale of {owned:g} shares")
+                _log_route_exit(ticker, "ROUTE_ZERO_SHARES", result,
+                                f"trim/exit rule TRIM: no partial sale of {owned:g} shares",
+                                {"trim_exit": rule, "owned": owned})
+                return
+        else:
+            if rule and action == "EXIT" and rule.get("reason") == "trim_one_share_exit":
+                # The rule turned a TRIM into this EXIT because the review's
+                # position read held one share. If the fresh read allows a
+                # partial sale (shares bought since), the EXIT would sell
+                # them all: nothing is routed, and the next review decides.
+                from agents import trim_exit
+                partial = trim_exit.trim_qty(owned)
+                if partial > 0:
+                    log.info(f"[{ticker}] trim/exit rule one-share EXIT not routed: "
+                             f"{owned:g} shares held now")
+                    _log_route_exit(ticker, "ROUTE_ZERO_SHARES", result,
+                                    f"trim/exit rule one-share EXIT: {owned:g} shares held now, "
+                                    f"a partial sale of {partial} exists; nothing routed",
+                                    {"trim_exit": rule, "owned": owned, "partial_qty": partial})
+                    return
+            sell_qty = owned if action == "EXIT" else min(owned, max(1, int(owned * TRIM_FRACTION)))
 
         price = _get_price(ticker, trading_client) or float(pos.get("current_price") or 0)
         sizing = {
@@ -2155,9 +2442,12 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
         if action == "TRIM":
             # Record-only: at a few shares the whole-share floor turns a TRIM
             # into a sale of most or all of the position.
-            sizing["trim_granularity"] = {"owned": owned, "fraction": TRIM_FRACTION,
-                                          "intended_qty": round(owned * TRIM_FRACTION, 4),
+            sizing["trim_granularity"] = {"owned": owned, "fraction": fraction,
+                                          "intended_qty": round(owned * fraction, 4),
                                           "sell_qty": sell_qty, "full_exit": sell_qty >= owned}
+        if rule:
+            # execute_approved rechecks the rule's switches on this key.
+            sizing["trim_exit"] = {**rule, "owned": owned, "sell_qty": sell_qty}
         entry_strategy = f"{action}: sell {sell_qty:g} of {owned:g} held shares @ ~${price:.2f}."
     else:
         try:
@@ -2357,7 +2647,8 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
             if sizing.get("shares_initial", 0) <= 0:
                 flags = sizing.get("flags", [])
                 log.info(f"[{ticker}] Risk sizing returned 0 shares: {flags}")
-                _log_route_exit(ticker, "ROUTE_ZERO_SHARES", result, "; ".join(flags))
+                _log_route_exit(ticker, "ROUTE_ZERO_SHARES", result, "; ".join(flags),
+                                decision_extra=_add_guard_record(ticker, result, sizing))
                 _shadow_swap(rm, ticker, conviction, sizing, result)
                 _c6_bar_tier_floor(result, regime_str, price, sizing)   # log-only
                 return
@@ -2453,7 +2744,9 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
                                     decision_extra={"concentration_check": conc_rec,
                                                     "theme_group_shadow": sizing.get("theme_group_shadow"),
                                                     "concentration_inflight_shadow":
-                                                        sizing.get("concentration_inflight_shadow")})
+                                                        sizing.get("concentration_inflight_shadow"),
+                                                    **(_add_guard_record(ticker, result, sizing)
+                                                       or {})})
                     return
 
         # Correlation check
@@ -2498,7 +2791,8 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
         sizing["tighten_sizing_shadow"] = _tighten_sizing_shadow(ticker)   # log-only
         sizing["regime_score"] = regime.get("score")                     # log-only, beside the label
         if result.get("action") == "ADD":
-            sizing["add_context"] = _add_context(ticker, price, sizing, trading_client)   # log-only
+            sizing["add_context"] = _add_context(ticker, price, sizing, trading_client,
+                                                 rm=rm)   # log-only
 
         entry_strategy = (
             f"{sizing['initial_entry_pct']:.0%} initial ({sizing['shares_initial']} shares @ ~${price:.2f}). "

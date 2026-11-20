@@ -18,7 +18,9 @@ TODAY = date(2026, 11, 6)
 KEYS = {"implied_move_pct", "implied_move_dte", "implied_move_last_pct", "implied_move_last_date",
         "implied_move_last_dte",
         "gap_risk_pct_of_equity_last", "gap_risk_pct_of_equity_position", "stop_distance_pct", "gap_risk_pct_of_equity", "cap_pct",
-        "would_exceed", "next_earnings_days", "status"}
+        "would_exceed", "next_earnings_days", "status",
+        "implied_move_event_pct", "implied_move_event_expiry", "implied_move_event_dte",
+        "implied_move_event_earnings_date", "implied_move_event_date", "gap_risk_pct_of_equity_event"}
 
 
 def _book(move=8.0, et_date=TODAY.isoformat(), expiry="2026-11-13"):
@@ -208,3 +210,99 @@ def test_pre_open_falls_back_to_the_last_sessions_move_with_its_date():
 
     undated = _shadow(book=_book(8.0, et_date=None))
     assert undated["implied_move_last_pct"] is None and undated["implied_move_last_date"] is None
+
+
+# ── the event-spanning move (record only) ──────────────────────────────────
+
+def _event_book(event=12.0, ev_date=TODAY.isoformat(), move=3.0, et_date=TODAY.isoformat(),
+                expiry="2026-11-13", dte=7, earnings="2026-11-11"):
+    rec = {"implied_move_pct": move, "et_date": et_date, "expiry": "2026-11-06",
+           "underlying": 100.0, "straddle": move}
+    if event is not None:
+        rec["event_spanning"] = {"implied_move_pct": event, "expiry": expiry, "dte": dte,
+                                 "earnings_date": earnings, "et_date": ev_date,
+                                 "computed_at": f"{ev_date}T09:45:00-05:00"}
+        rec["dte30"] = {"implied_move_pct": 20.0, "expiry": "2026-12-04", "dte": 28,
+                        "earnings_date": earnings, "et_date": ev_date}
+    return json.dumps({"MSFT": rec})
+
+
+def _read(book, today=TODAY):
+    out = {}
+    with patch("db.get_state", return_value=book):
+        crew._read_implied_move("MSFT", today, out)
+    return out
+
+
+def test_read_fills_the_event_move_beside_the_nearest_keys():
+    got = _read(_event_book())
+    assert got["implied_move_event_pct"] == 12.0 and got["implied_move_event_expiry"] == "2026-11-13"
+    assert got["implied_move_event_dte"] == 7 and got["implied_move_event_earnings_date"] == "2026-11-11"
+    assert got["implied_move_event_date"] == TODAY.isoformat()
+    # The nearest-expiry keys read exactly as they do without it.
+    without = _read(_event_book(event=None))
+    assert {k: v for k, v in got.items() if not k.startswith("implied_move_event_")} == without
+    assert without["implied_move_pct"] == 3.0 and without["implied_move_dte"] == 0
+    assert not any(k.startswith("implied_move_event_") for k in without)
+
+
+def test_read_event_move_from_an_earlier_date_but_not_a_later_one():
+    # Monday pre-open: Friday's entry and its event move.
+    fri = _read(_event_book(ev_date="2026-11-05", et_date="2026-11-05"))
+    assert fri["implied_move_event_pct"] == 12.0 and fri["implied_move_event_date"] == "2026-11-05"
+    assert "implied_move_pct" not in fri and fri["implied_move_last_pct"] == 3.0
+    later = _read(_event_book(ev_date="2026-11-09", et_date="2026-11-09"))
+    assert not any(k.startswith("implied_move_event_") for k in later)
+
+
+def test_read_old_format_and_malformed_event_entries_fill_nothing_and_raise_nothing():
+    old = json.dumps({"MSFT": {"implied_move_pct": 3.0, "et_date": TODAY.isoformat(),
+                               "expiry": "2026-11-06"}})
+    assert _read(old) == {"implied_move_last_pct": 3.0, "implied_move_last_date": TODAY.isoformat(),
+                          "implied_move_last_dte": 0, "implied_move_pct": 3.0, "implied_move_dte": 0}
+    for bad in ("x", None, {"implied_move_pct": "x", "et_date": TODAY.isoformat()},
+                {"implied_move_pct": -1.0, "et_date": TODAY.isoformat()},
+                {"implied_move_pct": 5.0, "et_date": "garbage"},
+                {"implied_move_pct": 5.0}):
+        book = json.dumps({"MSFT": {"implied_move_pct": 3.0, "et_date": TODAY.isoformat(),
+                                    "event_spanning": bad}})
+        got = _read(book)
+        assert got["implied_move_pct"] == 3.0
+        assert not any(k.startswith("implied_move_event_") for k in got)
+    # A bad expiry or dte keeps the move with None (or the dte from the expiry).
+    got = _read(_event_book(expiry="garbage", dte="x"))
+    assert got["implied_move_event_pct"] == 12.0 and got["implied_move_event_expiry"] is None
+    assert got["implied_move_event_dte"] is None
+    got = _read(_event_book(dte=None))
+    assert got["implied_move_event_dte"] == 7                    # 11-06 to the 11-13 expiry
+
+
+def test_gap_risk_event_uses_the_larger_of_stop_and_event_move():
+    s = _shadow(book=_event_book(event=12.0))
+    assert set(s) == KEYS and s["status"] == "ok"
+    assert s["implied_move_pct"] == 3.0 and s["stop_distance_pct"] == 5.0
+    assert s["gap_risk_pct_of_equity"] == pytest.approx(0.5)          # unchanged: max(5, 3)
+    assert s["gap_risk_pct_of_equity_event"] == pytest.approx(1.2)    # 10 x $100 x 12% / $10k
+    assert s["implied_move_event_pct"] == 12.0 and s["implied_move_event_expiry"] == "2026-11-13"
+    assert s["would_exceed"] is False
+    small = _shadow(book=_event_book(event=2.0))
+    assert small["gap_risk_pct_of_equity_event"] == pytest.approx(0.5)   # stop distance wider
+
+
+def test_gap_risk_event_is_null_without_an_event_move():
+    for book in (_event_book(event=None), _book(8.0), None, "not json",
+                 _event_book(ev_date="2026-11-09", et_date="2026-11-09")):
+        s = _shadow(book=book)
+        assert set(s) == KEYS
+        assert s["gap_risk_pct_of_equity_event"] is None and s["implied_move_event_pct"] is None
+    assert _shadow(stop=None, book=_event_book())["gap_risk_pct_of_equity_event"] is None
+    assert _shadow(equity=None, book=_event_book())["gap_risk_pct_of_equity_event"] is None
+
+
+def test_gap_risk_existing_keys_unchanged_by_the_event_move():
+    for kw in ({}, {"held_shares": 20}, {"stop": 80.0}):
+        with_ev = _shadow(book=_event_book(event=12.0), **kw)
+        without = _shadow(book=_event_book(event=None), **kw)
+        new = {k for k in with_ev if k.startswith("implied_move_event_")} | {"gap_risk_pct_of_equity_event"}
+        assert {k: v for k, v in with_ev.items() if k not in new} == \
+            {k: v for k, v in without.items() if k not in new}

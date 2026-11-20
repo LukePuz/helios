@@ -65,6 +65,10 @@ REGIME_REASONING_CAP = 400
 SIGNALS_MAX_KEYS = 40
 SIGNALS_MAX_DEPTH = 3
 SIGNALS_TEXT_CAP = 160
+# Record-only subtrees of signals_json (dotted paths) that are left out of the
+# flattened signals, so adding one cannot change the macro role's slice or
+# which keys fit under SIGNALS_MAX_KEYS.
+SIGNALS_SKIP = frozenset({"trend.shadow_200"})
 
 # Parents whose scalar values keep their keys (see SCRUBBING above).
 _SCALAR_EXEMPT_PARENTS = ("fundamentals", "regime.signals")
@@ -281,13 +285,15 @@ def flatten_signals(sig, max_keys: int = SIGNALS_MAX_KEYS, max_depth: int = SIGN
     liquidity.notes, markov.state, ... Lists become a short joined string.
     Bounded: the first ``max_keys`` keys in sorted order, ``max_depth``
     levels, strings cut to ``text_cap``; ``_truncated`` says how many were
-    left out."""
+    left out. Paths in SIGNALS_SKIP are not walked and not counted."""
     flat: dict = {}
 
     def walk(obj, prefix, depth):
         for k in sorted(obj, key=str):
             v = obj[k]
             key = f"{prefix}.{k}" if prefix else str(k)
+            if key in SIGNALS_SKIP:
+                continue
             if isinstance(v, dict):
                 if depth < max_depth:
                     walk(v, key, depth + 1)

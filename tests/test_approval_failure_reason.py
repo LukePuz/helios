@@ -216,13 +216,18 @@ def test_every_deferral_sends_its_own_alert():
     import inspect
     import re
     import execution
-    lines = inspect.getsource(execution.execute_approved).splitlines()
-    returns = [i for i, ln in enumerate(lines) if re.search(r'_outcome\(\s*f?"deferred:', ln)]
-    assert len(returns) >= 4
-    for i in returns:
-        j = i - 1
-        while j >= 0 and "alert_module._send(" not in lines[j] and "_send_wait_alert(" not in lines[j]:
-            assert not re.search(r"\breturn\b(?!.*failed:)", lines[j]), \
-                f"no deferral alert before: {lines[i].strip()}"
-            j -= 1
-        assert j >= 0 and i - j <= 15, f"no deferral alert before: {lines[i].strip()}"
+    # The stale-price deferral lives in _stale_buy_outcome, which
+    # execute_approved returns from directly.
+    total = 0
+    for fn in (execution.execute_approved, execution._stale_buy_outcome):
+        lines = inspect.getsource(fn).splitlines()
+        returns = [i for i, ln in enumerate(lines) if re.search(r'_outcome\(\s*f?"deferred:', ln)]
+        total += len(returns)
+        for i in returns:
+            j = i - 1
+            while j >= 0 and "alert_module._send(" not in lines[j] and "_send_wait_alert(" not in lines[j]:
+                assert not re.search(r"\breturn\b(?!.*failed:)", lines[j]), \
+                    f"no deferral alert before: {lines[i].strip()}"
+                j -= 1
+            assert j >= 0 and i - j <= 15, f"no deferral alert before: {lines[i].strip()}"
+    assert total >= 4

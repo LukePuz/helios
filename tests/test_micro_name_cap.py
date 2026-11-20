@@ -348,7 +348,10 @@ def test_route_records_hold_no_account_dollar_values(caplog):
     _no_dollars(ls.call_args.kwargs["decision"]["micro_name_cap"])
     reason = ls.call_args.args[3]
     assert "2,000" not in reason and "558" not in reason and "27.9% of equity" in reason
-    assert "2,000" not in caplog.text and "558" not in caplog.text
+    # Without the source locations ("crew.py:1558"), which are not values.
+    import re
+    logged = re.sub(r"\S+\.py:\d+", "", caplog.text)
+    assert "2,000" not in logged and "558" not in logged
 
 
 def test_c6_shadow_record_holds_no_account_dollar_values():

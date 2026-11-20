@@ -347,6 +347,81 @@ PRICE_FALLBACK_SESSION_ORDER = os.getenv("PRICE_FALLBACK_SESSION_ORDER", "false"
 # ---------------------------------------------------------------------------
 TRIM_FRACTION = 0.33   # analyst TRIM sells this fraction of the held position
 
+# Trim-or-exit rule (agents/trim_exit.py). A fixed rule evaluated after each
+# held-position review, on the verdict the analyst already wrote; it changes
+# nothing the analyst reads. Before an earnings print one TRIM or EXIT verdict
+# trims and a confirmed EXIT exits; elsewhere a sale needs an earlier sell
+# verdict that confirms it. A rule TRIM leaves at least
+# TRIM_EXIT_MIN_REMAINING_SHARES under a resized stop. Every value below is a
+# placeholder: each one is the owner's decision.
+#
+# Master switch. Off: the rule is not evaluated; nothing is read, nothing is
+# written and routing is as before. On by itself is shadow: one TRIM_EXIT_RULE
+# signals row per held review (and per TRIM/EXIT verdict on the event and scan
+# paths), no order, routing as before. The rows are written at confidence 0
+# with no model: a verdict count outside this repo that keeps its own
+# non-verdict list instead of db._NON_ANALYST_SIGNALS (the conviction-share
+# script) needs TRIM_EXIT_RULE added before this is turned on.
+TRIM_EXIT_ENABLED = os.getenv("TRIM_EXIT_ENABLED", "false").lower() == "true"
+# Sell switch. Does nothing without the master switch. Off: shadow. On: in
+# the contexts named in TRIM_EXIT_LIVE_CONTEXTS the rule decides whether a
+# held review's TRIM/EXIT verdict at TRIM_EXIT_MIN_CONVICTION or above is
+# routed, in place of the model's own pass flag (it can add a sale and it can
+# withhold one). The sale uses the existing approval and execution path.
+# Turning it on changes live trading.
+TRIM_EXIT_LIVE = os.getenv("TRIM_EXIT_LIVE", "false").lower() == "true"
+# Contexts where the sell switch applies, comma-separated: earnings_pre (the
+# print is ahead, within TRIM_EXIT_EARNINGS_MAX_DAYS_BEFORE days), earnings_day
+# (the print is dated today and is not known to be after the close), general
+# (everything else). A context not named is recorded and routes as before.
+# Empty: none. Kept as a sorted tuple, not a set: the config hash
+# (config_env.env_record) uses repr(), and a set's order differs by process.
+TRIM_EXIT_LIVE_CONTEXTS = tuple(sorted({
+    s.strip().lower() for s in os.getenv("TRIM_EXIT_LIVE_CONTEXTS", "earnings_pre").split(",")
+    if s.strip()}))
+# Tickers the rule never routes, comma-separated. Their rows still record what
+# the rule would have done. This does not stop the other sell paths (the
+# model's own pass flag, the low-conviction rule) or the protective stop.
+TRIM_EXIT_EXEMPT_TICKERS = tuple(sorted({
+    s.strip().upper() for s in os.getenv("TRIM_EXIT_EXEMPT_TICKERS", "").split(",")
+    if s.strip()}))
+# The rule reads TRIM/EXIT verdicts at this conviction or above. Below it the
+# analyst's low-conviction sell rule applies, unchanged.
+TRIM_EXIT_MIN_CONVICTION = int(os.getenv("TRIM_EXIT_MIN_CONVICTION", "5"))
+# earnings_pre reaches this many calendar days before the print (0 = only a
+# print after today's close).
+TRIM_EXIT_EARNINGS_MAX_DAYS_BEFORE = int(os.getenv("TRIM_EXIT_EARNINGS_MAX_DAYS_BEFORE", "4"))
+# Confirmation: the newest analyst verdict on the ticker that is at least
+# this many hours older than the evaluation must be a TRIM or EXIT, no older
+# than TRIM_EXIT_CONFIRM_MAX_AGE_DAYS and not from before the position's stop
+# record was opened. The gap keeps the verdict under evaluation, and others
+# from the same session, from confirming it. Values under 1 read as 1, so
+# the verdict can never confirm itself.
+TRIM_EXIT_CONFIRM_MIN_GAP_HOURS = float(os.getenv("TRIM_EXIT_CONFIRM_MIN_GAP_HOURS", "12"))
+TRIM_EXIT_CONFIRM_MAX_AGE_DAYS = int(os.getenv("TRIM_EXIT_CONFIRM_MAX_AGE_DAYS", "7"))
+# No rule TRIM within this many days of any recorded SELL on the ticker, so a
+# daily earnings review trims once per window (0 = no cooldown). It also holds
+# back a one-share TRIM turned into an EXIT (TRIM_EXIT_ONE_SHARE_TRIM=exit),
+# so two TRIM verdicts can't sell a 2-share position whole inside the window.
+# An EXIT verdict is not held back by it.
+TRIM_EXIT_COOLDOWN_DAYS = int(os.getenv("TRIM_EXIT_COOLDOWN_DAYS", "5"))
+# No rule sale within this many hours of a decided OPEN/ADD on the ticker
+# (0 = no minimum hold).
+TRIM_EXIT_MIN_HOLD_HOURS = int(os.getenv("TRIM_EXIT_MIN_HOLD_HOURS", "48"))
+# A rule TRIM that cannot leave TRIM_EXIT_MIN_REMAINING_SHARES (one share
+# held): "hold" sells nothing; "exit" treats it as an EXIT request, which
+# sells only when confirmed and outside TRIM_EXIT_COOLDOWN_DAYS. Any other
+# value reads as hold. Execution rechecks it: a one-share EXIT already routed
+# is skipped if this is no longer "exit".
+TRIM_EXIT_ONE_SHARE_TRIM = os.getenv("TRIM_EXIT_ONE_SHARE_TRIM", "hold").strip().lower()
+# Shares a rule TRIM must leave (0 = a one-share TRIM closes the position, as
+# the model-flag TRIM does).
+TRIM_EXIT_MIN_REMAINING_SHARES = int(os.getenv("TRIM_EXIT_MIN_REMAINING_SHARES", "1"))
+# Fraction of the position a rule TRIM sells, whole shares, at least one.
+# Defaults to TRIM_FRACTION; a TRIM routed on the model's own flag keeps
+# TRIM_FRACTION.
+TRIM_EXIT_FRACTION = float(os.getenv("TRIM_EXIT_FRACTION", str(TRIM_FRACTION)))
+
 # No new OPEN/ADD within this many calendar days before earnings (0 = off).
 # Off since 2026-10-28 by Luke's decision: "don't forbid trading near earnings,
 # the bot should be able to buy and sell based on what it thinks the earnings
@@ -394,6 +469,14 @@ BRIEF_POSITION_CONTEXT = os.getenv("BRIEF_POSITION_CONTEXT", "true").lower() == 
 REGIME_OVERALL_ONLY = os.getenv("REGIME_OVERALL_ONLY", "true").lower() == "true"
 # Regime and scanner score completed daily bars only (A1053-2; Luke D3).
 REGIME_COMPLETED_BARS = os.getenv("REGIME_COMPLETED_BARS", "true").lower() == "true"
+# Log-only: the regime's bar request spans 250 calendar days, about 173
+# completed bars, so its "200DMA" averages fewer than 200. With this on, each
+# regime assessment makes one more, wider request (330 calendar days,
+# 5-second limit), re-scores trend, the ETF-proxy breadth fallback and sector
+# price action on those bars, and records the score and label they imply in
+# signals.trend.shadow_200. The live request, score, label, sizing and
+# prompts are the same either way; false skips the second request.
+REGIME_SHADOW_200_ENABLED = os.getenv("REGIME_SHADOW_200_ENABLED", "true").lower() == "true"
 # When a monitored stop level is breached and NO protective stop exists at
 # the broker, execute a market sell of the full position instead of only
 # alerting. Only ever reduces exposure; set False to fall back to alert-only.

@@ -64,6 +64,68 @@ def _trim(filled, held_after, stop_rec=None, stop_err=None, working=0.0):
     return queue, place, alert, manual
 
 
+def test_two_share_rule_trim_one_share_stop():
+    """A trim/exit rule TRIM of a 2-share position, sized by routing, sells
+    1: the execution recheck runs once and lets it through, and the stop is
+    re-placed for the 1 share left, at the recorded stop price."""
+    from agents import crew, trim_exit
+    route_client = MagicMock()
+    route_client.get_all_positions.return_value = [MagicMock(
+        symbol="NVDA", qty=2.0, avg_entry_price=100.0, current_price=100.0, market_value=200.0)]
+    tag = {"row_id": 55, "context": "earnings_pre", "verdict_action": "TRIM", "action": "TRIM",
+           "reason": "earnings_trim"}
+    result = {"ticker": "NVDA", "action": "TRIM", "conviction": 6, "thesis_bucket": "Accelerator",
+              "reasoning": "r", "trim_exit": tag}
+    with patch("db.has_active_approval", return_value=False), \
+         patch("db.log_pending_approval", return_value=10) as lpa, patch("db.log_signal"), \
+         patch("db.claim_approval_for_execution", return_value=True), \
+         patch("db.get_approval_by_id", return_value={"id": 10}), \
+         patch("db.update_approval_status"), \
+         patch("execution.execute_approved", return_value=True), \
+         patch("agents.crew._get_price", return_value=100.0), \
+         patch("risk_manager.RiskManager"), patch("config.AUTO_EXECUTE", True), \
+         patch("config.TRIM_EXIT_FRACTION", 0.33), patch("config.TRIM_EXIT_MIN_REMAINING_SHARES", 1):
+        crew._route_to_approval(result, {"regime": "Neutral"}, route_client)
+    risk = lpa.call_args.kwargs["risk_json"]
+    assert risk["shares_initial"] == 1 and risk["trim_exit"]["sell_qty"] == 1
+    approval = _approval(action="TRIM", shares_initial=risk["shares_initial"])
+    approval["risk_json"]["trim_exit"] = risk["trim_exit"]
+    client = MagicMock()
+    client.get_open_position.return_value = MagicMock(qty=2.0)
+    client.get_all_positions.return_value = [MagicMock(symbol="NVDA", qty=1.0)]
+    with ExitStack() as st, patch("risk_manager._floored_level", return_value=90.0):
+        for p in (patch("ibkr.get_ib"), patch("ibkr.get_client", return_value=client),
+                  patch("ibkr.cancel_stop_orders_for", return_value=0),
+                  patch("ibkr.get_latest_price", return_value=100.0),
+                  patch("market_data.get_priced_quote", return_value=None),
+                  patch("market_data.is_market_hours", return_value=True),
+                  patch("db.log_signal"),
+                  patch("config.USE_BRACKET_ORDERS", False),
+                  patch.multiple("config", create=True, TRIM_EXIT_ENABLED=True, TRIM_EXIT_LIVE=True,
+                                 TRIM_EXIT_EXEMPT_TICKERS=(), TRIM_EXIT_MIN_REMAINING_SHARES=1,
+                                 TRIM_EXIT_LIVE_CONTEXTS=("earnings_pre",)),
+                  patch("db.log_trade"), patch("db.log_order", return_value=1),
+                  patch("db.update_order_fill"), patch("db.log_trade_outcome"),
+                  patch("alerts.send_trade_alert"),
+                  patch("db.get_position_stop", return_value={"stop_price": 90.0})):
+            st.enter_context(p)
+        recheck = st.enter_context(patch("agents.trim_exit.execution_block",
+                                         wraps=trim_exit.execution_block))
+        delete = st.enter_context(patch("db.delete_position_stop"))
+        close = st.enter_context(patch("db.close_trade_outcome"))
+        order = st.enter_context(patch("ibkr.place_market_order"))
+        order.return_value = {"order_id": 1, "fill_price": 100.0, "filled_qty": 1.0}
+        queue, place, alert, manual = _common(st, 0.0)
+        execution.execute_approved(approval)
+    recheck.assert_called_once_with("NVDA", "TRIM", 1, 2.0, risk["trim_exit"])
+    assert order.call_args.args[2] == 1
+    assert place.call_args.args[1:3] == (1.0, 90.0)
+    queue.assert_not_called()
+    manual.assert_not_called()
+    delete.assert_not_called()          # the position is still open
+    close.assert_not_called()
+
+
 def test_part_filled_trim_stops_now_what_the_working_sell_wont_sell():
     with patch("risk_manager._floored_level", return_value=90.0):
         queue, place, alert, _ = _trim(filled=20.0, held_after=70.0, stop_rec={"stop_price": 90.0},

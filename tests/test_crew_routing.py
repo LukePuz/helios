@@ -83,6 +83,116 @@ class TestSellRouting:
             rec = lpa.call_args.kwargs["risk_json"]["trim_granularity"]
             assert rec["sell_qty"] == want_qty and rec["full_exit"] is want_full and rec["owned"] == held
 
+    @staticmethod
+    def _route_sell(result, held, fraction=0.33, active_approval=False):
+        client = MagicMock()
+        client.get_all_positions.return_value = [MagicMock(
+            symbol="NVDA", qty=held, avg_entry_price=100.0, current_price=100.0,
+            market_value=held * 100.0)]
+        with patch("db.has_active_approval", return_value=active_approval), \
+             patch("db.log_pending_approval", return_value=10) as lpa, \
+             patch("db.log_signal") as log_signal, \
+             patch("db.claim_approval_for_execution", return_value=True), \
+             patch("db.get_approval_by_id", return_value={"id": 10}), \
+             patch("db.update_approval_status"), \
+             patch("execution.execute_approved", return_value=True), \
+             patch("agents.crew._get_price", return_value=100.0), \
+             patch("risk_manager.RiskManager"), \
+             patch("config.AUTO_EXECUTE", True), \
+             patch("config.TRIM_EXIT_FRACTION", fraction), \
+             patch("config.TRIM_EXIT_MIN_REMAINING_SHARES", 1):
+            crew._route_to_approval(result, {"regime": "Neutral"}, client)
+        return lpa, log_signal
+
+    def test_rule_trim_sizes_with_its_own_fraction(self):
+        """TRIM_EXIT_FRACTION, not TRIM_FRACTION, sizes a rule TRIM: at 0.5,
+        4 sells 2 and 10 sells 5 (TRIM_FRACTION would sell 1 and 3)."""
+        for held, want in ((4.0, 2), (10.0, 5)):
+            result = {**_analyst_result(action="TRIM"), "trim_exit": dict(self._RULE_TAG)}
+            lpa, _ = self._route_sell(result, held, fraction=0.5)
+            risk = lpa.call_args.kwargs["risk_json"]
+            assert risk["shares_initial"] == want and risk["trim_exit"]["sell_qty"] == want
+            assert risk["trim_granularity"]["fraction"] == 0.5
+        # Untagged, the same TRIM keeps TRIM_FRACTION.
+        lpa, _ = self._route_sell(_analyst_result(action="TRIM"), 10.0, fraction=0.5)
+        assert lpa.call_args.kwargs["risk_json"]["shares_initial"] == 3
+
+    def test_rule_one_share_exit_rechecked_on_the_fresh_position(self):
+        """The rule turned a TRIM into an EXIT on a one-share snapshot. With
+        4 shares held at routing a partial sale exists, so nothing routes
+        (a ROUTE_ZERO_SHARES row); with 1 held the EXIT sells it."""
+        tag = {**self._RULE_TAG, "action": "EXIT", "verdict_action": "TRIM", "confirmed": True,
+               "reason": "trim_one_share_exit"}
+        result = {**_analyst_result(action="EXIT"), "trim_exit": tag}
+        lpa, log_signal = self._route_sell(result, 4.0)
+        lpa.assert_not_called()
+        assert log_signal.call_args.args[1] == "ROUTE_ZERO_SHARES"
+        decision = log_signal.call_args.kwargs["decision"]
+        assert decision["owned"] == 4.0 and decision["partial_qty"] == 1
+        assert decision["trim_exit"]["reason"] == "trim_one_share_exit"
+        lpa, _ = self._route_sell(result, 1.0)
+        assert lpa.call_args.kwargs["risk_json"]["shares_initial"] == 1.0
+        # A confirmed EXIT verdict is not rechecked: it sells all 4.
+        lpa, _ = self._route_sell({**result, "trim_exit": {**tag, "reason": "confirmed"}}, 4.0)
+        assert lpa.call_args.kwargs["risk_json"]["shares_initial"] == 4.0
+
+    def test_routing_rows_of_a_rule_copy_keep_the_verdict_action(self):
+        """A routing-exit row for a copy the rule routed records the model's
+        action as verdict_action, the rule's beside it, and the tag. An
+        untagged row is as before."""
+        tag = {**self._RULE_TAG, "verdict_action": "EXIT", "action": "TRIM"}
+        _, log_signal = self._route_sell({**_analyst_result(action="TRIM"), "trim_exit": tag}, 5.0,
+                                         active_approval=True)
+        assert log_signal.call_args.args[1] == "ROUTE_APPROVAL_PENDING"
+        decision = log_signal.call_args.kwargs["decision"]
+        assert decision["verdict_action"] == "EXIT" and decision["rule_action"] == "TRIM"
+        assert decision["trim_exit"]["row_id"] == 55
+        _, log_signal = self._route_sell(_analyst_result(action="TRIM"), 5.0, active_approval=True)
+        assert log_signal.call_args.kwargs["decision"] == {
+            "route_exit": "ROUTE_APPROVAL_PENDING", "verdict_action": "TRIM", "verdict_conviction": 6}
+
+    _RULE_TAG = {"rule_version": "1", "row_id": 55, "context": "earnings_pre",
+                 "verdict_action": "TRIM", "action": "TRIM", "confirmed": False,
+                 "reason": "earnings_trim", "would_qty": 1.0}
+
+    def test_rule_trim_two_shares_sells_one(self):
+        """A TRIM the trim/exit rule routed keeps a share: 1 of 2, 2 of 7."""
+        for held, want in ((2.0, 1), (7.0, 2), (10.0, 3)):
+            result = {**_analyst_result(action="TRIM"), "trim_exit": dict(self._RULE_TAG)}
+            lpa, _ = self._route_sell(result, held)
+            risk = lpa.call_args.kwargs["risk_json"]
+            assert risk["shares_initial"] == want
+            assert risk["trim_exit"]["row_id"] == 55 and risk["trim_exit"]["sell_qty"] == want
+            assert risk["trim_exit"]["owned"] == held
+            assert risk["trim_granularity"]["full_exit"] is False
+            assert lpa.call_args.kwargs["analyst_json"]["trim_exit"]["row_id"] == 55
+
+    def test_rule_trim_one_share_no_approval(self):
+        """One share has no partial: no approval, a ROUTE_ZERO_SHARES row."""
+        result = {**_analyst_result(action="TRIM"), "trim_exit": dict(self._RULE_TAG)}
+        lpa, log_signal = self._route_sell(result, 1.0)
+        lpa.assert_not_called()
+        assert log_signal.call_args.args[1] == "ROUTE_ZERO_SHARES"
+        assert log_signal.call_args.kwargs["decision"]["trim_exit"]["row_id"] == 55
+
+    def test_rule_exit_sells_everything(self):
+        tag = {**self._RULE_TAG, "action": "EXIT", "verdict_action": "EXIT"}
+        lpa, _ = self._route_sell({**_analyst_result(action="EXIT"), "trim_exit": tag}, 3.0)
+        risk = lpa.call_args.kwargs["risk_json"]
+        assert risk["shares_initial"] == 3.0 and risk["trim_exit"]["sell_qty"] == 3.0
+
+    def test_legacy_trim_quantity_unchanged(self):
+        """Without the rule's tag a TRIM sizes as before: a 1-share TRIM is a
+        full exit, and nothing of the rule reaches risk_json."""
+        for held, want in ((1.0, 1), (2.0, 1), (90.0, 29)):
+            lpa, _ = self._route_sell(_analyst_result(action="TRIM"), held)
+            risk = lpa.call_args.kwargs["risk_json"]
+            assert risk["shares_initial"] == want and "trim_exit" not in risk
+            assert risk["trim_granularity"]["fraction"] == 0.33
+        lpa, _ = self._route_sell(_analyst_result(action="EXIT"), 4.0)
+        assert lpa.call_args.kwargs["risk_json"]["shares_initial"] == 4.0
+        assert "trim_exit" not in lpa.call_args.kwargs["risk_json"]
+
     def test_exit_with_no_position_logs_signal_and_returns(self):
         """EXIT recommended on a ticker we don't actually hold must not
         fall through to buy sizing — just log and stop."""

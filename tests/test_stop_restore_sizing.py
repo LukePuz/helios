@@ -417,7 +417,9 @@ def test_buy_add_passes_the_fill_price_to_the_whole_position_stop(action):
          patch("ibkr.place_market_order",
                return_value={"order_id": 1, "fill_price": 101.5, "filled_qty": 5.0}), \
          patch("ibkr.get_latest_price", return_value=100.0), \
-         patch("market_data.get_priced_quote", return_value=None), \
+         patch("market_data.get_priced_quote",
+               return_value={"price": 100.0, "is_stale": False, "age_minutes": 1.0,
+                             "market_open": True}), \
          patch("config.USE_BRACKET_ORDERS", False), \
          patch("db.log_trade"), patch("db.log_order", return_value=1), \
          patch("db.update_order_fill"), patch("db.log_trade_outcome"), \
@@ -1254,7 +1256,9 @@ def test_add_with_disagreeing_reads_keeps_the_record_and_stops_only_the_fill():
          patch("ibkr.place_market_order",
                return_value={"order_id": 1, "fill_price": 101.5, "filled_qty": 2.0}), \
          patch("ibkr.get_latest_price", return_value=100.0), \
-         patch("market_data.get_priced_quote", return_value=None), \
+         patch("market_data.get_priced_quote",
+               return_value={"price": 100.0, "is_stale": False, "age_minutes": 1.0,
+                             "market_open": True}), \
          patch("config.USE_BRACKET_ORDERS", False), \
          patch("db.log_trade"), patch("db.log_order", return_value=1), \
          patch("db.update_order_fill"), patch("db.log_trade_outcome"), \

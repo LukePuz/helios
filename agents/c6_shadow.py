@@ -263,7 +263,11 @@ def _sizing_block(sizing: dict) -> str:
 def _routing_blocks(ticker: str, action: str, conviction: int) -> list[str]:
     """crew._route_to_approval's checks before sizing, read-only, failing
     the same way it does (closed on an unreadable duplicate-buy guard for a
-    buy, as crew does since audit 11-06 21:36 #8; closed for earnings)."""
+    buy, as crew does since audit 11-06 21:36 #8; closed for earnings).
+    Not mirrored: the live entry gates (crew._entry_gate, from
+    deploy-2026-11-23: a broker exit under STOPOUT_REENTRY_GATE_DAYS old, or a
+    close below both the 50- and 200-day averages), so a would-route here can
+    still be an ENTRY_GATE_BLOCKED in live routing."""
     import db
     out = []
     try:

@@ -1369,7 +1369,10 @@ _NON_ANALYST_SIGNALS = ("SCREENED_OUT", "CATALYST_BLOCKED", "COOLDOWN_SKIPPED", 
                         # review: kept out of the verdict reads, so it confirms
                         # nothing and never reaches the brief.
                         "TRIM_EXIT_RULE", "STOPOUT_REENTRY_SHADOW",
-                        "ENTRY_QUALITY_SHADOW")
+                        "ENTRY_QUALITY_SHADOW",
+                        # A buy skipped by the live entry gates
+                        # (agents/crew.py:_entry_gate).
+                        "ENTRY_GATE_BLOCKED")
 
 
 def get_latest_signal_for(ticker: str, with_trigger: bool = False,
@@ -1701,7 +1704,8 @@ def get_last_broker_exit(ticker: str, days: int, strict: bool = False) -> dict |
     entries_since_exit counts the OPEN/ADD approvals decided (APPROVED or
     FAILED, as the rebuy cooldown counts them) after that exit, so a reader
     can tell the first buy back from later ones. Read by the
-    stop-out re-entry shadow only, never by routing or sizing. A stop fill
+    stop-out re-entry shadow, whose record the live entry gate
+    (agents/crew.py:_entry_gate) reads; never by sizing. A stop fill
     is reconciled up to ~20 min after it fills, so a buy in that gap sees
     no exit. strict: raise on a DB error instead of returning None."""
     conn = _get_conn()

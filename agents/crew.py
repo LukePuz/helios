@@ -2286,7 +2286,18 @@ def _add_exit_state(ticker: str, px, sizing, prior, held_qty, avg) -> dict:
 _STOPOUT_WINDOWS_DAYS = (1, 3, 5, 10)
 
 
-def _stopout_reentry_shadow(ticker: str, result: dict) -> None:
+def _stopout_lookback_days() -> int:
+    """Days of broker exits the stop-out shadow reads: its widest window, or
+    the live gate's window (config STOPOUT_REENTRY_GATE_DAYS) if wider."""
+    try:
+        from config import STOPOUT_REENTRY_GATE_DAYS as gate
+    except ImportError:
+        gate = 0
+    widest = max(_STOPOUT_WINDOWS_DAYS)
+    return max(widest, int(gate)) if isinstance(gate, (int, float)) and not isinstance(gate, bool) else widest
+
+
+def _stopout_reentry_shadow(ticker: str, result: dict) -> dict | None:
     """Stop-out re-entry shadow (config STOPOUT_REENTRY_SHADOW_ENABLED). Called
     for an OPEN/ADD once it has passed the rebuy cooldown. When the ticker's
     newest exit the bot did not place (db.get_last_broker_exit: a resting
@@ -2295,25 +2306,26 @@ def _stopout_reentry_shadow(ticker: str, result: dict) -> None:
     STOPOUT_REENTRY_SHADOW row: hours since that exit, its lots' outcomes, and
     would_block per re-entry cooldown window (1, 3, 5, 10 days). No row when
     there is no such exit. A failed read writes a row with read "error:
-    <class>" and would_block None. Record only: nothing routes, sizes or
-    prompts on it, and the buy goes on either way. Never raises."""
+    <class>" and would_block None. The row itself changes nothing; it returns
+    the record it wrote (None when no row) for _entry_gate, which may skip
+    the buy and writes its own ENTRY_GATE_BLOCKED row. Never raises."""
     try:
         try:
             from config import STOPOUT_REENTRY_SHADOW_ENABLED
         except ImportError:
             return
         if not STOPOUT_REENTRY_SHADOW_ENABLED or result.get("action") not in ("OPEN", "ADD"):
-            return
+            return None
         import db
         kind = "STOPOUT_REENTRY_SHADOW"
         try:
-            ex = db.get_last_broker_exit(ticker, max(_STOPOUT_WINDOWS_DAYS), strict=True)
+            ex = db.get_last_broker_exit(ticker, _stopout_lookback_days(), strict=True)
             read = "ok"
         except Exception as e:
             ex, read = None, f"error: {type(e).__name__}"
         if ex is None and read == "ok":
-            return
-        rec = {"read": read, "lookback_days": max(_STOPOUT_WINDOWS_DAYS),
+            return None
+        rec = {"read": read, "lookback_days": _stopout_lookback_days(),
                "windows_days": list(_STOPOUT_WINDOWS_DAYS), "would_block": None}
         if ex:
             rec.update(ex)
@@ -2336,9 +2348,14 @@ def _stopout_reentry_shadow(ticker: str, result: dict) -> None:
         fields = _route_row_fields(result, kind)
         fields["decision"]["shadow"] = kind
         fields["decision"]["stopout_reentry"] = rec
-        db.log_signal(ticker, kind, 0.0, reason[:500], **fields)
+        try:
+            db.log_signal(ticker, kind, 0.0, reason[:500], **fields)
+        except Exception as e:
+            log.warning(f"[{ticker}] stop-out re-entry shadow row not written: {type(e).__name__}: {e}")
+        return rec
     except Exception as e:
         log.warning(f"[{ticker}] stop-out re-entry shadow failed: {type(e).__name__}: {e}")
+        return None
 
 
 # Entry-quality shadow (_entry_quality_shadow). One price_history read of this
@@ -2503,23 +2520,24 @@ def _entry_trend_check(ticker: str, now=None) -> dict:
     return rec
 
 
-def _entry_quality_shadow(ticker: str, result: dict, now=None) -> None:
+def _entry_quality_shadow(ticker: str, result: dict, now=None) -> dict | None:
     """Entry-quality shadow (config ENTRY_QUALITY_SHADOW_ENABLED). Called for
     an OPEN/ADD once it has passed the rebuy cooldown, right after
     _stopout_reentry_shadow. Writes one ENTRY_QUALITY_SHADOW row:
     opinion_trigger (_entry_opinion_trigger), trend_check (_entry_trend_check,
     one cached-bar read) and would_block_trend, fixed illustrative labels
     (below_200dma, below_50dma, drawdown_gt_3atr; None when the number is
-    missing) that trend_check's raw numbers let anyone rescore. Record only:
-    nothing routes, sizes or prompts on it, result is not changed, and the
-    buy goes on either way. Never raises."""
+    missing) that trend_check's raw numbers let anyone rescore. The row
+    itself changes nothing and result is not changed; it returns trend_check
+    (None when switched off or on a raise) for _entry_gate, which may skip
+    the buy and writes its own ENTRY_GATE_BLOCKED row. Never raises."""
     try:
         try:
             from config import ENTRY_QUALITY_SHADOW_ENABLED
         except ImportError:
             return
         if not ENTRY_QUALITY_SHADOW_ENABLED or result.get("action") not in ("OPEN", "ADD"):
-            return
+            return None
         import db
         kind = "ENTRY_QUALITY_SHADOW"
         trig = _entry_opinion_trigger(result)
@@ -2540,9 +2558,101 @@ def _entry_quality_shadow(ticker: str, result: dict, now=None) -> None:
         fields["decision"]["opinion_trigger"] = trig
         fields["decision"]["trend_check"] = trend
         fields["decision"]["would_block_trend"] = would
-        db.log_signal(ticker, kind, 0.0, reason[:500], **fields)
+        try:
+            db.log_signal(ticker, kind, 0.0, reason[:500], **fields)
+        except Exception as e:
+            log.warning(f"[{ticker}] entry-quality shadow row not written: {type(e).__name__}: {e}")
+        return trend
     except Exception as e:
         log.warning(f"[{ticker}] entry-quality shadow failed: {type(e).__name__}: {e}")
+        return None
+
+
+def _entry_gate(ticker: str, result: dict, stop_rec: dict | None, trend: dict | None) -> bool:
+    """Live entry gates (config STOPOUT_REENTRY_GATE_DAYS,
+    ENTRY_TREND_GATE_ENABLED) for an OPEN/ADD that has passed the rebuy
+    cooldown, on what the two shadows just read (stop_rec from
+    _stopout_reentry_shadow, trend from _entry_quality_shadow). Blocks when
+    (a) the newest exit the bot did not place is under STOPOUT_REENTRY_GATE_DAYS
+    days old, or (b) the last completed close is below both its 50- and
+    200-day simple averages on bars at most ENTRY_TREND_GATE_MAX_BAR_AGE_DAYS
+    old while ENTRY_TREND_GATE_MARKET_TICKER's last close is below its own
+    200-day average (read only for a stock that would be blocked; a failed or
+    stale market read does not block). A failed read, missing averages or
+    stale bars do not block (the buy
+    goes on as before). Conviction does not override. On a block writes one
+    ENTRY_GATE_BLOCKED row (decision.entry_gate) and returns True; the caller
+    returns before sizing. Never raises: an internal error returns False."""
+    try:
+        try:
+            from config import STOPOUT_REENTRY_GATE_DAYS as days
+        except ImportError:
+            days = 0
+        try:
+            from config import ENTRY_TREND_GATE_ENABLED as trend_on
+        except ImportError:
+            trend_on = False
+        try:
+            from config import ENTRY_TREND_GATE_MAX_BAR_AGE_DAYS as max_age
+        except ImportError:
+            max_age = 5
+        try:
+            from config import ENTRY_TREND_GATE_MARKET_TICKER as market_ticker
+        except ImportError:
+            market_ticker = ""
+        blocks, gate = [], {}
+        if days and days > 0:
+            s = stop_rec or {}
+            hrs = s.get("hours_since")
+            # A negative age (exit time ahead of the clock) does not block.
+            hit = (s.get("read") == "ok" and isinstance(hrs, (int, float))
+                   and not isinstance(hrs, bool) and 0 <= hrs < days * 24)
+            gate["stopout"] = {"days": days, "read": s.get("read"), "hours_since": hrs,
+                               "exit_at": s.get("exit_at"), "blocked": hit}
+            if hit:
+                blocks.append(f"{hrs:.1f} h after an exit the bot did not place (gate {days} d)")
+        if trend_on:
+            t = trend or {}
+            age = t.get("bar_age_days")
+            fresh = isinstance(age, int) and not isinstance(age, bool) and 0 <= age <= max_age
+            hit = (t.get("read") == "ok" and fresh
+                   and t.get("below_sma50") is True and t.get("below_sma200") is True)
+            market = None
+            if hit and market_ticker:
+                # Read only when the stock itself would be blocked. Its own
+                # try: a failure here must not drop a stop-out block too.
+                try:
+                    m = _entry_trend_check(market_ticker)
+                    m_age = m.get("bar_age_days")
+                    m_fresh = (isinstance(m_age, int) and not isinstance(m_age, bool)
+                               and 0 <= m_age <= max_age)
+                    m_down = m.get("read") == "ok" and m_fresh and m.get("below_sma200") is True
+                    market = {"ticker": market_ticker, "read": m.get("read"), "bar_age_days": m_age,
+                              "below_sma200": m.get("below_sma200"),
+                              "pct_vs_sma200": m.get("pct_vs_sma200"), "downtrend": m_down}
+                except Exception as e:
+                    market = {"ticker": market_ticker, "read": f"error: {type(e).__name__}",
+                              "bar_age_days": None, "below_sma200": None, "pct_vs_sma200": None,
+                              "downtrend": False}
+                hit = market["downtrend"]
+            gate["trend"] = {"read": t.get("read"), "bar_age_days": age, "max_bar_age_days": max_age,
+                             "below_sma50": t.get("below_sma50"), "below_sma200": t.get("below_sma200"),
+                             "pct_vs_sma50": t.get("pct_vs_sma50"),
+                             "pct_vs_sma200": t.get("pct_vs_sma200"), "market": market, "blocked": hit}
+            if hit:
+                blocks.append(f"close {t.get('pct_vs_sma50')}% vs the 50-day and "
+                              f"{t.get('pct_vs_sma200')}% vs the 200-day average"
+                              + (f", with {market_ticker} {market['pct_vs_sma200']}% vs its 200-day"
+                                 if market else ""))
+        if not blocks:
+            return False
+        reason = f"{result.get('action')} skipped by the entry gate: " + "; ".join(blocks)
+        log.info(f"[{ticker}] {reason}")
+        _log_route_exit(ticker, "ENTRY_GATE_BLOCKED", result, reason, {"entry_gate": gate})
+        return True
+    except Exception as e:
+        log.warning(f"[{ticker}] entry gate failed ({type(e).__name__}: {e}); not applied")
+        return False
 
 
 def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
@@ -2610,8 +2720,10 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
             except Exception as e:
                 log.warning(f"[{ticker}] COOLDOWN_SKIPPED signal log failed: {e}")
             return
-        _stopout_reentry_shadow(ticker, result)
-        _entry_quality_shadow(ticker, result)
+        stop_rec = _stopout_reentry_shadow(ticker, result)
+        trend = _entry_quality_shadow(ticker, result)
+        if _entry_gate(ticker, result, stop_rec, trend):
+            return
 
     if action in ("TRIM", "EXIT"):
         # Risk-reducing sells are sized from the held position, never through

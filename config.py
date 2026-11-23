@@ -481,17 +481,42 @@ REGIME_SHADOW_200_ENABLED = os.getenv("REGIME_SHADOW_200_ENABLED", "true").lower
 # rebuy cooldown, on a ticker whose last exit the bot did not place (a resting
 # stop fill or a manual sale) is under 10 days old, gets one
 # STOPOUT_REENTRY_SHADOW signals row saying which re-entry cooldowns
-# (1, 3, 5 and 10 days) would have blocked it. Routing, sizing and prompts are
-# the same either way; false skips the read. Not read from .env.
+# (1, 3, 5 and 10 days) would have blocked it. The row changes nothing, but
+# the live entry gate below reads it: false skips the read and so also turns
+# off the stop-out re-entry gate. Not read from .env.
 STOPOUT_REENTRY_SHADOW_ENABLED = True
 # Entry-quality shadow (record only): an OPEN/ADD that has passed the rebuy
 # cooldown gets one ENTRY_QUALITY_SHADOW signals row with the triggering
 # item's screener new_fact, the last completed close against the 50- and
 # 200-day averages and its distance below the 20-day high in ATR14 units (from
 # the cached price_history bars, no fetch), and which fixed illustrative trend
-# filters would have blocked it. Routing, sizing and prompts are the same
-# either way; false skips the read. Not read from .env.
+# filters would have blocked it. The row changes nothing, but the live entry
+# gate below reads its trend check: false skips the read and so also turns off
+# the trend gate. Not read from .env.
 ENTRY_QUALITY_SHADOW_ENABLED = True
+# Live entry gates (agents/crew.py:_entry_gate, from deploy-2026-11-23). An
+# OPEN/ADD that has passed the rebuy cooldown is skipped, with one
+# ENTRY_GATE_BLOCKED signals row, when (a) the ticker's newest exit the bot
+# did not place (a resting stop fill or a sale at the broker;
+# db.get_last_broker_exit) is under STOPOUT_REENTRY_GATE_DAYS days old, or
+# (b) ENTRY_TREND_GATE_ENABLED and the last completed close is below both its
+# 50- and 200-day simple averages on cached bars at most
+# ENTRY_TREND_GATE_MAX_BAR_AGE_DAYS calendar days old. The gates use what the
+# two shadows above read, so a shadow switched off disables its gate. A read
+# that fails, too few bars or stale bars do not block. Higher conviction does
+# not override either gate. Sells, stops and sizing are untouched. 0 / False
+# turns a gate off. Not read from .env.
+STOPOUT_REENTRY_GATE_DAYS = 10
+ENTRY_TREND_GATE_ENABLED = True
+ENTRY_TREND_GATE_MAX_BAR_AGE_DAYS = 5
+# The trend gate applies only while the market itself is in a downtrend: the
+# last completed close of ENTRY_TREND_GATE_MARKET_TICKER below its 200-day
+# simple average (cached bars, same freshness rule). In June-October 2026,
+# with the market above its 200-day, buys below both averages did better than
+# buys above them (team gap hunt 2026-11-21, pilot diagnostics), so the gate
+# stands down in an up-market. A failed or stale market read does not block.
+# Empty string turns the condition off (gate on the stock alone).
+ENTRY_TREND_GATE_MARKET_TICKER = "SPY"
 # When a monitored stop level is breached and NO protective stop exists at
 # the broker, execute a market sell of the full position instead of only
 # alerting. Only ever reduces exposure; set False to fall back to alert-only.

@@ -392,6 +392,16 @@ def test_assign_routes_windows_and_prompt_sha():
                        "next_verdict_id": None}
 
 
+def test_entry_gate_row_ends_routing():
+    assert "ENTRY_GATE_BLOCKED" in H.ROUTE_TERMINAL and "ENTRY_GATE_BLOCKED" in H.ROUTE_KINDS
+    verdicts = [{"signal_id": 10, "ticker": "AAA", "trading_env": "live", "prompt_sha": "a",
+                 "approval_id": None}]
+    rows = [{"id": 11, "ticker": "AAA", "kind": "ENTRY_GATE_BLOCKED", "trading_env": "live",
+             "prompt_sha": "a"}]
+    got = H.assign_routes(verdicts, rows, {"AAA": [10]})
+    assert got[10]["outcome"] == "ENTRY_GATE_BLOCKED"
+
+
 def test_pass_without_routing_record_differs():
     src = FakeSource()
     src.add(1, "AAA", _mo("OPEN", 8, pass_to_risk=True))

@@ -957,17 +957,35 @@ class RiskManager:
                 f"DRAWDOWN HALT — drawdown {drawdown:.1%} exceeds {DRAWDOWN_HALT_PCT:.0%} "
                 f"(high-water=${baseline:,.2f}, current=${current:,.2f})"
             )
+            halt_saved = False
             try:
                 import db
                 not_saved = db.set_state_verified([
                     (f"trading_halted_{TRADING_ENV}", "true"),
                     (f"halt_reason_{TRADING_ENV}", f"Auto: drawdown {drawdown:.1%} from HWM ${baseline:,.2f}")])
+                halt_saved = f"trading_halted_{TRADING_ENV}" not in not_saved
                 # Marked when the flag couldn't be confirmed saved (M149); this buy is blocked either way.
                 db.log_halt_event("auto_halt", "per_buy_check", "drawdown",
-                                  drawdown_pct=round(drawdown, 4),
-                                  verified=f"trading_halted_{TRADING_ENV}" not in not_saved)
+                                  drawdown_pct=round(drawdown, 4), verified=halt_saved)
             except Exception:
                 pass
+            # The latch used to be silent: only the 30-min task alerted, at its
+            # own MAX_DRAWDOWN_PCT. One alert per latch: a set flag returns
+            # above, before this branch. Percentages only. Never raises.
+            try:
+                import alerts
+                alerts._send(
+                    f"🚨 <b>TRADING HALTED — DRAWDOWN LIMIT</b> ({TRADING_ENV}, per-buy check)\n"
+                    f"Drawdown: -{drawdown:.1%} from the high-water mark "
+                    f"(limit {DRAWDOWN_HALT_PCT:.0%}).\n"
+                    f"No new buys. Sells and stops are unaffected. /resume clears the flag, "
+                    f"but each buy re-checks and halts again while the drawdown is at or past "
+                    f"the limit."
+                    + ("" if halt_saved else "\n⚠️ The halt flag could not be confirmed saved; "
+                       "check /status and send /halt if it isn't set.")
+                )
+            except Exception as e:
+                log.warning(f"Per-buy halt alert failed: {e}")
             return True
 
         # Ratchet the high-water mark up as the portfolio grows

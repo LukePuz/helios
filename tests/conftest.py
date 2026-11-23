@@ -191,6 +191,16 @@ def _no_entry_quality_row(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _entry_gates_off(monkeypatch):
+    """The live entry gates (agents/crew.py:_entry_gate) skip an OPEN/ADD after
+    a recent broker exit or below both moving averages. Off here so existing
+    routing tests route as before; tests/test_entry_gate.py turns them on."""
+    import config
+    monkeypatch.setattr(config, "STOPOUT_REENTRY_GATE_DAYS", 0)
+    monkeypatch.setattr(config, "ENTRY_TREND_GATE_ENABLED", False)
+
+
+@pytest.fixture(autouse=True)
 def _no_kombu_publish(monkeypatch):
     """Backstop for the send_task trap: any message published through kombu
     (control broadcasts, a second app, a raw Producer) fails the test."""

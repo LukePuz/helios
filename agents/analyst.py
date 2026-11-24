@@ -1788,6 +1788,44 @@ def count_distinct_sources(sources: list) -> int:
     })
 
 
+
+def _source_mix_record(sources) -> dict:
+    """Record only (agents/source_mix.py): the cited sources split into
+    external, brief-section and other, on the gate's own dedupe, and whether
+    _MIN_DISTINCT_SOURCES would be met by the external ones alone. Nothing
+    reads it to decide. Never raises."""
+    try:
+        from agents.source_mix import source_mix
+        return source_mix(sources, _MIN_DISTINCT_SOURCES)
+    except Exception as e:
+        return {"error": type(e).__name__}
+
+
+def _news_timeline_enqueue(ticker: str, signal_id, trigger, prompt, prompt_at=None) -> None:
+    """Record only (agents/news_timeline.py, config NEWS_TIMELINE_RECORD_ENABLED):
+    after the verdict row is written, queue the ticker's last-7-days news
+    timeline for this verdict on the news-timeline thread. No I/O here: the
+    reads and the row happen on that thread, off the verdict path. Only
+    verdicts on config.NEWS_TIMELINE_PATHS whose row was written (an int
+    signal_id). Nothing reads it to decide. Never raises."""
+    try:
+        import config
+        if not getattr(config, "NEWS_TIMELINE_RECORD_ENABLED", False):
+            return
+        path = trigger.get("path") if isinstance(trigger, dict) else None
+        if path not in tuple(getattr(config, "NEWS_TIMELINE_PATHS", ())):
+            return
+        if not isinstance(signal_id, int) or isinstance(signal_id, bool):
+            return
+        from agents.news_timeline import enqueue
+        enqueue({"ticker": ticker, "signal_id": signal_id, "env": config.TRADING_ENV,
+                 "path": path, "verdict_at": datetime.now(timezone.utc), "prompt": prompt,
+                 "prompt_at": prompt_at,
+                 "trigger": {"url": trigger.get("url"), "title": trigger.get("title")}})
+    except Exception as e:
+        log.debug(f"[{ticker}] news timeline not queued: {e}")
+
+
 def _prior_verdicts(ticker: str) -> list | None:
     """Shadow record for buy verdicts (limitations audit 2026-10-28 14:53,
     #1b): the ticker's verdicts in the previous 72 h, so whether a buy agreed
@@ -2652,7 +2690,7 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
     if addon_text:
         prompt = prompt + "\n" + addon_text
 
-    ctx["prompt"] = prompt
+    ctx["prompt"], ctx["prompt_at"] = prompt, datetime.now(timezone.utc)
 
     raw_response = _call_ollama(prompt)
     # Read here, not in _call_ollama, whose source is part of the prompt
@@ -3219,6 +3257,27 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
         provenance["plan"]["sizing_bucket"] = bucket
     pending_entry = _pending_entry_shadow(ticker, action, conviction, model_action, parsed,
                                           situation_brief)
+    # Record only: the reply's valuation numbers against the prompt's own
+    # FUNDAMENTALS block and its own peer range (agents/valuation_check.py).
+    # Computed after the reply; nothing in the prompt, gates or routing reads it.
+    try:
+        from agents.valuation_check import valuation_check
+        valuation_fields = valuation_check(parsed, prompt, ticker)
+    except Exception as e:
+        valuation_fields = {"valuation_check_error": type(e).__name__}
+    # Record only: does a catalyst that names earnings have a date any
+    # earnings source knows, and is it a sector earnings-cluster week
+    # (earnings_claim.py)? Merged into catalyst_check; read by nothing.
+    try:
+        from earnings_claim import earnings_claim_check
+        earnings_claim_fields = earnings_claim_check(ticker, parsed)
+    except Exception as e:
+        earnings_claim_fields = {"earnings_claim": {"error": type(e).__name__}}
+    try:   # Record only (agents/target_anchor.py): bull target vs the brief's targets.
+        from agents.target_anchor import target_anchor_record
+        target_anchor = target_anchor_record(parsed, prompt, ticker)
+    except Exception as e:
+        target_anchor = {"error": type(e).__name__}
     try:
         import db
         signal_id = db.log_signal(
@@ -3234,7 +3293,8 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
                 "final_action": action, "final_conviction": conviction,
                 "final_pass_to_risk": bool(parsed.get("pass_to_risk", False)),
                 "gates": gates, "model_output": model_output,
-                "catalyst_check": _catalyst_check(ticker, parsed),
+                "catalyst_check": {**_catalyst_check(ticker, parsed), **earnings_claim_fields},
+                "source_mix": _source_mix_record(parsed.get("sources")),   # record only
                 "prior_verdicts_72h": _prior_verdicts(ticker) if action in ("OPEN", "ADD") else None,
                 "rule_shadows": _rule_shadows(ticker, action, situation_brief),
                 "trim_shadow": _trim_shadow(ticker, action, parsed, situation_brief),
@@ -3243,6 +3303,8 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
                                                                 source_count=source_count),
                 "pending_entry": pending_entry,
                 "udr_check": _udr_check(parsed, situation_brief),
+                **valuation_fields,
+                "target_anchor": target_anchor,
                 "udr_structural": _udr_structural(ticker, parsed, udr, situation_brief),
                 "event_burst": _event_burst(ticker, trigger, gates),
                 "downgraded_reason": "malformed_catalyst" if malformed_fields else None,
@@ -3279,6 +3341,7 @@ def _analyze_inner(candidate: dict, situation_brief: str, regime_packet: dict | 
         log.warning(f"[{ticker}] Signal log failed: {e}")
         signal_id = None
     _store_pending_entry(ticker, pending_entry, signal_id, action=action)   # log-only shadow
+    _news_timeline_enqueue(ticker, signal_id, trigger, prompt, ctx.get("prompt_at"))   # record only
 
     result = {
         "ticker":    ticker,

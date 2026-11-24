@@ -134,6 +134,7 @@ class TestRoutingUnchanged:
         others = [c[0][1] for c in ls.call_args_list if c[0][1] != "STOPOUT_REENTRY_SHADOW"]
         return rm.return_value.size_position.call_count, others, len(_rows(ls))
 
+    @pytest.mark.switches(STOPOUT_REENTRY_GATE_DAYS=0)   # the record-only shadow; the live gate is tested in test_entry_gate.py
     def test_same_route_with_row_error_and_none(self):
         base = self._route(return_value=None)
         with_row = self._route(return_value=_exit())

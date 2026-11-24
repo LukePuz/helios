@@ -91,6 +91,7 @@ def _db(verdicts=None, stop="default", log_id=55, **raise_on):
         "db.has_active_approval": False,
         "db.get_next_earnings_row": (PRINT, True),
         "db.get_state": None,
+        "db.get_price_history": [],
         "market_data.is_market_hours": True,
         "market_data.market_session": "rth",
     }
@@ -377,7 +378,10 @@ def test_each_read_error_fails_closed(fn, block):
                               positions=POSITIONS)
     row = _row(log_signal)
     assert block in row["blocked_by"] and row["routed"] is False
-    assert any(v.startswith("error:") for v in row["reads"].values())
+    reads_name = {"get_position_stop": "stop", "get_last_executed_approval": "last_buy",
+                  "sell_trades_since": "last_sell", "has_active_approval": "active_approval",
+                  "is_market_hours": "market"}.get(fn, "pending_sell")
+    assert row["reads"][reads_name].startswith("error:")
     # The rule owns this verdict, so the model's own pass flag is withheld.
     assert out is not result and out["pass_to_risk"] is False and "trim_exit" not in out
 
@@ -947,3 +951,203 @@ def test_rule_kind_is_kept_out_of_verdict_reads():
     import db
     assert "TRIM_EXIT_RULE" in db._NON_ANALYST_SIGNALS and "TRIM_EXIT_RULE" in db._RECORD_ONLY_SIGNALS
     assert trim_exit.KIND == "TRIM_EXIT_RULE"
+
+
+# ── record-only held trend (_held_trend_fields) ──────────────────────────────
+
+OUTPUTS = trim_exit.OUTPUT_KEYS
+
+
+def _bars(closes):
+    last = (NOW - timedelta(days=1)).date()
+    n = len(closes)
+    return [{"date": (last - timedelta(days=n - 1 - i)).isoformat(), "open": float(c),
+             "high": float(c) + 1, "low": float(c) - 1, "close": float(c), "volume": 1}
+            for i, c in enumerate(closes)]
+
+
+def _apply(action="HOLD", **gp):
+    with _flags(), _db() as log_signal, patch("db.get_price_history", **gp):
+        trim_exit.apply(_result(action=action), path="scheduled_review", positions=POSITIONS)
+    return _row(log_signal)
+
+
+@pytest.mark.parametrize("closes,below", [(list(range(300, 50, -1)), True),
+                                          (list(range(1, 251)), False)])
+def test_trend_and_label_recorded(closes, below):
+    row = _apply(return_value=_bars(closes))
+    assert row["reads"]["held_trend"] == "ok"
+    assert row["held_trend"]["read"] == "ok"
+    assert row["held_below_both_sma"] is below
+    assert row["unrealized_pct"] == pytest.approx(10.0)
+
+
+def test_fallback_price_records_no_unrealized():
+    assert trim_exit._held_trend_fields("NVDA", NOW, 100.0, 100.0, {})["unrealized_pct"] is None
+
+
+def test_todays_unfinished_bar_is_dropped():
+    bars = _bars(list(range(1, 251)))
+    bars.append({**bars[-1], "date": NOW.date().isoformat(), "close": 1.0, "low": 0.5, "open": 1.0})
+    row = _apply(return_value=bars)
+    assert row["held_trend"]["partial_bar_dropped"] is True and row["held_below_both_sma"] is False
+
+
+def _live_sale(**trend_patch):
+    import copy as _copy
+    result = _result(action="EXIT", pass_to_risk=False)
+    with _flags(), _db() as log_signal, patch("agents.crew._entry_trend_check", **trend_patch):
+        out = trim_exit.apply(result, path="earnings_review", event=PRE_EVENT, earnings_date=PRINT,
+                              positions=POSITIONS)
+    return {k: v for k, v in out.items() if k != "trim_exit"}, out.get("trim_exit"), _row(log_signal)
+
+
+def test_live_routed_sale_identical_whatever_the_trend():
+    good = _live_sale(return_value={"read": "ok", "below_sma50": True, "below_sma200": True})
+    assert good[0]["pass_to_risk"] is True and good[0]["action"] == "TRIM" and good[2]["routed"] is True
+    for kw in ({"side_effect": RuntimeError("x")}, {"return_value": None}, {"return_value": "junk"}):
+        other = _live_sale(**kw)
+        assert other[0] == good[0] and other[1] == good[1]
+        assert {k: other[2][k] for k in OUTPUTS} == {k: good[2][k] for k in OUTPUTS}
+        assert other[2]["reads"]["held_trend"].startswith("error:")
+
+
+def test_short_history_records_no_label():
+    row = _apply(return_value=_bars([100.0] * 30))
+    assert row["reads"]["held_trend"] == "insufficient_bars"
+    assert _apply(return_value=[])["reads"]["held_trend"] == "no_cached_bars"
+    assert row["held_below_both_sma"] is None
+
+
+def test_read_error_recorded_rule_unchanged():
+    err = _apply(action="EXIT", side_effect=RuntimeError("down"))
+    ok = _apply(action="EXIT", return_value=_bars(list(range(300, 50, -1))))
+    assert err["held_trend"]["read"].startswith("error") and err["held_below_both_sma"] is None
+    assert {k: err[k] for k in OUTPUTS} == {k: ok[k] for k in OUTPUTS}
+
+
+def test_decide_ignores_the_fields():
+    row = _apply(action="EXIT", return_value=_bars(list(range(300, 50, -1))))
+    cfg = row["flags"]
+    base = trim_exit.decide(row, cfg)
+    for k in ("held_trend", "held_below_both_sma", "unrealized_pct"):
+        changed = dict(row, **{k: "anything"})
+        assert trim_exit.decide(changed, cfg) == base
+    reads = dict(row["reads"], held_trend="error:X")
+    assert trim_exit.decide(dict(row, reads=reads), cfg) == base
+
+
+def test_helper_never_raises():
+    reads = {}
+    with patch("agents.crew._entry_trend_check", side_effect=RuntimeError("x")):
+        out = trim_exit._held_trend_fields("NVDA", NOW, 110.0, 100.0, reads)
+    assert reads["held_trend"] == "error:RuntimeError" and out["held_trend"] is None
+    assert trim_exit._held_trend_fields("NVDA", NOW, None, 100.0, {})["unrealized_pct"] is None
+
+
+# ── record-only held-exit candidates (_held_exit_fields) ─────────────────────
+
+def _apply_he(action="HOLD", bars=None, plan=None, hist_exc=None, plan_exc=None, on=True):
+    hist = {"side_effect": hist_exc} if hist_exc else {"return_value": bars if bars is not None else []}
+    pl = {"side_effect": plan_exc} if plan_exc else {"return_value": plan}
+    with _flags(HELD_EXIT_SHADOW_ENABLED=on, HELD_EXIT_TIME_STOP_SESSIONS=20,
+                HELD_EXIT_DRAWDOWN_ATR=3.0), \
+         _db() as log_signal, patch("db.get_price_history", **hist), \
+         patch("db.get_active_plan", **pl) as gap:
+        trim_exit.apply(_result(action=action), path="scheduled_review", positions=POSITIONS)
+    return _row(log_signal), gap
+
+
+def test_held_exit_recorded_on_row():
+    row, gap = _apply_he(bars=_bars(list(range(300, 50, -1))),
+                         plan={"id": 3, "structural_stop": 60.0, "invalidation_price": 40.0})
+    gap.assert_called_once_with("NVDA", strict=True)
+    rec = row["held_exit_candidates"]
+    assert row["reads"]["held_exit"] == "ok" and row["reads"]["held_exit_plan"] == "ok"
+    assert rec["read"] == "ok" and rec["entry_price"] == 100.0
+    from agents.catalyst_time import ET
+    assert rec["entry_date"] == OPENED.astimezone(ET).date().isoformat()
+    c = rec["candidates"]
+    assert c["below_both_sma"]["would_exit"] is True
+    assert c["below_plan_structural"]["would_exit"] is True       # close 51 < 60
+    assert c["below_plan_invalidation"]["would_exit"] is False    # 51 > 40
+    # The test bars are consecutive days: 20 sessions since entry, close under entry.
+    assert rec["sessions_held"] == 20 and c["time_stop"]["would_exit"] is True
+    assert "below_both_sma" in rec["firing"] and rec["any_would_exit"] is True
+
+
+def test_held_exit_drops_todays_partial_bar():
+    bars = _bars(list(range(300, 50, -1)))
+    bars.append({**bars[-1], "date": NOW.date().isoformat(), "close": 500.0, "high": 501.0})
+    row, _ = _apply_he(bars=bars)
+    rec = row["held_exit_candidates"]
+    assert rec["last_bar_date"] == (NOW - timedelta(days=1)).date().isoformat()
+    assert rec["last_close"] == 51.0 and rec["sessions_held"] == 20
+
+
+def test_held_exit_skips_non_finite_bars():
+    bars = _bars(list(range(300, 50, -1)))
+    bars[-5] = {**bars[-5], "close": float("inf")}
+    row, _ = _apply_he(bars=bars)
+    rec = row["held_exit_candidates"]
+    assert row["reads"]["held_exit"] == "ok" and rec["bars"] == len(bars) - 1
+    assert rec["sessions_held"] == 19 and rec["highest_close_since_entry"] < float("inf")
+
+
+def test_held_exit_off_records_none_and_reads_nothing():
+    row, gap = _apply_he(on=False)
+    assert row["held_exit_candidates"] is None and row["reads"]["held_exit"] == "off"
+    gap.assert_not_called()
+
+
+def test_held_exit_read_errors_recorded():
+    row, _ = _apply_he(hist_exc=RuntimeError("down"), plan_exc=RuntimeError("down"))
+    rec = row["held_exit_candidates"]
+    assert row["reads"]["held_exit"] == "error:RuntimeError"
+    assert row["reads"]["held_exit_plan"] == "error:RuntimeError"
+    assert rec["read"] == "error:RuntimeError" and rec["any_would_exit"] is False
+    row, _ = _apply_he(bars=_bars([100.0] * 250), plan_exc=RuntimeError("down"))
+    rec = row["held_exit_candidates"]
+    assert row["reads"]["held_exit"] == "ok"
+    assert rec["candidates"]["below_plan_structural"]["reason"] == "plan_read_error"
+
+
+def test_held_exit_helper_never_raises():
+    reads = {}
+    with _flags(HELD_EXIT_SHADOW_ENABLED=True, HELD_EXIT_TIME_STOP_SESSIONS=20,
+                HELD_EXIT_DRAWDOWN_ATR=3.0), \
+         patch("agents.held_exit.candidates", side_effect=ValueError("boom")), \
+         patch("db.get_price_history", return_value=[]), patch("db.get_active_plan", return_value=None):
+        out = trim_exit._held_exit_fields("NVDA", NOW, 100.0, OPENED, reads)
+    assert out == {"version": None, "read": "error:ValueError"} and reads["held_exit"] == "error:ValueError"
+
+
+def test_decide_ignores_held_exit():
+    row, _ = _apply_he(action="EXIT", bars=_bars(list(range(300, 50, -1))))
+    cfg = row["flags"]
+    base = trim_exit.decide(row, cfg)
+    assert trim_exit.decide(dict(row, held_exit_candidates="anything"), cfg) == base
+    reads = dict(row["reads"], held_exit="error:X", held_exit_plan="error:X")
+    assert trim_exit.decide(dict(row, reads=reads), cfg) == base
+
+
+def test_live_routed_sale_identical_whatever_held_exit():
+    import copy as _copy
+
+    def run(**kw):
+        result = _result(action="EXIT", pass_to_risk=False)
+        hist = kw.get("hist", {"return_value": _bars(list(range(300, 50, -1)))})
+        with _flags(HELD_EXIT_SHADOW_ENABLED=True, HELD_EXIT_TIME_STOP_SESSIONS=20,
+                    HELD_EXIT_DRAWDOWN_ATR=3.0), _db() as log_signal, \
+             patch("db.get_price_history", **hist), \
+             patch("db.get_active_plan", **kw.get("plan", {"return_value": None})):
+            out = trim_exit.apply(result, path="earnings_review", event=PRE_EVENT, earnings_date=PRINT,
+                                  positions=POSITIONS)
+        return {k: v for k, v in out.items() if k != "trim_exit"}, out.get("trim_exit"), _row(log_signal)
+    good = run()
+    assert good[0]["pass_to_risk"] is True and good[2]["routed"] is True
+    for kw in ({"hist": {"side_effect": RuntimeError("x")}}, {"plan": {"side_effect": RuntimeError("x")}},
+               {"hist": {"return_value": []}}):
+        other = run(**kw)
+        assert other[0] == good[0] and other[1] == good[1]
+        assert {k: other[2][k] for k in OUTPUTS} == {k: good[2][k] for k in OUTPUTS}

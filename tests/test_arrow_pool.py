@@ -11,9 +11,31 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def test_system_pool_in_force():
-    import pyarrow as pa
+    """The bot's import order in a fresh interpreter: config, then pandas
+    (which loads pyarrow). In-process the pool is whatever the first pyarrow
+    import of the test session picked, so this runs in a subprocess."""
     assert config.ARROW_MEMORY_POOL == "system"
-    assert pa.default_memory_pool().backend_name == "system"
+    code = ("import os; os.environ.pop('ARROW_DEFAULT_MEMORY_POOL', None); import config; "
+            "import pandas; import pyarrow as pa; print(pa.default_memory_pool().backend_name)")
+    out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True,
+                         text=True, timeout=60).stdout.split()
+    assert out[-1:] == ["system"]
+
+
+def test_without_config_first_the_pool_is_not_system():
+    """The case conftest guards: pandas imported before config picks
+    pyarrow's default pool, which is why the test session sets the variable
+    before any test module is imported."""
+    code = ("import os; os.environ.pop('ARROW_DEFAULT_MEMORY_POOL', None); import pandas; "
+            "import pyarrow as pa; print(pa.default_memory_pool().backend_name)")
+    out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True,
+                         text=True, timeout=60).stdout.split()
+    assert out and out[-1] != "system"
+
+
+def test_test_session_runs_the_system_pool():
+    import pyarrow as pa
+    assert pa.default_memory_pool().backend_name == "system"   # conftest sets it first
 
 
 def test_config_imports_no_numpy_or_pyarrow():

@@ -81,6 +81,17 @@ def screen_event_only(event: dict) -> dict:
         try:
             import db
             prov = screening.get("provenance") or {}
+            # Record only: a reject of the ticker's own new fact whose reason
+            # cites other or watchlist stocks (agents/own_ticker.py). Read by
+            # nothing; the screen above is unchanged.
+            try:
+                from agents.own_ticker import own_ticker_record
+                if prov:
+                    prov = {**prov, **own_ticker_record(prov.get("title_names_ticker"),
+                                                        screening.get("new_fact"),
+                                                        screening.get("reason"))}
+            except Exception as e:
+                log.debug(f"[{ticker}] own_ticker record failed: {e}")
             # The item's identifiers, as on SCREENED_IN, so a rejected item
             # can be found again (audit 2026-11-07 15:07 #1: only a 70-char
             # feed title survived). Never its text.
@@ -120,6 +131,178 @@ def event_item_fields(event) -> dict:
             "form": event.get("form") or event.get("type")}
 
 
+# The zone a source's naive time is in, where that source's own code fixes
+# it: market_data._session_quote_uncached reads a naive bar label as ET (its
+# bars are aware in practice). latest_quote's naive label is TWS's wall
+# clock, whose zone the code does not know, so it is not listed: only its
+# as_of_utc (from a bar that carried its offset) is used.
+_NAIVE_AS_OF_ZONE = {"session_quote": "America/New_York"}
+
+
+def _as_of_utc(info: dict | None) -> datetime | None:
+    """The source time in _get_price's info as an aware UTC datetime:
+    info["as_of_utc"] when present, else info["as_of"] when it is aware (an
+    ISO string with a zone included), else a naive as_of in its source's
+    known zone (_NAIVE_AS_OF_ZONE). None when the zone is unknown: never
+    guessed. Raises nothing."""
+    try:
+        info = info or {}
+        for key in ("as_of_utc", "as_of"):
+            t = info.get(key)
+            if isinstance(t, str):
+                try:
+                    t = datetime.fromisoformat(t.replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+            if not isinstance(t, datetime):
+                continue
+            if t.tzinfo is None:
+                zone = _NAIVE_AS_OF_ZONE.get(info.get("source")) if key == "as_of" else None
+                if zone is None:
+                    continue
+                from zoneinfo import ZoneInfo
+                t = t.replace(tzinfo=ZoneInfo(zone))
+            return t.astimezone(timezone.utc)
+    except Exception:
+        pass
+    return None
+
+
+def _brief_price_record(info: dict | None, built_at: str | None) -> dict:
+    """trigger keys for the brief's price (record only): brief_price_source,
+    brief_price_as_of (UTC ISO), brief_price_age_s (built_at minus as_of, in
+    seconds, 1 dp) and brief_price_is_stale, from _get_price's info. The
+    time is _as_of_utc's: None (with the age) when the source's zone is not
+    known. None where unknown. Never raises."""
+    out = {"brief_price_source": None, "brief_price_as_of": None, "brief_price_age_s": None,
+           "brief_price_is_stale": None}
+    try:
+        info = info or {}
+        out["brief_price_source"] = info.get("source")
+        st = info.get("is_stale")
+        out["brief_price_is_stale"] = bool(st) if st is not None else None
+        as_of = _as_of_utc(info)
+        if as_of is not None:
+            out["brief_price_as_of"] = as_of.isoformat()
+            if built_at:
+                built = datetime.fromisoformat(str(built_at).replace("Z", "+00:00"))
+                out["brief_price_age_s"] = round((built - as_of).total_seconds(), 1)
+    except Exception as e:
+        log.debug(f"brief price record unavailable: {e}")
+    return out
+
+
+# Read-through record (record only; config.READ_THROUGH_RECORD_ENABLED): which
+# held names an analysed event bears on, from the related-symbol mapping the
+# brief itself uses. The marker is per (source item, held ticker).
+_READ_THROUGH_STAGE = "read_through"
+_READ_THROUGH_MARKER = "helios:read_through:{env}:{item}:{held}"
+_READ_THROUGH_MARKER_TTL_S = 8 * 86400
+_RELATED_SECTION_HEADING = "=== RELATED SYMBOLS IN WATCHLIST ==="
+
+
+def _read_through_record(event: dict, ticker: str, positions: dict | None, held_as_of,
+                         brief: str | None, brief_error, result: dict) -> dict | None:
+    """One queued activity row (stage read_through) when the event's ticker
+    has related symbols (context_engine._find_related_symbols over
+    config.SYMBOLS, called as the brief calls it) that the book holds, per
+    the positions snapshot deep_analyze already read; no broker call. Held
+    names already recorded for this source item (a Redis NX marker per
+    item and held ticker) are listed as deduped and get no new row; with
+    Redis unreadable the row is written anyway. No row when the brief failed
+    (the book was not read). Returns the row's extra, or None. Never raises
+    and never blocks the analysis: the row goes through the activity
+    writer's queue."""
+    try:
+        from celery.exceptions import SoftTimeLimitExceeded
+    except Exception:          # celery absent: nothing to re-raise
+        SoftTimeLimitExceeded = ()
+    try:
+        import config
+        if not getattr(config, "READ_THROUGH_RECORD_ENABLED", False):
+            return None
+        if brief_error is not None or positions is None:
+            return None
+        import context_engine
+        related = context_engine._find_related_symbols(ticker, config.SYMBOLS)
+        if not related:
+            return None
+
+        def held(sym):
+            pos = positions.get(sym)
+            if not isinstance(pos, dict):
+                return False
+            try:
+                return float(pos.get("qty") or 0) != 0
+            except (TypeError, ValueError):
+                return True
+        rows = [{"ticker": s, "held": held(s)} for s in related]
+        held_related = [r["ticker"] for r in rows if r["held"]]
+        if not held_related:
+            return None
+        import db
+        env = db.TRADING_ENV
+        item = event_item_fields(event)
+        fresh, deduped, dedupe_read = list(held_related), [], "ok"
+        if item.get("item_id"):
+            import hashlib
+            key_item = hashlib.sha256(item["item_id"].encode()).hexdigest()[:16]
+            try:
+                import stop_lock
+                r = stop_lock._redis()
+                fresh = []
+                for h in held_related:
+                    if r.set(_READ_THROUGH_MARKER.format(env=env, item=key_item, held=h), "1",
+                             nx=True, ex=_READ_THROUGH_MARKER_TTL_S):
+                        fresh.append(h)
+                    else:
+                        deduped.append(h)
+            except SoftTimeLimitExceeded:
+                raise
+            except Exception as e:
+                fresh, deduped = list(held_related), []
+                dedupe_read = f"error: {type(e).__name__}"
+        else:
+            dedupe_read = "no_item_id"
+        if not fresh:
+            return None
+        prov = (result or {}).get("provenance") or {}
+        try:
+            from agents import analyst
+            cap = int(getattr(analyst, "_BRIEF_MAX_CHARS"))
+        except Exception:
+            cap = None
+        text = brief or ""
+        extra = {
+            "env": env, "path": "event", "event_ticker": ticker,
+            "signal_id": prov.get("signal_id"),
+            "action": (result or {}).get("action"),
+            "conviction": (result or {}).get("conviction"),
+            "item": item,
+            "related": rows,
+            "held_related": fresh,
+            "held_related_deduped": deduped,
+            "mapping": "context_engine._find_related_symbols(ticker, config.SYMBOLS)",
+            "held_source": "deep_analyze positions snapshot",
+            "held_as_of": held_as_of,
+            # The section the brief appends, and whether it is inside the
+            # analyst's character cut (the token-budget guard is not judged).
+            "section_in_brief": _RELATED_SECTION_HEADING in text,
+            "section_within_char_cap": ((_RELATED_SECTION_HEADING in text[:cap])
+                                        if cap is not None else None),
+            "dedupe_read": dedupe_read,
+        }
+        db.log_activity_queued(_READ_THROUGH_STAGE, ticker,
+                               f"read-through: {ticker} event, held related "
+                               f"{', '.join(fresh)}", "neutral", extra)
+        return extra
+    except SoftTimeLimitExceeded:
+        raise
+    except Exception as e:
+        log.debug(f"[{ticker}] read-through record not written: {e}")
+        return None
+
+
 def deep_analyze(event: dict, screening: dict | None = None) -> dict:
     """
     Full 72B analyst pipeline for an event that already passed screening
@@ -148,6 +331,7 @@ def deep_analyze(event: dict, screening: dict | None = None) -> dict:
     held_as_of = None
     brief_error = None
     brief_price = None     # the price the brief showed (audit 2026-11-07 17:17 #1)
+    price_info: dict = {}  # where it came from and how old (record only)
     try:
         from ibkr import IBKRClient
         client = IBKRClient()
@@ -168,7 +352,7 @@ def deep_analyze(event: dict, screening: dict | None = None) -> dict:
         # not held previously had NO price anywhere in the brief, so the model
         # would invent one for any dollar-denominated valuation output (found
         # 2026-07-17: a SNDK target of "$300" while it traded near $1,350).
-        price = _get_price(ticker, client)
+        price = _get_price(ticker, client, info=price_info)
         brief_price = price
         brief = assemble_brief(event, positions, client, current_price=price)
     except Exception as e:
@@ -215,8 +399,21 @@ def deep_analyze(event: dict, screening: dict | None = None) -> dict:
         trigger["brief_degraded"] = brief_error is not None
         trigger["brief_built_at"] = brief_built_at
         trigger["brief_price"] = brief_price
+        # Record only (gap hunt 2026-11-21 item 3): which source gave the
+        # brief's price, that source's own time, its age when the brief was
+        # built, and the latest quote's stale flag. None where unknown.
+        trigger.update(_brief_price_record(price_info, brief_built_at))
         if brief_error:
             trigger["brief_error"] = brief_error
+        # Record only: would this story be skipped as a repeat or as stale?
+        # Read by nothing in the prompt, brief or routing; never raises.
+        try:
+            from agents.story_dedup import story_dedup_record
+            story_dedup = story_dedup_record(ticker, trigger)
+            if story_dedup is not None:
+                trigger["story_dedup"] = story_dedup
+        except Exception as e:
+            log.debug(f"[{ticker}] story dedup shadow not recorded: {e}")
         result = analyze(candidate, situation_brief=brief, regime_packet=regime,
                          trigger=trigger)
     except Exception as exc:
@@ -231,6 +428,9 @@ def deep_analyze(event: dict, screening: dict | None = None) -> dict:
     # a routing change. Never raises.
     from agents import trim_exit
     trim_exit.apply(result, path="event", event=event, positions=positions, observe=True)
+
+    # Read-through record (record only): held names this event bears on.
+    _read_through_record(event, ticker, positions, held_as_of, brief, brief_error, result)
 
     # ── Route to approval queue if actionable ─────────────────────────────────
     if result.get("pass_to_risk"):
@@ -274,7 +474,7 @@ _VERDICT_ONLY_PROVENANCE = ("plan", "brief_exposure", "gate_flags", "tighten_siz
                             "sell_confirm", "buy_confirm", "scan_reasons", "regime_entry")
 
 
-def _route_row_fields(result: dict, kind: str) -> dict:
+def _route_row_fields(result: dict, kind: str, decision_extra: dict | None = None) -> dict:
     """Model and provenance of the verdict a routing row belongs to, so the
     row stands on its own (SEF run 13, 2026-10-28: ROUTE_* rows had NULL model
     and provenance and had to be joined to the preceding verdict). The
@@ -299,6 +499,8 @@ def _route_row_fields(result: dict, kind: str) -> dict:
         # action stays verdict_action, the rule's goes beside it with the tag.
         decision.update(verdict_action=rule.get("verdict_action"),
                         rule_action=result.get("action"), trim_exit=rule)
+    if decision_extra:
+        decision.update({k: v for k, v in decision_extra.items() if k not in decision})
     return {
         "model": (prov or {}).get("model"),
         "provenance": prov,
@@ -349,6 +551,17 @@ def _route_guarded(result: dict, regime: dict, client) -> None:
         _log_route_exit(ticker, "ROUTE_ERROR", result, f"{type(e).__name__}: {e}",
                         {"error_class": type(e).__name__})
         _alert_route_error(ticker, type(e).__name__)
+    _verdict_vote_shadow(result)    # record only, after routing
+
+
+def _verdict_vote_shadow(result: dict) -> None:
+    """Enqueues the shadow re-draws for a routed OPEN/ADD (agents/
+    verdict_vote.py, config.VERDICT_VOTE_SHADOW_ENABLED). Never raises."""
+    try:
+        from agents.verdict_vote import observe_routed
+        observe_routed(result)
+    except Exception as e:
+        log.warning(f"[{result.get('ticker')}] verdict vote shadow not enqueued: {e}")
 
 
 # Swap shadow (Luke 10-29: "sell my lowest rated one and buy the higher rated
@@ -1286,14 +1499,16 @@ def _add_to_loser_shadow(ticker: str, result: dict, price: float, client=None) -
     return rec
 
 
-def _attach_shadows(sizing: dict, ticker: str, result: dict, price: float, client=None) -> None:
+def _attach_shadows(sizing: dict, ticker: str, result: dict, price: float, client=None,
+                    price_info: dict | None = None) -> None:
     """Log-only fields on a sizing dict, each guaranteed JSON-safe, with
     shadow_status saying why one is missing: ok, n/a (doesn't apply),
-    error (the helper raised; the dict holds the message) or unencodable."""
+    error (the helper raised; the dict holds the message) or unencodable.
+    price_info: _get_price's info for the sizing price (arrival record)."""
     stop = sizing.get("stop_loss_price")
     values = {"r_shadow": _r_shadow(result, price, stop),
               "plan_compiled": _compiled_plan(ticker, result, price, stop),
-              "arrival": _arrival_record(result, price)}
+              "arrival": _arrival_record(result, price, price_info)}
     try:
         values["partial_exec"] = _partial_exec_shadow(sizing, result.get("thesis_bucket"))
     except Exception as e:
@@ -1332,19 +1547,39 @@ def _parse_when(value):
     return None
 
 
-def _arrival_record(result: dict, price: float) -> dict:
+def _arrival_record(result: dict, price: float, price_info: dict | None = None) -> dict:
     """Log-only (audit 2026-11-07 17:17 #1): how far price moved and how much
     time passed between the brief the analyst read and the sizing quote the
     order is checked against, and how old the triggering item was. The drift
     guard and decision_price only see the sizing quote. Event path only has
-    a brief price and an event time; elsewhere they are None. Never
-    raises."""
+    a brief price and an event time; elsewhere they are None.
+
+    The sizing price's own provenance, from _get_price's info (price_info):
+    sizing_price_source (which source answered), sizing_bar_time (that
+    source's bar time in UTC, ISO, by _as_of_utc; None when the source gives
+    none or its zone is unknown), sizing_price_age_s (sizing_at minus sizing_bar_time, 1 dp) and
+    sizing_price_is_stale (the latest quote's flag, else None). All None when
+    no info is passed. Never raises."""
     from datetime import datetime, timezone
     rec = {"brief_price": None, "brief_built_at": None, "event_time": None,
            "event_time_source": None, "event_time_date_only": None,
            "sizing_price": price, "sizing_at": datetime.now(timezone.utc).isoformat(),
            "move_brief_to_sizing_pct": None, "minutes_brief_to_sizing": None,
-           "minutes_event_to_sizing": None}
+           "minutes_event_to_sizing": None,
+           "sizing_price_source": None, "sizing_bar_time": None, "sizing_price_age_s": None,
+           "sizing_price_is_stale": None}
+    try:
+        info = price_info or {}
+        rec["sizing_price_source"] = info.get("source")
+        st = info.get("is_stale")
+        rec["sizing_price_is_stale"] = bool(st) if st is not None else None
+        bt = _as_of_utc(info)   # the brief record's rule: a zone-less time stays None
+        if bt is not None:
+            rec["sizing_bar_time"] = bt.isoformat()
+            rec["sizing_price_age_s"] = round(
+                (datetime.fromisoformat(rec["sizing_at"]) - bt).total_seconds(), 1)
+    except Exception as e:
+        rec["sizing_info_error"] = type(e).__name__
     try:
         prov = result.get("provenance")
         trig = (prov.get("trigger") if isinstance(prov, dict) else None) or {}
@@ -1683,6 +1918,97 @@ def _udr_at_sizing(result: dict, price) -> dict | None:
         return {"error": str(e)[:120]}
 
 
+def _rr_vs_stop(result: dict, sizing: dict, price, thresholds=None) -> dict:
+    """Record only (config RR_VS_STOP_SHADOW_ENABLED): reward to the model's
+    target over risk to the stop sizing placed, for risk_json["rr_vs_stop"]
+    on an OPEN/ADD. The entry UDR gate reads the model's own
+    upside_downside_ratio, whose downside is its downside_scenario, not this
+    stop. Fields:
+      r_to_target      (target - price) / (price - stop). target is
+                       valuation.bull_case_target, else price x (1 +
+                       expected_return_pct / 100); target_source says which
+      r_to_plan_t1/_t2 the same with sizing["plan_compiled"]'s t1 (nearest
+                       ladder resistance) and t2
+      stop_pct/_atr    the stop distance in % of price and in ATR units;
+      target_pct/_atr  the same for the target. atr_source: "atr_stop" (the
+                       ATR the stop was set from), else "atr_brief" (the
+                       nightly ladder's ATR14), else None
+      model_udr, model_floor (valuation.downside_scenario), floor_vs_stop_pct
+                       ((floor - stop) / price x 100; + means the stop sits
+                       under the model's floor), stop_above_model_floor
+      would_block      {"r_lt_<t>": r_to_target < t} per threshold (default
+                       RR_VS_STOP_LABEL_THRESHOLDS); None per label when
+                       r_to_target is None. Unrounded R is compared.
+      reason           why r_to_target is None, else None
+    A ratio is None unless stop < price < its target. No reads: everything
+    comes from result and sizing, so scripts/rr_vs_stop.py replays it on
+    stored approvals. On an ADD, execution later sets one stop for the whole
+    position (execution._whole_position_stop); this sees the sizing stop.
+    Nothing routes or sizes on it. Never raises."""
+    import math
+
+    def num(v):
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        return f if math.isfinite(f) and not isinstance(v, bool) else None
+
+    out = {"r_to_target": None, "would_block": None, "reason": None}
+    try:
+        from agents.plans import _dollars
+        if thresholds is None:
+            try:
+                from config import RR_VS_STOP_LABEL_THRESHOLDS as thresholds
+            except ImportError:
+                thresholds = (1.5, 2.0)
+        result = result if isinstance(result, dict) else {}
+        sizing = sizing if isinstance(sizing, dict) else {}
+        val = result.get("valuation") if isinstance(result.get("valuation"), dict) else {}
+        p, stop = num(price), num(sizing.get("stop_loss_price"))
+        target, source = num(_dollars(val.get("bull_case_target"))), "bull_case_target"
+        if not target and p and num(result.get("expected_return_pct")) is not None:
+            target, source = p * (1 + num(result.get("expected_return_pct")) / 100), "expected_return_pct"
+        atr, atr_source = num(sizing.get("atr_stop")), "atr_stop"
+        if not atr or atr <= 0:
+            ab = sizing.get("atr_brief") if isinstance(sizing.get("atr_brief"), dict) else {}
+            atr, atr_source = num(ab.get("atr")), "atr_brief"
+        if not atr or atr <= 0:
+            atr, atr_source = None, None
+        floor = num(_dollars(val.get("downside_scenario")))
+        plan = sizing.get("plan_compiled") if isinstance(sizing.get("plan_compiled"), dict) else {}
+
+        def r(tgt):
+            return (tgt - p) / (p - stop) if p and stop and tgt and tgt > p > stop else None
+
+        raw = r(target)
+        rnd = lambda v, n=2: round(v, n) if v is not None else None
+        out.update(
+            price=p, stop=stop, stop_method=sizing.get("stop_method"),
+            target=rnd(target), target_source=source if target else None,
+            r_to_target=rnd(raw),
+            r_to_plan_t1=rnd(r(num(plan.get("t1")))), r_to_plan_t2=rnd(r(num(plan.get("t2")))),
+            stop_pct=rnd((p - stop) / p * 100) if p and stop else None,
+            stop_atr=rnd((p - stop) / atr) if p and stop and atr else None,
+            target_pct=rnd((target - p) / p * 100) if p and target else None,
+            target_atr=rnd((target - p) / atr) if p and target and atr else None,
+            atr=rnd(atr, 4), atr_source=atr_source,
+            model_udr=num(result.get("upside_downside_ratio")), model_floor=floor,
+            floor_vs_stop_pct=rnd((floor - stop) / p * 100) if p and stop and floor else None,
+            stop_above_model_floor=(stop > floor) if stop and floor else None,
+            thresholds=[float(t) for t in thresholds],
+            would_block={f"r_lt_{float(t):g}": (raw < float(t)) if raw is not None else None
+                         for t in thresholds},
+        )
+        if raw is None:
+            out["reason"] = ("no_price" if not p else "no_stop" if not stop else "no_target" if not target
+                             else "levels_not_stop_lt_price_lt_target")
+        return out
+    except Exception as e:
+        out["error"] = str(e)[:120]
+        return out
+
+
 def _attach_gap_risk_shadow(rm, ticker: str, sizing: dict, price, action: str | None = None) -> None:
     """sizing["gap_risk_shadow"] for the order as it will be sent (after the
     concentration, correlation and micro-name cuts). Equity is read for the
@@ -1843,10 +2169,12 @@ def _alert_risk_init_failed(item: str, now: float | None = None) -> bool:
         return False
 
 
-def _record_risk_init_failed(ticker: str, result: dict, exc: Exception) -> None:
+def _record_risk_init_failed(ticker: str, result: dict, exc: Exception,
+                             extra: dict | None = None) -> None:
     """ROUTE_RISK_INIT_FAILED row plus the throttled alert. The row carries
     the exception class only: the message can include account details.
-    Never raises."""
+    extra's keys go into the row's decision (the recheck-contradiction
+    record). Never raises."""
     try:
         action = result.get("action")
         conviction = result.get("conviction")
@@ -1854,7 +2182,8 @@ def _record_risk_init_failed(ticker: str, result: dict, exc: Exception) -> None:
         _log_route_exit(ticker, "ROUTE_RISK_INIT_FAILED", result,
                         f"RiskManager init failed ({error_class}); not sized, not executed",
                         decision_extra={"error_class": error_class,
-                                        "would_retry": _risk_init_would_retry(action)})
+                                        "would_retry": _risk_init_would_retry(action),
+                                        **(extra or {})})
         _alert_risk_init_failed(f"{ticker} {action} c{conviction} ({error_class})")
     except Exception as e:
         log.warning(f"[{ticker}] risk-init failure record failed: {e}")
@@ -2090,7 +2419,11 @@ def _apply_micro_name_cap(rm, ticker: str, sizing: dict, price: float, result: d
                                         "theme_group_shadow": sizing.get("theme_group_shadow"),
                                         "concentration_inflight_shadow":
                                             sizing.get("concentration_inflight_shadow"),
-                                        **(_add_guard_record(ticker, result, sizing) or {})})
+                                        **(_add_guard_record(ticker, result, sizing) or {}),
+                                        **({"recheck_contradiction": sizing["recheck_contradiction"]}
+                                           if "recheck_contradiction" in sizing else {}),
+                                        **({"same_day_consensus": sizing["same_day_consensus"]}
+                                           if "same_day_consensus" in sizing else {})})
         return True
     new = rec["shares_after"]
     sizing["shares_initial"] = new
@@ -2297,7 +2630,7 @@ def _stopout_lookback_days() -> int:
     return max(widest, int(gate)) if isinstance(gate, (int, float)) and not isinstance(gate, bool) else widest
 
 
-def _stopout_reentry_shadow(ticker: str, result: dict) -> dict | None:
+def _stopout_reentry_shadow(ticker: str, result: dict, path: str | None = None) -> dict | None:
     """Stop-out re-entry shadow (config STOPOUT_REENTRY_SHADOW_ENABLED). Called
     for an OPEN/ADD once it has passed the rebuy cooldown. When the ticker's
     newest exit the bot did not place (db.get_last_broker_exit: a resting
@@ -2308,7 +2641,10 @@ def _stopout_reentry_shadow(ticker: str, result: dict) -> dict | None:
     there is no such exit. A failed read writes a row with read "error:
     <class>" and would_block None. The row itself changes nothing; it returns
     the record it wrote (None when no row) for _entry_gate, which may skip
-    the buy and writes its own ENTRY_GATE_BLOCKED row. Never raises."""
+    the buy and writes its own ENTRY_GATE_BLOCKED row. path, when given
+    (tasks._deferred_entry_gate passes "deferred_retry"), is recorded on the
+    row's stopout_reentry so a retry's second row for the same verdict can be
+    told from the verdict-time one. Never raises."""
     try:
         try:
             from config import STOPOUT_REENTRY_SHADOW_ENABLED
@@ -2327,6 +2663,8 @@ def _stopout_reentry_shadow(ticker: str, result: dict) -> dict | None:
             return None
         rec = {"read": read, "lookback_days": _stopout_lookback_days(),
                "windows_days": list(_STOPOUT_WINDOWS_DAYS), "would_block": None}
+        if path:
+            rec["path"] = path
         if ex:
             rec.update(ex)
             hrs = ex.get("hours_since")
@@ -2365,6 +2703,42 @@ _ENTRY_QUALITY_BAR_ROWS = 260
 _ENTRY_QUALITY_HIGH_DAYS = 20
 _ENTRY_QUALITY_SWING_BARS = 60
 _ENTRY_QUALITY_DRAWDOWN_ATR = 3.0
+# Split-discontinuity guard (_split_discontinuity), on the closes the SMA200
+# uses. A one-day close ratio r is a split candidate when it is within
+# _SPLIT_RATIO_TOL (relative) of a factor in _SPLIT_FACTORS or its inverse
+# (rule "factor"), or at or beyond _SPLIT_SCALE_BREAK or its inverse (rule
+# "scale_break", for steps off the factor list: the SNDK cache's 2025-11-21
+# step, x0.1277, is caught here), and its |ln r| is at least _SPLIT_MOVE_MULT
+# times the median |ln r| of the window's other days. A real crash or pop
+# passes those tests, so a candidate also needs volume corroboration: an
+# unadjusted split steps volume by about 1/r and the step persists. The
+# median volume of the _SPLIT_VOLUME_BARS bars after the step (skipping the
+# first _SPLIT_VOLUME_SKIP_BARS, where a crash's volume spike sits) over the
+# median of the _SPLIT_VOLUME_BARS bars before it, v, must give v x r within
+# a factor of 1 + _SPLIT_VOLUME_TOL of 1 on the factor rule (dollar volume
+# carries across a split; a crash's usually falls), or v at least
+# _SPLIT_VOLUME_BREAK_MIN in the split's direction (up when the price stepped
+# down) on the scale_break rule, with v x r also within a factor of
+# _SPLIT_BREAK_DOLLAR_MAX of 1. And no step-day spike: an unadjusted split
+# carries its new volume from day 0, a crash spikes on days 0-2, so the
+# largest of the first _SPLIT_VOLUME_SKIP_BARS volumes must be at most
+# _SPLIT_SPIKE_MAX times the after-median (missing there: not corroborated).
+# A crash whose dollar volume holds steady with no early spike still looks
+# like a split: the tests narrow that case, they cannot remove it. A side with fewer than _SPLIT_VOLUME_MIN_BARS
+# bars of positive volume is not corroborated: no flag, the gate as before.
+# _entry_gate does not block on a split-suspect read.
+_SPLIT_FACTORS = (2, 3, 4, 5, 10)
+_SPLIT_RATIO_TOL = 0.02
+_SPLIT_SCALE_BREAK = 3.0
+_SPLIT_MOVE_MULT = 5.0
+_SPLIT_WINDOW_BARS = 200
+_SPLIT_VOLUME_BARS = 20
+_SPLIT_VOLUME_SKIP_BARS = 3
+_SPLIT_VOLUME_MIN_BARS = 5
+_SPLIT_VOLUME_TOL = 0.25
+_SPLIT_VOLUME_BREAK_MIN = 2.5
+_SPLIT_BREAK_DOLLAR_MAX = 2.0
+_SPLIT_SPIKE_MAX = 2.0
 
 
 def _entry_opinion_trigger(result: dict) -> dict:
@@ -2391,6 +2765,151 @@ def _entry_opinion_trigger(result: dict) -> dict:
     return out
 
 
+def _split_discontinuity(dates: list, closes: list, volumes: list | None = None,
+                         window: int = _SPLIT_WINDOW_BARS) -> dict:
+    """Whether the last `window` closes (the SMA200's bars) look like two
+    price scales mixed by an unadjusted split. dates, closes and volumes are
+    the full aligned bar lists, oldest first; volume windows may reach before
+    the price window. For each one-day ratio r = close / previous close
+    inside the window (the step into the window is left out: it doesn't mix
+    the average):
+      candidate   |r / f - 1| <= _SPLIT_RATIO_TOL for f in _SPLIT_FACTORS or
+                  1/f (rule "factor"), else r <= 1/_SPLIT_SCALE_BREAK or
+                  r >= _SPLIT_SCALE_BREAK (rule "scale_break")
+      move        |ln r| >= _SPLIT_MOVE_MULT x the median |ln r| of the
+                  window's other days (a flat window passes any candidate)
+      volume      v = median volume of the _SPLIT_VOLUME_BARS bars after the
+                  step, skipping its first _SPLIT_VOLUME_SKIP_BARS, over the
+                  median of the _SPLIT_VOLUME_BARS bars before it (positive
+                  volumes only; under _SPLIT_VOLUME_MIN_BARS on a side, or no
+                  volumes, is not corroborated). factor: |ln(v x r)| <=
+                  ln(1 + _SPLIT_VOLUME_TOL); scale_break: v >= _SPLIT_VOLUME_BREAK_MIN
+                  when r < 1, v <= 1/_SPLIT_VOLUME_BREAK_MIN when r > 1, and
+                  |ln(v x r)| <= ln _SPLIT_BREAK_DOLLAR_MAX
+      no spike    max volume of the step day and the next
+                  _SPLIT_VOLUME_SKIP_BARS - 1 days <= _SPLIT_SPIKE_MAX x the
+                  after-median (each of those volumes present and positive)
+    A day is flagged when all four hold. A non-positive close gives no ratio.
+    A split in the last _SPLIT_VOLUME_SKIP_BARS + _SPLIT_VOLUME_MIN_BARS - 1
+    sessions (1-7) can't be corroborated yet and is not flagged: the gate
+    still blocks on those bars, the safe direction. The real SNDK 2025-11-21
+    step fails the spike rule (day 0 at 2.31x the after-median), and the
+    nightly yfinance refresh leaves its split steps a year back, outside this
+    window (ingestion/price_history.py rescales those): the guard targets
+    unadjusted or fallback feeds.
+
+    Returns split_suspect (True/False; None with under 2 closes or on an
+    error, with split_error), split_suspect_count, split_candidates (days
+    passing candidate and move), split_uncorroborated (of those, failing a
+    volume test) with split_uncorroborated_reasons (no_volume, volume_step,
+    dollar_volume, spike: counts), and for the flagged day with the largest move:
+    split_suspect_date (the day of the new scale), split_suspect_ratio,
+    split_suspect_rule, split_suspect_factor ("1/2" for a halving, "2" for a
+    doubling; None on a scale break), split_suspect_volume_ratio,
+    split_suspect_spike_ratio (step-window max over the after-median) and
+    split_suspect_move_vs_typical (|ln r| / median); split_window_bars is the
+    number of closes checked. Record only: the averages are computed as
+    before. Never raises."""
+    import math
+    import statistics
+    out = {"split_suspect": None, "split_suspect_count": None, "split_candidates": None,
+           "split_uncorroborated": None, "split_suspect_date": None, "split_suspect_ratio": None,
+           "split_suspect_rule": None, "split_suspect_factor": None,
+           "split_suspect_volume_ratio": None, "split_suspect_spike_ratio": None,
+           "split_suspect_move_vs_typical": None, "split_uncorroborated_reasons": None,
+           "split_window_bars": None}
+    try:
+        cl_all, ds_all = list(closes), list(dates)
+        vol_all = list(volumes) if volumes is not None else None
+        start = max(0, len(cl_all) - window)
+        cl = cl_all[start:]
+        out["split_window_bars"] = len(cl)
+        if len(cl) < 2:
+            return out
+        ratios = [(cl[i] / cl[i - 1]) if cl[i - 1] > 0 and cl[i] > 0 else None
+                  for i in range(1, len(cl))]
+        moves = [abs(math.log(r)) if r else None for r in ratios]
+
+        def vmed(lo, hi):
+            if vol_all is None:
+                return None
+            vs = []
+            for v in vol_all[max(0, lo):max(0, hi)]:
+                try:
+                    f = float(v)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(f) and f > 0:
+                    vs.append(f)
+            return statistics.median(vs) if len(vs) >= _SPLIT_VOLUME_MIN_BARS else None
+
+        hits, candidates, why = [], 0, {}
+        for k, r in enumerate(ratios):
+            if not r:
+                continue
+            factor = next((label for f in _SPLIT_FACTORS
+                           for target, label in ((1 / f, f"1/{f}"), (f, str(f)))
+                           if abs(r / target - 1) <= _SPLIT_RATIO_TOL), None)
+            rule = "factor" if factor else None
+            if factor is None and (r <= 1 / _SPLIT_SCALE_BREAK or r >= _SPLIT_SCALE_BREAK):
+                rule = "scale_break"
+            if rule is None:
+                continue
+            others = [m for j, m in enumerate(moves) if j != k and m is not None]
+            typical = statistics.median(others) if others else 0.0
+            vs_typ = moves[k] / typical if typical > 0 else math.inf
+            if vs_typ < _SPLIT_MOVE_MULT:
+                continue
+            candidates += 1
+            g = start + k + 1                      # first bar on the new scale, full-list index
+            before = vmed(g - _SPLIT_VOLUME_BARS, g)
+            after = vmed(g + _SPLIT_VOLUME_SKIP_BARS, g + _SPLIT_VOLUME_SKIP_BARS + _SPLIT_VOLUME_BARS)
+            v = after / before if before and after else None
+            step_vols = []
+            for x in (vol_all or [])[g:g + _SPLIT_VOLUME_SKIP_BARS]:
+                try:
+                    f = float(x)
+                except (TypeError, ValueError):
+                    f = 0.0
+                step_vols.append(f if math.isfinite(f) else 0.0)
+            if (v is None or len(step_vols) < _SPLIT_VOLUME_SKIP_BARS
+                    or min(step_vols) <= 0):
+                why["no_volume"] = why.get("no_volume", 0) + 1
+                continue
+            if rule == "factor":
+                if abs(math.log(v * r)) > math.log(1 + _SPLIT_VOLUME_TOL):
+                    why["volume_step"] = why.get("volume_step", 0) + 1
+                    continue
+            else:
+                if not (v >= _SPLIT_VOLUME_BREAK_MIN if r < 1 else v <= 1 / _SPLIT_VOLUME_BREAK_MIN):
+                    why["volume_step"] = why.get("volume_step", 0) + 1
+                    continue
+                if abs(math.log(v * r)) > math.log(_SPLIT_BREAK_DOLLAR_MAX):
+                    why["dollar_volume"] = why.get("dollar_volume", 0) + 1
+                    continue
+            spike = max(step_vols) / after
+            if spike > _SPLIT_SPIKE_MAX:
+                why["spike"] = why.get("spike", 0) + 1
+                continue
+            hits.append((moves[k], str(ds_all[g])[:10], r, rule, factor, v, spike, vs_typ))
+        out["split_candidates"] = candidates
+        out["split_uncorroborated"] = candidates - len(hits)
+        out["split_uncorroborated_reasons"] = why
+        out["split_suspect"] = bool(hits)
+        out["split_suspect_count"] = len(hits)
+        if hits:
+            _, day, r, rule, factor, v, spike, vs_typ = max(hits, key=lambda h: h[0])
+            fin = lambda x, n: round(x, n) if isinstance(x, (int, float)) and math.isfinite(x) else None
+            out.update(split_suspect_date=day, split_suspect_ratio=fin(r, 4),
+                       split_suspect_rule=rule, split_suspect_factor=factor,
+                       split_suspect_volume_ratio=fin(v, 2), split_suspect_spike_ratio=fin(spike, 2),
+                       split_suspect_move_vs_typical=fin(vs_typ, 1))
+    except Exception as e:
+        out["split_suspect"] = None
+        out["split_error"] = type(e).__name__
+    return out
+
+
 def _entry_trend_check(ticker: str, now=None) -> dict:
     """Price structure on completed daily bars for _entry_quality_shadow. One
     read of the nightly price_history cache (db.get_price_history, a database
@@ -2408,7 +2927,11 @@ def _entry_trend_check(ticker: str, now=None) -> dict:
     structure label (price_action._swing_structure) with whether the last
     swing high is under the one before it, from the same fractal swings
     collapsed the same way. read is "ok" with 200+ bars, "insufficient_bars"
-    under that, "no_cached_bars" or "error: <class>". Never raises."""
+    under that, "no_cached_bars" or "error: <class>". The split_suspect
+    keys (_split_discontinuity, on the last 200 closes) say whether those
+    bars look like two price scales mixed by an unadjusted split; the
+    averages are computed either way and _entry_gate does not block on a
+    suspect read. Never raises."""
     rec = {"read": None, "source": "price_history", "rows_read": None, "bars": 0,
            "partial_bar_dropped": None, "nonfinite_bars": None, "last_bar_date": None,
            "last_close": None}
@@ -2420,6 +2943,8 @@ def _entry_trend_check(ticker: str, now=None) -> dict:
                 "drawdown_reason": None, "swing_bars": _ENTRY_QUALITY_SWING_BARS,
                 "swing_structure": None, "swing_highs": None, "last_swing_high_lower": None,
                 "swing_reason": None})
+    rec.update(_split_discontinuity([], []))   # the split_* keys
+    rec["split_window_bars"] = None             # set when bars are read
     try:
         import math
         import db
@@ -2466,6 +2991,8 @@ def _entry_trend_check(ticker: str, now=None) -> dict:
         closes = [float(b["close"]) for b in bars]
         last = closes[-1]
         rec["last_close"] = round(last, 4)
+        rec.update(_split_discontinuity([b.get("date") for b in bars], closes,
+                                        [b.get("volume") for b in bars]))
         for n in (50, 200):
             if len(closes) < n:
                 rec[f"sma{n}_reason"] = f"{len(closes)} completed bars, {n} needed"
@@ -2568,7 +3095,367 @@ def _entry_quality_shadow(ticker: str, result: dict, now=None) -> dict | None:
         return None
 
 
-def _entry_gate(ticker: str, result: dict, stop_rec: dict | None, trend: dict | None) -> bool:
+_NON_BUY_VERDICTS = ("HOLD", "WATCH", "PASS", "TRIM", "EXIT", "SELL")
+# The earlier verdicts whose non-buy would_block counts: a stale-entry recheck
+# of this very decision and a held-position review.
+_RECHECK_BLOCK_SOURCES = ("stale_entry_recheck", "held_review")
+# A prior verdict stamped up to this far after now still counts (clock skew).
+_RECHECK_CLOCK_SKEW_HOURS = 0.05
+
+
+def _verdict_source_class(path, source) -> str:
+    """What started a verdict, from its provenance trigger: stale_entry_recheck
+    (source, on the event path), plan_level (path plan_level_review or source
+    plan_watcher), held_review (scheduled_review, earnings_review), event,
+    daily_scan or chat; unknown without a trigger (rows before 10-29), else
+    the path itself. plan_level_review is a held review in
+    _HELD_REVIEW_PATHS, but is classed plan_level here and so is not in
+    _RECHECK_BLOCK_SOURCES: a definition choice that is Luke's to change.
+    The raw trigger_path is recorded beside it."""
+    if source == "stale_entry_recheck":
+        return "stale_entry_recheck"
+    if path == "plan_level_review" or source == "plan_watcher":
+        return "plan_level"
+    if path in ("scheduled_review", "earnings_review"):
+        return "held_review"
+    if path in ("event", "daily_scan", "chat"):
+        return path
+    return str(path) if path else "unknown"
+
+
+def _recheck_contradiction_record(ticker: str, result: dict, now=None) -> dict | None:
+    """Record only (config RECHECK_CONTRADICTION_SHADOW_ENABLED): the most
+    recent non-buy verdict (_NON_BUY_VERDICTS) on ticker in this env within
+    RECHECK_CONTRADICTION_WINDOW_HOURS before an OPEN/ADD, from one
+    db.get_recent_verdicts read: prior {signal_id, kind, model_action (the
+    model's own action before any coercion, e.g. an OPEN the analyst demoted to
+    WATCH), source (_verdict_source_class), trigger_path, trigger_source,
+    age_hours, conviction, is_recheck, at}, or None with none in the window
+    (verdicts up to _RECHECK_CLOCK_SKEW_HOURS after now count, at age 0 or a
+    small negative age, for clock skew between writers);
+    n_non_buy_in_window; the current verdict's trigger path and new_fact (the
+    screener's flag on an event verdict, else None); would_block, True when
+    prior's source is in _RECHECK_BLOCK_SOURCES and the current new_fact is
+    not True. A failed read: read "error: ...", prior and would_block None.
+    None for anything but OPEN/ADD or with the record off. Nothing reads it to
+    decide. Never raises."""
+    try:
+        if result.get("action") not in ("OPEN", "ADD"):
+            return None
+        import config
+        if not getattr(config, "RECHECK_CONTRADICTION_SHADOW_ENABLED", False):
+            return None
+        window = float(config.RECHECK_CONTRADICTION_WINDOW_HOURS)
+    except Exception:
+        return None
+    rec = {"window_hours": window, "read": None, "prior": None, "n_non_buy_in_window": None,
+           "current_trigger_path": None, "current_new_fact": None, "would_block": None}
+    try:
+        import math
+        from datetime import datetime, timezone
+        prov = result.get("provenance")
+        trig = (prov.get("trigger") if isinstance(prov, dict) else None) or {}
+        trig = trig if isinstance(trig, dict) else {}
+        rec["current_trigger_path"] = trig.get("path")
+        nf = trig.get("new_fact") if trig.get("path") == "event" else None
+        rec["current_new_fact"] = nf if isinstance(nf, bool) else None
+        import db
+        rows = db.get_recent_verdicts(ticker, hours=max(1, math.ceil(window)), limit=50,
+                                      strict=True, with_trigger=True)
+        now = now or datetime.now(timezone.utc)
+        found = []
+        for r in rows or []:
+            if r.get("signal") not in _NON_BUY_VERDICTS:
+                continue
+            ts = r.get("timestamp")
+            if not isinstance(ts, datetime):
+                continue
+            ts = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+            age = (now - ts).total_seconds() / 3600
+            if -_RECHECK_CLOCK_SKEW_HOURS <= age <= window:
+                found.append((age, ts, r))
+        rec.update(read="ok", n_non_buy_in_window=len(found), would_block=False)
+        if found:
+            age, ts, r = min(found, key=lambda f: f[0])
+            src = _verdict_source_class(r.get("trigger_path"), r.get("trigger_source"))
+            rec["prior"] = {"signal_id": r.get("signal_id"), "kind": r.get("signal"),
+                            "model_action": r.get("model_action"), "source": src,
+                            "trigger_path": r.get("trigger_path"), "trigger_source": r.get("trigger_source"),
+                            "age_hours": round(age, 2), "conviction": r.get("conviction"),
+                            "is_recheck": src == "stale_entry_recheck", "at": ts.isoformat()}
+            rec["would_block"] = src in _RECHECK_BLOCK_SOURCES and rec["current_new_fact"] is not True
+    except Exception as e:
+        rec.update(read=f"error: {type(e).__name__}", prior=None, n_non_buy_in_window=None,
+                   would_block=None)
+    return rec
+
+
+def _same_day_consensus_record(ticker: str, result: dict, now=None) -> dict | None:
+    """Record only (config SAME_DAY_CONSENSUS_RECORD_ENABLED): the ticker's
+    earlier analyst verdicts in this env before this OPEN/ADD, from one
+    bounded db.get_same_day_verdicts read of the last 24 h (the current
+    verdict, by provenance.signal_id, excluded; scripts/fire_test.py verdicts
+    are counted, as their analyst rows carry no marker), summed over two
+    windows that both end at this route:
+    since ET midnight: n_earlier; n_buy_grade, the verdicts whose stored
+    final_pass_to_risk is True on an OPEN/ADD (the analyst's own pass after
+    every gate, as decided when each was written; not recomputed here),
+    buy_grade_share (n_buy_grade / n_earlier, None with none) and
+    n_buy_grade_unknown (rows without the stored flag, counted as not
+    buy-grade); n_model_buy, the model's own OPEN/ADD with its own
+    pass_to_risk; median_conviction (n_conviction verdicts with a stored
+    confidence) and median_udr (n_udr verdicts with a finite UDR);
+    n_story_keys and n_distinct_stories (story_dedup story_key, None when no
+    row has one); window {start (ET midnight), basis}; limit_hit (the ET-day
+    rows read, the current verdict included, reached
+    SAME_DAY_CONSENSUS_LIMIT: an ET-day read of its own would have been cut);
+    the last 24 h: n_earlier_24h, n_buy_grade_24h, buy_grade_share_24h (same
+    definitions), window_24h {hours, basis} (it starts 24 h before the routing
+    row's own time; a stored start would be a wall-clock value) and
+    limit_hit_24h (the read itself reached the limit, so its oldest 24 h rows
+    may be cut).
+    The read starts at the earlier of the two starts (ET midnight on a 25 h
+    fall-back day) and returns newest first, so the ET-day rows are its
+    newest. No wall-clock value is stored: the record depends only on the
+    verdicts read. read "ok", "skipped_budget" (the read hit
+    SAME_DAY_CONSENSUS_READ_TIMEOUT_MS) or "error: <class>".
+    None for anything but OPEN/ADD or with the record off. Nothing reads it
+    to decide. Never raises."""
+    try:
+        if result.get("action") not in ("OPEN", "ADD"):
+            return None
+        import config
+        if not getattr(config, "SAME_DAY_CONSENSUS_RECORD_ENABLED", False):
+            return None
+        timeout_ms = int(config.SAME_DAY_CONSENSUS_READ_TIMEOUT_MS)
+        limit = int(config.SAME_DAY_CONSENSUS_LIMIT)
+    except Exception:
+        return None
+    from datetime import datetime, time as dtime, timedelta, timezone
+    from zoneinfo import ZoneInfo
+    rec = {"window": None, "read": None, "limit_hit": None,
+           "current_signal_id": None, "n_earlier": None, "n_buy_grade": None,
+           "buy_grade_share": None, "n_buy_grade_unknown": None, "n_model_buy": None,
+           "median_conviction": None, "n_conviction": None, "median_udr": None,
+           "n_udr": None, "n_story_keys": None, "n_distinct_stories": None,
+           "window_24h": None, "limit_hit_24h": None, "n_earlier_24h": None,
+           "n_buy_grade_24h": None, "buy_grade_share_24h": None,
+           "buy_grade_definition": "stored final_pass_to_risk on an OPEN/ADD verdict"}
+    try:
+        now = now or datetime.now(timezone.utc)
+        et = ZoneInfo("America/New_York")
+        start = datetime.combine(now.astimezone(et).date(), dtime(0), et)
+        start_24h = now - timedelta(hours=24)
+        rec["window"] = {"start": start.isoformat(), "basis": "same ET day, before this route"}
+        rec["window_24h"] = {"hours": 24, "basis": "the 24 h before this route"}
+        prov = result.get("provenance")
+        sid = prov.get("signal_id") if isinstance(prov, dict) else None
+        sid = sid if isinstance(sid, int) and not isinstance(sid, bool) else None
+        rec["current_signal_id"] = sid
+        import db
+        try:
+            rows = db.get_same_day_verdicts(ticker, min(start, start_24h), now, limit=limit,
+                                            timeout_ms=timeout_ms)
+        except Exception as e:
+            canceled = type(e).__name__ == "QueryCanceled" or "statement timeout" in str(e)
+            rec["read"] = "skipped_budget" if canceled else f"error: {type(e).__name__}"
+            return rec
+
+        def since(r, t0):
+            ts = r.get("timestamp")
+            if not isinstance(ts, datetime):
+                return False                    # undated: in neither window
+            return (ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)) >= t0
+        dicts = [r for r in rows or [] if isinstance(r, dict)]
+        raw_day = [r for r in dicts if since(r, start)]
+        raw_24h = [r for r in dicts if since(r, start_24h)]
+        day = [r for r in raw_day if sid is None or r.get("signal_id") != sid]
+        last_24h = [r for r in raw_24h if sid is None or r.get("signal_id") != sid]
+        import math
+        import statistics
+
+        def n_buy(rs):
+            return sum(1 for r in rs if r.get("signal") in ("OPEN", "ADD")
+                       and r.get("final_pass_to_risk") is True)
+        buy, buy_24h = n_buy(day), n_buy(last_24h)
+        convs = [r["conviction"] for r in day if isinstance(r.get("conviction"), (int, float))
+                 and not isinstance(r.get("conviction"), bool)]
+        udrs = [r["udr"] for r in day if isinstance(r.get("udr"), (int, float))
+                and not isinstance(r.get("udr"), bool) and math.isfinite(r["udr"])]
+        keys = [r["story_key"] for r in day if r.get("story_key")]
+        rec.update(
+            read="ok", n_earlier=len(day), n_buy_grade=buy,
+            buy_grade_share=round(buy / len(day), 4) if day else None,
+            n_buy_grade_unknown=sum(1 for r in day if r.get("final_pass_to_risk") is None),
+            n_model_buy=sum(1 for r in day if r.get("model_action") in ("OPEN", "ADD")
+                            and r.get("model_pass_to_risk") is True),
+            median_conviction=statistics.median(convs) if convs else None,
+            n_conviction=len(convs),
+            median_udr=round(statistics.median(udrs), 3) if udrs else None,
+            n_udr=len(udrs), n_story_keys=len(keys),
+            n_distinct_stories=len(set(keys)) if keys else None,
+            limit_hit=len(raw_day) >= limit,
+            n_earlier_24h=len(last_24h), n_buy_grade_24h=buy_24h,
+            buy_grade_share_24h=round(buy_24h / len(last_24h), 4) if last_24h else None,
+            limit_hit_24h=len(raw_24h) >= limit)
+    except Exception as e:
+        rec.update(read=f"error: {type(e).__name__}", n_earlier=None, n_buy_grade=None,
+                   buy_grade_share=None, n_earlier_24h=None, n_buy_grade_24h=None,
+                   buy_grade_share_24h=None)
+    return rec
+
+
+_ADD_LOSER_MODES = ("shadow", "enforce", "off")
+
+
+def _add_loser_mode() -> str:
+    """config.ADD_LOSER_GATE_MODE: "shadow" (record, never block), "enforce"
+    or "off" (no read). Any other value reads as "shadow", with a warning, so
+    a typo can neither block buys nor drop the record."""
+    try:
+        import config
+        mode = getattr(config, "ADD_LOSER_GATE_MODE", "shadow")
+    except Exception:
+        return "shadow"
+    if mode in _ADD_LOSER_MODES:
+        return mode
+    log.warning(f"ADD_LOSER_GATE_MODE={mode!r} is not one of {_ADD_LOSER_MODES}; read as 'shadow'")
+    return "shadow"
+
+
+def _add_loser_reason(rec: dict) -> str:
+    """The reason text for an add-to-loser block or would-block, from its
+    record: where the price sits against the average cost and why the
+    trigger is not a new fact."""
+    pct = rec.get("pct_vs_avg_cost")
+    where = ("at the average cost" if isinstance(pct, (int, float)) and round(pct, 1) == 0
+             else f"{pct}% vs the average cost")
+    src = rec.get("trigger_new_fact_source")
+    if src == "none_on_path":
+        why = f"no news item behind the verdict (a {rec.get('trigger_path') or 'untriggered'} verdict)"
+    elif src == "no_news_item":
+        why = ("a price-only drop-watch review behind the verdict, which has no news item "
+               "(DIP_REVIEW_COUNTS_AS_NEW_FACT is off)")
+    elif rec.get("trigger_new_fact") is False:
+        why = "the triggering item not a new fact"
+    else:
+        why = "no new fact on the triggering item"
+    return f"ADD {where} with {why} (never add to a loser without a new catalyst)"
+
+
+def _add_loser_check(ticker: str, result: dict, client) -> dict | None:
+    """What the add-to-loser gate (config ADD_LOSER_GATE_MODE) reads for an
+    ADD: the broker's average cost for the position (client.get_all_positions),
+    the current price (_get_price, else the position's own current price), the
+    price's percent vs that cost, and the triggering item's new_fact, with
+    trigger_new_fact_source saying where it came from:
+      "event_provenance"   the screener's judged flag on an event verdict;
+      "unjudged"           nothing judged it: a keyword-fallback screen
+                           (screener_fallback_reason set), a missing flag, or a
+                           stale-entry recheck (source stale_entry_recheck);
+                           read like a failed read, so it never blocks;
+      "none_on_path"       not an event verdict (a held review, the daily scan):
+                           no news item, None;
+      "no_news_item"       a drop-watch review (source "dip_watch"), price-only,
+                           with DIP_REVIEW_COUNTS_AS_NEW_FACT off: None;
+      "dip_review_counts_as_new_fact"   the same with that switch on: True, as
+                           new_fact_gate treats it.
+    would_block is True only when both reads worked, the price is more than
+    ADD_LOSER_GATE_MIN_PCT percent below the cost, the flag was judged (or
+    there is no news item) and it is not True. blocked = would_block in mode
+    "enforce", else False. Also recorded: mode, screener_fallback_reason, and
+    earnings_phase on an earnings_review (pre / day / post; not exempted). A
+    failed read, a name not held or no price: would_block False, with the read
+    field saying why. None for anything but an ADD, or in mode "off".
+    Percent vs cost only: no prices or quantities. Never raises."""
+    import math
+    try:
+        if result.get("action") != "ADD":
+            return None
+        mode = _add_loser_mode()
+        if mode == "off":
+            return None
+        import config
+        min_pct = float(getattr(config, "ADD_LOSER_GATE_MIN_PCT", 0.0))
+    except Exception:
+        return None
+    rec = {"mode": mode, "min_pct": min_pct, "avg_cost_read": None, "price_read": None,
+           "pct_vs_avg_cost": None, "trigger_path": None, "trigger_source": None,
+           "trigger_new_fact": None, "trigger_new_fact_source": None,
+           "screener_fallback_reason": None, "earnings_phase": None,
+           "would_block": False, "blocked": False}
+    try:
+        prov = result.get("provenance")
+        trig = (prov.get("trigger") if isinstance(prov, dict) else None) or {}
+        trig = trig if isinstance(trig, dict) else {}
+        path, source = trig.get("path"), trig.get("source")
+        rec["trigger_path"], rec["trigger_source"] = path, source
+        rec["screener_fallback_reason"] = trig.get("screener_fallback_reason")
+        if path == "earnings_review":
+            rec["earnings_phase"] = trig.get("earnings_phase")
+        item = trig.get("new_fact")
+        if path != "event":
+            rec["trigger_new_fact"], rec["trigger_new_fact_source"] = None, "none_on_path"
+        elif source == "dip_watch":
+            # A drop-watch review (path "event", source "dip_watch") has no
+            # news item; Luke's buy-gate switch lets the drop count as the
+            # new fact, as in new_fact_gate, so this gate follows it.
+            if getattr(config, "DIP_REVIEW_COUNTS_AS_NEW_FACT", False):
+                rec["trigger_new_fact"], rec["trigger_new_fact_source"] = True, "dip_review_counts_as_new_fact"
+            else:
+                rec["trigger_new_fact"], rec["trigger_new_fact_source"] = None, "no_news_item"
+        elif source == "stale_entry_recheck" or rec["screener_fallback_reason"] or not isinstance(item, bool):
+            rec["trigger_new_fact"] = item if isinstance(item, bool) else None
+            rec["trigger_new_fact_source"] = "unjudged"
+        else:
+            rec["trigger_new_fact"], rec["trigger_new_fact_source"] = item, "event_provenance"
+        if client is None:
+            rec["avg_cost_read"] = "no_client"
+            return rec
+        try:
+            pos = next((p for p in client.get_all_positions() if p.symbol == ticker), None)
+        except Exception as e:
+            rec["avg_cost_read"] = f"error: {type(e).__name__}"
+            return rec
+        try:
+            avg = float(pos.avg_entry_price) if pos is not None and pos.avg_entry_price else None
+        except (TypeError, ValueError):
+            avg = None
+        if not avg or avg <= 0 or not math.isfinite(avg):
+            rec["avg_cost_read"] = "not_held" if pos is None else "no_avg_cost"
+            return rec
+        rec["avg_cost_read"] = "ok"
+        price, price_source = None, None
+        try:
+            price, price_source = float(_get_price(ticker, client) or 0) or None, "quote"
+        except Exception:
+            price = None
+        if not price:
+            try:
+                price, price_source = float(pos.current_price or 0) or None, "position"
+            except (TypeError, ValueError, AttributeError):
+                price = None
+        if not price or price <= 0 or not math.isfinite(price):
+            rec["price_read"] = "none"
+            return rec
+        rec["price_read"] = price_source
+        pct = (price - avg) / avg * 100
+        rec["pct_vs_avg_cost"] = round(pct, 2)
+        rec["would_block"] = bool(pct < -min_pct and rec["trigger_new_fact_source"] != "unjudged"
+                                  and rec["trigger_new_fact"] is not True)
+        rec["blocked"] = rec["would_block"] and mode == "enforce"
+        return rec
+    except Exception as e:
+        log.warning(f"[{ticker}] add-to-loser check failed ({type(e).__name__}: {e}); not applied")
+        rec.update(avg_cost_read=rec.get("avg_cost_read") or f"error: {type(e).__name__}",
+                   would_block=False, blocked=False)
+        return rec
+
+
+def _entry_gate(ticker: str, result: dict, stop_rec: dict | None, trend: dict | None,
+                path: str | None = None, extra: dict | None = None,
+                add_loser: dict | None = None,
+                row_extra: dict | None = None) -> bool:
     """Live entry gates (config STOPOUT_REENTRY_GATE_DAYS,
     ENTRY_TREND_GATE_ENABLED) for an OPEN/ADD that has passed the rebuy
     cooldown, on what the two shadows just read (stop_rec from
@@ -2577,12 +3464,33 @@ def _entry_gate(ticker: str, result: dict, stop_rec: dict | None, trend: dict | 
     days old, or (b) the last completed close is below both its 50- and
     200-day simple averages on bars at most ENTRY_TREND_GATE_MAX_BAR_AGE_DAYS
     old while ENTRY_TREND_GATE_MARKET_TICKER's last close is below its own
-    200-day average (read only for a stock that would be blocked; a failed or
-    stale market read does not block). A failed read, missing averages or
-    stale bars do not block (the buy
-    goes on as before). Conviction does not override. On a block writes one
+    200-day average (read only for a stock that would be blocked, split-
+    suspect or not; a failed, stale or split-suspect market read does not
+    block, and a raising one keeps a stop-out block). A failed read, missing
+    averages, stale bars or split-suspect bars (_split_discontinuity) do not
+    block. gate["trend"]["split_fail_open"] is True when the stock's split
+    suspicion withheld a block (it was below both averages and the market
+    was below its 200-day on fresh bars, split-suspect or not),
+    market["split_fail_open"] when only the market's suspicion did;
+    with no other block, either writes one entry_gate_split_fail_open
+    activity row (the buy goes on as before). Conviction does not override. On a block writes one
     ENTRY_GATE_BLOCKED row (decision.entry_gate) and returns True; the caller
-    returns before sizing. Never raises: an internal error returns False."""
+    returns before sizing. Never raises: an internal error returns False.
+
+    path, when given, is recorded as entry_gate.path with extra's keys beside
+    it. path "deferred_retry" (tasks._deferred_entry_gate) applies the
+    stop-out half only: the trend half is not evaluated or recorded there,
+    since the cached daily bars it reads have not changed between the
+    verdict and the next open.
+
+    add_loser, when given (_add_loser_check, an ADD with ADD_LOSER_GATE_MODE
+    "enforce"; the route passes none in "shadow"), is recorded as
+    entry_gate.add_loser and blocks when its blocked is True: the ADD is more
+    than ADD_LOSER_GATE_MIN_PCT below the average cost and the triggering
+    item, judged, is not a new fact.
+
+    row_extra's keys go into the ENTRY_GATE_BLOCKED row's decision beside
+    entry_gate (the recheck-contradiction record); they never decide."""
     try:
         try:
             from config import STOPOUT_REENTRY_GATE_DAYS as days
@@ -2601,6 +3509,11 @@ def _entry_gate(ticker: str, result: dict, stop_rec: dict | None, trend: dict | 
         except ImportError:
             market_ticker = ""
         blocks, gate = [], {}
+        if path:
+            gate["path"] = path
+            gate.update(extra or {})
+        if path == "deferred_retry":
+            trend_on = False
         if days and days > 0:
             s = stop_rec or {}
             hrs = s.get("hours_since")
@@ -2615,44 +3528,236 @@ def _entry_gate(ticker: str, result: dict, stop_rec: dict | None, trend: dict | 
             t = trend or {}
             age = t.get("bar_age_days")
             fresh = isinstance(age, int) and not isinstance(age, bool) and 0 <= age <= max_age
-            hit = (t.get("read") == "ok" and fresh
-                   and t.get("below_sma50") is True and t.get("below_sma200") is True)
+            would = (t.get("read") == "ok" and fresh
+                     and t.get("below_sma50") is True and t.get("below_sma200") is True)
+            # Bars that look like an unadjusted split (_split_discontinuity)
+            # give averages on mixed price scales: such a read never blocks.
+            suspect = t.get("split_suspect") is True
             market = None
-            if hit and market_ticker:
-                # Read only when the stock itself would be blocked. Its own
-                # try: a failure here must not drop a stop-out block too.
+            market_down = True   # no market ticker: the stock condition alone decides
+            market_raw = True    # the market condition before the market's own split check
+            if would and market_ticker:
+                # Read only when the stock itself would be blocked (also when
+                # its bars are split-suspect, as a record). Its own try: a
+                # failure here must not drop a stop-out block too.
+                market_down = market_raw = False
                 try:
                     m = _entry_trend_check(market_ticker)
                     m_age = m.get("bar_age_days")
                     m_fresh = (isinstance(m_age, int) and not isinstance(m_age, bool)
                                and 0 <= m_age <= max_age)
-                    m_down = m.get("read") == "ok" and m_fresh and m.get("below_sma200") is True
+                    m_would = m.get("read") == "ok" and m_fresh and m.get("below_sma200") is True
+                    m_suspect = m.get("split_suspect") is True
+                    market_raw = m_would
+                    market_down = m_would and not m_suspect
                     market = {"ticker": market_ticker, "read": m.get("read"), "bar_age_days": m_age,
                               "below_sma200": m.get("below_sma200"),
-                              "pct_vs_sma200": m.get("pct_vs_sma200"), "downtrend": m_down}
+                              "pct_vs_sma200": m.get("pct_vs_sma200"), "downtrend": market_down,
+                              "split_suspect": m.get("split_suspect"),
+                              "split_suspect_date": m.get("split_suspect_date"),
+                              "split_suspect_ratio": m.get("split_suspect_ratio"),
+                              # the block withheld only by the market's own split suspicion
+                              "split_fail_open": bool(not suspect and m_would and m_suspect)}
                 except Exception as e:
+                    market_down = market_raw = False
                     market = {"ticker": market_ticker, "read": f"error: {type(e).__name__}",
                               "bar_age_days": None, "below_sma200": None, "pct_vs_sma200": None,
-                              "downtrend": False}
-                hit = market["downtrend"]
+                              "downtrend": False, "split_suspect": None, "split_suspect_date": None,
+                              "split_suspect_ratio": None, "split_fail_open": False}
+            # The block the stock's split suspicion withheld: everything else
+            # held, on the market's raw condition (a split-suspect SPY below
+            # its 200-day still counts, so that case leaves a record).
+            split_fail_open = bool(would and suspect and market_raw)
+            hit = bool(would and not suspect and market_down)
             gate["trend"] = {"read": t.get("read"), "bar_age_days": age, "max_bar_age_days": max_age,
                              "below_sma50": t.get("below_sma50"), "below_sma200": t.get("below_sma200"),
                              "pct_vs_sma50": t.get("pct_vs_sma50"),
-                             "pct_vs_sma200": t.get("pct_vs_sma200"), "market": market, "blocked": hit}
+                             "pct_vs_sma200": t.get("pct_vs_sma200"), "market": market,
+                             "split_suspect": t.get("split_suspect"),
+                             "split_suspect_date": t.get("split_suspect_date"),
+                             "split_suspect_ratio": t.get("split_suspect_ratio"),
+                             "split_suspect_rule": t.get("split_suspect_rule"),
+                             "split_suspect_factor": t.get("split_suspect_factor"),
+                             "split_fail_open": split_fail_open, "blocked": hit}
             if hit:
                 blocks.append(f"close {t.get('pct_vs_sma50')}% vs the 50-day and "
                               f"{t.get('pct_vs_sma200')}% vs the 200-day average"
                               + (f", with {market_ticker} {market['pct_vs_sma200']}% vs its 200-day"
                                  if market else ""))
+        if add_loser is not None:
+            gate["add_loser"] = add_loser
+            if add_loser.get("blocked") is True:
+                blocks.append(_add_loser_reason(add_loser))
         if not blocks:
+            tr = gate.get("trend") or {}
+            if tr.get("split_fail_open") or (tr.get("market") or {}).get("split_fail_open"):
+                # No gate row is written when nothing blocks, so the trend
+                # gate's split fail-open leaves an activity row instead.
+                try:
+                    import db
+                    db.log_activity_queued(
+                        "entry_gate_split_fail_open", ticker,
+                        f"{result.get('action')}: trend gate not applied, split-suspect bars "
+                        f"({tr.get('split_suspect_date') or (tr.get('market') or {}).get('split_suspect_date')})",
+                        extra={"entry_gate": gate, "action": result.get("action")})
+                except Exception as e:
+                    log.warning(f"[{ticker}] split fail-open record not written: {type(e).__name__}: {e}")
             return False
         reason = f"{result.get('action')} skipped by the entry gate: " + "; ".join(blocks)
         log.info(f"[{ticker}] {reason}")
-        _log_route_exit(ticker, "ENTRY_GATE_BLOCKED", result, reason, {"entry_gate": gate})
+        _log_route_exit(ticker, "ENTRY_GATE_BLOCKED", result, reason,
+                        {"entry_gate": gate, **(row_extra or {})})
         return True
     except Exception as e:
         log.warning(f"[{ticker}] entry gate failed ({type(e).__name__}: {e}); not applied")
         return False
+
+
+_BOOK_HEAT_SNAPSHOT_MAX_AGE_MIN = 15   # the same freshness the held checks use (tasks._broker_held)
+
+
+def _book_heat_inputs():
+    """The latest portfolio snapshot of this env (positions_json, total value,
+    age in minutes) and the position_stops (ticker, stop_price) rows: two
+    SELECTs in one read transaction under a 3 s statement timeout, so a lock
+    or a stuck connection can't hold up the buy route for long. No broker
+    call. Returns None when there is no snapshot; raises on a failed read
+    (_book_heat_record catches it)."""
+    import db
+    from datetime import datetime, timezone
+    from config import TRADING_ENV
+    conn = db._get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = 3000")
+            cur.execute("SELECT positions_json, total_value, timestamp FROM portfolio_snapshots "
+                        "WHERE trading_env=%s ORDER BY timestamp DESC LIMIT 1", (TRADING_ENV,))
+            row = cur.fetchone()
+            stops = []
+            if row and row[2] is not None:
+                cur.execute("SELECT ticker, stop_price FROM position_stops WHERE trading_env=%s",
+                            (TRADING_ENV,))
+                stops = [{"ticker": r[0], "stop_price": r[1]} for r in cur.fetchall()]
+    finally:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        db._put_conn(conn)
+    if not row or row[2] is None:
+        return None
+    ts = row[2] if row[2].tzinfo else row[2].replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - ts).total_seconds() / 60
+    return {"positions": row[0] or {}, "pv": row[1], "age_min": age, "stops": stops}
+
+
+def _book_heat_record(ticker: str, sizing: dict) -> dict:
+    """Record-only (config BOOK_HEAT_SHADOW_ENABLED): the book's open risk at
+    this buy, as fractions of the portfolio. For each held position, qty x
+    (snapshot price - its position_stops stop) / portfolio value: what the book
+    loses if every recorded stop fills at its price (0 for a stop at or above
+    the price; None and counted in n_no_stop without a stop record). The
+    order's own risk is shares_initial x (price_at_sizing - stop_loss_price)
+    / portfolio value, at the final share count. The order's 1-sigma
+    20-session loss comes from the vol record when it has one; held names have
+    no vol in hand, so they get none. The broker's resting stops are not read
+    (position_stops is the bot's record of them). No pv, dollars or quantities
+    are recorded. Never raises."""
+    import math
+    rec = {"source": "portfolio_snapshot+position_stops", "read": None, "snapshot_age_min": None,
+           "n_positions": None, "n_with_stop": None, "n_no_stop": None,
+           "n_stop_at_or_above_price": None, "sum_open_risk_pct": None,
+           "max_single_risk_pct": None, "max_single_ticker": None, "unprotected_value_pct": None,
+           "positions": None, "order_risk_pct": None, "sum_open_risk_after_pct": None,
+           "order_risk_sigma20": None, "order_sigma20_loss_pct": None,
+           "held_sigma20": None, "held_sigma20_reason": "no per-name vol in hand for held positions",
+           "weights_at": "final_order", "reason": None}
+
+    def frac(x, nd=4):
+        try:
+            x = float(x)
+        except (TypeError, ValueError):
+            return None
+        return round(x, nd) if math.isfinite(x) else None
+    try:
+        try:
+            inp = _book_heat_inputs()
+        except Exception as e:
+            rec["read"] = f"error: {type(e).__name__}"
+            rec["reason"] = "snapshot or stop records unreadable"
+            return rec
+        if inp is None:
+            rec["read"], rec["reason"] = "no_snapshot", "no portfolio snapshot for this env"
+            return rec
+        rec["snapshot_age_min"] = frac(inp.get("age_min"), 1)
+        if rec["snapshot_age_min"] is None or rec["snapshot_age_min"] > _BOOK_HEAT_SNAPSHOT_MAX_AGE_MIN:
+            rec["read"] = "stale_snapshot"
+            rec["reason"] = f"newest snapshot older than {_BOOK_HEAT_SNAPSHOT_MAX_AGE_MIN} min"
+            return rec
+        pv = frac(inp.get("pv"), 6)
+        if not pv or pv <= 0:
+            rec["read"], rec["reason"] = "no_portfolio_value", "snapshot has no portfolio value"
+            return rec
+        stops = {}
+        for s in inp.get("stops") or []:
+            t = str(s.get("ticker") or "").upper()
+            sp = frac(s.get("stop_price"), 6)
+            if t and sp is not None and sp > 0:
+                stops[t] = sp
+        positions = inp.get("positions") if isinstance(inp.get("positions"), dict) else {}
+        rows, total, n_stop, n_none, n_above, unprot = [], 0.0, 0, 0, 0, 0.0
+        n_short = n_unpriced = 0
+        for t, p in sorted(positions.items()):
+            if not isinstance(p, dict):
+                continue
+            qty, mv = frac(p.get("qty"), 6), frac(p.get("market_value"), 6)
+            if qty is not None and qty < 0:
+                n_short += 1                  # long-only bot: a short means an oversell; counted
+                continue
+            if not qty:
+                continue                      # flat
+            if mv is None or mv <= 0:
+                n_unpriced += 1               # held but no usable price: not in the sums, counted
+                continue
+            px = mv / qty
+            stop = stops.get(str(t).upper())
+            if stop is None:
+                n_none += 1
+                unprot += mv / pv
+                rows.append({"ticker": t, "risk_pct": None, "stop": "none"})
+                continue
+            n_stop += 1
+            if stop >= px:
+                n_above += 1
+            risk = max(px - stop, 0.0) * qty / pv
+            total += risk
+            rows.append({"ticker": t, "risk_pct": frac(risk), "stop": "position_stops"})
+        rec.update({"read": "ok", "n_positions": len(rows), "n_with_stop": n_stop, "n_no_stop": n_none,
+                    "n_short": n_short, "n_unpriced": n_unpriced,
+                    "n_stop_at_or_above_price": n_above, "sum_open_risk_pct": frac(total),
+                    "unprotected_value_pct": frac(unprot), "positions": rows})
+        risks = [r for r in rows if r["risk_pct"] is not None]
+        if risks:
+            top = max(risks, key=lambda r: r["risk_pct"])
+            rec["max_single_risk_pct"], rec["max_single_ticker"] = top["risk_pct"], top["ticker"]
+        n = sizing.get("shares_initial")
+        price, stop = frac(sizing.get("price_at_sizing"), 6), frac(sizing.get("stop_loss_price"), 6)
+        if isinstance(n, int) and not isinstance(n, bool) and n >= 0 and price and stop is not None:
+            order_risk = n * max(price - stop, 0.0) / pv
+            rec["order_risk_pct"] = frac(order_risk)
+            rec["sum_open_risk_after_pct"] = frac(total + order_risk)
+        else:
+            rec["reason"] = "order risk unknown (no shares, price or stop)"
+        sv = sizing.get("stop_vol") if isinstance(sizing.get("stop_vol"), dict) else {}
+        vt = sizing.get("vol_target_shadow") if isinstance(sizing.get("vol_target_shadow"), dict) else {}
+        rec["order_risk_sigma20"] = sv.get("stop_sigma20")
+        sigma20, ow = sv.get("sigma20_pct"), vt.get("order_weight")
+        if isinstance(sigma20, (int, float)) and isinstance(ow, (int, float)):
+            rec["order_sigma20_loss_pct"] = frac(ow * sigma20)
+    except Exception as e:
+        rec["read"] = f"error: {type(e).__name__}"
+        rec["reason"] = str(e)[:200]
+    return rec
 
 
 def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
@@ -2692,6 +3797,10 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
                             f"pending-approval check unreadable: {type(e).__name__}")
             return
 
+    # Record only: the latest non-buy verdict on the name before this buy,
+    # set past the rebuy cooldown; rx carries it onto the rows below.
+    recheck, consensus, rx = None, None, {}
+    add_loser = None   # the add-to-loser record (_add_loser_check), set at the entry gates
     if action == "ADD":
         _rule_shadow_average_down(ticker, bucket, trading_client)
 
@@ -2720,9 +3829,18 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
             except Exception as e:
                 log.warning(f"[{ticker}] COOLDOWN_SKIPPED signal log failed: {e}")
             return
+        recheck = _recheck_contradiction_record(ticker, result)
+        rx = {"recheck_contradiction": recheck} if recheck is not None else {}
+        consensus = _same_day_consensus_record(ticker, result)   # record only
+        if consensus is not None:
+            rx["same_day_consensus"] = consensus
         stop_rec = _stopout_reentry_shadow(ticker, result)
         trend = _entry_quality_shadow(ticker, result)
-        if _entry_gate(ticker, result, stop_rec, trend):
+        add_loser = _add_loser_check(ticker, result, trading_client) if action == "ADD" else None
+        # "enforce": a gate half; "shadow": recorded on the approval only.
+        if _entry_gate(ticker, result, stop_rec, trend,
+                       add_loser=add_loser if (add_loser or {}).get("mode") == "enforce" else None,
+                       row_extra=rx):
             return
 
     if action in ("TRIM", "EXIT"):
@@ -2836,7 +3954,7 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
                     _feed_emit("risk", ticker, f"Blocked by catalyst gate — {reason}", "alert")
                 try:
                     db.log_signal(ticker, "CATALYST_BLOCKED", 0.0, reason,
-                                  **_route_row_fields(result, "CATALYST_BLOCKED"))
+                                  **_route_row_fields(result, "CATALYST_BLOCKED", rx))
                 except Exception as e:
                     log.warning(f"[{ticker}] CATALYST_BLOCKED signal log failed: {e}")
                 try:
@@ -2854,7 +3972,7 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
             log.error(f"[{ticker}] Catalyst gate skipped after an error: {e}")
             try:
                 db.log_signal(ticker, "CATALYST_GATE_ERROR", 0.0, str(e)[:500],
-                              **_route_row_fields(result, "CATALYST_GATE_ERROR"))
+                              **_route_row_fields(result, "CATALYST_GATE_ERROR", rx))
             except Exception as log_error:
                 log.warning(f"[{ticker}] CATALYST_GATE_ERROR signal log failed: {log_error}")
 
@@ -2880,7 +3998,7 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
                 _feed_emit("risk", ticker, f"Blocked — {reason}", "info")
             try:
                 db.log_signal(ticker, "EARNINGS_BLOCKED", conviction / 10.0, reason,
-                              **_route_row_fields(result, "EARNINGS_BLOCKED"))
+                              **_route_row_fields(result, "EARNINGS_BLOCKED", rx))
             except Exception as e:
                 log.warning(f"[{ticker}] EARNINGS_BLOCKED signal log failed: {e}")
             return
@@ -2894,7 +4012,7 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
             if _feed_emit:
                 _feed_emit("risk", ticker, f"Blocked — {new_fact['reason']}", "info")
             _log_route_exit(ticker, "ROUTE_NO_NEW_FACT", result, new_fact["reason"],
-                            decision_extra={"new_fact_gate": new_fact})
+                            decision_extra={"new_fact_gate": new_fact, **rx})
             _c6_bar_no_new_fact(result, regime_str)   # log-only
             _alert_new_fact_fallback_block(            # alert only (M275)
                 ticker, new_fact, prov.get("trigger") if isinstance(prov, dict) else None)
@@ -2904,20 +4022,29 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
             rm = RiskManager(trading_client)
         except Exception as e:
             log.error(f"[{ticker}] RiskManager init failed: {e}")
-            _record_risk_init_failed(ticker, result, e)
+            _record_risk_init_failed(ticker, result, e, rx)
             return
 
         # Get current price
-        price = _get_price(ticker, trading_client)
+        sizing_price_info: dict = {}   # its source and bar time (record only)
+        price = _get_price(ticker, trading_client, info=sizing_price_info)
         if not price:
             log.warning(f"[{ticker}] Could not determine price — skipping approval queue")
-            _log_route_exit(ticker, "ROUTE_NO_PRICE", result, "could not determine price")
+            _log_route_exit(ticker, "ROUTE_NO_PRICE", result, "could not determine price",
+                            decision_extra=rx or None)
             return
 
         # Size the position — stamp the price used so execution can validate freshness
         sizing = rm.size_position(ticker, conviction, bucket, regime_str, price)
         sizing["price_at_sizing"] = price
-        _attach_shadows(sizing, ticker, result, price, trading_client)
+        _attach_shadows(sizing, ticker, result, price, trading_client,
+                        price_info=sizing_price_info)
+        if recheck is not None:
+            sizing["recheck_contradiction"] = recheck
+        if consensus is not None:
+            sizing["same_day_consensus"] = consensus
+        if (add_loser or {}).get("mode") == "shadow":
+            sizing["add_loser_gate"] = add_loser
         swap_sold = None   # the holding a swap sold for this buy, if any
         if sizing.get("shares_initial", 0) <= 0:
             # 2026-08-13: if this is specifically a cash shortage (not a
@@ -3005,7 +4132,14 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
                         _wait_for_swap_cash(rm, cash_before, sell_result, ticker)
                         sizing = rm.size_position(ticker, conviction, bucket, regime_str, price)
                         sizing["price_at_sizing"] = price
-                        _attach_shadows(sizing, ticker, result, price, trading_client)
+                        _attach_shadows(sizing, ticker, result, price, trading_client,
+                                        price_info=sizing_price_info)
+                        if recheck is not None:
+                            sizing["recheck_contradiction"] = recheck
+                        if consensus is not None:
+                            sizing["same_day_consensus"] = consensus
+                        if (add_loser or {}).get("mode") == "shadow":
+                            sizing["add_loser_gate"] = add_loser
                         if sizing.get("shares_initial", 0) <= 0:
                             try:
                                 import alerts as alert_module
@@ -3024,7 +4158,7 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
                 flags = sizing.get("flags", [])
                 log.info(f"[{ticker}] Risk sizing returned 0 shares: {flags}")
                 _log_route_exit(ticker, "ROUTE_ZERO_SHARES", result, "; ".join(flags),
-                                decision_extra=_add_guard_record(ticker, result, sizing))
+                                decision_extra={**(_add_guard_record(ticker, result, sizing) or {}), **rx})
                 _shadow_swap(rm, ticker, conviction, sizing, result)
                 _c6_bar_tier_floor(result, regime_str, price, sizing)   # log-only
                 return
@@ -3122,7 +4256,7 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
                                                     "concentration_inflight_shadow":
                                                         sizing.get("concentration_inflight_shadow"),
                                                     **(_add_guard_record(ticker, result, sizing)
-                                                       or {})})
+                                                       or {}), **rx})
                     return
 
         # Correlation check
@@ -3164,11 +4298,36 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
             sizing["new_fact_gate"] = new_fact
         _attach_gap_risk_shadow(rm, ticker, sizing, price, action)   # log-only, final shares
         sizing["udr_at_sizing"] = _udr_at_sizing(result, price)      # log-only
+        try:
+            from config import RR_VS_STOP_SHADOW_ENABLED
+        except ImportError:
+            RR_VS_STOP_SHADOW_ENABLED = False
+        if RR_VS_STOP_SHADOW_ENABLED:
+            sizing["rr_vs_stop"] = _rr_vs_stop(result, sizing, price)   # record only
         sizing["tighten_sizing_shadow"] = _tighten_sizing_shadow(ticker)   # log-only
         sizing["regime_score"] = regime.get("score")                     # log-only, beside the label
         if result.get("action") == "ADD":
             sizing["add_context"] = _add_context(ticker, price, sizing, trading_client,
                                                  rm=rm)   # log-only
+        # Log-only: restate size_position's vol shadow at the final share count,
+        # after the concentration, correlation and micro-name cuts above.
+        try:
+            if isinstance(sizing.get("vol_target_shadow"), dict):
+                from risk_manager import _vol_shadow_reweigh
+                sizing["vol_target_shadow"] = _vol_shadow_reweigh(sizing["vol_target_shadow"],
+                                                                  sizing.get("shares_initial"))
+        except Exception as e:
+            log.debug(f"[{ticker}] vol shadow restate failed: {e}")
+        # Log-only: open risk on the book at this buy (config BOOK_HEAT_SHADOW_ENABLED).
+        try:
+            from config import BOOK_HEAT_SHADOW_ENABLED as book_heat_on
+        except ImportError:
+            book_heat_on = False
+        if book_heat_on:
+            try:
+                sizing["book_heat"] = _book_heat_record(ticker, sizing)
+            except Exception as e:
+                log.debug(f"[{ticker}] book heat record failed: {e}")
 
         entry_strategy = (
             f"{sizing['initial_entry_pct']:.0%} initial ({sizing['shares_initial']} shares @ ~${price:.2f}). "
@@ -3328,13 +4487,38 @@ def _get_positions(client, strict: bool = False) -> dict | None:
         return None if strict else {}
 
 
-def _get_price(ticker: str, client) -> float | None:
+def _aware_utc(t):
+    """t as an aware UTC datetime when it is an aware datetime, else None
+    (a naive time has no known zone). Never raises."""
+    import datetime as _dtm
+    try:
+        if isinstance(t, _dtm.datetime) and t.tzinfo is not None:
+            return t.astimezone(_dtm.timezone.utc)
+    except Exception:
+        pass
+    return None
+
+
+def _get_price(ticker: str, client, info: dict | None = None) -> float | None:
+    """The price for a brief, from the first source that answers. info
+    (optional dict, record only): filled with which source answered
+    ("session_quote", "polygon_snapshot", "latest_quote", "yfinance_info",
+    or None when none did), as_of (that source's own bar time when it has
+    one, else None), as_of_utc (that time as an aware UTC datetime where the
+    source gave its zone, else None) and is_stale (the latest quote's flag;
+    None for the others). Only values the sources already return; the price
+    is unchanged."""
+    def note(source, as_of=None, is_stale=None, as_of_utc=None):
+        if info is not None:
+            info.update(source=source, as_of=as_of, is_stale=is_stale, as_of_utc=as_of_utc)
+    note(None)
     # Outside regular hours, the last extended-hours trade (Luke D6, 10-29);
     # the regular-hours quote below is the prior close all night.
     try:
         from market_data import get_session_quote
         sq = get_session_quote(ticker)
         if sq and sq.get("price"):
+            note("session_quote", sq.get("bar_time"), as_of_utc=_aware_utc(sq.get("bar_time")))
             return float(sq["price"])
     except Exception:
         pass
@@ -3342,14 +4526,17 @@ def _get_price(ticker: str, client) -> float | None:
         from ingestion.polygon_stream import get_snapshot
         snap = get_snapshot(ticker)
         if snap.get("price"):
+            note("polygon_snapshot")
             return float(snap["price"])
     except Exception:
         pass
     try:
         from market_data import get_latest_quotes
         quotes = get_latest_quotes([ticker])
-        mid = quotes.get(ticker, {}).get("mid")
+        q = quotes.get(ticker, {})
+        mid = q.get("mid")
         if mid:
+            note("latest_quote", q.get("bar_time"), q.get("is_stale"), q.get("bar_time_utc"))
             return float(mid)
     except Exception:
         pass
@@ -3381,6 +4568,7 @@ def _get_price(ticker: str, client) -> float | None:
         if price:
             p = float(price)
             if 0.01 <= p <= 50000.0:
+                note("yfinance_info")
                 return p
             log.warning(f"[{ticker}] yfinance returned implausible price ${p:.2f} — discarding")
     except Exception:

@@ -111,14 +111,17 @@ def next_market_open(now_utc: datetime | None = None) -> datetime:
 
 def get_priced_quote(ticker: str) -> dict | None:
     """
-    Returns {price, bar_time, age_minutes, is_stale, market_open,
-    price_source} or None.
+    Returns {price, bar_time, bar_time_utc, age_minutes, is_stale,
+    market_open, price_source} or None.
     price comes from the last 1-min bar (RTH); is_stale is True whenever the
     bar is older than STALE_AFTER_MINUTES — i.e. always true outside RTH.
     price_source says which bars the price came from: "1min", or
     "daily_fallback" when there were no 1-min bars and the last 2-day daily
     bar was used (its date-only time is aged from midnight UTC, so it is
     always stale during RTH). Record only: nothing decides on it.
+    bar_time is naive (the bar's wall-clock label in TWS's time zone);
+    bar_time_utc is the same label as an aware UTC datetime when the bar
+    carried its UTC offset, else None. Record only.
     """
     try:
         price_source = "1min"
@@ -132,6 +135,7 @@ def get_priced_quote(ticker: str) -> dict | None:
         price = float(last["close"])
 
         bar_time = None
+        bar_time_utc = None
         age_min: float | None = None
         try:
             raw = str(last["time"])
@@ -142,7 +146,8 @@ def get_priced_quote(ticker: str) -> dict | None:
             try:
                 bar_time = datetime.fromisoformat(raw)
                 if bar_time.tzinfo is not None:
-                    age_min = (datetime.now(timezone.utc) - bar_time.astimezone(timezone.utc)).total_seconds() / 60
+                    bar_time_utc = bar_time.astimezone(timezone.utc)
+                    age_min = (datetime.now(timezone.utc) - bar_time_utc).total_seconds() / 60
                     bar_time = bar_time.replace(tzinfo=None)
             except ValueError:
                 bar_time = None
@@ -170,6 +175,7 @@ def get_priced_quote(ticker: str) -> dict | None:
         return {
             "price":       price,
             "bar_time":    bar_time,
+            "bar_time_utc": bar_time_utc,
             "age_minutes": round(age_min, 1) if age_min is not None else None,
             "is_stale":    is_stale,
             "market_open": market_open,
@@ -344,6 +350,11 @@ def get_latest_quotes(symbols: list[str]) -> dict[str, dict]:
                 "mid":       q["price"],
                 "is_stale":  q["is_stale"],
                 "timestamp": datetime.now(timezone.utc),
+                # The quote's own bar time and source, passed through for
+                # record-only provenance (crew._get_price's info).
+                "bar_time":     q.get("bar_time"),
+                "bar_time_utc": q.get("bar_time_utc"),
+                "price_source": q.get("price_source"),
             }
     return result
 

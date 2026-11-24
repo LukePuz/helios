@@ -85,6 +85,12 @@ def _texts(send):
     return [c[0][0] for c in send.call_args_list]
 
 
+def _unclocked(texts):
+    """The texts without their "Time:" line: the two runs compared below can
+    straddle a minute boundary, and the clock line is not what they test."""
+    return ["\n".join(l for l in t.split("\n") if not l.startswith("Time:")) for t in texts]
+
+
 def _record_alerts(send):
     return [t for t in _texts(send) if "STOP RECORD MISSING" in t]
 
@@ -101,7 +107,7 @@ def test_entry_stop_is_placed_when_the_record_write_raises(err):
     assert "placed at the broker" in alerts[0]
     queued.assert_not_called()
     # Every other alert is the one the healthy run sends.
-    assert [t for t in _texts(send) if t not in alerts] == _texts(h_send)
+    assert _unclocked([t for t in _texts(send) if t not in alerts]) == _unclocked(_texts(h_send))
 
 
 def test_entry_healthy_path_sends_no_record_alert():
@@ -157,7 +163,7 @@ def test_manual_buy_stop_is_placed_when_the_record_write_raises(err):
     alerts = _record_alerts(send)
     assert len(alerts) == 1 and "ZZZ" in alerts[0] and "$95.00" in alerts[0]
     queued.assert_not_called()
-    assert [t for t in _texts(send) if t not in alerts] == _texts(h_send)
+    assert _unclocked([t for t in _texts(send) if t not in alerts]) == _unclocked(_texts(h_send))
 
 
 def test_manual_buy_healthy_path_sends_no_record_alert():
@@ -298,7 +304,7 @@ def test_no_record_after_placement_is_written_with_the_healthy_kwargs():
     assert place.call_args_list == h_place.call_args_list
     place.assert_called_once_with("NVDA", 10, 90.0, market_price=100.0)
     fns["upsert_position_stop"].assert_called_once_with(**h_db["upsert_position_stop"].call_args.kwargs)
-    assert _texts(send) == _texts(h_send)               # quiet: nothing to report
+    assert _unclocked(_texts(send)) == _unclocked(_texts(h_send))              # quiet: nothing to report
     _LAST["cancel"].assert_not_called()
     _LAST["action"].assert_not_called()
 

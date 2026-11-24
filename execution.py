@@ -195,9 +195,13 @@ def _early_order_row(**row):
     def on_submitted(order_id, perm_id):
         state["perm_id"] = perm_id
         state["attempted"] = True
+        written = {}
         try:
             oid = db.log_order(**row, broker_order_id=order_id, perm_id=perm_id,
-                               status="submitted", reconcile_note=db.AWAITING_FILL_NOTE)
+                               status="submitted", reconcile_note=db.AWAITING_FILL_NOTE,
+                               **({"written": written} if "held_before_qty" in row else {}))
+            if written.get("held_before_qty") and (oid or -1) > 0:
+                state["held_stored"] = True   # roadmap 04ah: the count went in with the row
         except Exception as e:
             log.error(f"[{row.get('ticker')}] order row before the fill wait not written: {e}")
             oid = -1
@@ -207,6 +211,48 @@ def _early_order_row(**row):
             log.error(f"[{row.get('ticker')}] order row before the fill wait not written; "
                       f"writing it after the wait instead")
     return on_submitted, state
+
+
+def _held_before_mode_on() -> bool:
+    """config LATE_FILL_HELD_BEFORE_MODE is "shadow" or "enforce" (roadmap 04ah)."""
+    try:
+        import config
+        return getattr(config, "LATE_FILL_HELD_BEFORE_MODE", None) in ("shadow", "enforce")
+    except Exception:
+        return False
+
+
+def _store_held_before(order_row_id, ticker: str, qty: float | None) -> bool:
+    """Store a BUY's held count before its order on its orders row, for
+    reconcile's late-fill booking (config LATE_FILL_HELD_BEFORE_MODE, roadmap
+    04ah). Only in "shadow" or "enforce", for a known count and a written row.
+    Record keeping: nothing at execution reads it. True when stored. Never
+    raises."""
+    try:
+        import config
+        if getattr(config, "LATE_FILL_HELD_BEFORE_MODE", None) not in ("shadow", "enforce"):
+            return False
+        if qty is None or not order_row_id or order_row_id <= 0:
+            return False
+        import db
+        if db.set_order_held_before(order_row_id, qty):
+            return True
+        log.warning(f"[{ticker}] held count before the order not stored on order row "
+                    f"{order_row_id}; a late fill of it is booked as before")
+    except Exception as e:
+        log.warning(f"[{ticker}] held count before the order not stored: {e}")
+    return False
+
+
+def _with_held_before(on_submitted, early: dict, ticker: str, qty: float | None):
+    """on_submitted, then the held count stored on the row it wrote, so the
+    count is on the row before the fill wait (a worker killed during the
+    wait leaves a row reconcile books late). Never raises past on_submitted."""
+    def wrapped(order_id, perm_id):
+        on_submitted(order_id, perm_id)
+        if not early.get("held_stored"):   # not already in with the row's INSERT
+            early["held_stored"] = _store_held_before(early.get("id"), ticker, qty)
+    return wrapped
 
 
 def _recover_early_row(ticker: str, side: str, early: dict, order_result: dict) -> None:
@@ -391,7 +437,8 @@ def _stop_work_done(ticker: str, early: dict) -> None:
                   f"reconcile keeps the stop record written for it")
 
 
-def _log_unconfirmed_order(order_row_id: int | None = None, **row) -> bool:
+def _log_unconfirmed_order(order_row_id: int | None = None, held_before: float | None = None,
+                           **row) -> bool:
     """Write the 'unconfirmed' orders row that reconcile_unconfirmed_orders
     uses to find a late fill. With order_row_id (the row written before the
     fill wait) that row is set 'unconfirmed' instead and nothing is
@@ -406,7 +453,12 @@ def _log_unconfirmed_order(order_row_id: int | None = None, **row) -> bool:
     Ownership: db.log_order spills every failed write itself, so this only
     spills when log_order raised instead of returning -1. This alert is the
     one alert for the event: db's generic hourly "DB WRITE FAILED" for
-    log_order is held off for this call. Returns True if the row was written."""
+    log_order is held off for this call. Returns True if the row was written.
+
+    held_before: a BUY's held count before its order not yet on its row
+    (roadmap 04ah, _store_held_before), stored on the row this writes or
+    updates. A row that goes to the untracked-order store is re-written
+    later without it, and its late fill is booked as before."""
     import time
     import db
     import tasks
@@ -415,6 +467,8 @@ def _log_unconfirmed_order(order_row_id: int | None = None, **row) -> bool:
     if order_row_id:
         try:
             if db.finish_submitted_order(order_row_id, "unconfirmed", perm_id=row.get("perm_id")):
+                if held_before is not None:
+                    _store_held_before(order_row_id, ticker, held_before)
                 return True
         except Exception as e:
             log.error(f"[{ticker}] order row {order_row_id} unconfirmed update raised: {e}")
@@ -426,7 +480,10 @@ def _log_unconfirmed_order(order_row_id: int | None = None, **row) -> bool:
     if isinstance(throttle, dict):
         throttle["log_order"] = time.time()   # this call's alert is ORDER UNTRACKED below
     try:
-        if (db.log_order(**row) or -1) > 0:
+        new_id = db.log_order(**row) or -1
+        if new_id > 0:
+            if held_before is not None:
+                _store_held_before(new_id, ticker, held_before)
             if isinstance(throttle, dict):
                 if prev is None:
                     throttle.pop("log_order", None)
@@ -477,7 +534,8 @@ def _schedule_held_sell_retry(approval: dict, trigger: str) -> None:
         log.error(f"[{approval.get('ticker')}] could not schedule the held-sell retry: {e}")
 
 
-def _stops_still_resting(ticker: str, prices_out: list | None = None) -> float | None:
+def _stops_still_resting(ticker: str, prices_out: list | None = None,
+                         rows_out: list | None = None) -> float | None:
     """Total quantity of SELL stops still working at the broker for ticker,
     or None if it can't be read. A sell must not go out on top of a resting
     stop: after an EXIT that stop would short the account (limitations audit
@@ -486,7 +544,9 @@ def _stops_still_resting(ticker: str, prices_out: list | None = None) -> float |
 
     prices_out (optional list): filled with the stop prices of a successful
     read, so a sell path's pre-cancel check also gives _floor_before_cancel
-    its floor without a second broker read."""
+    its floor without a second broker read. rows_out (optional list): filled
+    with the rows themselves (tasks._resting_sell_stops), for a re-place's
+    floor and above-market guard."""
     import tasks
     for attempt in (1, 2):
         try:
@@ -497,6 +557,8 @@ def _stops_still_resting(ticker: str, prices_out: list | None = None) -> float |
             continue
         if prices_out is not None:
             prices_out[:] = [o.get("stop_price") for o in stops]
+        if rows_out is not None:
+            rows_out[:] = stops
         return total
     return None
 
@@ -601,17 +663,21 @@ def _alert_stop_refused(ticker: str, qty: float, err: Exception) -> None:
         pass
 
 
-def _queue_stop_for_retry(ticker: str, qty: float, stop_price: float, alert: bool = True) -> None:
+def _queue_stop_for_retry(ticker: str, qty: float, stop_price: float, alert: bool = True,
+                          own_stop: float | None = None) -> None:
     """A stop request never reached the orders worker (busy or stuck):
     nothing was sent. Hand it to the reconcile re-protect queue, which
     places the recorded stop for the held shares every cycle until done,
-    instead of blocking this worker on retries (audit 04:53, A0453-3)."""
+    instead of blocking this worker on retries (audit 04:53, A0453-3).
+    own_stop (a BUY's fill-anchored stop for its new shares) rides on the
+    entry as the above-market guard's fallback."""
     import alerts as alert_module
     import tasks
     log.error(f"[{ticker}] Stop request not picked up by the orders worker; queued for the "
               f"reconcile retry ({qty:g} @ ${stop_price:.2f})")
     try:
-        tasks._queue_reprotect(ticker, {"intent": "BUY"}, None)
+        tasks._queue_reprotect(ticker, {"intent": "BUY", **({"own_stop": own_stop}
+                                                             if own_stop is not None else {})}, None)
     except Exception as e:
         log.error(f"[{ticker}] Could not queue the stop retry: {e}")
     if not alert:
@@ -1134,9 +1200,137 @@ def _held_before_order(ticker: str) -> float | None:
         return None
 
 
+def _record_add_stale(ticker: str, prior: dict, new_stop: float, filled_qty: float,
+                      cache_qty: float | None, fresh_qty: float | None,
+                      held_before: float | None, reclassified_open: bool) -> None:
+    """Activity row (stage add_stale_record) when an ADD takes
+    _whole_position_stop's stale-record branch (not an OPEN over a leftover
+    record): the position reads show no more than the fill, so the old stop
+    is not cancelled, the new shares get their own stop at new_stop, and the
+    caller rewrites the record at that level. A lagging read (11-10 NVDA) leaves
+    the old shares' stop resting below or above it. Levels are given as
+    percent from the old record's stop. No broker read; queued write, so the
+    stop placement never waits on it. Record only; never raises."""
+    try:
+        import db
+        opened = prior.get("opened_at")
+        old = float(prior["stop_price"])
+        pct = round((float(new_stop) / old - 1) * 100, 3) if old > 0 else None
+        db.log_activity_queued(
+            "add_stale_record", ticker,
+            f"ADD on the stale-record branch: reads show {cache_qty} after a {filled_qty:g}-share "
+            f"fill; the record is rewritten at the new shares' stop ({pct}% vs the old record), "
+            f"the old stop is not cancelled",
+            "neutral",
+            {"record": "rewritten_at_new_stop", "new_stop_vs_prior_stop_pct": pct,
+             "filled_qty": filled_qty, "cache_qty": cache_qty, "fresh_qty": fresh_qty,
+             "held_before": held_before, "reclassified_open": reclassified_open,
+             "prior_opened_at": opened.isoformat() if hasattr(opened, "isoformat") else opened,
+             "prior_stop_method": prior.get("stop_method")})
+    except Exception as e:
+        log.warning(f"[{ticker}] add_stale_record row not written: {type(e).__name__}: {e}")
+
+
+def _add_stop_qty(ticker: str, read_qty: float, filled_qty: float, cache_qty: float | None,
+                  fresh_qty: float | None, held_before: float | None,
+                  alerts_out: list | None = None) -> float:
+    """The share count for an ADD's whole-position stop (config
+    ADD_STOP_QTY_FROM_BROKER): this process's ib.positions() count
+    (ibkr.cached_stock_qty: no request, no reconnect). read_qty, from the portfolio cache and the
+    fresh reqPositions read that chose the whole-position path, sized it
+    before. Since 7ba0857 the deduplicated fresh read and this count should
+    agree, so this is a safety net against a duplicated fresh read (11-13
+    NVDA: cache 1, fresh 4 from a duplicated row, broker 2; the stop for 4
+    was refused and the position had no stop for about 2 min), not an
+    independent third source, and not the orders worker's own count.
+
+    An unreadable, zero, short (negative) or non-finite count keeps read_qty
+    and alerts. A usable count is used; it alerts, and the row is marked
+    negative, whenever it is below read_qty, not above the fill, or below
+    the shares held before the order plus the fill: never a silent
+    undersize. One activity row (stage add_stop_qty) per call. alerts_out:
+    when a list, the alert texts are appended to it instead of sent (it runs
+    before the ADD's cancel, while the new shares have no stop; the caller
+    sends them after its place). Never raises."""
+    import config
+    if not getattr(config, "ADD_STOP_QTY_FROM_BROKER", False):
+        return read_qty
+    import math
+    import alerts as alert_module
+    import db
+
+    def send(text: str) -> None:
+        if alerts_out is not None:
+            alerts_out.append(text)
+        else:
+            alert_module._send(text)
+    broker, read = None, "ok"
+    try:
+        import ibkr
+        # No request and no get_ib() (its heartbeat or a reconnect would sit
+        # in the window where the new shares have no stop); one event-loop
+        # run applies position messages already received. Not connected
+        # raises and keeps read_qty with the alert below.
+        broker = float(ibkr.cached_stock_qty(ticker))
+    except Exception as e:
+        read = f"error: {type(e).__name__}"
+    expected = (held_before + filled_qty) if held_before is not None and held_before > 1e-6 else None
+    if broker is not None and not math.isfinite(broker):
+        read = "not_finite"
+    elif broker is not None and broker < -1e-6:
+        read = "short"
+    elif broker is not None and broker <= 1e-6:
+        read = "zero"
+    if read != "ok":
+        used, source = read_qty, "position_reads"
+    else:
+        used, source = round(broker, 4), "broker"
+    short_of = []
+    if source == "broker":
+        if used + 1e-6 < read_qty:
+            short_of.append(f"below the position reads ({read_qty:g})")
+        if used <= filled_qty + 1e-6:
+            short_of.append(f"not above this fill ({filled_qty:g})")
+        if expected is not None and used + 1e-6 < expected:
+            short_of.append(f"below the {expected:g} expected after the fill")
+    rec = {"source": source, "broker_read": read, "broker_qty": broker, "cache_qty": cache_qty,
+           "fresh_qty": fresh_qty, "read_qty": read_qty, "used_qty": used,
+           "filled_qty": filled_qty, "held_before": held_before, "expected_qty": expected,
+           "undersize_flags": short_of}
+    try:
+        db.log_activity_queued("add_stop_qty", ticker,
+                               f"ADD whole-position stop sized from the {source.replace('_', ' ')}"
+                               f" ({used:g}; cache {cache_qty}, fresh {fresh_qty}, broker {broker})",
+                               "neutral" if source == "broker" and not short_of else "negative", rec)
+    except Exception as e:
+        log.warning(f"[{ticker}] add_stop_qty row not written: {e}")
+    try:
+        if source != "broker":
+            log.warning(f"[{ticker}] ADD: position count unusable ({read}); stop sized from the "
+                        f"position reads ({read_qty:g})")
+            send(f"⚠️ ADD STOP SIZE UNCONFIRMED — <b>{ticker}</b>\nThe position "
+                 f"count could not be used ({read}), so the whole-position stop is "
+                 f"sized from the position reads ({read_qty:g} shares). Check the "
+                 f"stop covers the position in TWS.")
+        elif short_of:
+            log.warning(f"[{ticker}] ADD: position count {used:g} is " + "; ".join(short_of)
+                        + "; stop sized to it")
+            send(f"⚠️ ADD STOP MAY NOT COVER — <b>{ticker}</b>\nThe position count "
+                 f"is {used:g} shares, " + "; ".join(short_of) + f". The stop is "
+                 f"for {used:g}. Reconcile covers the rest if it shows up; check "
+                 f"TWS.")
+        elif abs(used - read_qty) > 1e-6:
+            log.warning(f"[{ticker}] ADD: position reads gave {read_qty:g} (cache {cache_qty}, "
+                        f"fresh {fresh_qty}); the position count is {used:g}: stop sized to it")
+    except Exception as e:
+        log.warning(f"[{ticker}] add_stop_qty alert failed: {e}")
+    return used
+
+
 def _whole_position_stop(ticker: str, new_stop: float, filled_qty: float,
                          status: dict | None = None, market_price: float | None = None,
-                         action: str | None = None, held_before: float | None = None):
+                         action: str | None = None, held_before: float | None = None,
+                         price_is_fill: bool = True):
     """Stop handling when a BUY adds to a position that already has a stop.
 
     Before 2026-10-27 an ADD overwrote entry_price with the add's fill price
@@ -1156,10 +1350,18 @@ def _whole_position_stop(ticker: str, new_stop: float, filled_qty: float,
     shares are stopped, at new_stop, and the old stop is not cancelled: the
     earlier shares keep their resting stop, and no whole-position level is
     guessed without the old one. The caller writes the record only once a
-    read after placement shows none exists."""
+    read after placement shows none exists. status["alerts_out"], when the
+    caller puts a list there: the stop-size, floor-read and above-market
+    guard alert texts go into it instead of being sent, and the caller sends
+    them after its place (they run before the cancel, while the new shares
+    have no stop).
+    """
     import db
     import ibkr
     import tasks
+    held_alerts = status.get("alerts_out") if isinstance(status, dict) else None
+    if not isinstance(held_alerts, list):
+        held_alerts = None
     reclassified_open = False
     if action == "OPEN" and held_before is not None and held_before > 1e-6:
         # An OPEN on a ticker the broker already held before the order (the
@@ -1195,6 +1397,7 @@ def _whole_position_stop(ticker: str, new_stop: float, filled_qty: float,
         # An ADD the cache doesn't show at all (it can read empty after a
         # reconnect): the fresh read below decides.
         total_qty, avg_cost = 0.0, None
+    cache_qty, fresh_qty = total_qty, None
     if action == "ADD":
         # The portfolio cache lags a fill: on 2026-11-10 an NVDA ADD read the
         # pre-fill quantity here, so the add got its own looser stop and the
@@ -1278,7 +1481,20 @@ def _whole_position_stop(ticker: str, new_stop: float, filled_qty: float,
         # old position's exit isn't booked yet, so this entry keeps its
         # opened_at and entry thesis (audit 11-06 03:34 #5). Log-only.
         _record_stale_entry(ticker, prior, filled_qty, total_qty, decision_basis="post_fill_read")
+        if action == "ADD" and not open_over_leftover:
+            # An ADD whose reads lag the fill (11-10 NVDA): the old shares'
+            # stop still rests. Not a reclassified OPEN over a leftover
+            # record, whose earlier shares are gone.
+            _record_add_stale(ticker, prior, new_stop, filled_qty, total_qty, fresh_qty,
+                              held_before, reclassified_open)
+        if status is not None:
+            # Record only (execution._record_add_lot_r): the record is about
+            # to be rewritten at the new shares' stop over an existing one.
+            status["stale_record"] = True
         return new_stop, None
+    if action == "ADD":
+        total_qty = _add_stop_qty(ticker, total_qty, filled_qty, cache_qty, fresh_qty, held_before,
+                                  alerts_out=held_alerts)
     stop = max(new_stop, float(prior["stop_price"]))
     # A native TRAIL's trigger can sit above the record: the whole-position
     # stop never goes below the highest resting stop it cancels. Read before
@@ -1286,8 +1502,29 @@ def _whole_position_stop(ticker: str, new_stop: float, filled_qty: float,
     # market_price is the fill's price from the caller; an implausible one
     # (None, NaN, <= 0, > 1e9) counts as missing (risk_manager._plausible_price).
     import risk_manager
+    floor_read: dict = {}
     stop, _ = risk_manager._floor_at_resting_stop(ticker, stop, "ADD whole-position stop",
-                                                  market_price=market_price)
+                                                  market_price=market_price,
+                                                  resting_out=floor_read, alerts_out=held_alerts)
+    # Never a whole-position SELL stop at or above the price: the record kept
+    # by the ambiguous path can sit above it once the old shares' own stop
+    # has filled. The new shares' own stop is the fallback.
+    # Shadow by default (config.STOP_GUARD_MODE): the level comes back
+    # unchanged. Enforced, a lowered level reaches the record only when
+    # market_price is this order's fill (price_is_fill); otherwise
+    # status["record_stop"] keeps the higher one for the caller's record.
+    unguarded = stop
+    # The guard reuses the rows the floor just read (no second broker read
+    # before the cancel); a failed floor read is not repeated.
+    stop = risk_manager._stop_below_market(ticker, stop, new_stop, market_price,
+                                           "ADD whole-position stop", path="add_whole_position",
+                                           resting=floor_read.get("rows"),
+                                           resting_unread="rows" not in floor_read,
+                                           cancel_window=False,   # before the cancel below
+                                           record_follows=price_is_fill,
+                                           price_is_fill=price_is_fill, alerts_out=held_alerts)
+    if stop < unguarded - 1e-9 and not price_is_fill and status is not None:
+        status["record_stop"] = unguarded
     try:
         tasks.manage_cancel_stop_orders_for(ticker)
     except Exception as e:
@@ -1298,6 +1535,307 @@ def _whole_position_stop(ticker: str, new_stop: float, filled_qty: float,
     if status is not None:
         status["prior_stop"] = float(prior["stop_price"])
     return stop, (avg_cost, total_qty)
+
+
+def add_lot_r(lots: list[dict], placed_stop, threshold: float = 1.2) -> dict:
+    """Per-lot R at a placed stop, ratios only. Each lot is {lot_id,
+    approval_id, entry_date, entry_price, own_stop, own_stop_source}; R at
+    the placed stop = (entry - placed) / (entry - own_stop), so 1.0 means the
+    placed stop sits at the lot's own initial stop and 1.88 means a stop-out
+    there loses 1.88 times the lot's planned risk. A lot whose own stop is
+    missing or not below its entry gets r None. Prices are not returned:
+    own_stop_pct and placed_stop_pct are percent from the lot's entry.
+    placed_stop is the requested level (before tick rounding at placement).
+    lots_over_threshold compares the unrounded R. Pure; never raises on bad
+    values; a bool is not a price."""
+    import math
+
+    def _f(v):
+        if isinstance(v, bool):
+            return None
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            return None
+        return x if math.isfinite(x) else None
+    placed = _f(placed_stop)
+    out_lots, rs, raw = [], [], []
+    for lot in lots or []:
+        entry, own = _f(lot.get("entry_price")), _f(lot.get("own_stop"))
+        rec = {"lot_id": lot.get("lot_id"), "approval_id": lot.get("approval_id"),
+               "entry_date": lot.get("entry_date"), "own_stop_source": lot.get("own_stop_source"),
+               "own_stop_pct": None, "placed_stop_pct": None, "r_at_placed_stop": None}
+        if entry and entry > 0:
+            if own is not None:
+                rec["own_stop_pct"] = round((own / entry - 1) * 100, 3)
+            if placed is not None:
+                rec["placed_stop_pct"] = round((placed / entry - 1) * 100, 3)
+            if own is not None and placed is not None and own < entry:
+                r = (entry - placed) / (entry - own)
+                rec["r_at_placed_stop"] = round(r, 3)
+                rs.append(rec["r_at_placed_stop"])
+                raw.append(r)
+        out_lots.append(rec)
+    return {"lots": out_lots, "n_lots": len(out_lots), "n_with_r": len(rs),
+            "max_lot_r": max(rs) if rs else None, "threshold": threshold,
+            "lots_over_threshold": sum(1 for r in raw if r > threshold)}
+
+
+def entry_basis(lots: list[dict], sells: list[dict], broker_avg, total_qty, bucket: str | None,
+                ladder_applies: bool = False) -> dict:
+    """The fill-weighted average of the bot's own fills over the open lots,
+    against the broker's average cost that an ADD writes as the stop
+    record's entry. Pure.
+
+    lots: oldest first, each {"price", "qty"} (qty None when the lot has no
+    fill on record). sells: [{"qty"}], the SELL trades since the oldest open
+    lot, taken from the oldest lots first (FIFO: a partial exit leaves its
+    lot open in trade_outcomes). basis_gap_frac = broker_avg / fill_avg - 1,
+    the snapshot's definition. The shifts say where each legacy threshold
+    sits measured from the fill basis when the record holds broker_avg:
+    (1 + threshold) * (1 + gap) - 1; breakeven sits at the gap itself.
+    ladder_applies: SETUP_GATES_ENABLED with a ladder bucket, where these
+    tables are not used. IBKR's averageCost includes commission and any
+    wash-sale adjustment, so a small positive gap is expected with no wash
+    sale; qty_coverage (remaining fill qty over the broker's) above 1 means
+    duplicate order rows, below 1 shares the bot has no fill for."""
+    from config import TRAILING_STOP_ACTIVATE, PROFIT_TARGET_PCT_BY_STYLE
+    known = [dict(l) for l in lots if l.get("qty") and l.get("price")]
+    sold = sum(float(s.get("qty") or 0) for s in sells)
+    for lot in known:                       # FIFO: oldest lots absorb the sells
+        take = min(lot["qty"], sold)
+        lot["qty"], sold = lot["qty"] - take, sold - take
+    rem = sum(l["qty"] for l in known)
+    fill_avg = (sum(l["qty"] * l["price"] for l in known) / rem) if rem > 0 else None
+    gap = (float(broker_avg) / fill_avg - 1) if fill_avg and broker_avg else None
+
+    def _shift(t):
+        return round((1 + t) * (1 + gap) - 1, 4) if gap is not None and t is not None else None
+    act = TRAILING_STOP_ACTIVATE.get(bucket)
+    pt = {style: _shift(sum(tbl[bucket]) / 2) for style, tbl in PROFIT_TARGET_PCT_BY_STYLE.items()
+          if bucket in tbl}
+    return {"broker_avg": float(broker_avg) if broker_avg else None,
+            "fill_avg": round(fill_avg, 4) if fill_avg else None,
+            "basis_gap_frac": round(gap, 4) if gap is not None else None,
+            "n_lots": len(lots), "lots_without_fill": len(lots) - len(known),
+            "sold_since_oldest_lot": round(sum(float(s.get("qty") or 0) for s in sells), 4),
+            "unmatched_sold": round(sold, 4),
+            "qty_coverage": round(rem / float(total_qty), 4) if total_qty else None,
+            "bucket": bucket, "legacy_tables_apply": not ladder_applies,
+            "trail_arm": act, "trail_arm_vs_fill": _shift(act),
+            "pt_by_style": {style: sum(tbl[bucket]) / 2
+                            for style, tbl in PROFIT_TARGET_PCT_BY_STYLE.items() if bucket in tbl},
+            "pt_vs_fill_by_style": pt,
+            "breakeven_vs_fill": round(gap, 4) if gap is not None else None}
+
+
+def _record_entry_basis(ticker: str, approval: dict, broker_avg, total_qty, fill_price,
+                        filled_qty, record_ok, stop_outcome: str | None,
+                        fill_source: str | None = None) -> None:
+    """Record only (config ENTRY_BASIS_RECORD_ENABLED): one activity row,
+    stage entry_basis, when an ADD writes the broker's average cost as the
+    stop record's entry_price. One bounded read (db.get_open_lot_fills),
+    made after the stop work, never before; this fill is its own lot (its
+    trade_outcomes row is written later). The row goes through the activity
+    writer queue. Changes nothing written to position_stops; never raises."""
+    try:
+        import config
+        if not getattr(config, "ENTRY_BASIS_RECORD_ENABLED", False):
+            return
+        import db
+        read = "ok"
+        try:
+            got = db.get_open_lot_fills(ticker, strict=True)
+        except Exception as e:
+            got, read = {"lots": [], "sells": []}, f"error: {type(e).__name__}"
+        lots = []
+        for lot in got["lots"]:
+            if lot.get("approval_id") is not None and lot.get("approval_id") == approval.get("id"):
+                continue                      # this fill's own row, if already written
+            fills = lot.get("fills") or []
+            q = sum(f[1] for f in fills)
+            lots.append({"price": (sum(f[0] * f[1] for f in fills) / q) if q else lot.get("outcome_entry"),
+                         "qty": q or None, "approval_id": lot.get("approval_id")})
+        lots.append({"price": float(fill_price) if fill_price else None,
+                     "qty": float(filled_qty) if filled_qty else None,
+                     "approval_id": approval.get("id")})
+        bucket = approval.get("thesis_bucket", "Accelerator")
+        ladder = bool(getattr(config, "SETUP_GATES_ENABLED", False)
+                      and bucket in getattr(config, "CATEGORY_RISK_PCT_PER_TRADE", {}))
+        rec = entry_basis(lots, got["sells"], broker_avg, total_qty, bucket, ladder)
+        rec.update({"read": read, "truncated": bool(got.get("truncated")),
+                    "approval_id": approval.get("id"), "action": approval.get("action"),
+                    "record_written": bool(record_ok), "stop_outcome": stop_outcome,
+                    "this_fill_source": fill_source,
+                    "env": getattr(config, "TRADING_ENV", None)})
+        gap = rec["basis_gap_frac"]
+        gap_txt = f"gap {gap:+.2%}" if gap is not None else "gap unknown"
+        msg = (f"ADD record entry is the broker average: {gap_txt} vs the bot's fills; record only"
+               if record_ok else
+               f"ADD record write failed; the broker average would be the entry: {gap_txt} vs "
+               f"the bot's fills; record only")
+        db.log_activity_queued("entry_basis", ticker, msg, "neutral", rec)
+    except Exception as e:
+        log.warning(f"[{ticker}] entry_basis record failed: {type(e).__name__}: {e}")
+
+
+def _iso_utc(t) -> str | None:
+    """An aware datetime (or ISO string with a zone) as a UTC ISO string;
+    None for anything else, a naive time included. Never raises."""
+    from datetime import datetime, timezone
+    try:
+        if isinstance(t, str):
+            t = datetime.fromisoformat(t.replace("Z", "+00:00"))
+        if isinstance(t, datetime) and t.tzinfo is not None:
+            return t.astimezone(timezone.utc).isoformat()
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _entry_ref_at_submit(risk_json: dict, pq, submitted_at) -> dict:
+    """The price references an OPEN/ADD BUY is sent on, from values already in
+    hand at submit (no I/O, so nothing is added before placeOrder): the
+    sizing price's bar time from risk_json.arrival (crew._arrival_record;
+    None on approvals sized before it was recorded) and the pre-submit
+    quote's (pq, market_data.get_priced_quote's dict, or None). Bar times
+    are the bar's label (its start), in UTC; a 1-minute bar's close can be up
+    to 60 s later, or the latest trade for a bar still forming. Ages are
+    submitted_at minus the bar time, in seconds (1 dp). Never raises."""
+    rec = {"submitted_at": None, "sizing_price_source": None,
+           "sizing_bar_time": None, "sizing_at": None, "sizing_price_is_stale": None,
+           "submit_price_source": None, "submit_bar_time": None,
+           "submit_quote_is_stale": None, "ref_age_s": None, "submit_ref_age_s": None,
+           "sizing_to_submit_s": None}
+    try:
+        from datetime import datetime
+        rec["submitted_at"] = _iso_utc(submitted_at)
+        arr = (risk_json or {}).get("arrival")
+        arr = arr if isinstance(arr, dict) else {}
+        rec["sizing_price_source"] = arr.get("sizing_price_source")
+        rec["sizing_price_is_stale"] = arr.get("sizing_price_is_stale")
+        rec["sizing_bar_time"] = _iso_utc(arr.get("sizing_bar_time"))
+        rec["sizing_at"] = _iso_utc(arr.get("sizing_at"))
+        if isinstance(pq, dict):
+            rec["submit_price_source"] = pq.get("price_source")
+            st = pq.get("is_stale")
+            rec["submit_quote_is_stale"] = bool(st) if st is not None else None
+            rec["submit_bar_time"] = _iso_utc(pq.get("bar_time_utc"))
+        sub = rec["submitted_at"] and datetime.fromisoformat(rec["submitted_at"])
+        for out, key in (("ref_age_s", "sizing_bar_time"), ("submit_ref_age_s", "submit_bar_time"),
+                         ("sizing_to_submit_s", "sizing_at")):
+            if sub and rec[key]:
+                rec[out] = round((sub - datetime.fromisoformat(rec[key])).total_seconds(), 1)
+    except Exception as e:
+        rec["error"] = type(e).__name__
+    return rec
+
+
+def _record_entry_ref_age(ticker: str, approval: dict, action: str, ref: dict | None) -> bool:
+    """Record only: one activity row (stage entry_ref_age) per OPEN/ADD BUY
+    that reached the submit point, queued from execute_approved's finally
+    (after the stop, the outcome row and the alert) through
+    db.log_activity_queued, so a slow DB never holds the ticker lock.
+
+    ref: _entry_ref_at_submit's dict, plus what the submit returned:
+    order_result (its quote is the bid/ask/last snapshot ibkr.place_market_order
+    took before placeOrder, with its market data type and age; None on a
+    bracket or when the call raised), order_type, submit_error (the
+    exception's class when the submit raised) and early (the order row
+    written at submission). submit_attempted is True once the broker place
+    call was made (bracket or market; a raise inside it may still have sent
+    the order) and False when something raised between the submit point and
+    that call, so nothing was sent; order_type is then None. outcome_reason
+    is last_outcome_reason() (None when the entry went through). Every key is
+    always present, None when unknown. Nothing is sent or changed. Never
+    raises; returns True once the row is queued, False when there was
+    nothing to queue or building it failed."""
+    try:
+        import db
+        from config import TRADING_ENV
+        if not isinstance(ref, dict):
+            return False
+        res = ref.get("order_result") if isinstance(ref.get("order_result"), dict) else {}
+        q = res.get("quote") if isinstance(res.get("quote"), dict) else {}
+        early = ref.get("early") if isinstance(ref.get("early"), dict) else {}
+        extra = {k: ref.get(k) for k in (
+            "submitted_at", "sizing_price_source", "sizing_bar_time", "sizing_at",
+            "sizing_price_is_stale", "submit_price_source", "submit_bar_time",
+            "submit_quote_is_stale", "ref_age_s", "submit_ref_age_s", "sizing_to_submit_s")}
+        extra.update({
+            "bid": q.get("bid"), "ask": q.get("ask"), "last": q.get("last"),
+            "quote_time": q.get("quote_time"), "quote_age_s": q.get("quote_age_s"),
+            "md_type_label": q.get("md_type_label"),
+            "approval_id": approval.get("id"), "action": action, "env": TRADING_ENV,
+            "order_type": ref.get("order_type"), "broker_order_id": res.get("order_id"),
+            "perm_id": res.get("perm_id"), "order_row_id": early.get("id"),
+            "status": res.get("status"),
+            # None on a bracket (its fill is assumed, not confirmed) or no result.
+            "filled": ((float(res.get("filled_qty") or 0) > 0)
+                       if res and ref.get("order_type") != "BRACKET" else None),
+            "submit_attempted": ref.get("order_type") is not None,
+            "submit_error": ref.get("submit_error"), "outcome_reason": last_outcome_reason(),
+            "ref_error": ref.get("error")})
+        age = extra["ref_age_s"]
+        db.log_activity_queued(
+            "entry_ref_age", ticker,
+            f"{action} {ticker}: sizing bar " + (f"{age:g}s old at submit" if age is not None
+                                                 else "age unknown"),
+            "neutral", extra)
+        return True
+    except Exception as e:
+        log.warning(f"[{ticker}] entry reference record failed: {e}")
+        return False
+
+
+def _record_add_lot_r(ticker: str, approval: dict, placed_stop, new_lot_entry, new_lot_stop,
+                      path: str, stop_outcome: str | None) -> None:
+    """Record only (config ADD_LOT_R_SHADOW_ENABLED): one activity row (stage
+    add_lot_r) when a BUY's stop is placed over an existing stop record.
+    path is "whole_position" (an ADD's one stop for all shares) or
+    "stale_record" (the record rewritten at the new shares' stop while the
+    old record's order may still rest at the broker). The lots are the open
+    trade_outcomes lots (db.get_open_lots_initial_stops, strict) plus this
+    fill's own lot (its row is written after the stop). A lot's own initial
+    stop is entry - fill_risk_per_share (the stop placed for its shares at
+    its fill) when stored, else its approval's stop; this fill's is the
+    fill-anchored stop for its shares. placed_stop is the requested level
+    (before tick rounding). read is "ok" or "error: <class>". The row goes
+    through the activity writer queue, so it never waits on the pool.
+    Never changes the stop; never raises."""
+    try:
+        import config
+        if not getattr(config, "ADD_LOT_R_SHADOW_ENABLED", False):
+            return
+        import db
+        threshold = float(getattr(config, "ADD_LOT_R_THRESHOLD", 1.2))
+        lots, read = [], "ok"
+        try:
+            for r in db.get_open_lots_initial_stops(ticker, strict=True):
+                if r.get("approval_id") is not None and r.get("approval_id") == approval.get("id"):
+                    continue                  # this fill's own row, if already written
+                entry, frps = r.get("entry_price"), r.get("fill_risk_per_share")
+                if entry is not None and frps is not None and frps > 0:
+                    own, src = entry - frps, "fill_risk_per_share"
+                else:
+                    own, src = r.get("stop_loss_price"), "approval_stop"
+                lots.append({"lot_id": r.get("lot_id"), "approval_id": r.get("approval_id"),
+                             "entry_date": r.get("entry_date"), "entry_price": entry,
+                             "own_stop": own, "own_stop_source": src})
+        except Exception as e:
+            read = f"error: {type(e).__name__}"
+        lots.append({"lot_id": None, "approval_id": approval.get("id"), "entry_date": None,
+                     "entry_price": new_lot_entry, "own_stop": new_lot_stop,
+                     "own_stop_source": "this_fill"})
+        rec = add_lot_r(lots, placed_stop, threshold)
+        rec.update({"path": path, "read": read, "approval_id": approval.get("id"),
+                    "action": approval.get("action"), "stop_outcome": stop_outcome})
+        db.log_activity_queued("add_lot_r", ticker,
+                        f"{path}: max lot R at the placed stop {rec['max_lot_r']} "
+                        f"({rec['lots_over_threshold']} over {threshold}); record only",
+                        "neutral", rec)
+    except Exception as e:
+        log.warning(f"[{ticker}] add_lot_r record failed: {type(e).__name__}: {e}")
 
 
 def log_buy_outcome(approval: dict, ticker: str, action: str, entry_price: float,
@@ -1727,6 +2265,7 @@ def execute_approved(
     ticker    = approval["ticker"]
     action    = approval["action"]
     risk_json = approval.get("risk_json") or {}
+    entry_ref = None   # an OPEN/ADD's price references at submit (record only)
 
     # Pre-flight: verify IBKR is reachable before touching the market
     try:
@@ -1903,6 +2442,7 @@ def execute_approved(
         # close can't masquerade as "no drift".
         price_at_sizing = risk_json.get("price_at_sizing")
         current_price_pre = None
+        pq = None
         stale_buy_entered = False   # the BUY stale branch below ran (never enter it twice)
         try:
             from market_data import get_priced_quote
@@ -2184,20 +2724,24 @@ def execute_approved(
                     "resting stops could not be read" if resting is None
                     else f"stop(s) for {resting} shares still resting"))
                 try:
-                    alert_module._send(
-                        f"⚠️ {action} NOT SENT — <b>{ticker}</b>\n" + (
-                            "The broker's resting stops could not be read" if resting is None
-                            else "An existing stop could not be cancelled")
-                        + ", and selling on top of a stop could short the account. "
-                          "Check the stop orders in TWS."
-                    )
-                except Exception:
-                    pass
-                # The cancel may have taken some stops before one stuck;
-                # put back what is now uncovered (A0053-2).
-                _restore_stop_after_failed_sell(ticker, floor=sell_floor)
-                if resting is None:
-                    _schedule_held_sell_retry(approval, trigger)
+                    # The cancel may have taken some stops before one stuck;
+                    # put back what is now uncovered (A0053-2). Before the
+                    # alert: a Telegram send can take tens of seconds, and
+                    # the shares may be unstopped until the restore lands.
+                    _restore_stop_after_failed_sell(ticker, floor=sell_floor)
+                    if resting is None:
+                        _schedule_held_sell_retry(approval, trigger)
+                finally:
+                    try:
+                        alert_module._send(
+                            f"⚠️ {action} NOT SENT — <b>{ticker}</b>\n" + (
+                                "The broker's resting stops could not be read" if resting is None
+                                else "An existing stop could not be cancelled")
+                            + ", and selling on top of a stop could short the account. "
+                              "Check the stop orders in TWS."
+                        )
+                    except Exception:
+                        pass
                 return _outcome("skipped: resting stops unreadable, sell not sent" if resting is None
                                 else "skipped: stop still resting, sell not sent")
 
@@ -2210,17 +2754,30 @@ def execute_approved(
 
         bracket_used = False
         held_before_order = None   # an ADD's held count before its order (_whole_position_stop)
+        held_retry_id = None       # a row still without that count: stored after the stop (04ah)
         early = {"id": None, "perm_id": None}   # the row written before the fill wait
         submitted_at = _now_utc()   # record-keeping only (orders.submitted_at)
+        if side == "BUY" and action in ("OPEN", "ADD"):
+            # Record only, no I/O: written from the finally below. A raise
+            # here must never stop the order.
+            try:
+                entry_ref = _entry_ref_at_submit(risk_json, pq, submitted_at)
+            except Exception as e:
+                entry_ref = None
+                log.warning(f"[{ticker}] entry reference record skipped: {e}")
         if side == "BUY" and USE_BRACKET_ORDERS and stop_price_for_entry:
             # Native bracket: entry + stop linked by parentId — TWS enforces
             # the pairing atomically, so this can't produce an orphaned stop.
+            if entry_ref is not None:
+                entry_ref["order_type"] = "BRACKET"
             try:
                 bracket_result = ibkr.place_bracket_order(
                     ticker, side, shares, stop_loss_price=float(stop_price_for_entry),
                 )
                 bracket_used = True
                 order_result = {"order_id": bracket_result["parent_order_id"], "fill_price": None, "filled_qty": None}
+                if entry_ref is not None:
+                    entry_ref.update(order_result=order_result, order_type="BRACKET")
                 log.info(f"[{ticker}] Bracket order submitted: {side} {shares} shares "
                         f"(parent={bracket_result['parent_order_id']}, stop={bracket_result['stop_order_id']})")
             except Exception as e:
@@ -2238,24 +2795,44 @@ def execute_approved(
                 else:
                     _release_buy(ticker)   # nothing was sent
                 raise
+            # Read before the callback is built (no I/O there), still before
+            # the order goes out, so the row written at submission carries it.
+            if side == "BUY" and action in ("ADD", "OPEN"):
+                held_before_order = _held_before_order(ticker)
             on_submitted, early = _early_order_row(
                 ticker=ticker, side=side, order_type="MARKET", qty=shares,
                 decision_price=price_at_sizing, approval_id=approval["id"], intent=action,
                 submitted_at=submitted_at, submit_price=current_price_pre,
+                # 04ah: the held count goes in with the row's INSERT (no extra
+                # round trip); _with_held_before stores it only if it didn't.
+                **({"held_before_qty": held_before_order}
+                   if side == "BUY" and _held_before_mode_on() else {}),
             )
-            if side == "BUY" and action in ("ADD", "OPEN"):
-                held_before_order = _held_before_order(ticker)
+            if side == "BUY" and held_before_order is not None:
+                on_submitted = _with_held_before(on_submitted, early, ticker, held_before_order)
+            if entry_ref is not None:
+                entry_ref.update(order_type="MARKET", early=early)
             try:
                 order_result = ibkr.place_market_order(ticker, side, shares,
                                                        on_submitted=on_submitted)
-            except Exception:
+            except Exception as e:
                 # A buy's reservation stays until it expires: the order may
                 # have been sent before the error and can still fill (review 4 #6).
                 if side == "SELL":
                     _restore_stop_after_failed_sell(ticker, floor=sell_floor)
+                if entry_ref is not None:
+                    entry_ref["submit_error"] = type(e).__name__
                 raise
+            if entry_ref is not None:
+                entry_ref["order_result"] = order_result
             log.info(f"[{ticker}] Order submitted: {side} {shares} shares (id={order_result['order_id']})")
             _recover_early_row(ticker, side, early, order_result)
+            if side == "BUY" and early.get("id") and not early.get("held_stored"):
+                # Not on the row yet (the store at submission failed, or the
+                # row is the one _recover_early_row found): stored after the
+                # stop, not between the fill wait and the stop. An unconfirmed
+                # return stores it through _log_unconfirmed_order instead.
+                held_retry_id = early["id"]
 
         if not bracket_used:
             filled_qty = float(order_result.get("filled_qty") or 0)
@@ -2287,6 +2864,9 @@ def execute_approved(
                     decision_price=price_at_sizing, approval_id=approval["id"],
                     status="unconfirmed", intent=action,
                     submitted_at=submitted_at, submit_price=current_price_pre,
+                    # the main late-fill case: the count goes on the row here
+                    held_before=(held_before_order if side == "BUY"
+                                 and not early.get("held_stored") else None),
                 )
                 try:
                     stop_note = ""
@@ -2312,6 +2892,7 @@ def execute_approved(
         if early["id"]:
             # The order row first, then the trade row (see _mark_early_row_filled).
             if not _mark_early_row_filled(ticker, early, order_result, filled_qty, shares):
+                _store_held_before(held_retry_id, ticker, held_before_order)   # 04ah, for reconcile
                 return _outcome(f"{_LEFT_TO_RECONCILE} (order row already adopted)")
 
         # Real fill price; fall back to latest quote only if fill unconfirmed
@@ -2332,6 +2913,7 @@ def execute_approved(
                 price=current_price,
                 reason=f"{action} {trigger_label} (conviction={approval['conviction']}/10)",
                 price_source=price_source):
+            _store_held_before(held_retry_id, ticker, held_before_order)   # 04ah, for reconcile
             return _outcome(f"{_LEFT_TO_RECONCILE} (trade row recovered)")
 
         # Order-lifecycle + slippage logging (decision price = price used at sizing time)
@@ -2347,6 +2929,8 @@ def execute_approved(
                     status="submitted", intent=action,
                     submitted_at=submitted_at, submit_price=current_price_pre,
                 )
+                if side == "BUY":
+                    held_retry_id = local_order_id   # stored after the stop is placed
             if not early["id"] and local_order_id > 0 and (
                     order_result.get("fill_price")
                     or (filled_qty > 0 and not bracket_used)):   # bracket qty is assumed
@@ -2460,12 +3044,27 @@ def execute_approved(
                     log.info(f"[{ticker}] TRIM part-filled; the working sell covers the "
                              f"remaining {remaining:g} shares, no stop placed")
                 elif remaining > 0 and stop_rec:
+                    guard_alerts = []
                     try:
                         import risk_manager
                         replace_px = risk_manager._floored_level(
                             ticker, float(stop_rec["stop_price"]), sell_floor, current_price,
                             "Stop re-place after TRIM")
-                        new_stop = tasks.manage_stop_place(ticker, stop_qty, replace_px,
+                        # Above-market guard (config.STOP_GUARD_MODE; shadow
+                        # by default: a row and an info alert, the level
+                        # unchanged). A record kept above the price would
+                        # sell the rest at once. The fallback is the resting
+                        # stop the sell cancelled; the record keeps its level.
+                        # No resting read and no alert before the place (the
+                        # shares are unstopped until it lands).
+                        placed_px = risk_manager._stop_below_market(
+                            ticker, replace_px, sell_floor, current_price,
+                            "Stop re-place after TRIM", path="trim_replace", resting=[],
+                            price_is_fill=price_source == "fill", alerts_out=guard_alerts,
+                            # Inside the sell's cancel-to-place window. No effect
+                            # today: resting=[] is never an unread set.
+                            cancel_window=True)
+                        new_stop = tasks.manage_stop_place(ticker, stop_qty, placed_px,
                                                            market_price=current_price)
                         _record_placed_stop(   # placed: a write failure is not "unprotected" (M227)
                             ticker, "Stop re-place after TRIM", new_stop.get("order_id"),
@@ -2490,6 +3089,8 @@ def execute_approved(
                         )
                         tasks.open_manual_action(ticker, f"re-place the stop @ "
                                                          f"${float(stop_rec['stop_price']):.2f} after a TRIM")
+                    if guard_alerts:   # sent after the place; the guard ran, so risk_manager is imported
+                        risk_manager._send_guard_alerts(ticker, guard_alerts)
                 elif remaining <= 0:
                     # A TRIM that sold the last share closes the position:
                     # close its outcome row too, or it stays open and a later
@@ -2524,77 +3125,93 @@ def execute_approved(
             log.info(f"[{ticker}] Bracket stop recorded (orderId={bracket_result['stop_order_id']})")
         elif stop_price and side == "BUY":
             stop_price = _stop_anchored_to_fill(ticker, float(stop_price), price_at_sizing, current_price)
+            new_lot_stop = float(stop_price)      # this fill's own stop, before any merge
             entry_for_stops, stop_qty = current_price, filled_qty
-            prior_info: dict = {}
-            stop_price, add_to_existing = _whole_position_stop(ticker, float(stop_price), filled_qty,
-                                                               status=prior_info,
-                                                               market_price=current_price,
-                                                               action=action,
-                                                               held_before=held_before_order)
-            entry_source = price_source
-            if add_to_existing:
-                entry_for_stops, stop_qty = add_to_existing
-                entry_source = "broker_avg"
-            # Prior record unreadable on a possible ADD: keep whatever record
-            # exists. The new shares' level written over it would let a later
-            # trail or ladder ratchet re-stop the whole position from it, below
-            # the old shares' stop.
-            prior_unread = bool(prior_info.get("prior_unreadable"))
-            record_ok = prior_unread or _write_stop_record(
-                ticker,
-                entry_price=entry_for_stops,
-                stop_price=float(stop_price),
-                stop_method=risk_json.get("stop_method", ""),
-                bucket=approval.get("thesis_bucket", "Accelerator"),
-                conviction=approval.get("conviction", 5),
-                trail_distance_pct=risk_json.get("trailing_stop_distance_pct"),
-                entry_price_source=entry_source,
-            )
-            _capture_original_thesis_if_new(ticker, approval)
-            stop_placed = False
-            stop_outcome = "failed"   # for the record-missing alert
-            placed_order_id = None
-            for stop_attempt in range(1, 4):
-                try:
-                    stop_result = tasks.manage_stop_place(ticker, stop_qty, float(stop_price),
-                                                         market_price=current_price)
-                    placed_order_id = stop_result["order_id"]
-                    if not prior_unread:
-                        # A kept record still points at the old shares' stop;
-                        # it is set below if no record turns out to exist.
-                        _set_stop_order_id(ticker, placed_order_id)
-                    stop_placed, stop_outcome = True, "placed"
-                    break
-                except Exception as e:
-                    log.warning(f"[{ticker}] Stop order attempt {stop_attempt}/3 failed: {e}")
-                    if type(e).__name__ == "SellExceedsPosition":
-                        # The broker shows fewer shares than the stop is for.
-                        # Right after a fill that is usually position lag, so
-                        # hand it to the retry queue (re-reads every cycle; a
-                        # real short just fails again) rather than drop it or
-                        # retry inline (professor run 11 follow-up).
-                        _alert_stop_refused(ticker, stop_qty, e)
-                        _queue_stop_for_retry(ticker, stop_qty, float(stop_price), alert=False)
-                        stop_placed, stop_outcome = True, "queued"
+            # alerts_out: the whole-position stop's alert texts, sent after
+            # the place loop below (the new shares have no stop until then).
+            prior_info: dict = {"alerts_out": []}
+            try:
+                # Inside the try: if it ever raises, the texts it already
+                # held still go out (finally below).
+                stop_price, add_to_existing = _whole_position_stop(
+                    ticker, float(stop_price), filled_qty, status=prior_info,
+                    market_price=current_price, action=action,
+                    held_before=held_before_order, price_is_fill=price_source == "fill")
+                entry_source = price_source
+                if add_to_existing:
+                    entry_for_stops, stop_qty = add_to_existing
+                    entry_source = "broker_avg"
+                # Prior record unreadable on a possible ADD: keep whatever record
+                # exists. The new shares' level written over it would let a later
+                # trail or ladder ratchet re-stop the whole position from it, below
+                # the old shares' stop.
+                prior_unread = bool(prior_info.get("prior_unreadable"))
+                record_ok = prior_unread or _write_stop_record(
+                    ticker,
+                    entry_price=entry_for_stops,
+                    # The guard's lowered level only on a fill price (else the higher one).
+                    stop_price=float(prior_info.get("record_stop", stop_price)),
+                    stop_method=risk_json.get("stop_method", ""),
+                    bucket=approval.get("thesis_bucket", "Accelerator"),
+                    conviction=approval.get("conviction", 5),
+                    trail_distance_pct=risk_json.get("trailing_stop_distance_pct"),
+                    entry_price_source=entry_source,
+                )
+                # The thesis snapshot is taken after the stop work below (place
+                # loop, record checks, failed-place alert): on an ADD the old stop
+                # is already cancelled, and its DB read and write change no order.
+                stop_placed = False
+                stop_outcome = "failed"   # for the record-missing alert
+                placed_order_id = None
+                for stop_attempt in range(1, 4):
+                    try:
+                        stop_result = tasks.manage_stop_place(ticker, stop_qty, float(stop_price),
+                                                             market_price=current_price)
+                        placed_order_id = stop_result["order_id"]
+                        if not prior_unread:
+                            # A kept record still points at the old shares' stop;
+                            # it is set below if no record turns out to exist.
+                            _set_stop_order_id(ticker, placed_order_id)
+                        stop_placed, stop_outcome = True, "placed"
                         break
-                    if isinstance(e, tasks.OrdersCallUnknown):
-                        # The stop may be resting already; a retry could stack
-                        # a second one. Reconcile fixes coverage either way
-                        # within two cycles (professor C24).
-                        _alert_stop_unknown(ticker, stop_qty, float(stop_price))
-                        stop_placed, stop_outcome = True, "unknown"  # not "failed": alerted above
-                        break
-                    if isinstance(e, tasks.OrdersCallExpired) or type(e).__name__ == "LockLost":
-                        # The orders worker is busy or stuck, or our ticker lock
-                        # lapsed (another process may be changing stops);
-                        # retrying here only repeats that. The queue re-reads
-                        # coverage under a fresh lock (A0453-3, m39).
-                        _queue_stop_for_retry(ticker, stop_qty, float(stop_price))
-                        stop_placed, stop_outcome = True, "queued"  # handed to the retry queue
-                        break
-                    if stop_attempt < 3:
-                        import time as _time
-                        _time.sleep(2 * stop_attempt)
+                    except Exception as e:
+                        log.warning(f"[{ticker}] Stop order attempt {stop_attempt}/3 failed: {e}")
+                        if type(e).__name__ == "SellExceedsPosition":
+                            # The broker shows fewer shares than the stop is for.
+                            # Right after a fill that is usually position lag, so
+                            # hand it to the retry queue (re-reads every cycle; a
+                            # real short just fails again) rather than drop it or
+                            # retry inline (professor run 11 follow-up). Queued
+                            # before the alert: a Telegram send can take tens of
+                            # seconds and the retry queue drains every 5 min.
+                            _queue_stop_for_retry(ticker, stop_qty, float(stop_price), alert=False,
+                                                  own_stop=new_lot_stop)
+                            _alert_stop_refused(ticker, stop_qty, e)
+                            stop_placed, stop_outcome = True, "queued"
+                            break
+                        if isinstance(e, tasks.OrdersCallUnknown):
+                            # The stop may be resting already; a retry could stack
+                            # a second one. Reconcile fixes coverage either way
+                            # within two cycles (professor C24).
+                            _alert_stop_unknown(ticker, stop_qty, float(stop_price))
+                            stop_placed, stop_outcome = True, "unknown"  # not "failed": alerted above
+                            break
+                        if isinstance(e, tasks.OrdersCallExpired) or type(e).__name__ == "LockLost":
+                            # The orders worker is busy or stuck, or our ticker lock
+                            # lapsed (another process may be changing stops);
+                            # retrying here only repeats that. The queue re-reads
+                            # coverage under a fresh lock (A0453-3, m39).
+                            _queue_stop_for_retry(ticker, stop_qty, float(stop_price),
+                                                  own_stop=new_lot_stop)
+                            stop_placed, stop_outcome = True, "queued"  # handed to the retry queue
+                            break
+                        if stop_attempt < 3:
+                            import time as _time
+                            _time.sleep(2 * stop_attempt)
+            finally:
+                # After the place (or its failure/queueing): the texts
+                # _whole_position_stop held back. Once each; never raises.
+                tasks._send_alert_texts(prior_info.get("alerts_out") or [])
             if prior_unread:
                 try:   # one read, after placement: a record, none, or unknown
                     prior_now = db.get_position_stop(ticker, strict=True)
@@ -2629,7 +3246,8 @@ def execute_approved(
                 log.error(f"[{ticker}] CRITICAL — stop order failed after 3 attempts. Position is UNPROTECTED.")
                 queued = False
                 try:
-                    tasks._queue_reprotect(ticker, {"intent": "BUY"}, None)  # m39
+                    tasks._queue_reprotect(ticker, {"intent": "BUY", "own_stop": new_lot_stop},
+                                           None)  # m39
                     queued = True
                 except Exception as e:
                     log.error(f"[{ticker}] Could not queue the stop retry: {e}")
@@ -2644,6 +3262,23 @@ def execute_approved(
                     tasks.open_manual_action(ticker, f"place a stop @ ${float(stop_price):.2f}")
                 except Exception:
                     pass
+            _capture_original_thesis_if_new(ticker, approval)
+            if add_to_existing or prior_info.get("stale_record"):
+                # Record only: per-lot R at the stop just placed. Last in the
+                # branch, after the reprotect and alert. Never raises.
+                _record_add_lot_r(ticker, approval, stop_price, current_price, new_lot_stop,
+                                  "whole_position" if add_to_existing else "stale_record",
+                                  stop_outcome)
+            if add_to_existing:
+                # Record only: the broker average just written as the entry
+                # vs the bot's own fills. After the stop work. Never raises.
+                _record_entry_basis(ticker, approval, add_to_existing[0], add_to_existing[1],
+                                    current_price, filled_qty, record_ok, stop_outcome,
+                                    fill_source=price_source)
+        if held_retry_id:
+            # The held count (roadmap 04ah) for a row that didn't get it at
+            # submission; after the stop, so its DB write can't delay it.
+            _store_held_before(held_retry_id, ticker, held_before_order)
 
         # Log outcome record for feedback loop — sub-scores live in
         # analyst_json (the full analyst.analyze() result), not as their own
@@ -2687,6 +3322,14 @@ def execute_approved(
     except Exception as e:
         log.error(f"[{ticker}] Order execution failed: {e}")
         return _outcome("failed: exception during execution")
+    finally:
+        if entry_ref is not None:
+            # Last, after the stop, outcome row and alert; a raise here must
+            # not replace the return value.
+            try:
+                _record_entry_ref_age(ticker, approval, action, entry_ref)
+            except Exception as e:
+                log.warning(f"[{ticker}] entry reference record failed: {e}")
 
 
 def _stop_record_or_none(ticker: str) -> dict | None:
@@ -2960,12 +3603,22 @@ def execute_manual(
                 log.info(f"[{ticker}] Manual sell part-filled; the working sell covers the "
                          f"remaining {remaining:g} shares, no stop placed")
             elif stop_rec:
+                guard_alerts = []
                 try:
                     import risk_manager
                     replace_px = risk_manager._floored_level(
                         ticker, float(stop_rec["stop_price"]), sell_floor, fill_price,
                         "Stop re-place after a manual sell")
-                    new_stop = tasks.manage_stop_place(ticker, stop_qty, replace_px,
+                    # Above-market guard, as on the TRIM re-place.
+                    placed_px = risk_manager._stop_below_market(
+                        ticker, replace_px, sell_floor, fill_price,
+                        "Stop re-place after a manual sell", path="manual_sell_replace",
+                        resting=[], price_is_fill=bool(order_result.get("fill_price")),
+                        alerts_out=guard_alerts,
+                        # Inside the sell's cancel-to-place window. No effect
+                        # today: resting=[] is never an unread set.
+                        cancel_window=True)
+                    new_stop = tasks.manage_stop_place(ticker, stop_qty, placed_px,
                                                        market_price=fill_price)
                     _record_placed_stop(   # placed: a write failure is not "unprotected" (M227)
                         ticker, "Stop re-place after a manual sell", new_stop.get("order_id"),
@@ -2988,6 +3641,8 @@ def execute_manual(
                         pass
                     tasks.open_manual_action(ticker, f"re-place the stop @ "
                                                      f"${float(stop_rec['stop_price']):.2f} after a manual sell")
+                if guard_alerts:   # sent after the place; the guard ran, so risk_manager is imported
+                    risk_manager._send_guard_alerts(ticker, guard_alerts)
     elif order_intent == "MANUAL_ADD" and (add_rec := _stop_record_or_none(ticker)):
         # Added to a held position: keep its stop record (a fresh ATR stop
         # from this fill could loosen it) and protect the whole position at
@@ -3074,8 +3729,9 @@ def execute_manual(
                 except Exception as e:
                     log.warning(f"[{ticker}] Stop attempt {attempt}/3: {e}")
                     if type(e).__name__ == "SellExceedsPosition":
-                        _alert_stop_refused(ticker, filled_qty, e)
+                        # Queued before the alert, as on the approval path.
                         _queue_stop_for_retry(ticker, filled_qty, float(stop_price), alert=False)
+                        _alert_stop_refused(ticker, filled_qty, e)
                         stop_placed, stop_outcome = True, "queued"
                         break
                     if isinstance(e, tasks.OrdersCallUnknown):

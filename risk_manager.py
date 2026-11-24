@@ -24,6 +24,10 @@ load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 log = logging.getLogger(__name__)
 
+# Set when the config import below fell back to this module's own constants:
+# the ImportError's text. None means config.py supplied every name.
+_CONFIG_FALLBACK_ERROR: str | None = None
+
 try:
     from config import (
         DRAWDOWN_HALT_PCT,
@@ -56,7 +60,24 @@ try:
         ALLOW_ONE_SHARE_ABOVE_ALLOCATION,
         ONE_SHARE_MAX_PCT_OF_CASH,
     )
-except ImportError:
+except ImportError as _cfg_err:
+    # A renamed or removed config name used to switch every constant below on
+    # with no log line, TRADING_ENV "paper" among them, so the halt read the
+    # paper flag and HWM and a live /halt was ignored. Say so, once per
+    # process. The fallbacks themselves are unchanged.
+    _CONFIG_FALLBACK_ERROR = f"{type(_cfg_err).__name__}: {_cfg_err}"
+    log.error(f"risk_manager: config import failed ({_CONFIG_FALLBACK_ERROR}); using the "
+              f"module's fallback constants, TRADING_ENV='paper' among them")
+    try:
+        import alerts as _cfg_alerts
+        _cfg_alerts._send(
+            _max_attempts=1, text=
+            "🚨 <b>RISK CONFIG FALLBACK</b>\n"
+            f"risk_manager could not import its settings from config.py "
+            f"({_CONFIG_FALLBACK_ERROR[:200]}). It is running on built-in fallback limits, "
+            f"and its halt checks read the paper keys. Fix config.py and restart.")
+    except Exception as _alert_err:
+        log.error(f"risk_manager: config-fallback alert failed: {_alert_err}")
     ALLOW_ONE_SHARE_ABOVE_ALLOCATION = False
     ONE_SHARE_MAX_PCT_OF_CASH = 0.20
     TRADING_ENV                   = "paper"
@@ -408,6 +429,199 @@ def _price_correlation(bars_a: list[dict], bars_b: list[dict]) -> float | None:
         return None
 
 
+def _realised_vol(closes, window: int = 20) -> float | None:
+    """Annualised realised volatility: sample stdev of the last `window`
+    daily log returns, times sqrt(252). None under window + 1 usable closes
+    (finite and positive) or on a non-finite result. Pure."""
+    import math
+    try:
+        vals = [float(c) for c in closes][-(window + 1):]
+    except (TypeError, ValueError):
+        return None
+    if window < 2 or len(vals) < window + 1 or any(not math.isfinite(c) or c <= 0 for c in vals):
+        return None
+    rets = [math.log(b / a) for a, b in zip(vals, vals[1:])]
+    mean = sum(rets) / len(rets)
+    var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+    vol = math.sqrt(var) * math.sqrt(252)
+    return vol if math.isfinite(vol) else None
+
+
+def _vol_shadow_bars(ticker: str, window: int) -> list[dict]:
+    """The newest completed daily bars from the nightly price_history cache
+    (a database read: nothing is fetched from a vendor or the broker).
+    Raises on a failed read; _vol_shadow_record catches it."""
+    import db
+    from agents.market_regime import completed_bars
+    raw = db.get_price_history(ticker, days=window + 3, strict=True)
+    return completed_bars(list(raw or []))
+
+
+def _finite_or_none(x, nd: int = 4):
+    import math
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return None
+    return round(x, nd) if math.isfinite(x) else None
+
+
+def _stale_sessions(last_bar_date, now=None) -> int | None:
+    """Weekdays after last_bar_date (ISO string or date) up to the last
+    completed New York session: today after 16:00 ET, else the weekday
+    before. Exchange holidays are not excluded, so a holiday counts as one
+    stale session. Between 16:00 ET and the nightly price_history refresh
+    every record reads 1 although the cache is as fresh as it can be.
+    None on an unreadable date. Pure."""
+    from datetime import date as _date
+    from zoneinfo import ZoneInfo
+    try:
+        if isinstance(last_bar_date, datetime):
+            last_bar_date = last_bar_date.date()
+        last = (last_bar_date if isinstance(last_bar_date, _date)
+                else _date.fromisoformat(str(last_bar_date)[:10]))
+        et = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo("America/New_York"))
+        end = et.date() if et.hour >= 16 else et.date() - timedelta(days=1)
+        n, d = 0, last + timedelta(days=1)
+        while d <= end:
+            n += d.weekday() < 5
+            d += timedelta(days=1)
+        return n
+    except Exception:
+        return None
+
+
+def _vol_shadow_reweigh(vt, shares):
+    """Record-only: vol_target_shadow restated at the final order's share
+    count, after crew's post-sizing cuts (concentration, correlation, micro
+    name cap), from the values recorded at sizing: the order weight scales
+    with shares at the same price, the held weight and vol_weight_shares do
+    not depend on the order. No read. Returns the restated dict, or vt
+    unchanged when it can't be restated; never raises."""
+    try:
+        if not isinstance(vt, dict):
+            return vt
+        n = int(shares or 0)
+        out = dict(vt)
+        n0, ow0, held_w = vt.get("shares_at_sizing"), vt.get("order_weight"), vt.get("held_weight")
+        out["order_weight_at_sizing"] = ow0
+        if isinstance(n0, int) and n0 > 0 and isinstance(ow0, (int, float)):
+            out["order_weight"] = _finite_or_none(ow0 * n / n0)
+        elif n == 0:
+            out["order_weight"] = 0.0
+        else:
+            return vt
+        if out["order_weight"] is None:
+            out["position_weight_after"] = None   # no stale sizing-time value under "final_order"
+        elif isinstance(held_w, (int, float)):
+            out["position_weight_after"] = _finite_or_none(held_w + out["order_weight"])
+        vw, w_after = vt.get("vol_weight"), out.get("position_weight_after")
+        out["weight_ratio"] = (_finite_or_none(vw / w_after, 3)
+                               if isinstance(vw, (int, float)) and w_after else None)
+        vws = vt.get("vol_weight_shares")
+        out["would_cut"] = (vws < n) if isinstance(vws, int) and not isinstance(vws, bool) else None
+        out["shares_final"] = n
+        out["weights_at"] = "final_order"
+        return out
+    except Exception:
+        return vt
+
+
+def _vol_shadow_record(ticker: str, price, shares, held_value, stop_price, atr, atr_multiple,
+                       pv) -> dict:
+    """Record-only (config VOL_TARGET_SIZING_SHADOW_ENABLED): the two
+    volatility shadows size_position attaches, {"vol_target_shadow": ...,
+    "stop_vol": ...}. One price_history read. Weights are fractions of the
+    portfolio; no dollar value is recorded. Nothing reads the result, and it
+    never raises: any failure is recorded as read "error: <class>"."""
+    import math
+    try:
+        from config import VOL_TARGET_CONTRIBUTION as target
+    except ImportError:
+        target = 0.02
+    try:
+        from config import VOL_TARGET_WINDOW_SESSIONS as window
+    except ImportError:
+        window = 20
+    vt = {"source": "price_history", "read": None, "window": window, "bars": 0,
+          "last_bar_date": None, "rvol20": None, "target_contribution": target,
+          "order_weight": None, "position_weight_after": None, "vol_weight": None,
+          "weight_ratio": None, "vol_weight_shares": None, "would_cut": None,
+          "weights_at": "size_position", "shares_at_sizing": None, "held_weight": None,
+          "stale_sessions": None, "reason": None}
+    sv = {"stop_pct": None, "atr": None, "atr_multiple": None, "stop_distance_atr": None,
+          "sigma20_pct": None, "stop_sigma20": None, "reason": None}
+    try:
+        px = float(price) if price else 0.0
+        pv_f = float(pv) if pv else 0.0
+        held = max(float(held_value or 0.0), 0.0)
+        n = int(shares or 0)
+        stop = float(stop_price) if stop_price else None
+        vt["shares_at_sizing"] = n
+        if px > 0 and pv_f > 0:
+            vt["held_weight"] = _finite_or_none(held / pv_f)
+            vt["order_weight"] = _finite_or_none(n * px / pv_f)
+            vt["position_weight_after"] = _finite_or_none((held + n * px) / pv_f)
+        if stop and px > 0 and stop < px:
+            sv["stop_pct"] = _finite_or_none((px - stop) / px)
+        if (isinstance(atr, (int, float)) and not isinstance(atr, bool) and math.isfinite(atr)
+                and atr > 0):
+            sv["atr"] = _finite_or_none(atr)
+            if sv["stop_pct"] is not None:
+                sv["stop_distance_atr"] = _finite_or_none((px - stop) / atr, 2)
+        if (isinstance(atr_multiple, (int, float)) and not isinstance(atr_multiple, bool)
+                and atr_multiple > 0):
+            sv["atr_multiple"] = _finite_or_none(atr_multiple, 2)
+        try:
+            bars = _vol_shadow_bars(ticker, window)
+        except Exception as e:
+            vt["read"] = f"error: {type(e).__name__}"
+            vt["reason"] = sv["reason"] = "bars unreadable"
+            return {"vol_target_shadow": vt, "stop_vol": sv}
+        vt["bars"] = len(bars)
+        if not bars:
+            vt["read"] = "no_cached_bars"
+            vt["reason"] = sv["reason"] = "no cached bars"
+            return {"vol_target_shadow": vt, "stop_vol": sv}
+        last = bars[-1].get("date")
+        vt["last_bar_date"] = last.isoformat() if hasattr(last, "isoformat") else (
+            str(last) if last is not None else None)
+        vt["stale_sessions"] = _stale_sessions(vt["last_bar_date"]) if vt["last_bar_date"] else None
+        vol = _realised_vol([b.get("close") for b in bars], window)
+        if vol is None:
+            vt["read"] = "insufficient_bars"
+            vt["reason"] = sv["reason"] = f"under {window + 1} usable closes"
+            return {"vol_target_shadow": vt, "stop_vol": sv}
+        if vol <= 0:
+            vt["read"] = "zero_vol"
+            vt["reason"] = sv["reason"] = "no price change over the window"
+            return {"vol_target_shadow": vt, "stop_vol": sv}
+        vt["read"] = "ok"
+        vt["rvol20"] = _finite_or_none(vol)
+        vw = target / vol
+        vt["vol_weight"] = _finite_or_none(vw)
+        w_after = vt["position_weight_after"]
+        if w_after:
+            vt["weight_ratio"] = _finite_or_none(vw / w_after, 3)
+        if px > 0 and pv_f > 0:
+            room = max(vw * pv_f - held, 0.0)
+            vt["vol_weight_shares"] = int(room / px) if math.isfinite(room) else None
+            if vt["vol_weight_shares"] is not None:
+                vt["would_cut"] = vt["vol_weight_shares"] < n
+        else:
+            vt["reason"] = "no price or portfolio value"
+        sigma20 = vol * math.sqrt(window / 252)
+        sv["sigma20_pct"] = _finite_or_none(sigma20)
+        if sv["stop_pct"] is not None and sigma20 > 0:
+            sv["stop_sigma20"] = _finite_or_none(sv["stop_pct"] / sigma20, 3)
+        elif sv["stop_pct"] is None:
+            sv["reason"] = "no stop below price"
+    except Exception as e:
+        vt["read"] = f"error: {type(e).__name__}"
+        vt["reason"] = str(e)[:200]
+    return {"vol_target_shadow": vt, "stop_vol": sv}
+
+
 def _conviction_band(conviction: int) -> int:
     """Maps conviction (1-10) to the nearest lower band key (9,7,5,3)."""
     if conviction >= 9:
@@ -421,7 +635,9 @@ def _conviction_band(conviction: int) -> int:
 
 
 def _read_resting_stop_floor(ticker: str, new_level: float, what: str,
-                             floor_only: bool = False) -> tuple[bool, float | None]:
+                             floor_only: bool = False, resting: list | None = None,
+                             resting_out: dict | None = None,
+                             alerts_out: list | None = None) -> tuple[bool, float | None]:
     """Body of RiskManager._resting_stop_floor (see there), module level so
     execution.py's ADD path can use it without a RiskManager.
 
@@ -430,7 +646,14 @@ def _read_resting_stop_floor(ticker: str, new_level: float, what: str,
     highest resting stop instead of skipping. Then ok is False only when the
     read failed or a price was unreadable, and the alert says the change went
     ahead without the floor. A lower level is not alerted: with a native
-    TRAIL the record is expected to lag the broker's trigger."""
+    TRAIL the record is expected to lag the broker's trigger.
+
+    resting: the caller's resting-stop read (tasks._resting_sell_stops rows,
+    read before its cancel), used instead of a broker read. resting_out:
+    when a dict, resting_out["rows"] is set to the rows a successful read
+    (or resting) gave, so the caller's above-market guard can reuse them.
+    alerts_out: when a list, the alert texts are appended to it instead of
+    sent, for a caller that sends them after its place."""
     import tasks
 
     def alert(kind: str, body: str) -> None:
@@ -438,14 +661,20 @@ def _read_resting_stop_floor(ticker: str, new_level: float, what: str,
         # run is never skipped in silence, nor alerted every run.
         try:
             if tasks._reconcile_alert_due(f"stop_no_loosen_{kind}_{ticker}"):
-                import alerts
                 head = "STOP FLOOR UNREAD" if floor_only else "STOP CHANGE SKIPPED"
-                alerts._send(f"⚠️ {head} — <b>{ticker}</b>\n{body}")
+                text = f"⚠️ {head} — <b>{ticker}</b>\n{body}"
+                if alerts_out is not None:
+                    alerts_out.append(text)
+                    return
+                import alerts
+                alerts._send(text)
         except Exception as e:
             log.warning(f"[{ticker}] no-loosen alert failed: {e}")
 
     try:
-        resting = tasks._resting_sell_stops(ticker)
+        resting = list(resting) if resting is not None else tasks._resting_sell_stops(ticker)
+        if resting_out is not None:
+            resting_out["rows"] = resting
     except Exception as e:
         if floor_only:
             at = f" at ${float(new_level):.2f}" if new_level else ""
@@ -497,7 +726,9 @@ def _read_resting_stop_floor(ticker: str, new_level: float, what: str,
 
 
 def _floor_at_resting_stop(ticker: str, level: float, what: str,
-                           market_price: float | None = None) -> tuple[float, float | None]:
+                           market_price: float | None = None, resting: list | None = None,
+                           resting_out: dict | None = None,
+                           alerts_out: list | None = None) -> tuple[float, float | None]:
     """For a cancel-all-and-replace that must go ahead (ADD, breakeven,
     profit-target partial): read the working SELL stops BEFORE the cancel
     and raise the replacement to the highest of them, so a native TRAIL whose
@@ -508,10 +739,14 @@ def _floor_at_resting_stop(ticker: str, level: float, what: str,
     failed read returns the level unchanged (logged and alerted by
     _read_resting_stop_floor): protection is never blocked by it. A resting
     price at or above market_price is not used, since a SELL stop there
-    fills at once."""
+    fills at once. resting, resting_out, alerts_out: as for
+    _read_resting_stop_floor (a caller's read reused, the rows handed back
+    for the guard, the alert texts held for after the place)."""
     level = float(level)
     try:
-        _, highest = _read_resting_stop_floor(ticker, level, what, floor_only=True)
+        _, highest = _read_resting_stop_floor(ticker, level, what, floor_only=True,
+                                              resting=resting, resting_out=resting_out,
+                                              alerts_out=alerts_out)
     except Exception as e:   # never block the replacement on the floor read
         log.warning(f"[{ticker}] {what}: no-loosen floor read crashed ({e}); placing at ${level:.2f}")
         return level, None
@@ -523,6 +758,367 @@ def _floor_at_resting_stop(ticker: str, level: float, what: str,
                     f"${mp:.2f}; not used as the floor")
         return level, None
     return _floored_level(ticker, level, highest, None, what), highest
+
+
+# The above-market guard's one re-read of the resting stops after the
+# no-loosen floor's read failed (_reread_resting_stops): the open-orders
+# request is bounded at this, plus the 1 s settle in ibkr.get_open_orders.
+_GUARD_REREAD_TIMEOUT_S = 3.0
+
+
+def _reread_resting_stops(ticker: str) -> list[dict]:
+    """The guard's single bounded re-read of ticker's working SELL stops
+    (STP, STP LMT, TRAIL), the same rows as tasks._resting_sell_stops: one
+    reqAllOpenOrders bounded at _GUARD_REREAD_TIMEOUT_S on this process's
+    current session. It never connects, so a dropped session fails at once
+    instead of waiting on get_ib()'s connect. Raises on any failure."""
+    import ibkr
+    import tasks
+    orders = ibkr.get_open_orders(timeout=_GUARD_REREAD_TIMEOUT_S, reconnect=False)
+    return [o for o in tasks._working_sell_stops(orders) if o["ticker"] == ticker]
+
+
+def _stop_below_market(ticker: str, level: float, fallback: float | None, market_price,
+                       what: str, path: str, resting: list | None = None,
+                       record_follows: bool = False, price_is_fill: bool = False,
+                       alerts_out: list | None = None, resting_unread: bool = False,
+                       cancel_window: bool = False) -> float:
+    """The above-market guard for a stop that replaces a ticker's stops (a
+    whole-position merge or re-place, called before the cancel; the TRIM and
+    manual-sell re-places, called after the sell's cancel and before the
+    place; the reconcile resize). A SELL stop at or above the price sells at
+    once: a kept record (the ADD ambiguous path, a late ADD fill) can sit
+    above the price once the old shares' own stop has filled.
+
+    config.STOP_GUARD_MODE "shadow" (the default): the guard works out what
+    it would place, writes the row (stage stop_above_market_guard, outcome
+    would_<outcome>) and sends an info alert, and returns level unchanged.
+    No order or record changes come from it. "enforce": it places what it
+    works out, with a 🚨 alert.
+
+    What it works out, when level is at or above a plausible price:
+    - placed_below_market: the highest of fallback and the resting SELL
+      stops below the price;
+    - resting_at_or_above_price: level kept, because a working STP or TRAIL
+      (not one being cancelled) at or above the price hasn't triggered, so
+      the price looks old. Inferred only from a non-fill price during
+      regular hours: a fill is a real print, an STP LMT can trigger and not
+      fill, and stops don't trigger outside regular hours;
+    - no_level_below_market: level kept, nothing below the price.
+    No plausible price: price_unread, level kept. Never blocks protection.
+
+    resting: the caller's resting-stop read, reused instead of a second
+    read (None: the guard reads them itself, a broker round trip; [] on the
+    TRIM and manual-sell re-places, which rely on the fallback, the stop the
+    sell cancelled). resting_unread: the caller's read of them (the
+    no-loosen floor's) just failed. In shadow the guard makes no broker
+    call and works from the fallback alone (resting_read
+    "reread_skipped_shadow"), so the caller's timing is unchanged. In
+    enforce, only when level is at or above a plausible price (the row is
+    written), it re-reads them once, bounded (_reread_resting_stops, at
+    most _GUARD_REREAD_TIMEOUT_S + 1 s): resting_read "reread_ok" uses the
+    rows as a normal read would, "reread_failed" (reread_error the exception
+    class) works from the fallback alone. cancel_window: the caller is
+    between a stop cancel and its re-place (the position may be bare), so
+    in enforce an unread resting set is not re-read there: resting_read
+    "reread_skipped_window", fallback alone. After a reread_ok the row also
+    says what the fallback alone gave (fallback_only_outcome,
+    fallback_only_placed_vs_price_pct). alerts_out: when a list, the guard's alert texts are
+    appended to it instead of sent, and the caller sends them after its
+    place (_send_guard_alerts), so nothing slow runs between the cancel and
+    the place. record_follows: in enforce mode, the caller writes a
+    lowered level to the stop record (only when the price is this order's
+    own fill); otherwise the record keeps the higher level and backstop EXIT
+    alerts keep firing on it until it is rewritten; the alert says which.
+    Also run (paths trim_replace, manual_sell_replace, overstop_resize) on
+    the TRIM and manual-sell re-places and the reconcile resize
+    (tasks._fix_overstop, after its own refusal of a recorded stop not below
+    the last price).
+    Levels in the row are percent from the price. Never raises."""
+    def send(text: str) -> None:
+        if alerts_out is not None:
+            alerts_out.append(text)
+            return
+        try:
+            import alerts
+            alerts._send(text)
+        except Exception as e:
+            log.warning(f"[{ticker}] stop guard alert failed: {e}")
+    try:
+        level = float(level)
+        import config
+        enforce = getattr(config, "STOP_GUARD_MODE", "shadow") == "enforce"
+        mp = _plausible_price(market_price)
+        if mp is not None and level < mp - 1e-9:
+            return level
+        rec = {"mode": "enforce" if enforce else "shadow", "path": path, "what": what,
+               "level_vs_price_pct": None, "placed_vs_price_pct": None,
+               "fallback_vs_price_pct": None, "n_resting_below": None, "n_resting_at_or_above": None,
+               "resting_read": None, "stale_check": None, "price_is_fill": bool(price_is_fill),
+               "record": None, "reread_error": None, "fallback_only_outcome": None,
+               "fallback_only_placed_vs_price_pct": None}
+        if mp is None:
+            rec["outcome"] = "price_unread" if enforce else "would_price_unread"
+            _stop_guard_row(ticker, f"{what}: no usable price, so the above-market check was "
+                                    f"not made; placed as before", rec)
+            return level
+
+        def pct(x):
+            return round((float(x) / mp - 1) * 100, 3)
+        rec["level_vs_price_pct"] = pct(level)
+        cands, above = [], []
+        fb = _plausible_price(fallback)
+        if fb is not None:
+            rec["fallback_vs_price_pct"] = pct(fb)
+            if fb < mp - 1e-9:
+                cands.append(fb)
+        fb_cands = list(cands)
+        rows, read_as = None, "ok"
+        if resting_unread:
+            if not enforce:
+                # Shadow makes no broker call here: a re-read would delay the
+                # caller's cancel and place, and its timeout drops the session.
+                rec["resting_read"] = "reread_skipped_shadow"
+            elif cancel_window:
+                rec["resting_read"] = "reread_skipped_window"
+            else:
+                try:
+                    rows, read_as = _reread_resting_stops(ticker), "reread_ok"
+                except Exception as e:
+                    rec["resting_read"] = "reread_failed"
+                    rec["reread_error"] = type(e).__name__
+        if not resting_unread or rows is not None:
+            try:
+                import execution
+                import tasks
+                if rows is None:
+                    rows = list(resting) if resting is not None else tasks._resting_sell_stops(ticker)
+                below = [p for p in (_plausible_price(o.get("stop_price")) for o in rows)
+                         if p is not None and p < mp - 1e-9]
+                rec["resting_read"], rec["n_resting_below"] = read_as, len(below)
+                cands += below
+                in_rth = False
+                if not price_is_fill:
+                    try:
+                        import market_data
+                        in_rth = bool(market_data.is_market_hours())
+                    except Exception:
+                        in_rth = False
+                if price_is_fill:
+                    rec["stale_check"] = "skipped_fill_price"
+                elif not in_rth:
+                    rec["stale_check"] = "skipped_outside_rth"
+                else:
+                    rec["stale_check"] = "made"
+                    above = [p for p in (_plausible_price(o.get("stop_price")) for o in rows
+                                         if o.get("status") not in execution._CANCELLING_STATUSES
+                                         and o.get("order_type") in ("STP", "TRAIL"))
+                             if p is not None and p >= mp - 1e-9]
+                    rec["n_resting_at_or_above"] = len(above)
+            except Exception as e:
+                rec["resting_read"] = f"error: {type(e).__name__}"
+        if above:
+            outcome, placed = "resting_at_or_above_price", level
+        elif not cands:
+            outcome, placed = "no_level_below_market", level
+        else:
+            outcome, placed = "placed_below_market", max(cands)
+        rec["placed_vs_price_pct"] = pct(placed)
+        if rec["resting_read"] == "reread_ok":
+            # What the guard gave before the re-read existed: the fallback alone.
+            fb_outcome = "placed_below_market" if fb_cands else "no_level_below_market"
+            rec["fallback_only_outcome"] = fb_outcome      # reread_ok happens in enforce only
+            rec["fallback_only_placed_vs_price_pct"] = pct(max(fb_cands) if fb_cands else level)
+
+        if not enforce:
+            rec["outcome"] = f"would_{outcome}"
+            _stop_guard_row(ticker, f"{what} (shadow): {pct(level)}% vs the price; the guard "
+                                    f"would place {pct(placed)}% ({outcome}); placed as before", rec)
+            send(f"ℹ️ stop guard (shadow) — <b>{ticker}</b>\n{what} is at "
+                 f"{pct(level):+.2f}% vs the price; the guard would place "
+                 f"{pct(placed):+.2f}% vs price ({outcome.replace('_', ' ')}). "
+                 f"Not applied (shadow): the stop goes on at its level.")
+            return level
+
+        rec["outcome"] = outcome
+        if outcome == "resting_at_or_above_price":
+            _stop_guard_row(ticker, f"{what}: a working stop at ${max(above):.2f} is at/above "
+                                    f"the price ${mp:.2f}, so the price looks old; "
+                                    f"${level:.2f} placed as before", rec)
+            send(f"🚨 STOP GUARD: PRICE LOOKS OLD — <b>{ticker}</b>\n{what} at "
+                 f"${level:.2f} is at/above the price read ${mp:.2f}, but a working "
+                 f"stop at ${max(above):.2f} hasn't triggered, so the price looks "
+                 f"old. Placed at ${level:.2f} as before. Check the price and the "
+                 f"stops in TWS.")
+            return level
+        if outcome == "no_level_below_market":
+            _stop_guard_row(ticker, f"{what}: ${level:.2f} is at/above the price ${mp:.2f} and "
+                                    f"no stop below the price was found; placed as before", rec)
+            send(f"🚨 STOP AT/ABOVE THE PRICE — <b>{ticker}</b>\n{what} at "
+                 f"${level:.2f} is at or above the price ${mp:.2f}, and no lower "
+                 f"stop was found, so it was placed as before and may sell at once. "
+                 f"Check the position and stops in TWS now.")
+            return level
+        rec["record"] = "moved_to_placed" if record_follows else "kept_higher"
+        log.warning(f"[{ticker}] {what}: ${level:.2f} is at/above the price ${mp:.2f}; placing "
+                    f"${placed:.2f} (the highest of the new shares' stop and the resting stops "
+                    f"below the price)")
+        _stop_guard_row(ticker, f"{what}: ${level:.2f} at/above the price ${mp:.2f}; placed "
+                                f"${placed:.2f} instead", rec)
+        record_note = (f"The stop record is moved to ${placed:.2f}." if record_follows else
+                       f"The stop record still shows ${level:.2f} (the price is not this order's "
+                       f"fill), so backstop EXIT alerts keep firing until it is rewritten.")
+        send(f"🚨 STOP ABOVE THE PRICE REFUSED — <b>{ticker}</b>\n{what} would have "
+             f"been ${level:.2f}, at or above the price ${mp:.2f} (a SELL stop there "
+             f"sells at once). Placed at ${placed:.2f} instead, the highest stop "
+             f"below the price. {record_note} Check the stops in TWS.")
+        return placed
+    except Exception as e:
+        log.warning(f"[{ticker}] {what}: above-market guard failed ({type(e).__name__}: {e}); "
+                    f"placing {level!r}")
+        return level
+
+
+def _send_guard_alerts(ticker: str, texts: list) -> None:
+    """Send the alert texts _stop_below_market collected (alerts_out), after
+    the caller's place. Never raises."""
+    for text in texts or ():
+        try:
+            import alerts
+            alerts._send(text)
+        except Exception as e:
+            log.warning(f"[{ticker}] stop guard alert failed: {e}")
+
+
+def _stop_guard_row(ticker: str, message: str, extra: dict) -> None:
+    """The stop_above_market_guard activity row; queued write. Never raises."""
+    try:
+        import db
+        db.log_activity_queued("stop_above_market_guard", ticker, message,
+                               "neutral" if (extra.get("mode") == "shadow"
+                                             or extra.get("outcome") == "price_unread")
+                               else "negative",
+                               extra)
+    except Exception as e:
+        log.warning(f"[{ticker}] stop guard row not written: {e}")
+
+
+def _pt_stop_qty(ticker: str, read_qty: float, cache_qty: float | None,
+                 expected_qty: float, fill_qty: float | None = None
+                 ) -> tuple[float, str | None, str | None]:
+    """The share count for the stop after a profit-target partial sale
+    (config PT_STOP_QTY_FROM_BROKER), the alert text to send once the stop
+    is placed (or None) and its alerts._send severity (None: classified). The count is this process's ib.positions()
+    (ibkr.cached_stock_qty: no request and no reconnect, since the stop was
+    cancelled before the sale and get_ib()'s heartbeat or a reconnect would
+    sit between the sale and the remainder's place; not connected raises and
+    takes the fallback below). read_qty (the portfolio cache, read seconds
+    after the sale, or the held count minus the fill when that read fails)
+    sized it before; the cache can still show the shares just sold, and the
+    stop for them is refused. The sale was placed from this process and
+    ibkr.place_market_order's fill wait ran its event loop, so the position
+    message TWS pushes with the fill has normally been applied; the read
+    runs the loop once more first (settle) to apply any still pending. This
+    is not the orders worker's own count (a separate connection).
+
+    A stop is never sized above expected_qty (held before the sale minus the
+    fill) when that is positive and finite: anything above it would only be
+    refused. A count at most fill_qty above it is the sale not yet (or only
+    partly) applied (logged only); a larger excess has an unclear cause (e.g.
+    a held count missing an untracked ADD), so the row flags
+    capped_ambiguous and an info alert (severity REPORT) is returned. An unreadable, zero, short (negative) or non-finite
+    count falls back to read_qty, capped the same way, with an alert. Below
+    expected_qty the count is used with an alert and the row is negative,
+    never a silent undersize. With no positive expected_qty the fallback
+    keeps read_qty. The caller sends the alert after manage_stop_place: the
+    stop was cancelled before the sale and a Telegram send can take tens of
+    seconds. One activity row (stage pt_stop_qty) per call. Never raises."""
+    import config
+    if not getattr(config, "PT_STOP_QTY_FROM_BROKER", False):
+        return read_qty, None, None
+    import math
+    broker, read = None, "ok"
+    try:
+        import ibkr
+        broker = float(ibkr.cached_stock_qty(ticker))
+    except Exception as e:
+        read = f"error: {type(e).__name__}"
+    if broker is not None and not math.isfinite(broker):
+        read = "not_finite"
+    elif broker is not None and broker < -1e-6:
+        read = "short"
+    elif broker is not None and broker <= 1e-6:
+        read = "zero"
+    if read != "ok":
+        used, source = read_qty, "position_reads"
+    else:
+        used, source = round(broker, 4), "broker"
+    try:
+        exp = float(expected_qty)
+        exp_ok = math.isfinite(exp) and exp > 1e-6
+    except (TypeError, ValueError):
+        exp, exp_ok = None, False
+    count = used
+    below = source == "broker" and exp_ok and used + 1e-6 < exp
+    above = exp_ok and used > exp + 1e-6
+    ambiguous = False
+    if above:
+        used = round(exp, 4)              # never above held minus fill
+        try:
+            fill = float(fill_qty)
+            # 0 < count − exp holds here (above); up to the fill is the sale
+            # not yet, or only partly, applied.
+            by_sale = math.isfinite(fill) and (count - exp) <= fill + 1e-6
+        except (TypeError, ValueError):
+            by_sale = False
+        ambiguous = not by_sale
+    try:
+        import db
+        db.log_activity_queued(
+            "pt_stop_qty", ticker,
+            f"Profit-target remainder stop sized from the {source.replace('_', ' ')} ({used:g}; "
+            f"cache {cache_qty}, expected {expected_qty}, broker {broker})",
+            "neutral" if source == "broker" and not below and not ambiguous else "negative",
+            {"source": source, "broker_read": read, "broker_qty": broker, "cache_qty": cache_qty,
+             "expected_qty": expected_qty, "read_qty": read_qty, "used_qty": used,
+             "fill_qty": fill_qty, "below_expected": below, "above_expected": above,
+             "capped": above, "capped_ambiguous": ambiguous})
+    except Exception as e:
+        log.warning(f"[{ticker}] pt_stop_qty row not written: {e}")
+    text, severity = None, None
+    try:
+        if source != "broker":
+            how = (f"the position read ({read_qty:g}) capped at held minus the sale"
+                   if above else "the position read")
+            log.warning(f"[{ticker}] profit-target remainder: position count unusable ({read}); "
+                        f"stop sized from {how} ({used:g})")
+            text = (f"⚠️ PT STOP SIZE UNCONFIRMED — <b>{ticker}</b>\nThe position count "
+                    f"could not be used ({read}) after the profit-target sale, so the stop "
+                    f"for the rest is sized from {how} ({used:g} shares). "
+                    f"Check the stop covers the position in TWS.")
+        elif below:
+            log.warning(f"[{ticker}] profit-target remainder: position count {used:g} is below "
+                        f"the {exp:g} expected after the sale; stop sized to it")
+            text = (f"⚠️ PT STOP MAY NOT COVER — <b>{ticker}</b>\nThe position count is "
+                    f"{used:g} shares after the profit-target sale, below the "
+                    f"{exp:g} expected. The stop is for {used:g}. Reconcile covers "
+                    f"the rest if it shows up; check TWS.")
+        elif above and not ambiguous:
+            log.info(f"[{ticker}] profit-target remainder: position count {count:g}; stop capped "
+                     f"at held − fill ({used:g}) (count stale by the sale)")
+        elif above:
+            log.warning(f"[{ticker}] profit-target remainder: position count {count:g} is above "
+                        f"held − fill ({used:g}) by more than the sale; stop capped at {used:g}")
+            import alert_policy
+            severity = alert_policy.REPORT    # info, not critical (the text names TWS)
+            text = (f"ℹ️ PT STOP CAPPED — <b>{ticker}</b>\nPT stop capped at {used:g} shares "
+                    f"(held minus the sale); broker count {count:g}. Check TWS.")
+        elif abs(used - read_qty) > 1e-6:
+            log.warning(f"[{ticker}] profit-target remainder: position read {read_qty:g}, the "
+                        f"position count {used:g}: stop sized to the count")
+    except Exception as e:
+        log.warning(f"[{ticker}] pt_stop_qty alert text failed: {e}")
+    return used, text, severity
 
 
 def _plausible_price(price) -> float | None:
@@ -835,6 +1431,92 @@ def _inflight_theme_shadow(ticker: str, proposed_size_pct: float, theme_shadow: 
         return {"errored": True, "error": type(e).__name__}
 
 
+def _require_watchlist(watchlist: dict, loader, mode: str) -> None:
+    """Raise when the watchlist read came back empty. A missing watchlist.md
+    parses as {} with no error, and knowledge_loader's lru_cache would keep
+    that for the worker's life, so every name's sector and role read "" and
+    the theme and moonshot caps were skipped silently. This logs an ERROR and
+    raises into the sub-check's failure path (RISK_SUBCHECK_FAIL_MODE).
+    Called after the sub-check's own computation, so shadow keeps today's
+    values. Only in "enforce" does it also clear the loader's cache, so the
+    next call (from any caller) re-reads the file: that changes what the
+    analyst reads mid-run (universe, thesis files), which shadow must not.
+    Kept here, not in knowledge_loader, whose source is part of the
+    analyst's prompt_template_full_sha."""
+    if watchlist:
+        return
+    cleared = False
+    if mode == "enforce":
+        try:
+            loader.cache_clear()
+            cleared = True
+        except Exception:
+            pass
+    log.error("Concentration: the watchlist read empty (watchlist.md missing or unparsable)"
+              + ("; its cache was cleared so the next call re-reads it" if cleared else
+                 "; cache left as is (shadow)"))
+    raise RuntimeError("watchlist read empty")
+
+
+def _subcheck_fail_mode() -> str:
+    """config.RISK_SUBCHECK_FAIL_MODE, read at call time: "shadow" or
+    "enforce"; a missing or unknown value reads as "shadow"."""
+    try:
+        import config
+        mode = str(getattr(config, "RISK_SUBCHECK_FAIL_MODE", "shadow")).strip().lower()
+    except Exception:
+        mode = "shadow"
+    return mode if mode in ("shadow", "enforce") else "shadow"
+
+
+# Monotonic time of the last risk_subcheck_fail alert, per sub-check, in this process.
+_SUBCHECK_ALERT_AT: dict[str, float] = {}
+_SUBCHECK_ALERT_EVERY_S = 3600
+
+
+def _record_subcheck_failure(check: str, ticker: str, err: Exception, mode: str,
+                             simulation: bool) -> dict:
+    """The record of a concentration sub-check (theme / moonshot_total) that
+    raised: one risk_subcheck_fail activity row and an alert at most hourly
+    per sub-check. simulation is True for a what-if (a simulation=True
+    RiskManager such as the c6 shadow, or a quiet_fallback_alert one such as
+    the swap pre-check and scripts/sizing_dryrun.py): it writes and sends
+    nothing, so the rows count only real sizing. Returns the record; never
+    raises."""
+    rec = {"check": check, "error": type(err).__name__, "mode": mode,
+           "would_fail_closed": True, "applied": mode == "enforce"}
+    if simulation:
+        return rec
+    try:
+        import db
+        db.log_activity_queued(
+            "risk_subcheck_fail", ticker,
+            f"{check} concentration sub-check raised {type(err).__name__}; "
+            + ("cap set to 0 (enforce)" if mode == "enforce" else "sized as if uncapped (shadow)"),
+            "alert", dict(rec))
+    except Exception as e:
+        log.warning(f"risk_subcheck_fail row failed: {e}")
+    try:
+        import time
+        now = time.monotonic()
+        last = _SUBCHECK_ALERT_AT.get(check)
+        if last is None or now - last >= _SUBCHECK_ALERT_EVERY_S:
+            _SUBCHECK_ALERT_AT[check] = now
+            import alerts
+            alerts._send(
+                _max_attempts=1, text=
+                f"⚠️ <b>Concentration sub-check failed</b> ({check}, {ticker})\n"
+                f"{type(err).__name__}: {str(err)[:150]}\n"
+                + ("The cap was set to 0, so this buy is blocked (enforce)."
+                   if mode == "enforce" else
+                   "Shadow: the buy was sized without this cap, as before. "
+                   "Enforce would have blocked it.")
+                + " Alerts at most hourly per check.")
+    except Exception as e:
+        log.warning(f"risk_subcheck_fail alert failed: {e}")
+    return rec
+
+
 class RiskManager:
     simulation = False   # set per instance by __init__
     # The ATR-fallback alert only (the swap pre-check); nothing else changes.
@@ -901,6 +1583,72 @@ class RiskManager:
     # Drawdown halt
     # ------------------------------------------------------------------
 
+    def _hwm_guard(self, reason: str, stored: bool = True, effect: str | None = None) -> bool:
+        """The per-buy drawdown check's baseline is unusable
+        (config.HWM_GUARD_MODE). reason: "unparseable" (the stored mark is
+        not a number: is_halted raises, as it always has, so every caller
+        fails closed), "non_finite" (inf, -inf or nan: the check runs on it
+        unchanged) or "non_positive" (<= 0: the check does not block).
+        stored: the value is the stored mark, not the start value it falls
+        back to. effect: what the shadow check does with it, for the alert.
+
+        One hwm_guard activity row (reason, env, mode, action, stored) and at
+        most one alert per reason per ET day, with no dollar values. The
+        dedupe key (system_state hwm_guard_alerted_<env>_<reason>) is written
+        first and verified; only then is the alert sent, on a daemon thread,
+        so the buy path never waits on Telegram and a failed write sends
+        nothing. Returns True in enforce (halt_unknown set: this buy is
+        blocked, nothing latched), else False, the check then going on
+        exactly as it did before the guard. Never raises. Simulation
+        writes and sends nothing."""
+        import config
+        raw = str(getattr(config, "HWM_GUARD_MODE", "shadow")).strip().lower()
+        if raw not in ("shadow", "enforce"):
+            log.warning(f"HWM_GUARD_MODE {raw!r} is not shadow or enforce; treated as shadow")
+        enforce = raw == "enforce"
+        mode = "enforce" if enforce else "shadow"
+        try:
+            subject = ("The stored high-water mark" if stored
+                       else "No high-water mark is stored, and the start value it falls back to")
+            what = {"unparseable": "is not a number", "non_finite": "is not finite",
+                    "non_positive": "is not positive"}.get(reason, reason)
+            action = "blocked" if enforce else "as_before"
+            log.warning(f"High-water mark check ({TRADING_ENV}): {subject.lower()} {what} "
+                        f"({mode}: {'this buy blocked' if enforce else 'check runs as before'})")
+            if getattr(self, "simulation", False):
+                return self._hwm_guard_result(enforce)
+            import db
+            db.log_activity_queued(
+                "hwm_guard", "", f"High-water mark check ({TRADING_ENV}): {subject.lower()} {what}; "
+                f"{'this buy blocked' if enforce else 'the check ran as before'} ({mode})",
+                "negative" if enforce else "neutral",
+                {"reason": reason, "env": TRADING_ENV, "mode": mode, "action": action,
+                 "stored": bool(stored)})
+            from zoneinfo import ZoneInfo
+            today = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+            key = f"hwm_guard_alerted_{TRADING_ENV}_{reason}"
+            if db.get_state(key) != today and key not in db.set_state_verified([(key, today)]):
+                if enforce:
+                    tail = "This buy was blocked (not latched), as every buy will be until it is fixed."
+                else:
+                    tail = (effect or "The check ran as before.") + " (shadow)"
+                text = (f"⚠️ <b>HIGH-WATER MARK UNUSABLE</b> ({TRADING_ENV})\n{subject} {what}. "
+                        f"{tail} Check system_state high_water_mark_{TRADING_ENV}.")
+                import alerts
+                import alert_policy
+                threading.Thread(target=alerts._send, args=(text,),
+                                 kwargs={"severity": alert_policy.CRITICAL}, daemon=True,
+                                 name=f"hwm-guard-alert-{reason}").start()
+        except Exception as e:
+            log.warning(f"hwm guard record failed: {type(e).__name__}: {e}")
+        return self._hwm_guard_result(enforce)
+
+    def _hwm_guard_result(self, enforce: bool) -> bool:
+        if enforce:
+            self.halt_unknown = True
+            return True
+        return False
+
     def is_halted(self) -> bool:
         """
         Halt if (a) the persisted manual/auto halt flag is set, or
@@ -933,8 +1681,40 @@ class RiskManager:
             return True
 
         current  = self.portfolio_value()
-        baseline = float(hwm_str) if hwm_str else self.start_value
+        # An unusable baseline is recorded (config.HWM_GUARD_MODE); in shadow
+        # every case then runs exactly as it did before the guard.
+        import math
+        try:
+            baseline = float(hwm_str) if hwm_str else self.start_value
+        except (TypeError, ValueError):
+            # Not a number: this raises out of is_halted, so every caller
+            # fails closed (route error, ORDER BLOCKED, retry kept, swap 0).
+            if self._hwm_guard("unparseable", effect="The drawdown check raises on it, so "
+                               "every buy fails closed, as before."):
+                return True
+            raise
+        flagged = False
+        try:
+            finite = math.isfinite(baseline)
+        except TypeError:
+            finite = True
+        if not finite:
+            # Kept as parsed, so the path below is unchanged: inf reads as an
+            # implausible account value and blocks; -inf takes the <= 0
+            # branch; nan fails every comparison (no block, no ratchet).
+            effect = ("The drawdown check treats the account value as implausible and blocks "
+                      "buys, as before." if baseline > 0 else
+                      "The drawdown check does not block buys, as before." if baseline < 0 else
+                      "The drawdown check cannot compare against it and does not block buys, "
+                      "as before.")
+            flagged = True
+            if self._hwm_guard("non_finite", stored=bool(hwm_str), effect=effect):
+                return True
         if baseline <= 0:
+            if not flagged and self._hwm_guard(
+                    "non_positive", stored=bool(hwm_str),
+                    effect="The drawdown check has no baseline, so it does not block buys, as before."):
+                return True
             return False
 
         # Plausibility guard: a transient broker read of $0 (clientId
@@ -1184,7 +1964,11 @@ class RiskManager:
             )
 
         # Whole shares only — IBKR rejects fractional stock orders on most tickers
+        # Record only (roadmap 04bb): the size before the whole-share floor and
+        # which floor rule set the count. Read by nothing; no new reads.
+        raw_shares = initial_dollar / price if price else 0.0
         shares_initial = int(initial_dollar / price)
+        floor_rule = "int_floor" if shares_initial < raw_shares - 1e-9 else "none"
 
         # One share above the allocation (2026-10-27). On a micro account the
         # 55% first tranche is often smaller than one share of a $400-600
@@ -1207,6 +1991,9 @@ class RiskManager:
             )
             shares_initial = 1
             initial_dollar = price
+            floor_rule = "one_share_above_allocation"
+        floor_record = {"unfloored_shares": round(raw_shares, 4),
+                        "floored_shares": shares_initial, "floor_rule": floor_rule}
 
         if shares_initial < 1:
             cash_blocked = cash_reserve <= 0 or cash_capped
@@ -1223,11 +2010,12 @@ class RiskManager:
             # check in crew.py whether it's even worth looking for a
             # position to rotate out of.
             return {"position_size_pct": 0, "dollar_amount": 0, "shares_initial": 0,
-                    "cash_blocked": cash_blocked,
+                    "cash_blocked": cash_blocked, **floor_record,
                     "flags": flags + [f"Allocation ${initial_dollar:,.2f} buys less than 1 share "
                               f"of {ticker} at ${price:,.2f} — skipping"]}
 
         # Stop loss
+        self.last_stop_mult = None        # log-only: the ATR multiple calculate_stop used
         self.last_stop_atr = None
         stop_price, stop_method = self.calculate_stop(ticker, price, bucket,
                                                       log_fallback=log_fallback,
@@ -1279,7 +2067,7 @@ class RiskManager:
         if target == hard_cap:
             flags.append(f"Size capped at {hard_cap:.0%} bucket maximum")
 
-        return {
+        sizing = {
             "ticker":              ticker,
             "position_size_pct":   round(remaining, 4),
             "dollar_amount":       round(dollar_amount, 2),
@@ -1299,6 +2087,10 @@ class RiskManager:
             "conviction":          conviction,
             "flags":               flags,
             "heat_shadow":         self._heat_shadow(ticker, shares_initial, price, stop_price, pv, mult),
+            # Record only: the size before the whole-share floor (pre-floor
+            # dollars / price, 4 dp), the count the floor step gave (the
+            # risk cap below it can still lower shares_initial) and the rule.
+            **floor_record,
             # Log-only (audit 2026-11-07 11:07 #7): the ATR the stop was set
             # from (live IBKR bars, today's partial bar included); None when
             # the stop didn't use one (0 means the flat fallback was used). The brief shows the nightly ladder's
@@ -1307,6 +2099,23 @@ class RiskManager:
                                     if isinstance(getattr(self, "last_stop_atr", None), (int, float))
                                     and self.last_stop_atr > 0 else None),
         }
+        # Record-only volatility shadows (config VOL_TARGET_SIZING_SHADOW_ENABLED):
+        # added after every live number above is final, and read by nothing,
+        # so shares, stop and order are the same with the switch on or off.
+        try:
+            from config import VOL_TARGET_SIZING_SHADOW_ENABLED as vol_shadow_on
+        except ImportError:
+            vol_shadow_on = False
+        # Skipped for simulations and dry runs (c6 shadow, swap check,
+        # sizing_dryrun): they never write an approval, so the read is wasted.
+        if vol_shadow_on and not self.simulation and log_fallback:
+            try:
+                sizing.update(_vol_shadow_record(
+                    ticker, price, shares_initial, held, stop_price,
+                    getattr(self, "last_stop_atr", None), getattr(self, "last_stop_mult", None), pv))
+            except Exception as e:
+                log.debug(f"[{ticker}] vol shadow failed: {e}")
+        return sizing
 
     def _heat_shadow(self, ticker: str, shares: int, price: float, stop_price, pv: float,
                      mult: float) -> dict | None:
@@ -1575,6 +2384,7 @@ class RiskManager:
 
         mult_lo, mult_hi = ATR_STOP_MULTIPLIER.get(bucket, (1.5, 2.0))
         mult = (mult_lo + mult_hi) / 2
+        self.last_stop_mult = mult        # log-only: size_position records it
         stop = round(entry_price - mult * atr, 2)
         return stop, f"{mult:.1f}× ATR ({atr:.2f}) below entry = ${stop:.2f}"
 
@@ -1661,6 +2471,9 @@ class RiskManager:
         # breaching sector; None otherwise.
         theme_size_cap_pct = None
         theme_shadow = None
+        subcheck_failures: list[dict] = []   # sub-checks that raised (_record_subcheck_failure)
+        fail_mode = _subcheck_fail_mode()
+        quiet = self.simulation or self.quiet_fallback_alert
         try:
             from knowledge_loader import load_watchlist
             watchlist = load_watchlist()
@@ -1677,8 +2490,14 @@ class RiskManager:
                 if theme_total > MAX_SINGLE_THEME_PCT:
                     flags.append(f"'{sector}' theme exposure {theme_total:.1%} exceeds "
                                  f"{MAX_SINGLE_THEME_PCT:.0%} limit")
+            _require_watchlist(watchlist, load_watchlist, fail_mode)   # after: shadow keeps today's values
         except Exception as e:
             log.warning(f"Theme concentration sub-check unavailable: {e}")
+            rec = _record_subcheck_failure("theme", ticker, e, fail_mode, quiet)
+            subcheck_failures.append(rec)
+            if rec["applied"]:
+                theme_size_cap_pct = 0.0
+                flags.append(f"RISK CHECK FAILED — theme concentration unverifiable: {e}. Buy blocked.")
 
         # Total moonshot exposure — RGTI incident 2026-08-18: flagged
         # correctly ("13.7% exceeds 10% limit") but nothing capped it,
@@ -1699,8 +2518,14 @@ class RiskManager:
                 if moonshot_total > MAX_MOONSHOT_TOTAL_PCT:
                     flags.append(f"Total moonshot exposure {moonshot_total:.1%} exceeds "
                                  f"{MAX_MOONSHOT_TOTAL_PCT:.0%} limit")
+                _require_watchlist(watchlist, load_watchlist, fail_mode)   # after: shadow keeps today's cap
             except Exception as e:
                 log.warning(f"Moonshot concentration sub-check unavailable: {e}")
+                rec = _record_subcheck_failure("moonshot_total", ticker, e, fail_mode, quiet)
+                subcheck_failures.append(rec)
+                if rec["applied"]:
+                    moonshot_size_cap_pct = 0.0
+                    flags.append(f"RISK CHECK FAILED — moonshot total unverifiable: {e}. Buy blocked.")
 
         return {
             "passed": len(flags) == 0,
@@ -1714,6 +2539,10 @@ class RiskManager:
                                        if moonshot_size_cap_pct is not None else None),
             # Log-only: the theme cap if themes were grouped by heading prefix.
             "theme_shadow": theme_shadow,
+            "subcheck_failures": subcheck_failures,
+            # An enforced sub-check failure reads like the outer read error, so a
+            # deferred retry keeps the buy for a retry instead of expiring it.
+            **({"errored": True} if any(r["applied"] for r in subcheck_failures) else {}),
         }
 
     def check_correlation(self, ticker: str, corr_threshold: float = 0.7,
@@ -2848,54 +3677,109 @@ class RiskManager:
             return None
 
         # Record the sale like every other fill (audit 2026-10-28 10:53 #3):
-        # before this, partial sales never reached trades or orders.
+        # before this, partial sales never reached trades or orders. Written
+        # after the remainder's stop (a finally, so a failed place still
+        # writes them): the rows are record-only, nothing before them reads
+        # them, and their DB writes stay out of the cancel-to-place window.
         filled = float(order_result.get("filled_qty") or 0)
         fill_price = order_result.get("fill_price") or decision_price or 0.0
-        try:
-            db.log_trade(symbol=ticker, side="SELL", quantity=filled, price=fill_price,
-                         reason="Profit target partial sell",
-                         price_source="fill" if order_result.get("fill_price") else
-                         ("decision" if decision_price else None))
-            local_id = db.log_order(ticker=ticker, side="SELL", order_type="MARKET",
-                                    qty=sell_qty, broker_order_id=order_result.get("order_id"),
-                                    perm_id=order_result.get("perm_id"),
-                                    decision_price=decision_price, status="submitted",
-                                    intent="PROFIT_TARGET", stop_price=new_stop)
-            if local_id and local_id > 0 and order_result.get("fill_price"):
-                # A remainder may still fill: reconcile picks up 'partial' (M53).
-                if not db.update_order_fill(local_id, order_result["fill_price"], filled,
-                                            "filled" if filled >= float(sell_qty) - 1e-6 else "partial",
-                                            filled_at=order_result.get("fill_time"),
-                                            filled_at_source=order_result.get("fill_time_source")):
-                    db.set_order_reconcile_note(local_id, "fill_write_failed")
-            elif local_id and local_id > 0:
-                # Filled with no price from the broker: the row stays
-                # 'submitted' (status unchanged); the note says why.
-                db.set_order_reconcile_note(local_id, "filled_no_price")
-        except Exception as e:
-            log.warning(f"[{ticker}] Profit-target sale logging failed: {e}")
 
-        try:
-            remaining = round(abs(float(ibkr.get_client().get_open_position(ticker).qty)), 4)
-        except Exception:
-            remaining = round(qty - float(order_result.get("filled_qty") or sell_qty), 4)
-        if remaining > 0:
+        def _log_profit_target_sale():
             try:
-                result = tasks.manage_stop_place(ticker, remaining, new_stop,
-                                                market_price=order_result.get("fill_price") or decision_price)
+                db.log_trade(symbol=ticker, side="SELL", quantity=filled, price=fill_price,
+                             reason="Profit target partial sell",
+                             price_source="fill" if order_result.get("fill_price") else
+                             ("decision" if decision_price else None))
+                local_id = db.log_order(ticker=ticker, side="SELL", order_type="MARKET",
+                                        qty=sell_qty, broker_order_id=order_result.get("order_id"),
+                                        perm_id=order_result.get("perm_id"),
+                                        decision_price=decision_price, status="submitted",
+                                        intent="PROFIT_TARGET", stop_price=new_stop)
+                if local_id and local_id > 0 and order_result.get("fill_price"):
+                    # A remainder may still fill: reconcile picks up 'partial' (M53).
+                    if not db.update_order_fill(local_id, order_result["fill_price"], filled,
+                                                "filled" if filled >= float(sell_qty) - 1e-6 else "partial",
+                                                filled_at=order_result.get("fill_time"),
+                                                filled_at_source=order_result.get("fill_time_source")):
+                        db.set_order_reconcile_note(local_id, "fill_write_failed")
+                elif local_id and local_id > 0:
+                    # Filled with no price from the broker: the row stays
+                    # 'submitted' (status unchanged); the note says why.
+                    db.set_order_reconcile_note(local_id, "filled_no_price")
             except Exception as e:
-                log.error(f"[{ticker}] Failed to re-place stop after profit-target sale: {e}")
-                alerts._send(
-                    f"🚨 UNPROTECTED POSITION — {ticker}\n"
-                    f"Profit-target sale filled but stop re-placement failed. "
-                    f"Place stop @ ${new_stop:.2f} for {remaining} shares manually."
-                )
+                log.warning(f"[{ticker}] Profit-target sale logging failed: {e}")
+
+        rows_written = False     # set once the rows went in early (a failed re-place)
+        pt_alert, pt_severity = None, None
+        try:
+            cache_qty = None
+            try:
+                remaining = cache_qty = round(abs(float(ibkr.get_client().get_open_position(ticker).qty)), 4)
+            except Exception:
+                remaining = round(qty - float(order_result.get("filled_qty") or sell_qty), 4)
+            sold_qty = float(order_result.get("filled_qty") or sell_qty)
+            remaining, pt_alert, pt_severity = _pt_stop_qty(ticker, remaining, cache_qty,
+                                                            round(qty - sold_qty, 4), sold_qty)
+            if remaining > 0:
+                try:
+                    result = tasks.manage_stop_place(ticker, remaining, new_stop,
+                                                    market_price=order_result.get("fill_price") or decision_price)
+                except Exception as e:
+                    log.error(f"[{ticker}] Failed to re-place stop after profit-target sale: {e}")
+                    # Queue and track it like the other failed re-places (M87):
+                    # the retry places new_stop for the count it then reads,
+                    # and marks the target taken (it never sells again).
+                    queued = False
+                    try:
+                        tasks._queue_reprotect(ticker, {"intent": "PROFIT_TARGET", "stop_price": new_stop,
+                                                        **({"floor": floor} if floor is not None else {})},
+                                               None)
+                        queued = True
+                    except Exception as e2:
+                        log.error(f"[{ticker}] Could not queue the profit-target stop: {e2}")
+                    # The place has failed (manage_stop_place can take ~150 s
+                    # to say so): write the rows now, before the manual action
+                    # and Telegram, so reconcile's untracked-sell booking and
+                    # the broker-sell watch see the order as the bot's.
+                    _log_profit_target_sale()
+                    rows_written = True
+                    try:
+                        tasks.open_manual_action(ticker, f"re-place the stop @ ${new_stop:.2f} after a "
+                                                         f"profit-target sale")
+                    except Exception as e2:
+                        log.error(f"[{ticker}] Could not open the manual action: {e2}")
+                    try:
+                        alerts._send(
+                            f"🚨 UNPROTECTED POSITION — {ticker}\n"
+                            f"Profit-target sale filled but stop re-placement failed. "
+                            + (f"It is queued and retried every reconcile cycle; place stop @ "
+                               f"${new_stop:.2f} for {remaining} shares manually if it isn't back "
+                               f"within ~15 min." if queued else
+                               f"Place stop @ ${new_stop:.2f} for {remaining} shares manually.")
+                            + ("\nThat share count was flagged by the sizing check (see the "
+                               "activity row pt_stop_qty): confirm it in TWS first." if pt_alert else "")
+                        )
+                    except Exception as e2:
+                        log.error(f"[{ticker}] Unprotected-position alert failed: {e2}")
+                    pt_alert = None   # no stop exists: its "stop for the rest" text would mislead
+                else:
+                    # Placed: a record write failure is not "unprotected" (M227).
+                    execution._record_placed_stop(
+                        ticker, "Stop re-place after a profit-target sale", result.get("order_id"),
+                        [("order id", lambda: db.set_stop_broker_order_id(ticker, result["order_id"]))])
+                    log.info(f"[{ticker}] Stop re-placed @ ${new_stop:.2f} for remaining {remaining} shares")
+        finally:
+            if rows_written:
+                log.info(f"[{ticker}] Profit-target sale rows already written after the failed re-place")
             else:
-                # Placed: a record write failure is not "unprotected" (M227).
-                execution._record_placed_stop(
-                    ticker, "Stop re-place after a profit-target sale", result.get("order_id"),
-                    [("order id", lambda: db.set_stop_broker_order_id(ticker, result["order_id"]))])
-                log.info(f"[{ticker}] Stop re-placed @ ${new_stop:.2f} for remaining {remaining} shares")
+                _log_profit_target_sale()
+        if pt_alert:
+            # Sent only now: the stop was cancelled before the sale, and a
+            # Telegram send before the place would widen that window.
+            try:
+                alerts._send(pt_alert, severity=pt_severity)
+            except Exception as e:
+                log.warning(f"[{ticker}] pt_stop_qty alert failed: {e}")
         # The stop actually used (may be above breakeven).
         return {**order_result, "new_stop": new_stop}
 

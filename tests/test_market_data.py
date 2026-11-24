@@ -152,8 +152,9 @@ class TestPriceSource:
         yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
         q, _ = self._quote([], _bars(yesterday))
         assert q["price_source"] == "daily_fallback" and q["is_stale"] is True
-        assert set(q) == {"price", "bar_time", "age_minutes", "is_stale", "market_open",
-                          "price_source"}
+        assert set(q) == {"price", "bar_time", "bar_time_utc", "age_minutes", "is_stale",
+                          "market_open", "price_source"}
+        assert q["bar_time_utc"] is None   # a date-only bar has no zone
 
 
 def _daily_intraday(prior_close, opens_and_closes):

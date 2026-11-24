@@ -206,6 +206,9 @@ def main():
          patch("ibkr.get_client", _no_ib), patch("ibkr.get_historical_bars", _no_ib), \
          patch.object(risk_manager, "_fetch_bars_for_atr", lambda t, days=20: bars.get(t, [])[-(days + 5):]):
         rm = risk_manager.RiskManager(client)
+        # A what-if: no risk_subcheck_fail rows or alerts from it. The flag
+        # gates only alerts and the alert-day state write (patched here anyway).
+        rm.quiet_fallback_alert = True
         print(f"regime={regime} conviction={args.conviction} positions={len(client.get_all_positions())}")
         for t in tickers:
             if not bars.get(t):

@@ -220,8 +220,9 @@ def test_profit_target_re_place_record_failure_is_not_unprotected():
 # ── M228: floor at the highest resting stop ──────────────────────────────
 
 def test_profit_target_stop_is_floored_at_a_higher_resting_trail():
-    # record 90, breakeven 100, broker TRAIL trigger 103
-    calls, send, result = _partial(90.0, [_stp(103.0)])
+    # record 90, breakeven 100, broker TRAIL trigger 103; the broker count agrees (100 - 30)
+    with patch("ibkr.cached_stock_qty", return_value=70.0):
+        calls, send, result = _partial(90.0, [_stp(103.0)])
     assert calls == ["cancel", "sell", ("stop", "NVDA", 70.0, 103.0)]
     assert result["new_stop"] == 103.0
     send.assert_not_called()

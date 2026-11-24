@@ -210,8 +210,13 @@ def _score_momentum_with_flow(bars: list[dict], ticker: str) -> tuple[int, str]:
         if flow.get("unusual"):
             bonus = 8
             score = min(25, score + bonus)
+            # The free flow proxy has no premium (total_premium None): the
+            # format raised after the bonus was added, so the +8 had no note.
             premium = flow.get("total_premium", 0)
-            notes += f" | Unusual options flow (${premium:,.0f} premium)"
+            try:
+                notes += f" | Unusual options flow (${float(premium):,.0f} premium)"
+            except (TypeError, ValueError):
+                notes += " | Unusual options flow (premium not reported)"
         elif flow.get("call_ratio", 0.5) > 0.65:
             bonus = 3
             score = min(25, score + bonus)

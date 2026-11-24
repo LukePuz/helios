@@ -195,6 +195,110 @@ def _invalidation_record(plan: dict, new: dict, price, atr) -> dict:
                 "invalidation_record_error": type(e).__name__}
 
 
+_BREACH_REASON = "price at or below invalidation"   # the INVALIDATE close_reason
+_RESEED_READ_TIMEOUT_MS = 500
+
+
+def _iso(v):
+    return v.isoformat() if hasattr(v, "isoformat") else v
+
+
+def _rel(level, entry) -> float | None:
+    lv, en = _num(level), _num(entry)
+    return round(lv / en, 4) if lv and en and lv > 0 and en > 0 else None
+
+
+def _horizon_record(plan: dict, today: date) -> dict:
+    """Log-only, on a plan this verdict writes (NEW_PLAN, SEEDED, a REVISE's
+    new revision): which branch of plan_from_verdict set its horizon_end
+    (audit 11-22 04:56 #3c). horizon_basis "catalyst" (a catalyst dated
+    today or later: the date plus _CATALYST_GRACE_DAYS) or "bucket_default"
+    (no catalyst date, or one before today: the bucket's days from today);
+    catalyst_on_or_before_today (None with no catalyst date);
+    catalyst_days_from_today (negative when past); horizon_days, horizon_end
+    less today. Nothing here changes the horizon. Never raises."""
+    try:
+        cdate, end = plan.get("catalyst_date"), plan.get("horizon_end")
+        return {"horizon_basis": "catalyst" if cdate and cdate >= today else "bucket_default",
+                "catalyst_on_or_before_today": (cdate <= today) if cdate else None,
+                "catalyst_days_from_today": (cdate - today).days if cdate else None,
+                "horizon_days": (end - today).days if end else None}
+    except Exception as e:
+        return {"horizon_basis": None, "horizon_record_error": type(e).__name__}
+
+
+def _reseed_record(ticker: str, plan: dict, stop: dict | None, held: bool, now) -> dict:
+    """Log-only, on a NEW_PLAN or SEEDED plan (config
+    PLAN_RESEED_RECORD_ENABLED; off, {}): whether the ticker's previous plan
+    was closed by an invalidation breach while the position held now was
+    already open, so a breach followed by a re-seed doesn't read as an
+    unrelated new plan (audit 11-22 04:56 #1). One read
+    (db.last_closed_plan, capped at 500 ms); on its failure the flag is
+    None. Changes nothing. Never raises.
+
+    reseeded_after_invalidate: True when the previous plan's close_reason is
+    the INVALIDATE one, the position is held (a stop row) and was opened at
+    or before the breach, and hours_since_breach is within
+    PLAN_RESEED_WINDOW_HOURS (None: no window); None when the read failed or
+    the stop row has no opened_at; else False.
+    reseed: status ("ok", "no_previous_plan", "error:<class>"),
+    prev_plan_id, prev_plan_source, prev_close_reason,
+    prev_invalidation_rel and new_invalidation_rel (each plan's level over
+    its own entry; no prices), new_vs_prev_invalidation (new level over the
+    previous one, less 1), breach_at (the INVALIDATE verdict's time, so the
+    price may have crossed earlier, between verdicts), breach_basis,
+    hours_since_breach, held, position_open_at_breach, window_hours,
+    read_ms."""
+    try:
+        import time
+        import config
+        import db
+        if not getattr(config, "PLAN_RESEED_RECORD_ENABLED", False):
+            return {}
+        window = getattr(config, "PLAN_RESEED_WINDOW_HOURS", None)
+        rec = {"status": "ok", "prev_plan_id": None, "prev_plan_source": None,
+               "prev_close_reason": None, "prev_invalidation_rel": None,
+               "new_invalidation_rel": _rel(plan.get("invalidation_price"), plan.get("entry_price")),
+               "new_vs_prev_invalidation": None, "breach_at": None,
+               "breach_basis": "invalidate_verdict", "hours_since_breach": None,
+               "held": held, "position_open_at_breach": None, "window_hours": window,
+               "read_ms": None}
+        t0 = time.monotonic()
+        try:
+            prev = db.last_closed_plan(ticker, timeout_ms=_RESEED_READ_TIMEOUT_MS)
+        except Exception as e:
+            rec.update(status=f"error:{type(e).__name__}",
+                       read_ms=round((time.monotonic() - t0) * 1000, 1))
+            return {"reseeded_after_invalidate": None, "reseed": rec}
+        rec["read_ms"] = round((time.monotonic() - t0) * 1000, 1)
+        if prev is None:
+            rec["status"] = "no_previous_plan"
+            return {"reseeded_after_invalidate": False, "reseed": rec}
+        prev_inv, new_inv = _num(prev.get("invalidation_price")), _num(plan.get("invalidation_price"))
+        rec.update(prev_plan_id=prev.get("id"), prev_plan_source=prev.get("source"),
+                   prev_close_reason=prev.get("close_reason"),
+                   prev_invalidation_rel=_rel(prev_inv, prev.get("entry_price")),
+                   new_vs_prev_invalidation=(round(new_inv / prev_inv - 1, 4)
+                                             if prev_inv and new_inv and prev_inv > 0 else None))
+        breach = prev.get("closed_at") if prev.get("close_reason") == _BREACH_REASON else None
+        if breach is None:
+            return {"reseeded_after_invalidate": False, "reseed": rec}
+        hours = round((now - breach).total_seconds() / 3600, 2)
+        opened = (stop or {}).get("opened_at")
+        open_at = (opened <= breach) if held and opened is not None else None
+        rec.update(breach_at=_iso(breach), hours_since_breach=hours,
+                   position_open_at_breach=open_at)
+        if not held or open_at is False or (window is not None and hours > window):
+            flag = False
+        else:
+            flag = open_at        # True, or None when opened_at is unknown
+        return {"reseeded_after_invalidate": flag, "reseed": rec}
+    except Exception as e:
+        log.debug(f"[{ticker}] reseed record failed: {e}")
+        return {"reseeded_after_invalidate": None,
+                "reseed": {"status": f"error:{type(e).__name__}"}}
+
+
 def classify(plan: dict, action: str, new: dict | None, price: float | None,
              today: date, held: bool) -> dict:
     """Relation of one verdict to an active plan. `new` is the plan this
@@ -381,7 +485,7 @@ def _observe(ticker: str, parsed: dict, action: str, conviction: int, brief: str
         # Close a plan that ran past its horizon, or a plan whose position
         # is gone, before judging this verdict (professor M93).
         close_check = {"would_close_on_exit": None, "close_outcome_id": None,
-                       "close_check_status": "not_checked"}
+                       "close_check_status": "not_checked", "stopped_out_since_plan": None}
         if plan is not None:
             reason = None
             if plan.get("horizon_end") and today > plan["horizon_end"]:
@@ -402,9 +506,20 @@ def _observe(ticker: str, parsed: dict, action: str, conviction: int, brief: str
                     entered = (db.plan_root_created_at(plan["id"]) if plan.get("revision")
                                else None) or plan["created_at"]
                     closed = db.outcome_closed_since(ticker, plan["created_at"], entered_since=entered)
+                    # Log-only (audit 11-22 04:56 #1): the exit's time and
+                    # kind beside the flag. Recorded only while the plan
+                    # stays active (with PLAN_CLOSE_ON_EXIT on the plan
+                    # closes and this record isn't written). kind is
+                    # trade_outcomes.exit_source ("broker_exit": closed at
+                    # the broker by an order the bot didn't place, such as a
+                    # resting stop's fill), "unknown" when unset.
                     close_check = {"would_close_on_exit": bool(closed),
                                    "close_outcome_id": (closed or {}).get("id"),
-                                   "close_check_status": "ok"}
+                                   "close_check_status": "ok",
+                                   "stopped_out_since_plan": (
+                                       {"exit_at": _iso(closed.get("exit_at") or closed.get("exit_date")),
+                                        "kind": closed.get("exit_source") or "unknown",
+                                        "outcome_id": closed.get("id")} if closed else None)}
                     if closed and config.PLAN_CLOSE_ON_EXIT:
                         reason = "position closed"
                 except Exception as e:
@@ -424,14 +539,16 @@ def _observe(ticker: str, parsed: dict, action: str, conviction: int, brief: str
                 return {"relation": "NEW_PLAN",
                         "plan_id": db.insert_plan(_with_levels(new, parsed, price, ticker, today)),
                         "price": price,
-                        "held": held, "plan_live": held, **held_info}
+                        "held": held, "plan_live": held, **held_info,
+                        **_horizon_record(new, today), **_reseed_record(ticker, new, stop, held, now)}
             if stop and price:
                 seed = plan_from_verdict(ticker, parsed, conviction, price, today)
                 seed.update(source="held_seed", entry_price=stop["entry_price"],
                             invalidation_price=stop["stop_price"],
                             bucket=stop.get("thesis_bucket") or seed["bucket"])
                 return {"relation": "SEEDED", "plan_id": db.insert_plan(seed), "price": price,
-                        "held": held, "plan_live": True, **held_info}
+                        "held": held, "plan_live": True, **held_info,
+                        **_horizon_record(seed, today), **_reseed_record(ticker, seed, stop, held, now)}
             return {"relation": "NO_PLAN", "price": price, "held": held, **held_info}
 
         out = classify(plan, action, new, price, today, held)
@@ -499,6 +616,7 @@ def _observe(ticker: str, parsed: dict, action: str, conviction: int, brief: str
             # line in the sand, and how close to it the buy came, from the
             # levels already here and the ladder read for the new revision.
             out.update(_invalidation_record(plan, new, price, seen.get("atr")))
+            out.update(_horizon_record(new, today))
         elif out["relation"] == "INVALIDATE":
             db.touch_plan(plan["id"], "INVALIDATE", close_reason="price at or below invalidation")
         else:
@@ -581,3 +699,39 @@ def level_hits(plan: dict, price: float | None, today: date) -> list[tuple[str, 
     elif plan.get("catalyst_date") and today > plan["catalyst_date"]:
         hits.append(("catalyst_passed", str(plan["catalyst_date"])))
     return hits
+
+
+# The compiled levels compile_plan stores on the plan (migration 82), with the
+# side the price crosses them from. time_stop is the plan's horizon_end.
+COMPILED_PRICE_LEVELS = (("structural_stop", "down"), ("t1", "up"), ("t2", "up"),
+                         ("add_trigger", "up"))
+
+
+def compiled_level_state(plan: dict, price: float | None, today: date) -> dict:
+    """Record only (config PLAN_COMPILED_HIT_SHADOW_ENABLED): where the price
+    and calendar stand against the plan's compiled levels, which level_hits
+    does not watch. Per level: {"crossed": True/False, or None with no price
+    or no level; "direction": "down" (structural_stop: price at or below it),
+    "up" (t1, t2, add_trigger: at or above it) or "date" (time_stop: today
+    after horizon_end); "pct_vs_level": (price / level - 1) x 100, None
+    without both; "reason": None, "no_level" or "no_price"}. The price is the
+    watcher's intraday snapshot price, not a close (add_trigger is compiled
+    as a close above t1's band). Pure; nothing reads it for trading."""
+    out = {}
+    for name, direction in COMPILED_PRICE_LEVELS:
+        level = plan.get(name)
+        rec = {"crossed": None, "direction": direction, "pct_vs_level": None, "reason": None}
+        if not isinstance(level, (int, float)) or isinstance(level, bool) or level <= 0:
+            rec["reason"] = "no_level"
+        elif not isinstance(price, (int, float)) or isinstance(price, bool) or price <= 0:
+            rec["reason"] = "no_price"
+        else:
+            rec["crossed"] = bool(price <= level if direction == "down" else price >= level)
+            rec["pct_vs_level"] = round((price / level - 1) * 100, 3)
+        out[name] = rec
+    end = plan.get("horizon_end")
+    out["time_stop"] = {"crossed": bool(today > end) if isinstance(end, date) else None,
+                        "direction": "date", "pct_vs_level": None,
+                        "reason": None if isinstance(end, date) else "no_level",
+                        "date": str(end) if isinstance(end, date) else None}
+    return out

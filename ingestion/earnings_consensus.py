@@ -163,6 +163,24 @@ def _history_rows(df) -> list | None:
     return rows[:HISTORY_QUARTERS] or None
 
 
+def _calendar_event(cal, today: date) -> dict | None:
+    """The calendar's next-event fields for ingestion/earnings_events.py:
+    {dates: the future earningsDate values (two are an estimated window),
+    eps_avg/low/high, rev_avg/low/high} as given (cleaned to JSON-safe
+    scalars), or None when there is no calendar. Kept on the in-memory
+    snapshot only; db.log_earnings_consensus does not store it."""
+    if not isinstance(cal, dict):
+        return None
+    days = [d.date() if isinstance(d, datetime) else d for d in cal.get("Earnings Date") or []]
+    return {"dates": sorted(d.isoformat() for d in days if isinstance(d, date) and d >= today),
+            "eps_avg": _clean(cal.get("Earnings Average")),
+            "eps_low": _clean(cal.get("Earnings Low")),
+            "eps_high": _clean(cal.get("Earnings High")),
+            "rev_avg": _clean(cal.get("Revenue Average")),
+            "rev_low": _clean(cal.get("Revenue Low")),
+            "rev_high": _clean(cal.get("Revenue High"))}
+
+
 def _next_date(cal, today: date) -> tuple[date | None, bool]:
     """(next earnings date, is_estimate) from Ticker.calendar, the same
     reading as ingestion.earnings_calendar: two dates are an estimated window
@@ -201,7 +219,12 @@ def fetch_consensus(ticker: str, yf_ticker=None, today: date | None = None) -> d
         return value
 
     def read_next():
-        d, is_estimate = _next_date(yf_ticker.calendar, today)
+        cal = yf_ticker.calendar
+        d, is_estimate = _next_date(cal, today)
+        try:
+            rec["calendar_event"] = _calendar_event(cal, today)
+        except Exception:
+            rec["calendar_event"] = None
         return (d, is_estimate) if d else None
 
     nxt = part("calendar", read_next)
@@ -227,7 +250,7 @@ def fetch_consensus(ticker: str, yf_ticker=None, today: date | None = None) -> d
 
 def refresh_all_earnings_consensus(tickers: list[str] | None = None, fetch=fetch_consensus,
                                    write=None, pause_s: float = 0.3, deadline_s: float | None = None,
-                                   clock=time.monotonic) -> dict:
+                                   clock=time.monotonic, on_record=None) -> dict:
     """Fetch and append one row per watchlist ticker. ETFs (no estimates;
     Yahoo answers 404) are not fetched and get a no_data row.
 
@@ -236,7 +259,9 @@ def refresh_all_earnings_consensus(tickers: list[str] | None = None, fetch=fetch
     with error_class rate_limited / deadline, and Yahoo isn't called for it.
     A failed write is counted and the run goes on. Celery's soft time limit
     is raised. Returns counts by status plus 'written' and 'stopped' (None,
-    'rate_limited' or 'deadline'). At most one WARNING per run."""
+    'rate_limited' or 'deadline'). At most one WARNING per run.
+    on_record(ticker, rec), when given, is called with each fetched
+    snapshot (not ETF or skipped rows); an exception from it is ignored."""
     from knowledge_loader import get_all_tickers, get_etf_tickers
     write_errors: list[str] = []
     if write is None:
@@ -295,6 +320,13 @@ def refresh_all_earnings_consensus(tickers: list[str] | None = None, fetch=fetch
             rec = {"source": SOURCE, "status": "error", "error_class": type(e).__name__,
                    "parts": {}}
         record(ticker, rec)
+        if on_record is not None:
+            try:
+                on_record(ticker, rec)
+            except _SoftTimeLimit:
+                raise
+            except Exception:
+                pass
         time.sleep(pause_s)  # be polite to Yahoo's unofficial endpoint
 
     stopped = counts["stopped"]

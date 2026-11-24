@@ -1222,3 +1222,125 @@ def test_revise_relation_and_existing_keys_unchanged_by_the_record():
         assert {k: v for k, v in with_rec.items() if k not in plans._INVALIDATION_RECORD_KEYS} \
             == without
         assert ins_a.call_args.args[0] == ins_b.call_args.args[0]
+
+
+
+def _watch_redis(plan, held_prices, review=False, log_id=7, cap_taken=False, rows=None):
+    import tasks
+    rows = [] if rows is None else rows
+    redis = MagicMock()
+    redis.set.side_effect = lambda key, *a, **k: not (cap_taken and key.startswith("helios:plan_review:"))
+    with patch("market_data.is_market_hours", return_value=True), \
+         patch("db.get_active_plans", return_value=[plan]), \
+         patch("tasks._held_prices", return_value=held_prices), \
+         patch("stop_lock._redis", return_value=redis), \
+         patch("config.PLAN_LEVEL_REVIEW_ENABLED", review), \
+         patch("tasks.review_plan_level_hit.apply_async"), \
+         patch("db.outcome_closed_since", return_value=None), \
+         patch("db.log_signal", return_value=log_id) as ls:
+        tasks.watch_plan_levels()
+    rows.extend(ls.call_args_list)
+    ttl = {c.args[0]: c.kwargs.get("ex") for c in redis.set.call_args_list
+           if str(c.args[0]).startswith("helios:plan_hit:")}
+    ttl.update({c.args[0]: c.args[1] for c in redis.expire.call_args_list})
+    return ttl
+
+
+def test_date_hits_are_deduped_once_per_plan_price_hits_daily():
+    """catalyst_passed and horizon_end happen once per plan: their key
+    outlives the plan's horizon. invalidation and target keep one day."""
+    import tasks
+    keys = _watch_redis(_plan(catalyst_date=None, horizon_end=date(2026, 10, 1)), {"NVDA": 470.0})
+    assert keys == {"helios:plan_hit:1:invalidation": 86400,
+                    "helios:plan_hit:1:horizon_end": tasks._PLAN_DATE_HIT_TTL_S}
+    keys = _watch_redis(_plan(catalyst_date=date(2026, 10, 1), horizon_end=date(2099, 1, 1)),
+                        {"NVDA": 660.0})
+    assert keys == {"helios:plan_hit:1:target": 86400,
+                    "helios:plan_hit:1:catalyst_passed": tasks._PLAN_DATE_HIT_TTL_S}
+    assert tasks._PLAN_DATE_HIT_TTL_S >= 365 * 86400
+    assert tasks._plan_hit_ttl("structural_stop") == 86400
+
+
+def test_a_date_hit_logs_once_across_days():
+    """With a Redis that keeps the key, the same horizon_end logs on the
+    first day only, however many days the plan stays active."""
+    import tasks
+    store = {}
+
+    def _set(key, val, nx=False, ex=None):
+        if nx and key in store:
+            return None
+        store[key] = ex
+        return True
+
+    def _expire(key, ex):
+        store[key] = ex
+    redis = MagicMock()
+    redis.set.side_effect = _set
+    redis.expire.side_effect = _expire
+    redis.delete.side_effect = lambda key: store.pop(key, None)
+    plan = _plan(ticker="PLTR", catalyst_date=None, horizon_end=date(2026, 10, 1))
+    counts = []
+    for day in range(3):
+        with patch("market_data.is_market_hours", return_value=True), \
+             patch("db.get_active_plans", return_value=[plan]), \
+             patch("tasks._held_prices", return_value={}), \
+             patch("stop_lock._redis", return_value=redis), \
+             patch("config.PLAN_LEVEL_REVIEW_ENABLED", False), \
+             patch("db.outcome_closed_since", return_value=None), \
+             patch("db.log_signal", return_value=7) as ls:
+            tasks.watch_plan_levels()
+        counts.append(sum(1 for c in ls.call_args_list if c.args[1] == "PLAN_LEVEL_HIT"))
+        # A one-day key would expire here; the date key does not.
+        for k, ex in list(store.items()):
+            if ex is not None and ex <= 86400:
+                store.pop(k)
+    assert counts == [1, 0, 0]
+
+
+
+def test_date_hit_without_a_queued_review_keeps_the_one_day_key():
+    """Reviews on, the day's review cap already taken: the date hit's key keeps
+    one day, so its review comes on a later day; the row says daily."""
+    import tasks
+    rows = []
+    plan = _plan(catalyst_date=None, horizon_end=date(2026, 10, 1))
+    keys = _watch_redis(plan, {"NVDA": 540.0}, review=True, cap_taken=True, rows=rows)
+    assert keys == {"helios:plan_hit:1:horizon_end": 86400}
+    assert rows[0].kwargs["provenance"]["hit_dedupe"] == "daily"
+    assert rows[0].kwargs["provenance"]["review_queued"] is False
+    rows = []
+    keys = _watch_redis(plan, {"NVDA": 540.0}, review=True, rows=rows)        # queued
+    assert keys["helios:plan_hit:1:horizon_end"] == tasks._PLAN_DATE_HIT_TTL_S
+    assert rows[0].kwargs["provenance"]["hit_dedupe"] == "once_per_plan"
+
+
+def test_hit_dedupe_is_on_every_row():
+    rows = []
+    _watch_redis(_plan(catalyst_date=None, horizon_end=date(2026, 10, 1)), {"NVDA": 470.0}, rows=rows)
+    got = {c.kwargs["provenance"]["kind"]: c.kwargs["provenance"]["hit_dedupe"] for c in rows}
+    assert got == {"invalidation": "daily", "horizon_end": "once_per_plan"}
+
+
+def test_a_failed_row_write_keeps_the_one_day_key(caplog):
+    """log_signal returned no id (spilled or degraded): the one-day claim stays,
+    so it is tried again the next day, not every tick; a warning says so."""
+    import logging
+    import tasks
+    redis = MagicMock()
+    redis.set.return_value = True
+    plan = _plan(catalyst_date=None, horizon_end=date(2026, 10, 1))
+    with patch("market_data.is_market_hours", return_value=True), \
+         patch("db.get_active_plans", return_value=[plan]), \
+         patch("tasks._held_prices", return_value={}), \
+         patch("stop_lock._redis", return_value=redis), \
+         patch("config.PLAN_LEVEL_REVIEW_ENABLED", False), \
+         patch("db.outcome_closed_since", return_value=None), \
+         patch("db.log_signal", return_value=None), \
+         caplog.at_level(logging.WARNING, logger="tasks"):
+        tasks.watch_plan_levels()
+    assert redis.set.call_args.args[0] == "helios:plan_hit:1:horizon_end"
+    assert redis.set.call_args.kwargs == {"nx": True, "ex": 86400}
+    redis.delete.assert_not_called()
+    redis.expire.assert_not_called()
+    assert "row not written (spilled or degraded); one-day key kept" in caplog.text

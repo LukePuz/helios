@@ -569,6 +569,50 @@ def _fetch_submissions(ticker: str, cik: str, label: str = "EDGAR") -> tuple | N
 
 _AGED_OUT_THIS_PASS: list[tuple[str, str]] = []   # (accession, "TICKER FORM ACCEPTED")
 _AGED_OUT_WARNED: set[str] = set()   # accessions already logged by this process
+# Log-only: an accession named in the aged-out warning by any worker process
+# (the 4 prefork children and each daily start had their own set, so the same
+# Form 4s were named ~4 times a day, 11-16 to 11-18). The TTL covers the whole
+# window in which _note_aged_out can list a filing, so a filing is not named
+# again while it can still be listed.
+_AGED_OUT_WARNED_KEY = "helios:edgar_aged_out_warned:{env}:{accession}"
+_AGED_OUT_WARNED_TTL_S = (_MAX_AGE_HOURS + _AGED_OUT_LOOKBACK_HOURS + 24) * 3600
+_AGED_OUT_NAMED_PER_PASS = 20
+
+
+def _aged_out_to_name(entries: list[tuple[str, str]]) -> tuple[list[tuple[str, str]], int]:
+    """(entries to name in the aged-out warning now, how many are new). New
+    means not yet named by any process: a Redis NX key per accession
+    (_AGED_OUT_WARNED_KEY), with this process's _AGED_OUT_WARNED in front.
+    At most _AGED_OUT_NAMED_PER_PASS are named a pass and claimed; the rest
+    are checked without claiming, so a later pass names them. When Redis
+    can't be read, only the in-process set is used, as before. Log-only;
+    never raises."""
+    fresh = [e for e in dict(entries).items() if e[0] not in _AGED_OUT_WARNED]
+    named, new = [], 0
+    try:
+        import stop_lock
+        from config import TRADING_ENV
+        r = stop_lock._redis()
+        for acc, label in fresh:
+            key = _AGED_OUT_WARNED_KEY.format(env=TRADING_ENV, accession=acc)
+            if len(named) < _AGED_OUT_NAMED_PER_PASS:
+                claimed = r.set(key, "1", nx=True, ex=_AGED_OUT_WARNED_TTL_S)
+            else:
+                claimed = None if r.exists(key) else False
+            if claimed:
+                named.append((acc, label))
+                new += 1
+            elif claimed is False:
+                new += 1          # new, but named on a later pass
+            else:
+                _AGED_OUT_WARNED.add(acc)   # another process named it
+    except Exception as e:
+        log.debug(f"EDGAR: aged-out warning dedupe read failed ({type(e).__name__}); "
+                  f"this process's set only")
+        named = [e for e in fresh if e[0] not in _AGED_OUT_WARNED][:_AGED_OUT_NAMED_PER_PASS]
+        new = len([e for e in fresh if e[0] not in _AGED_OUT_WARNED])
+    _AGED_OUT_WARNED.update(acc for acc, _ in named)
+    return named, new
 
 
 def _note_aged_out(ticker: str, data: dict, tz) -> None:
@@ -816,13 +860,12 @@ def _poll_all(on_filing=None) -> list[dict]:
                     log.error(f"EDGAR: dispatch failed for {ticker} {filing.get('form')}: {e}")
     stats["skipped"] = total - polled
     stats["aged_out_unseen"] = len(_AGED_OUT_THIS_PASS)
-    # Each filing is named once per process, up to 20 a pass (the rest are
-    # named on later passes); the count is kept every pass.
-    fresh = [(acc, label) for acc, label in _AGED_OUT_THIS_PASS if acc not in _AGED_OUT_WARNED]
-    named = fresh[:20]
-    _AGED_OUT_WARNED.update(acc for acc, _ in named)
-    if fresh:
-        log.warning(f"EDGAR: {len(fresh)} new unseen filing(s) older than "
+    # Each filing is named once across worker processes (_aged_out_to_name),
+    # up to 20 a pass (the rest are named on later passes); the count is kept
+    # every pass.
+    named, new = _aged_out_to_name(_AGED_OUT_THIS_PASS)
+    if named:
+        log.warning(f"EDGAR: {new} new unseen filing(s) older than "
                     f"{_MAX_AGE_HOURS}h skipped by the age filter (log-only; "
                     f"{len(_AGED_OUT_THIS_PASS)} this pass): " + "; ".join(label for _, label in named))
     if stats["aborted"]:

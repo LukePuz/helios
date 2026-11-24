@@ -126,6 +126,26 @@ def _redis():
     return _client
 
 
+def _lock_key(ticker: str) -> str:
+    return f"helios:stop_lock:{ticker}"
+
+
+def held_elsewhere(ticker: str) -> bool | None:
+    """Whether another holder (another process, or another thread here) has
+    ticker's stop lock right now: a read-only EXISTS on its key, never
+    taking it. False when this thread holds it (the caller is inside the
+    change), None when Redis can't be read. A stop change on the ticker is
+    under way while True (a profit-target sale holds it from the cancel
+    through its trade and order rows), so a SELL execution seen then may be
+    the bot's own and its rows not yet written."""
+    if (getattr(_local, "held", None) or {}).get(ticker):
+        return False
+    try:
+        return bool(_redis().exists(_lock_key(ticker)))
+    except Exception:
+        return None
+
+
 @contextmanager
 def ticker_lock(ticker: str, wait: float | None = None):
     held = getattr(_local, "held", None)
@@ -142,7 +162,7 @@ def ticker_lock(ticker: str, wait: float | None = None):
     lock = None
     try:
         # thread_local=False so the renew thread can use the token.
-        lock = _redis().lock(f"helios:stop_lock:{ticker}", timeout=LOCK_TTL_S,
+        lock = _redis().lock(_lock_key(ticker), timeout=LOCK_TTL_S,
                              blocking_timeout=DEFAULT_WAIT_S if wait is None else wait,
                              thread_local=False)
         acquired = lock.acquire()

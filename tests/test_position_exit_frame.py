@@ -2,7 +2,19 @@
 #1). Log-only."""
 from unittest.mock import patch
 
+import pytest
+
 import tasks
+
+
+@pytest.fixture(autouse=True)
+def _no_gap_risk_row():
+    """position_exit_frame also writes the book_gap_risk and book_deployment
+    rows (their own tests, test_gap_risk.py and test_book_deployment.py);
+    these count only the exit frame's rows."""
+    with patch("tasks.book_gap_risk_record", return_value=False), \
+         patch("tasks.book_deployment_record", return_value=False):
+        yield
 
 
 def _bars(*pairs):

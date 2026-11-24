@@ -42,6 +42,7 @@ def test_stop_is_cancelled_then_replaced_for_remaining_shares_at_breakeven():
          patch("ibkr.place_market_order",
                side_effect=lambda *a: calls.append("sell") or {"filled_qty": 30, "order_id": 7}), \
          patch("ibkr.get_client", return_value=_client(70)), \
+         patch("ibkr.cached_stock_qty", return_value=70.0), \
          patch("tasks.manage_stop_place",
                side_effect=lambda *a, **k: calls.append(("stop",) + a) or {"order_id": 8}), \
          patch("alerts._send") as send:
@@ -88,7 +89,31 @@ def test_alert_when_the_new_stop_cannot_be_placed():
         result = _rm()._partial_sell_and_resize_stop("NVDA", 100, 30, 100.0)
 
     assert result == {"filled_qty": 30, "new_stop": 100.0}
-    assert "UNPROTECTED" in send.call_args[0][0]
+    # The sale's rows are written after the place (unmocked here, so a DB
+    # alert can follow): UNPROTECTED is sent, before them.
+    assert any("UNPROTECTED" in c.args[0] for c in send.call_args_list)
+
+
+@pytest.mark.parametrize("broker", [70.0, TimeoutError("ib")])
+def test_alert_when_the_new_stop_cannot_be_placed_with_the_shipped_count_check(broker):
+    """PT_STOP_QTY_FROM_BROKER on (shipped): the last alert is still the
+    UNPROTECTED one, and no PT STOP text about a stop that does not exist."""
+    import config
+    bkw = {"side_effect": broker} if isinstance(broker, Exception) else {"return_value": broker}
+    with patch.object(config, "PT_STOP_QTY_FROM_BROKER", True), \
+         patch("ibkr.cached_stock_qty", **bkw), patch("db.log_activity_queued"), \
+         patch("db.get_position_stop", return_value={"stop_price": 90.0}), \
+         patch("tasks.manage_cancel_stop_orders_for"), \
+         patch("ibkr.place_market_order", return_value={"filled_qty": 30}), \
+         patch("ibkr.get_client", return_value=_client(70)), \
+         patch("tasks.manage_stop_place", side_effect=RuntimeError("down")), \
+         patch("alerts._send") as send:
+        result = _rm()._partial_sell_and_resize_stop("NVDA", 100, 30, 100.0)
+    assert result == {"filled_qty": 30, "new_stop": 100.0}
+    # The sale's rows are written after the place (unmocked here, so a DB
+    # alert can follow): UNPROTECTED is sent, before them.
+    assert any("UNPROTECTED" in c.args[0] for c in send.call_args_list)
+    assert not any("PT STOP" in c.args[0] for c in send.call_args_list)
 
 
 def test_unconfirmed_fill_is_not_treated_as_a_sale():

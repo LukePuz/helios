@@ -81,9 +81,11 @@ SERVICES: dict[str, dict] = {
         # llm_p2 (chat-requested "analyze TICKER" research, see
         # tasks.LLM_QUEUE_RESEARCH) sorts and drains last, behind held-ticker
         # events and organic news-driven ideas — same worker/concurrency,
-        # just always at the back of the line.
+        # just always at the back of the line. llm_p3 (tasks.SHADOW_LLM_QUEUE,
+        # the verdict-vote shadow re-draws) sorts after it; nothing is sent
+        # there unless config.VERDICT_VOTE_SHADOW_ENABLED is on.
         "cmd":   [CELERY, "-A", "tasks", "worker", "--loglevel=info",
-                  "-Q", "llm_p0,llm_p1,llm_p2", "-n", "llm@%h",
+                  "-Q", "llm_p0,llm_p1,llm_p2,llm_p3", "-n", "llm@%h",
                   "--prefetch-multiplier=1"] + _LLM_POOL_ARGS,
         "log":   LOG_DIR / "celery_llm_worker.log",
     },

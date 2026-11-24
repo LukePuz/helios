@@ -6,7 +6,10 @@ import db
 
 def test_each_new_migration_runs_under_a_lock_timeout():
     cur = MagicMock()
-    cur.fetchall.return_value = [(v,) for v, _ in db._MIGRATIONS[:-2]]   # last two are new
+    # The last two plain migrations are new; CREATE INDEX CONCURRENTLY ones
+    # run outside a transaction (tests/test_signals_index_migration.py).
+    plain = [(v, s) for v, s in db._MIGRATIONS if not db._CONCURRENT_INDEX_RE.match(s)]
+    cur.fetchall.return_value = [(v,) for v, _ in db._MIGRATIONS if (v, _) not in plain[-2:]]
     conn = MagicMock()
     conn.cursor.return_value.__enter__.return_value = cur
     with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
@@ -15,4 +18,4 @@ def test_each_new_migration_runs_under_a_lock_timeout():
     sets = [i for i, q in enumerate(sqls) if q.startswith("SET LOCAL lock_timeout")]
     assert len(sets) == 2
     for i in sets:
-        assert "30s" in sqls[i] and sqls[i + 1] in {s for _, s in db._MIGRATIONS[-2:]}
+        assert "30s" in sqls[i] and sqls[i + 1] in {s for _, s in plain[-2:]}

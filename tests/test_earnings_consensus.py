@@ -329,7 +329,11 @@ def test_beat_entry_runs_after_the_close_on_the_ingestion_queue():
 
 # --- nothing the analyst sees reads it -------------------------------------
 
-_ALLOWED = {"db.py", "tasks.py", "ingestion/earnings_consensus.py", "helios3d/features/store.py"}
+# earnings_claim.py: the record-only earnings-claim check, run after the
+# reply; its source label names the table and its date is in the verdict
+# record (decision.catalyst_check), which no prompt or panel role reads.
+_ALLOWED = {"db.py", "tasks.py", "ingestion/earnings_consensus.py", "helios3d/features/store.py",
+            "earnings_claim.py"}
 _SKIP = ("tests", "venv", ".venv", ".git", ".claude")
 
 

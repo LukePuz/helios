@@ -15,6 +15,11 @@ os.environ["OLLAMA_HOST"] = "http://127.0.0.1:1"
 os.environ["OLLAMA_CPU_HOST"] = "http://127.0.0.1:1"
 # ingestion.edgar builds its ticker -> CIK map from SEC at import time.
 os.environ["HELIOS_EDGAR_OFFLINE"] = "1"
+# pyarrow fixes its allocator when it is first imported (pandas imports it).
+# config.py sets the system pool first in the bot; some test modules import
+# pandas before config, and whichever ran first decided the pool for the
+# whole session. Set it here, before any test module, as config does.
+os.environ.setdefault("ARROW_DEFAULT_MEMORY_POOL", "system")
 
 import tempfile
 from pathlib import Path
@@ -30,6 +35,26 @@ os.environ["HELIOS_DB_SPILL_PATH"] = os.path.join(_SESSION_SPILL_DIR, "db_write_
 _REPO_SPILL = Path(__file__).resolve().parent.parent / "logs" / "db_write_spill.jsonl"
 
 import pytest
+
+# HELIOS_TEST_SHIPPED_DEFAULTS=1 runs the suite on config.py's shipped switch
+# values: the switch-off fixtures below (the ones calling _switch_off) leave config
+# alone, so every test sees the combination that deploys. The fixtures that
+# stub DB, network and broker reads stay on in both modes. A test that needs a
+# switch at a given value says so with @pytest.mark.switches(NAME=value),
+# applied in both modes after the switch-off fixtures (_explicit_switches).
+# Run: HELIOS_TEST_SHIPPED_DEFAULTS=1 pytest -q tests  (see tests/README.md).
+SHIPPED_DEFAULTS = os.getenv("HELIOS_TEST_SHIPPED_DEFAULTS", "").strip() == "1"
+
+
+def _switch_off(monkeypatch, config, name, value):
+    """A switch-off fixture's setattr: applied in the default mode only."""
+    if not SHIPPED_DEFAULTS:
+        monkeypatch.setattr(config, name, value)
+
+
+def pytest_report_header(config):
+    return ("config switches: SHIPPED DEFAULTS (HELIOS_TEST_SHIPPED_DEFAULTS=1)"
+            if SHIPPED_DEFAULTS else "config switches: conftest switch-off defaults")
 
 
 def _spill_size():
@@ -187,17 +212,170 @@ def _no_entry_quality_row(monkeypatch):
     tests see no new row or read; tests/test_entry_quality_shadow.py turns it
     on."""
     import config
-    monkeypatch.setattr(config, "ENTRY_QUALITY_SHADOW_ENABLED", False)
+    _switch_off(monkeypatch, config, "ENTRY_QUALITY_SHADOW_ENABLED", False)
+
+
+@pytest.fixture(autouse=True)
+def _no_vol_shadow_read(monkeypatch):
+    """size_position's record-only volatility shadows read cached bars from
+    price_history. Stubbed as "no cached bars" (no DB read) unless a test
+    patches it itself; tests/test_vol_target_shadow.py does."""
+    import risk_manager
+    monkeypatch.setattr(risk_manager, "_vol_shadow_bars", lambda ticker, window: [])
+
+
+@pytest.fixture(autouse=True)
+def _no_book_heat_read(monkeypatch):
+    """The route's record-only book heat reads the newest portfolio snapshot
+    and position_stops. Stubbed as "no snapshot" (no DB read) unless a test
+    patches it itself; tests/test_book_heat.py does."""
+    from agents import crew
+    monkeypatch.setattr(crew, "_book_heat_inputs", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_recheck_contradiction_read(monkeypatch):
+    """Every OPEN/ADD past the rebuy cooldown reads the recent verdicts for a
+    record-only field (agents/crew.py:_recheck_contradiction_record). Off here
+    so existing routing tests see no new read or field;
+    tests/test_recheck_contradiction.py turns it on."""
+    import config
+    _switch_off(monkeypatch, config, "RECHECK_CONTRADICTION_SHADOW_ENABLED", False)
+
+
+@pytest.fixture(autouse=True)
+def _no_same_day_consensus_read(monkeypatch):
+    """Every OPEN/ADD past the rebuy cooldown reads today's earlier verdicts
+    for a record-only field (agents/crew.py:_same_day_consensus_record). Off
+    here so existing routing tests see no new read or field;
+    tests/test_same_day_consensus.py turns it on."""
+    import config
+    _switch_off(monkeypatch, config, "SAME_DAY_CONSENSUS_RECORD_ENABLED", False)
+
+
+@pytest.fixture(autouse=True)
+def _no_news_timeline(monkeypatch):
+    """Each event/scan verdict queues a record-only news-timeline job for a
+    side thread (agents/news_timeline.py). Off here so existing analyst
+    tests queue nothing; tests/test_news_timeline.py turns it on."""
+    import config
+    _switch_off(monkeypatch, config, "NEWS_TIMELINE_RECORD_ENABLED", False)
+
+
+@pytest.fixture(autouse=True)
+def _inert_news_timeline_lane(request, monkeypatch):
+    """In both modes, a news-timeline job queued by any test outside the
+    lane's own (@pytest.mark.news_timeline_lane) goes to a list on
+    agents.news_timeline (_TEST_JOBS), not to a thread: a thread would run
+    the job after the verdict, possibly into this test's own db mocks (a
+    mocked log_activity_queued) or the next test's. The hook and its switch
+    still run as shipped; only the thread is not started."""
+    from agents import news_timeline
+    if request.node.get_closest_marker("news_timeline_lane"):
+        return
+    jobs = []
+    monkeypatch.setattr(news_timeline, "_TEST_JOBS", jobs, raising=False)
+    monkeypatch.setattr(news_timeline, "enqueue", lambda job: jobs.append(job) or True)
 
 
 @pytest.fixture(autouse=True)
 def _entry_gates_off(monkeypatch):
     """The live entry gates (agents/crew.py:_entry_gate) skip an OPEN/ADD after
     a recent broker exit or below both moving averages. Off here so existing
-    routing tests route as before; tests/test_entry_gate.py turns them on."""
+    routing tests route as before; tests/test_entry_gate.py and
+    tests/test_add_loser_gate.py turn them on."""
     import config
-    monkeypatch.setattr(config, "STOPOUT_REENTRY_GATE_DAYS", 0)
-    monkeypatch.setattr(config, "ENTRY_TREND_GATE_ENABLED", False)
+    _switch_off(monkeypatch, config, "STOPOUT_REENTRY_GATE_DAYS", 0)
+    _switch_off(monkeypatch, config, "ENTRY_TREND_GATE_ENABLED", False)
+    _switch_off(monkeypatch, config, "ADD_LOSER_GATE_MODE", "off")
+
+
+@pytest.fixture(autouse=True)
+def _no_add_lot_r_read(monkeypatch):
+    """A BUY stopped over an existing stop record writes a record-only
+    add_lot_r activity row from a trade_outcomes read (execution._record_add_lot_r).
+    Off here so existing tests see no new read or row; tests/test_add_lot_r.py
+    turns it on."""
+    import config
+    _switch_off(monkeypatch, config, "ADD_LOT_R_SHADOW_ENABLED", False)
+
+
+@pytest.fixture(autouse=True)
+def _no_add_stop_qty_from_broker(monkeypatch):
+    """An ADD's whole-position stop is sized from ibkr.cached_stock_qty
+    (execution._add_stop_qty), a read the existing ADD tests don't mock. Off
+    here so they keep sizing from the position reads;
+    tests/test_add_stop_qty.py turns it on."""
+    import config
+    _switch_off(monkeypatch, config, "ADD_STOP_QTY_FROM_BROKER", False)
+
+
+@pytest.fixture(autouse=True)
+def _no_more_stop_qty_from_broker(monkeypatch):
+    """The profit-target remainder stop (risk_manager._pt_stop_qty,
+    ibkr.cached_stock_qty) and a late BUY fill's expect_at_least
+    (tasks._late_fill_expect, ibkr.get_broker_stock_qty) read counts, which the existing tests don't mock. Off here;
+    tests/test_stop_qty_more.py turns them on."""
+    import config
+    _switch_off(monkeypatch, config, "PT_STOP_QTY_FROM_BROKER", False)
+    _switch_off(monkeypatch, config, "LATE_FILL_EXPECT_MODE", "off")
+
+
+@pytest.fixture(autouse=True)
+def _no_story_dedup_read(monkeypatch):
+    """Each event analysis reads the ticker's earlier event verdicts for its
+    record-only story de-dup shadow (agents/story_dedup.py). Off here so
+    existing tests see no new read or trigger key; tests/test_story_dedup.py
+    turns it on."""
+    import config
+    _switch_off(monkeypatch, config, "STORY_DEDUP_SHADOW_ENABLED", False)
+
+
+@pytest.fixture(autouse=True)
+def _no_plan_compiled_hit_row(monkeypatch):
+    """watch_plan_levels writes a record-only plan_compiled_hit activity row
+    the first time a compiled plan level is crossed (tasks._plan_compiled_hit_record).
+    Off here so existing watcher tests see no new row or Redis key;
+    tests/test_plan_compiled_hit.py turns it on."""
+    import config
+    _switch_off(monkeypatch, config, "PLAN_COMPILED_HIT_SHADOW_ENABLED", False)
+
+
+@pytest.fixture(autouse=True)
+def _no_late_fill_held_before(monkeypatch):
+    """execute_approved stores a BUY's held count before the order on its row,
+    and a late OPEN fill reads it (tasks._late_fill_held_decide). Off here so
+    existing tests see no new read, write or row; tests/test_late_fill_held_before.py
+    sets "shadow" or "enforce"."""
+    import config
+    _switch_off(monkeypatch, config, "LATE_FILL_HELD_BEFORE_MODE", "off")
+
+
+@pytest.fixture(autouse=True)
+def _no_held_exit_reads(monkeypatch):
+    """Each trim/exit rule row reads cached bars and the active trade plan for
+    its record-only held-exit candidates (agents/held_exit.py). Off here so
+    existing tests see no new read; tests/test_held_exit.py turns it on."""
+    import config
+    _switch_off(monkeypatch, config, "HELD_EXIT_SHADOW_ENABLED", False)
+
+
+@pytest.fixture(autouse=True)
+def _explicit_switches(request, monkeypatch, _no_entry_quality_row, _no_recheck_contradiction_read,
+                       _no_same_day_consensus_read, _no_news_timeline,
+                       _entry_gates_off, _no_add_lot_r_read, _no_add_stop_qty_from_broker,
+                       _no_more_stop_qty_from_broker, _no_story_dedup_read,
+                       _no_plan_compiled_hit_row, _no_late_fill_held_before, _no_held_exit_reads):
+    """@pytest.mark.switches(NAME=value, ...): set by name on config, in both
+    modes. It depends on every switch-off fixture, so it runs after them and
+    the marker wins. A name config.py lacks is an error (a typo would test
+    nothing)."""
+    import config
+    for mark in reversed(list(request.node.iter_markers("switches"))):   # closest mark last
+        for name, value in mark.kwargs.items():
+            if not hasattr(config, name):
+                raise AttributeError(f"switches marker: config has no {name}")
+            monkeypatch.setattr(config, name, value)
 
 
 @pytest.fixture(autouse=True)
@@ -244,6 +422,60 @@ def _no_real_database(monkeypatch):
     monkeypatch.setattr(db, "_get_pool", _blocked)
     monkeypatch.setattr(db.psycopg2.pool, "ThreadedConnectionPool", _blocked)
     monkeypatch.setattr(db.psycopg2, "connect", _blocked)
+
+
+_ACTIVITY_SETTLE_S = 2.0   # how long a test's teardown waits for the writer's row in flight
+
+
+def _settle_activity_queue(q) -> bool:
+    """Drop the rows still queued on q (their test is over; nothing may write
+    them through the next test's patches) and wait, bounded, for the row the
+    writer is on. True when q is idle. Never raises or blocks unbounded."""
+    import queue
+    import time
+    if q is None:
+        return True
+    try:
+        while True:
+            q.get_nowait()
+            q.task_done()
+    except queue.Empty:
+        pass
+    except Exception:
+        return False
+    end = time.monotonic() + _ACTIVITY_SETTLE_S
+    while getattr(q, "unfinished_tasks", 0) and time.monotonic() < end:
+        time.sleep(0.01)
+    return not getattr(q, "unfinished_tasks", 0)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_activity_writer(_no_real_database, monkeypatch):
+    """db.log_activity_queued's writer thread outlives the test that queued a
+    row and calls whatever db.log_activity_direct is at write time, so a row
+    queued by one test could reach the next test's patched writer (an
+    add_stop_qty row failed a later assert_not_called). After each test, the
+    queue the test started with and the one it ended with are settled
+    (_settle_activity_queue). A queue whose writer is still busy after the
+    bound is dropped from db's module references, so the next test starts a
+    fresh queue and writer. db.py's runtime behaviour is unchanged. Depends
+    on _no_real_database and monkeypatch so it tears down first: the DB is
+    still blocked, and a test's own monkeypatched queue is still in place."""
+    import db
+    before = getattr(db, "_ACTIVITY_QUEUE", None)
+    yield
+    after = getattr(db, "_ACTIVITY_QUEUE", None)
+    idle = all([_settle_activity_queue(q) for q in {id(x): x for x in (before, after)
+                                                  if x is not None}.values()])
+    if not idle:
+        db._ACTIVITY_QUEUE = None
+        db._ACTIVITY_WRITER = None
+    # The news-timeline thread (agents/news_timeline.py) the same way: its
+    # jobs read and write through whatever db is when they run.
+    from agents import news_timeline
+    if not _settle_activity_queue(news_timeline._QUEUE):
+        news_timeline._QUEUE = None
+        news_timeline._WORKER = None
 
 
 @pytest.fixture(autouse=True)
@@ -329,7 +561,8 @@ class _FakeRedis:
         return True
 
     def exists(self, key):
-        return int(key in _FakeRedis.store)
+        # A held lock is an ordinary key in Redis.
+        return int(key in _FakeRedis.store or key in _FakeLock.held)
 
     def get(self, key):
         v = _FakeRedis.store.get(key)
@@ -423,6 +656,11 @@ def _buy_room_passes(request, monkeypatch):
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "real_buy_room: run the real execution-time cash/cap check")
+    config.addinivalue_line("markers", "news_timeline_lane: start the real news-timeline thread "
+                            "(tests/conftest.py:_inert_news_timeline_lane)")
+    config.addinivalue_line(
+        "markers", "switches(**names): set these config switches for the test, in both the "
+                   "default and the shipped-defaults mode (_explicit_switches)")
 
 
 @pytest.fixture(autouse=True)

@@ -227,9 +227,12 @@ def test_route_blocks_with_a_route_row_before_sizing(trigger):
     rm_cls, lpa, ls = _route(result)
     lpa.assert_not_called()
     rm_cls.assert_not_called()                     # no sizing, so no swap sale
-    assert ls.call_count == 1                      # the route row only
-    assert ls.call_args.args[1] == "ROUTE_NO_NEW_FACT"
-    assert ls.call_args.args[3].startswith("no new fact (all_buys, same_run): ")
+    import config
+    rows = [c for c in ls.call_args_list                # the shipped entry-quality shadow row aside
+            if not (c.args[1] == "ENTRY_QUALITY_SHADOW" and config.ENTRY_QUALITY_SHADOW_ENABLED)]
+    assert len(rows) == 1                          # the route row only
+    assert rows[0].args[1] == "ROUTE_NO_NEW_FACT"
+    assert rows[0].args[3].startswith("no new fact (all_buys, same_run): ")
     decision = ls.call_args.kwargs["decision"]
     assert decision["route_exit"] == "ROUTE_NO_NEW_FACT"
     assert decision["new_fact_gate"]["passed"] is False

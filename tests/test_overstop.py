@@ -6,6 +6,16 @@ import pytest
 import tasks
 
 
+@pytest.fixture(autouse=True)
+def _no_price_read():
+    """The stop re-place guard (tasks._reprotect_after_late_sell) reads a
+    price: patched to no price here, so these tests place as before and
+    never reach IBKR. A test that needs a price patches its own."""
+    with patch("ibkr.get_latest_price", return_value=None), \
+         patch("ibkr.get_fresh_minute_price", return_value=None):
+        yield
+
+
 def _orders(*qtys):
     return [{"order_id": i, "ticker": "AMD", "action": "SELL", "order_type": "STP",
              "qty": q, "stop_price": 150.0, "status": "Submitted"} for i, q in enumerate(qtys)]
@@ -808,11 +818,13 @@ def test_queued_restore_takes_a_second_look_at_a_pending_cancel():
          patch("ibkr.get_open_orders", return_value=[]), \
          patch("db.get_position_stop", return_value={"stop_price": 150.0}), \
          patch("execution._stops_still_resting", return_value=5.0), \
-         patch("tasks._resting_sell_stops", side_effect=[[ours], []]), \
-         patch("tasks.manage_cancel_stop_orders_for"), patch("time.sleep"), \
+         patch("tasks._resting_sell_stops",   # the floor read before the cancel, then two looks
+               side_effect=[[{**ours, "status": "Submitted"}], [ours], []]), \
+         patch("tasks.manage_cancel_stop_orders_for"), patch("time.sleep") as sleep, \
          patch("tasks.manage_stop_place", return_value={"order_id": 3}) as place, \
          patch("db.set_stop_broker_order_id"):
         assert tasks._reprotect_after_late_sell("CRWD", {"intent": "RESTORE"}, None, from_queue=True) is True
+    sleep.assert_called_once_with(5)                  # the second look ran
     place.assert_called_once_with("CRWD", 20.0, 150.0)
 
 
@@ -1109,7 +1121,7 @@ class _Broker:
                 else:
                     del self.orders[oid]
 
-    def open_orders(self):
+    def open_orders(self, *a, **k):
         self._tick()
         return [{"order_id": k, "perm_id": v["perm"], "ticker": "AMD", "action": "SELL",
                  "order_type": "STP", "qty": v["qty"], "stop_price": 150.0,

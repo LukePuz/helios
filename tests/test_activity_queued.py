@@ -8,6 +8,12 @@ from unittest.mock import patch
 import db
 
 
+# Each test's writer keeps only its own rows (OWN stage): a writer thread left
+# by an earlier test can still deliver that test's queued rows through the
+# patched log_activity_direct.
+OWN = "test_activity_queued_own"
+
+
 def _wait(pred, timeout=2.0):
     end = time.monotonic() + timeout
     while time.monotonic() < end and not pred():
@@ -21,11 +27,13 @@ def test_a_burst_is_written_in_order_by_one_thread(monkeypatch):
     seen, threads = [], set()
 
     def write(stage, ticker, msg, sentiment, extra):
+        if stage != OWN:
+            return
         seen.append(extra["i"])
         threads.add(threading.current_thread().name)
     with patch("db.log_activity_direct", side_effect=write):
         for i in range(50):
-            db.log_activity_queued("task_lost", "", "m", "neutral", {"i": i})
+            db.log_activity_queued(OWN, "", "m", "neutral", {"i": i})
         assert _wait(lambda: len(seen) == 50)
     assert seen == list(range(50)) and threads == {"activity-writer"}
     assert db._ACTIVITY_WRITER[0] == os.getpid()
@@ -69,12 +77,14 @@ def test_a_failing_row_does_not_stop_the_writer(monkeypatch):
     seen = []
 
     def write(stage, ticker, msg, sentiment, extra):
+        if stage != OWN:
+            return
         if extra["i"] == 0:
             raise RuntimeError("db")
         seen.append(extra["i"])
     with patch("db.log_activity_direct", side_effect=write):
-        db.log_activity_queued("x", "", "m", "neutral", {"i": 0})
-        db.log_activity_queued("x", "", "m", "neutral", {"i": 1})
+        db.log_activity_queued(OWN, "", "m", "neutral", {"i": 0})
+        db.log_activity_queued(OWN, "", "m", "neutral", {"i": 1})
         assert _wait(lambda: seen == [1])
 
 
@@ -97,8 +107,9 @@ def test_rows_carry_their_enqueue_time(monkeypatch):
     monkeypatch.setattr(db, "_ACTIVITY_QUEUE", None)
     monkeypatch.setattr(db, "_ACTIVITY_WRITER", None)
     seen = []
-    with patch("db.log_activity_direct", side_effect=lambda *a: seen.append(a[4])):
-        db.log_activity_queued("x", "", "m", "neutral", {"k": 1})
+    with patch("db.log_activity_direct",
+               side_effect=lambda *a: a[0] == OWN and seen.append(a[4])):
+        db.log_activity_queued(OWN, "", "m", "neutral", {"k": 1})
         assert _wait(lambda: seen)
     assert seen[0]["k"] == 1 and seen[0]["queued_at"].endswith("+00:00")
 

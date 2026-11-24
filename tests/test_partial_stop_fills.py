@@ -65,7 +65,7 @@ def _run(held, ledger, fill, state=None, recorded=(set(), set()), log_ok=True,
          patch("db.recorded_sell_order_ids", return_value=recorded), \
          patch("db.log_trade", side_effect=lambda **kw: calls["trades"].append(kw) or log_ok), \
          patch("ibkr.get_recent_sell_fill", side_effect=_lookup), \
-         patch("tasks._log_stop_slippage", side_effect=lambda *a, **k: calls["slip"].append(a)), \
+         patch("tasks._log_stop_slippage", side_effect=lambda *a, **k: calls["slip"].append((a, k))), \
          patch("alerts._send", side_effect=lambda m: calls["alerts"].append(m)):
         msgs = tasks._book_partial_stop_fills(
             held, [{"ticker": "NVDA", "stop_price": 146.24}], pending, skip=skip, now=NOW)
@@ -84,7 +84,17 @@ def test_nvda_11_12_first_lot_is_booked():
     assert (t["symbol"], t["side"], t["quantity"], t["price"], t["price_source"]) == \
         ("NVDA", "SELL", 1.0, 152.4, "fill")
     assert len(calls["alerts"]) == 1 and "NVDA" in calls["alerts"][0]
-    assert calls["slip"] == []   # stop_slippage keeps its whole-exit meaning (review r3)
+    # stop_slippage keeps its whole-exit meaning (review r3): the booking's
+    # row goes to its own stage, one per booking.
+    assert len(calls["slip"]) == 1
+    a, k = calls["slip"][0]
+    assert k["stage"] == tasks.PARTIAL_STOP_SLIPPAGE_STAGE != "stop_slippage"
+    assert k["ident"] == "partial:2026-11-12:9001:1"       # ET date of the fill
+    assert a[0] == "NVDA" and a[1] == 146.24 and a[3] == "partial_stop_fill"
+    assert a[2]["filled_qty"] == 1.0 and a[2]["fill_price"] == 152.4
+    assert a[2]["order_ids"] == [42] and a[2]["by_order"][0]["perm_id"] == 9001
+    assert k["extra"]["perm_id"] == 9001 and k["extra"]["booked_qty_for_perm"] == 1.0
+    assert k["extra"]["fill_price_basis"] == "order_day_vwap_at_booking"
     assert _booked(state) == {"9001": 1.0} and len(msgs) == 1
 
 
@@ -235,3 +245,72 @@ def test_netted_fill_time_comes_from_the_kept_order():
     b = _order(46, 9002, 1.0, 140.0, ft=NOW - timedelta(hours=3))
     fill = {**_fill(a, b), "fill_time": a["fill_time"]}
     assert tasks._net_of_partial_bookings(fill, {9001: 1.0})["fill_time"] == b["fill_time"]
+
+
+@pytest.mark.parametrize("held", [True, None])
+def test_ticker_with_its_stop_lock_held_or_unreadable_waits(held):
+    """A bot stop change (e.g. a profit-target sale) may not have written its
+    order row yet: nothing is booked or looked up while the lock is held."""
+    with patch("stop_lock.held_elsewhere", return_value=held):
+        msgs, calls, _ = _run({"NVDA": 1.0}, [BUY("NVDA", 2)], NVDA_FILL)
+    assert calls["lookups"] == 0 and calls["trades"] == [] and msgs == []
+    msgs, calls, _ = _run({"NVDA": 1.0}, [BUY("NVDA", 2)], NVDA_FILL)    # released: booked
+    assert len(calls["trades"]) == 1
+
+
+def test_spilled_or_unbooked_executions_get_no_partial_row():
+    _, calls, _ = _run({"NVDA": 1.0}, [BUY("NVDA", 2)], NVDA_FILL, log_ok=False)
+    assert calls["slip"] == []   # as the stale path: a row only once the trade row is written
+    _, calls, _ = _run({"NVDA": 1.0}, [BUY("NVDA", 2)], NVDA_FILL, state={KEY: _st({"9001": 1.0})})
+    assert calls["slip"] == []
+
+
+def test_partial_row_is_its_own_stage_and_key():
+    """The real writer: the booked execution's own price and shares, its own
+    stage and shadow_key; the default call still writes stop_slippage."""
+    o = _order(42, 9001, 1.0, 152.4)
+    fill = {"fill_price": 152.4, "filled_qty": 1.0, "fill_time": OLD, "order_ids": [42],
+            "by_order": [o]}
+    with patch("db.get_activity_shadow_keys", return_value=set()) as keys, \
+         patch("db.get_price_history", return_value=[]), \
+         patch("tasks._read_stop_trigger_cache",
+               return_value={"42": {"ticker": "NVDA", "order_id": 42, "perm_id": 9001,
+                                    "trigger": 163.68, "seen_at": "x", "order_type": "STP"}}), \
+         patch("db.log_activity", return_value=True) as act:
+        assert tasks._log_stop_slippage("NVDA", 146.24, fill, "partial_stop_fill", 46,
+                                        stage=tasks.PARTIAL_STOP_SLIPPAGE_STAGE,
+                                        ident="partial:9001:1", extra={"perm_id": 9001})
+        keys.assert_called_once_with(tasks.PARTIAL_STOP_SLIPPAGE_STAGE)
+        stage, ticker, _, _, x = act.call_args.args
+        assert stage == "stop_slippage_partial" and ticker == "NVDA"
+        assert x["shadow_key"] == f"{TRADING_ENV}:NVDA:partial:9001:1"
+        assert x["fill_price"] == 152.4 and x["shares"] == 1.0 and x["perm_id"] == 9001
+        assert x["matched_perm_id"] == 9001 and x["broker_trigger_price"] == 163.68
+        assert x["fill_match"] == "stop_order_perm_id"
+    with patch("db.get_activity_shadow_keys", return_value={f"{TRADING_ENV}:NVDA:partial:9001:1"}), \
+         patch("db.log_activity", return_value=True) as act:
+        assert not tasks._log_stop_slippage("NVDA", 146.24, fill, "partial_stop_fill", 46,
+                                            stage=tasks.PARTIAL_STOP_SLIPPAGE_STAGE,
+                                            ident="partial:9001:1")
+        act.assert_not_called()
+    with patch("db.get_activity_shadow_keys", return_value=set()), \
+         patch("db.get_price_history", return_value=[]), \
+         patch("db.log_activity", return_value=True) as act:
+        tasks._log_stop_slippage("NVDA", 146.24, fill, "reconcile_stale_stop", 46)
+        assert act.call_args.args[0] == "stop_slippage"
+        assert act.call_args.args[4]["shadow_key"] == f"{TRADING_ENV}:NVDA:46"
+        assert "perm_id" not in act.call_args.args[4]
+
+
+def test_a_gtc_stop_part_filling_on_two_days_gets_two_rows():
+    """The booked state resets each ET day, so the same permId books 1 share
+    on each day with the same booked count: the fill's ET date keeps the two
+    partial rows apart (review SF2)."""
+    day1 = _fill(_order(42, 9001, 1.0, 152.4, ft=OLD - timedelta(days=1)))
+    _, c1, _ = _run({"NVDA": 2.0}, [BUY("NVDA", 3, ENTRY - timedelta(days=1))], day1)
+    _, c2, _ = _run({"NVDA": 1.0}, [BUY("NVDA", 3, ENTRY - timedelta(days=1)),
+                                    SELL("NVDA", 1, OLD - timedelta(days=1))], NVDA_FILL)
+    (_, k1), = c1["slip"]
+    (_, k2), = c2["slip"]
+    assert k1["ident"] == "partial:2026-11-11:9001:1"
+    assert k2["ident"] == "partial:2026-11-12:9001:1"

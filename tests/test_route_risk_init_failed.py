@@ -62,12 +62,20 @@ def test_risk_init_failure_writes_one_row_and_one_alert():
     log_signal, send = MagicMock(), MagicMock(return_value=1)
     _route(_result(), log_signal, send)
     rows = _rows(log_signal)
-    assert len(rows) == 1 and len(log_signal.call_args_list) == 1
+    import config
+    shadow = [c for c in log_signal.call_args_list           # the shipped entry-quality shadow row
+              if c.args[1] == "ENTRY_QUALITY_SHADOW" and config.ENTRY_QUALITY_SHADOW_ENABLED]
+    assert len(rows) == 1 and len(log_signal.call_args_list) == 1 + len(shadow)
     args, kw = rows[0].args, rows[0].kwargs
     assert args[0] == "NVDA" and args[2] == 0.7
     assert "ConnectionError" in args[3] and "U123" not in args[3] and "TWS" not in args[3]
     assert kw["model"] == "m"
-    assert kw["decision"] == {"route_exit": "ROUTE_RISK_INIT_FAILED", "verdict_action": "OPEN",
+    decision = dict(kw["decision"])
+    if config.RECHECK_CONTRADICTION_SHADOW_ENABLED:  # the shipped recheck shadow adds its key
+        assert isinstance(decision.pop("recheck_contradiction"), dict)
+    if config.SAME_DAY_CONSENSUS_RECORD_ENABLED:    # the shipped same-day record adds its key
+        assert isinstance(decision.pop("same_day_consensus"), dict)
+    assert decision == {"route_exit": "ROUTE_RISK_INIT_FAILED", "verdict_action": "OPEN",
                               "verdict_conviction": 7, "error_class": "ConnectionError",
                               "would_retry": True}
     send.assert_called_once()

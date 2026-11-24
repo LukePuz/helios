@@ -630,3 +630,98 @@ def test_an_aged_out_filing_is_warned_once_but_counted_every_pass(caplog):
             counts.append(edgar.LAST_PASS["aged_out_unseen"])
     assert counts == [1, 1]
     assert caplog.text.count("META 8-K 2026-11-06T19:30") == 1
+
+
+def _aged_passes(items, passes, reset_process=False):
+    """Run poll_once `passes` times with `items` aged out each pass. With
+    reset_process, each pass is a fresh worker process (empty in-process set);
+    the Redis fake (conftest) is shared, as the real one is."""
+    def recent(ticker, cik):
+        edgar._AGED_OUT_THIS_PASS.extend(items)
+        return []
+    counts = []
+    with patch("ingestion.edgar.TICKER_TO_CIK", {"PLTR": "1"}), \
+         patch("ingestion.edgar._get_recent_filings", side_effect=recent), \
+         patch("ingestion.edgar._get_state", return_value=None), patch("ingestion.edgar._set_state"), \
+         patch("ingestion.edgar._backoff_until", return_value=None), patch("ingestion.edgar._note_pass_health"), \
+         patch("db.seen_ids", return_value=set()):
+        for _ in range(passes):
+            if reset_process:
+                edgar._AGED_OUT_WARNED.clear()
+            edgar.poll_once()
+            counts.append(edgar.LAST_PASS["aged_out_unseen"])
+    return counts
+
+
+_FORM4S = [("0001321655-26-000201", "PLTR 4 2026-11-13T20:00-05:00"),
+           ("0001535527-26-000301", "CRWD 4 2026-11-13T20:00-05:00"),
+           ("0001535527-26-000302", "CRWD 4 2026-11-13T15:00-05:00")]
+
+
+def test_an_aged_out_filing_is_named_once_across_worker_processes(caplog):
+    """The 11-16..11-18 case: 4 prefork children and a daily start each had
+    their own set, so the same 3 Form 4s were named ~4 times a day."""
+    edgar._AGED_OUT_WARNED.clear()
+    with caplog.at_level("WARNING"):
+        counts = _aged_passes(_FORM4S, 4, reset_process=True)
+    assert counts == [3, 3, 3, 3]                       # the per-pass count is unchanged
+    assert caplog.text.count("skipped by the age filter") == 1
+    assert caplog.text.count("PLTR 4 2026-11-13T20:00") == 1
+    import stop_lock
+    from config import TRADING_ENV
+    r = stop_lock._redis()
+    assert all(r.exists(edgar._AGED_OUT_WARNED_KEY.format(env=TRADING_ENV, accession=a))
+               for a, _ in _FORM4S)
+
+
+def test_the_marker_ttl_covers_the_whole_listing_window():
+    window_s = (edgar._MAX_AGE_HOURS + edgar._AGED_OUT_LOOKBACK_HOURS) * 3600
+    assert edgar._AGED_OUT_WARNED_TTL_S >= window_s
+    seen = {}
+
+    class R:
+        def set(self, key, value, ex=None, nx=False):
+            seen.update(key=key, ex=ex, nx=nx)
+            return True
+    edgar._AGED_OUT_WARNED.clear()
+    with patch("stop_lock._redis", return_value=R()):
+        named, new = edgar._aged_out_to_name(_FORM4S[:1])
+    assert named == _FORM4S[:1] and new == 1
+    assert seen["nx"] is True and seen["ex"] == edgar._AGED_OUT_WARNED_TTL_S
+    assert seen["key"].endswith(":" + _FORM4S[0][0])
+
+
+def test_redis_unreadable_falls_back_to_the_process_set(caplog):
+    edgar._AGED_OUT_WARNED.clear()
+    with patch("stop_lock._redis", side_effect=ConnectionError("down")), caplog.at_level("WARNING"):
+        counts = _aged_passes(_FORM4S, 2)
+    assert counts == [3, 3]
+    assert caplog.text.count("skipped by the age filter") == 1   # once per process, as before
+
+
+def test_more_than_twenty_are_named_over_later_passes_each_once(caplog):
+    items = [(f"0000000001-26-{i:06d}", f"T{i} 4 2026-11-13T20:00-05:00") for i in range(25)]
+    edgar._AGED_OUT_WARNED.clear()
+    with caplog.at_level("WARNING"):
+        _aged_passes(items, 3, reset_process=True)
+    warns = [r.getMessage() for r in caplog.records if "skipped by the age filter" in r.getMessage()]
+    assert len(warns) == 2
+    assert warns[0].startswith("EDGAR: 25 new") and warns[1].startswith("EDGAR: 5 new")
+    assert all(caplog.text.count(label) == 1 for _, label in items)
+
+
+def test_a_duplicate_accession_in_one_pass_is_named_once():
+    edgar._AGED_OUT_WARNED.clear()
+    named, new = edgar._aged_out_to_name(_FORM4S[:1] * 2)
+    assert named == _FORM4S[:1] and new == 1
+
+
+def test_the_dedupe_never_raises():
+    edgar._AGED_OUT_WARNED.clear()
+
+    class R:
+        def set(self, *a, **k):
+            raise TimeoutError("slow")
+    with patch("stop_lock._redis", return_value=R()):
+        named, new = edgar._aged_out_to_name(_FORM4S)
+    assert named == _FORM4S and new == 3

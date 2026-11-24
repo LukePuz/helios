@@ -46,7 +46,7 @@ nothing caught on its own:
   drift.
 
 ## 3. Pipeline health
-- Celery: `redis-cli llen ops/llm_p0/llm_p1/llm_p2/screen` — any queue
+- Celery: `redis-cli llen ops/llm_p0/llm_p1/llm_p2/llm_p3/screen` — any queue
   still backed up after close? Grep all four service logs
   (`logs/celery_worker.log`, `celery_llm_worker.log`,
   `celery_screen_worker.log`, `celery_beat.log`) for ERROR-level lines

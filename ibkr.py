@@ -382,25 +382,32 @@ def disconnect() -> None:
         log.info("Disconnected from IBKR TWS.")
 
 
-def _bounded_req(ib: ibi.IB, what: str, fn, *args, drop_session: bool = True):
+def _bounded_req(ib: ibi.IB, what: str, fn, *args, drop_session: bool = True,
+                 timeout: float | None = None):
     """Runs one IB read with a bound. ib_async waits for the reply with no
     timeout by default (RequestTimeout 0), so a read TWS never answers hangs
     the task. On a timeout the session is dropped before raising: open
     orders, completed orders and positions share one fixed request key, so
     a late reply to the timed-out read would end the next one early and it
     would come back short (a resting stop read as missing). Requests with
-    their own reqId (contract details) pass drop_session=False: a late reply
-    to those can't be mistaken for another one."""
+    their own reqId (contract details, executions) pass drop_session=False:
+    a late reply to those can't be mistaken for another one. timeout: a
+    shorter bound than _REQ_TIMEOUT_S for a caller on a stop path."""
     global _ib, _last_heartbeat
+    limit = _REQ_TIMEOUT_S if timeout is None else timeout
+    # The bound is set on the shared ib.RequestTimeout and restored in the
+    # finally. That is safe because each process (Celery prefork child,
+    # main.py) has its own single IB and runs one request at a time on it;
+    # two threads sharing one IB would see each other's bound.
     prev = ib.RequestTimeout
-    ib.RequestTimeout = _REQ_TIMEOUT_S
+    ib.RequestTimeout = limit
     try:
         return fn(*args)
     except TimeoutError:
         if not drop_session:
-            log.warning(f"IBKR {what} got no reply in {_REQ_TIMEOUT_S}s")
-            raise TimeoutError(f"IBKR {what} timed out after {_REQ_TIMEOUT_S}s") from None
-        log.warning(f"IBKR {what} got no reply in {_REQ_TIMEOUT_S}s; dropping the session")
+            log.warning(f"IBKR {what} got no reply in {limit}s")
+            raise TimeoutError(f"IBKR {what} timed out after {limit}s") from None
+        log.warning(f"IBKR {what} got no reply in {limit}s; dropping the session")
         try:
             ib.disconnect()
         except Exception:
@@ -408,7 +415,7 @@ def _bounded_req(ib: ibi.IB, what: str, fn, *args, drop_session: bool = True):
         if _ib is ib:
             _ib = None
             _last_heartbeat = 0.0
-        raise TimeoutError(f"IBKR {what} timed out after {_REQ_TIMEOUT_S}s") from None
+        raise TimeoutError(f"IBKR {what} timed out after {limit}s") from None
     finally:
         ib.RequestTimeout = prev
 
@@ -441,6 +448,40 @@ def _stock(ib: ibi.IB, ticker: str) -> ibi.Stock:
 # ---------------------------------------------------------------------------
 # Market data
 # ---------------------------------------------------------------------------
+
+def get_fresh_minute_price(ticker: str, max_age_s: float = 300.0,
+                           timeout_s: float = 5.0) -> float | None:
+    """The last 1-minute bar's close, only when that bar ended within
+    max_age_s; None otherwise (no bars, a timeout, an old bar, any error).
+    timeout_s bounds the historical-data request itself; get_ib()'s connect
+    (when the session is down) and contract qualification keep their own
+    bounds. No daily-bar fallback, unlike get_latest_price. For checks that
+    must not act on an old price or wait long while a position may be
+    unstopped (the stop re-place floor and guard). Never raises."""
+    import datetime as _dt
+    import math
+    try:
+        ib = get_ib()
+        contract = _stock(ib, ticker)
+        bars = ib.reqHistoricalData(contract, endDateTime="", durationStr="1800 S",
+                                    barSizeSetting="1 min", whatToShow="TRADES", useRTH=False,
+                                    formatDate=2, timeout=timeout_s)
+        if not bars:
+            return None
+        last = bars[-1]
+        end = last.date
+        if not isinstance(end, _dt.datetime):
+            return None          # a date-only bar is a daily bar, never fresh
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=_dt.timezone.utc)
+        age = (_dt.datetime.now(_dt.timezone.utc) - (end + _dt.timedelta(minutes=1))).total_seconds()
+        close = float(last.close)
+        if age > max_age_s or not math.isfinite(close) or close <= 0:
+            return None
+        return close
+    except Exception as e:
+        log.warning(f"get_fresh_minute_price({ticker}) failed: {e}")
+        return None
 
 def get_latest_price(ticker: str) -> float | None:
     """
@@ -535,6 +576,24 @@ def _refuse_sell_on_short(ib, ticker: str, qty: float | None = None) -> None:
     if bad:
         raise SellExceedsPosition(f"{ticker}: SELL {qty if qty is not None else ''} refused; "
                                   f"broker shows {held:g} shares")
+
+
+def get_broker_stock_qty(symbol: str, settle: bool = False) -> float:
+    """This process's ib.positions() stock count for one symbol (signed: a
+    short reads negative), summed over accounts. ib.positions() is synced
+    at connect and updated by the position messages TWS pushes with each
+    fill, but only as of this process's last event-loop run, so a caller
+    that needs a fill included must let the loop run after it (or read
+    reqPositions first). It is NOT the orders worker's count that
+    _refuse_sell_on_short checks (a separate connection). The portfolio
+    cache (get_client().get_all_positions) lags a fill by minutes. 0.0 when
+    not held. settle: run the event loop once first (ib.sleep(0)), so
+    position messages already received are applied. Raises on any read
+    failure."""
+    ib = get_ib()
+    if settle:
+        ib.sleep(0)
+    return round(_long_qty(ib.positions(), symbol), 4)
 
 
 def get_fresh_stock_positions() -> dict[str, float]:
@@ -656,6 +715,57 @@ def _write_order_quote(ticker: str, side: str, result: dict) -> None:
         log.warning(f"[{ticker}] order quote record failed: {e}")
 
 
+# The poll after place_market_order's market-closed cancel: no longer than
+# cancel_order's default _poll_seconds (one ib.sleep(1) per read).
+MARKET_CLOSED_CANCEL_POLL_S = 5
+_CANCEL_CONFIRMED_STATUSES = ("Cancelled", "ApiCancelled")
+# The error codes a broker cancel arrives with in trade.log: 0 (an
+# orderStatus message) and 202 ("Order Canceled"). ib_async's error handler
+# also sets the status to Cancelled locally on any other order error, a
+# rejected cancel (10148, 161, 10147) among them, while the order may still
+# fill.
+_CANCEL_CONFIRMING_ERROR_CODES = (0, 202)
+# _poll_after_cancel's return for a Cancelled that only a rejection set:
+# not in execution._DEAD_ORDER_STATUSES, so callers take the unconfirmed path.
+CANCEL_REJECTED_STATUS = "CancelRejected"
+
+
+def _cancel_confirmed_by_log(trade, status: str) -> bool:
+    """True when the newest trade.log entry with this status carries a
+    cancel's error code (_CANCEL_CONFIRMING_ERROR_CODES); False when it
+    carries another code, or no entry has the status."""
+    try:
+        entries = list(getattr(trade, "log", None) or [])
+    except TypeError:
+        return False
+    for entry in reversed(entries):
+        if getattr(entry, "status", None) == status:
+            return getattr(entry, "errorCode", None) in _CANCEL_CONFIRMING_ERROR_CODES
+    return False
+
+
+def _poll_after_cancel(ib, trade, poll_seconds: int = MARKET_CLOSED_CANCEL_POLL_S) -> str:
+    """Reads trade's status once a second, up to poll_seconds times, after a
+    cancelOrder. Returns at the first Filled or Inactive, or at a Cancelled /
+    ApiCancelled that trade.log confirms (_cancel_confirmed_by_log). A
+    Cancelled the log doesn't confirm (a rejected cancel) is polled on to the
+    bound, since the fill can still arrive, and comes back as
+    CANCEL_REJECTED_STATUS if nothing else replaces it. Anything else comes
+    back as the status after the last read (PendingCancel, PreSubmitted,
+    ...): not a confirmed cancel. cancel_order's bound."""
+    status = trade.orderStatus.status
+    for _ in range(poll_seconds):
+        ib.sleep(1)
+        status = trade.orderStatus.status
+        if status in ("Filled", "Inactive"):
+            return status
+        if status in _CANCEL_CONFIRMED_STATUSES:
+            if _cancel_confirmed_by_log(trade, status):
+                return status
+            status = CANCEL_REJECTED_STATUS
+    return status
+
+
 def place_market_order(ticker: str, side: str, qty: float, fill_timeout: float = 30.0,
                        on_submitted=None) -> dict:
     """
@@ -682,6 +792,15 @@ def place_market_order(ticker: str, side: str, qty: float, fill_timeout: float =
     ends with the order still pending AND the market is closed, cancel it
     here so no caller can ever leave one dangling, regardless of whether
     that caller itself checks market hours first.
+
+    That cancel is confirmed the way cancel_order confirms one
+    (_poll_after_cancel, at most MARKET_CLOSED_CANCEL_POLL_S): status is
+    "Cancelled"/"ApiCancelled" only when the broker reports it (trade.log
+    carries a cancel's code, not a rejection's), a fill during the poll
+    comes back as that fill, Inactive comes back as dead, a rejected
+    cancel as CANCEL_REJECTED_STATUS, and anything else as the status the
+    broker last reported; callers treat those last two as unconfirmed
+    (reconcile), not as a dead order.
     """
     ib = get_ib()
     if side == "SELL":
@@ -744,12 +863,39 @@ def place_market_order(ticker: str, side: str, qty: float, fill_timeout: float =
                 from market_data import is_market_hours
                 if not is_market_hours():
                     ib.cancelOrder(trade.order)
-                    ib.sleep(1)
-                    log.warning(
-                        f"Cancelled {side.upper()} {qty} {ticker} (orderId={trade.order.orderId}) "
-                        f"— market is closed, order would have queued for next session untracked"
-                    )
-                    status = "Cancelled"
+                    # "Cancelled" only once the broker says so: a sell
+                    # reported cancelled that then fills has its full-size
+                    # stop restored on sold shares by the caller, and no
+                    # booking. A fill during the poll is returned as one; a
+                    # status still pending is returned as it is, so the
+                    # caller takes its unconfirmed path (reconcile).
+                    status = _poll_after_cancel(ib, trade)
+                    fill_price = float(trade.orderStatus.avgFillPrice or 0) or None
+                    filled_qty = float(trade.orderStatus.filled or 0)
+                    if status in _CANCEL_CONFIRMED_STATUSES:
+                        log.warning(
+                            f"Cancelled {side.upper()} {qty} {ticker} (orderId={trade.order.orderId}) "
+                            f"— market is closed, order would have queued for next session untracked"
+                            + (f"; {filled_qty:g} filled before the cancel" if filled_qty else "")
+                        )
+                    elif status == "Inactive":
+                        log.warning(
+                            f"{side.upper()} {qty} {ticker} (orderId={trade.order.orderId}) went "
+                            f"Inactive after the market-closed cancel; dead at the broker"
+                            + (f", {filled_qty:g} filled" if filled_qty else ""))
+                    elif fill_price:
+                        log.warning(
+                            f"Order FILLED during the market-closed cancel: {side.upper()} "
+                            f"{filled_qty} {ticker} @ ${fill_price:.2f} status={status} "
+                            f"(orderId={trade.order.orderId})")
+                    else:
+                        log.error(
+                            f"Cancel sent for {side.upper()} {qty} {ticker} "
+                            f"(orderId={trade.order.orderId}) with the market closed, but the "
+                            f"status is '{status}' after {MARKET_CLOSED_CANCEL_POLL_S}s"
+                            + (" (a Cancelled set by an order error, not by the cancel)"
+                               if status == CANCEL_REJECTED_STATUS else "") + "; "
+                            f"not confirmed cancelled — fill will need reconciliation")
             except Exception as e:
                 log.error(f"Failed to cancel stale {side.upper()} {ticker} order "
                           f"(orderId={trade.order.orderId}) after market-closed check: {e}")
@@ -1122,17 +1268,28 @@ def _price_or_none(v) -> float | None:
     return f if 0 < f < 1e300 else None
 
 
-def get_open_orders() -> list[dict]:
+def get_open_orders(timeout: float | None = None, reconnect: bool = True) -> list[dict]:
     """
     Returns all open orders as dicts:
     {order_id, ticker, action, order_type, qty, stop_price, status}
+
+    timeout: a shorter bound on the read than _REQ_TIMEOUT_S (_bounded_req;
+    a timeout still drops the session). reconnect=False: use this process's
+    session as it is (no connect, no heartbeat) and raise ConnectionError
+    when there is none, so a stop path's re-read stays within timeout.
+    The defaults are the usual read.
     """
-    ib = get_ib()
+    if reconnect:
+        ib = get_ib()
+    else:
+        ib = _ib
+        if ib is None or not ib.isConnected():
+            raise ConnectionError("IBKR not connected")
     # Build from the snapshot reqAllOpenOrders() returns, not openTrades():
     # this process's cache is never pruned for orders another client
     # (the orders worker) cancels, so a cancelled stop would still read as
     # resting here (audit 00:53 A0053-1).
-    trades = _bounded_req(ib, "reqAllOpenOrders", ib.reqAllOpenOrders)
+    trades = _bounded_req(ib, "reqAllOpenOrders", ib.reqAllOpenOrders, timeout=timeout)
     ib.sleep(1)
     results = []
     seen = set()
@@ -1162,6 +1319,103 @@ def get_open_orders() -> list[dict]:
     return results
 
 
+def _cancel_parallel_enabled() -> bool:
+    try:
+        import config
+        return bool(getattr(config, "CANCEL_PARALLEL_ENABLED", False))
+    except Exception:
+        return False
+
+
+def _find_cancel_target(ib, order_id: int, symbol: str | None, perm_id: int | None,
+                        skip: set | None = None):
+    """The open trade cancel_order would cancel for this orderId: the first
+    in ib.openTrades() with the id whose ticker (and permId, when both are
+    known) match, a mismatch logged and skipped exactly as cancel_order does.
+    skip: id()s of trades already sent a cancel in this pass. ib_async leaves
+    such a trade PendingCancel and still in openTrades(), and orderIds repeat
+    across clientIds, so without it a second stop with the same orderId (and a
+    permId of 0) would find the first again. None when there is none."""
+    for trade in ib.openTrades():
+        if skip and id(trade) in skip:
+            continue
+        if trade.order.orderId == order_id:
+            got_perm = int(getattr(trade.order, "permId", 0) or 0)
+            if ((symbol is not None and trade.contract.symbol != symbol)
+                    or (perm_id and got_perm and got_perm != int(perm_id))):
+                log.error(f"cancel_order: orderId={order_id} is {trade.contract.symbol} "
+                          f"permId={got_perm or '?'}, not the {symbol or '?'} "
+                          f"permId={perm_id or '?'} asked for; not cancelled")
+                continue
+            return trade
+    return None
+
+
+def _cancel_stops_parallel(ib, ticker: str, matches: list, _poll_seconds: int = 5):
+    """cancel_stop_orders_for's loop for 2+ stops: every cancelOrder is sent
+    first, then all of them are polled in one loop of up to _poll_seconds
+    one-second sleeps, so the total wait is the one-stop wait, not N of them.
+
+    Per stop, the rule is cancel_order's: confirmed only on Cancelled or
+    ApiCancelled within the window (a PendingCancel, a fill or anything else
+    is not confirmed); an orderId not found, or found only on another ticker
+    or permId, is not confirmed. A cancelOrder that raises stops the sending,
+    as the raise did in the one-at-a-time loop, so when cancelOrder raises the
+    same cancels are sent as on that path: that stop and the ones after it are
+    not sent and are not confirmed. A raise while finding the next stop
+    (openTrades) does the same. Either way the ones already sent are still
+    polled and warned on, and the exception is returned for the caller to
+    re-raise after the poll. A trade already sent a cancel is never matched
+    or polled twice. Returns (confirmed
+    count, the orderIds not confirmed in match order, the exception or None)."""
+    confirmed = 0
+    not_ok: set[int] = set()            # indexes into matches
+    first_exc = None
+    pending = []                        # (index, order_id, trade)
+    sent: set[int] = set()              # id(trade) of every trade sent a cancel
+    for i, order in enumerate(matches):
+        oid = order.orderId
+        try:
+            trade = _find_cancel_target(ib, oid, ticker,
+                                        int(getattr(order, "permId", 0) or 0) or None, skip=sent)
+            if trade is None:
+                log.warning(f"cancel_order: orderId={oid} not found among open orders")
+                not_ok.add(i)
+                continue
+            ib.cancelOrder(trade.order)
+        except Exception as e:
+            log.error(f"[{ticker}] cancelling orderId={oid} raised {type(e).__name__}: {e}; "
+                      f"no further cancels sent, the ones sent are polled")
+            first_exc = e
+            not_ok.update(range(i, len(matches)))
+            break
+        sent.add(id(trade))
+        pending.append((i, oid, trade))
+    status: dict[int, str] = {}
+    for _ in range(_poll_seconds):
+        if not pending:
+            break
+        ib.sleep(1)
+        still = []
+        for i, oid, trade in pending:
+            status[i] = trade.orderStatus.status
+            if status[i] in ("Cancelled", "ApiCancelled"):
+                log.info(f"Cancel confirmed for orderId={oid} "
+                         f"({trade.order.action} {trade.order.totalQuantity} "
+                         f"{trade.contract.symbol}) status={status[i]}")
+                confirmed += 1
+            else:
+                still.append((i, oid, trade))
+        pending = still
+    for i, oid, trade in pending:
+        log.warning(f"Cancel sent for orderId={oid} but status is still "
+                    f"'{status.get(i, trade.orderStatus.status)}' after {_poll_seconds}s — broker "
+                    f"likely ignored it (owned by a different clientId) or hasn't resolved yet; "
+                    f"needs manual cancel/verification in TWS")
+        not_ok.add(i)
+    return confirmed, [matches[i].orderId for i in sorted(not_ok)], first_exc
+
+
 def cancel_stop_orders_for(ticker: str) -> int:
     """Cancel all open SELL stop orders for a ticker. Returns the count
     the broker actually CONFIRMED cancelled, not just requested.
@@ -1184,6 +1438,16 @@ def cancel_stop_orders_for(ticker: str) -> int:
     warning for anything that didn't actually go away, so a caller placing
     a replacement stop right after at least has the fact on record even
     though it can't force a cross-clientId cancel to succeed.
+
+    With config.CANCEL_PARALLEL_ENABLED and 2+ stops, every cancel is sent
+    first and all are polled in one window (_cancel_stops_parallel): the same
+    confirmation rule, return value and stuck warning. A cancelOrder that
+    raises stops the sending as before (then the same cancels are sent); a
+    raise while finding the next stop does too. The ones already sent are
+    polled, then the exception is re-raised. The paths can differ on an
+    ib.sleep raise or a disconnect mid-loop (one ib here, get_ib per stop
+    there). One stop always
+    runs the loop below.
     """
     ib = get_ib()
     matches = [
@@ -1194,14 +1458,19 @@ def cancel_stop_orders_for(ticker: str) -> int:
     ]
     confirmed = 0
     stuck = []
-    for order in matches:
-        # orderIds repeat across clientIds: name the order fully, or
-        # cancel_order could match another ticker's order with this id.
-        if cancel_order(order.orderId, symbol=ticker,
-                        perm_id=int(getattr(order, "permId", 0) or 0) or None):
-            confirmed += 1
-        else:
-            stuck.append(order.orderId)
+    first_exc = None
+    if len(matches) > 1 and _cancel_parallel_enabled():
+        # All cancels sent, then one poll (config.CANCEL_PARALLEL_ENABLED).
+        confirmed, stuck, first_exc = _cancel_stops_parallel(ib, ticker, matches)
+    else:
+        for order in matches:
+            # orderIds repeat across clientIds: name the order fully, or
+            # cancel_order could match another ticker's order with this id.
+            if cancel_order(order.orderId, symbol=ticker,
+                            perm_id=int(getattr(order, "permId", 0) or 0) or None):
+                confirmed += 1
+            else:
+                stuck.append(order.orderId)
     if stuck:
         log.warning(
             f"[{ticker}] {len(stuck)} stop order(s) did NOT actually cancel "
@@ -1209,6 +1478,8 @@ def cancel_stop_orders_for(ticker: str) -> int:
             f"new stop placed now will overlap with these, not replace them. "
             f"Cancel manually in TWS."
         )
+    if first_exc is not None:
+        raise first_exc
     return confirmed
 
 
@@ -1283,6 +1554,53 @@ def get_fill_for_order(broker_order_id: int, ticker: str | None = None,
         return None
     return _with_fill_time({"filled_qty": total_qty, "fill_price": _weighted_exec_price(matches, total_qty)},
                            matches)
+
+
+def cached_stock_qty(symbol: str) -> float:
+    """This process's ib.positions() signed stock count for one symbol (a
+    short reads negative; options excluded), after
+    one event-loop run (ib.sleep(0)) applies position messages already
+    received. Sends no request and never reconnects (reads _ib, not
+    get_ib()), so it can't stall or drop the session a stop placement needs.
+    Raises when not connected or on a read error."""
+    ib = _ib
+    if ib is None or not ib.isConnected():
+        raise ConnectionError("IBKR not connected")
+    ib.sleep(0)
+    return round(_long_qty(ib.positions(), symbol), 4)
+
+
+def order_exec_check(broker_order_id: int, ticker: str, placed_at=None,
+                     timeout: float = 5.0) -> dict:
+    """One fresh reqExecutions pass for a ticker since placed_at:
+    {"own_bot": this order's bought shares, "other_bot": BOT executions of
+    the ticker under another orderId, "sld": SLD executions of the ticker}.
+    Executions without a readable time are kept (counted). Bounded at timeout
+    seconds without dropping the session (executions have their own reqId)
+    and never reconnects (reads _ib), so a stop path can call it. Raises on a
+    timeout, no connection or a read error."""
+    ib = _ib
+    if ib is None or not ib.isConnected():
+        raise ConnectionError("IBKR not connected")
+    execs = _bounded_req(ib, "reqExecutions", ib.reqExecutions, drop_session=False,
+                         timeout=timeout)
+    out = {"own_bot": 0.0, "other_bot": 0, "sld": 0}
+    for e in execs:
+        if e.contract.symbol != ticker:
+            continue
+        if placed_at is not None:
+            t = _exec_time(e)
+            if t is not None and t < placed_at:
+                continue
+        side = e.execution.side
+        if side == "SLD":
+            out["sld"] += 1
+        elif side == "BOT" and e.execution.orderId == broker_order_id:
+            out["own_bot"] += float(e.execution.shares)
+        elif side == "BOT":
+            out["other_bot"] += 1
+    out["own_bot"] = round(out["own_bot"], 4)
+    return out
 
 
 def _weighted_exec_price(fills, total_qty: float) -> float:
@@ -1375,6 +1693,41 @@ def _fill_time_and_source(record):
             log.warning(f"Execution time {t.isoformat()} is in the future; "
                         f"read as UTC: {fixed.isoformat()}")
     return (None, None) if bad else (fixed, "execution")
+
+
+def get_today_sell_executions() -> list[dict]:
+    """Today's SELL (SLD) executions across all clientIds, one dict per order:
+    {"ticker", "perm_id", "order_id", "first_exec_at", "last_exec_at",
+    "time_source", "n_execs"}; times are aware UTC (via _fill_time_and_source),
+    None when unreadable. Grouped on permId (orderIds collide across
+    clientIds, professor m102), else orderId. No price or quantity. A read
+    only (reqExecutions, current trading day, as get_recent_sell_fill);
+    raises on a failed read."""
+    ib = get_ib()
+    # Executions have their own reqId: a timeout needn't drop the session.
+    execs = _bounded_req(ib, "reqExecutions", ib.reqExecutions, drop_session=False)
+    groups: dict = {}
+    for e in execs or []:
+        ex = getattr(e, "execution", None)
+        if ex is None or getattr(ex, "side", None) != "SLD":
+            continue
+        sym = getattr(getattr(e, "contract", None), "symbol", None)
+        if not sym:
+            continue
+        perm = int(getattr(ex, "permId", 0) or 0) or None
+        oid = int(getattr(ex, "orderId", 0) or 0)
+        key = (sym, ("perm", perm) if perm else ("oid", oid))
+        t, src = _fill_time_and_source(e)
+        g = groups.setdefault(key, {"ticker": sym, "perm_id": perm, "order_id": oid,
+                                    "first_exec_at": None, "last_exec_at": None,
+                                    "time_source": None, "n_execs": 0})
+        g["n_execs"] += 1
+        if t is not None:
+            if g["first_exec_at"] is None or t < g["first_exec_at"]:
+                g["first_exec_at"] = t
+            if g["last_exec_at"] is None or t > g["last_exec_at"]:
+                g["last_exec_at"], g["time_source"] = t, src
+    return list(groups.values())
 
 
 def get_recent_sell_fill(ticker: str, exclude_order_ids=frozenset(),

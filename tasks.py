@@ -77,6 +77,11 @@ LLM_QUEUE_BULK     = "llm_p1"   # scanner candidates and non-held-ticker events
 # anything actually held or an organic news-driven idea. Name sorts after
 # llm_p1 under queue_order_strategy=sorted above, same worker/concurrency.
 LLM_QUEUE_RESEARCH = "llm_p2"
+# Shadow re-draws (agents/verdict_vote.py, config.VERDICT_VOTE_SHADOW_ENABLED):
+# sorts after llm_p2, so the llm worker takes one only when p0..p2 are empty.
+# Nothing is sent here while the switch is off. Not named LLM_QUEUE_*: those
+# are the live lanes, which the shadow gates and the draws themselves wait on.
+SHADOW_LLM_QUEUE = "llm_p3"
 
 # External-data pollers (EDGAR, options flow, macro, arXiv, congressional,
 # insider, analyst ratings, news, fundamentals, price history) get their own
@@ -172,6 +177,16 @@ def _drain_on_child_exit(**_):
     queued activity rows (stop_lock_skipped and the other queued writes)
     were dropped at a stop (audit 2026-11-08 15:08 #6). Drain them here, in
     the child, before it exits. Never raises."""
+    # The news-timeline thread first: its jobs queue their rows on the
+    # activity writer, so draining that first would drop rows queued after.
+    # Only in a child that used it (no import otherwise).
+    try:
+        import sys
+        nt = sys.modules.get("agents.news_timeline")
+        if nt is not None:
+            nt.drain_now()
+    except Exception as e:
+        log.debug(f"news timeline drain at child exit failed: {e}")
     try:
         import db
         db.drain_activity_queue_now()
@@ -522,6 +537,14 @@ app.conf.beat_schedule = {
         "schedule": crontab(hour=18, minute=20, day_of_week="mon-fri"),
         "options":  {"queue": "ops", "expires": 3 * 3600},
     },
+    # Yield watch: a source at 0, or far under its own non-zero baseline,
+    # for consecutive sessions alerts once per source per day (config
+    # FEED_HEALTH_*). Reads seen_items only; nothing ingested changes.
+    "feed-health": {
+        "task":     "tasks.feed_health",
+        "schedule": crontab(hour=18, minute=40, day_of_week="mon-fri"),
+        "options":  {"queue": "ops", "expires": 3600},
+    },
     "screen-funnel": {
         "task":     "tasks.screen_funnel",
         "schedule": crontab(hour=18, minute=10, day_of_week="mon-fri"),
@@ -697,6 +720,16 @@ app.conf.beat_schedule = {
         "schedule": 900,
         "options":  {"expires": 900},
     },
+    # Record-only fill watch -- every 2 minutes, market hours only (the body
+    # returns at once outside them). Writes a broker_sell_seen activity row
+    # when a SELL the bot did not place first appears in today's executions,
+    # about 15-30 min before reconcile-stops books it. Reads only; expires
+    # with its own interval, since a late run adds nothing.
+    "watch-broker-sells": {
+        "task":     "tasks.watch_broker_sells",
+        "schedule": 120,
+        "options":  {"expires": 120},
+    },
     # Late-fill reconciliation — every 5 minutes. Catches orders that filled
     # after place_market_order's wait window gave up (see
     # tasks.reconcile_unconfirmed_orders docstring for the 2026-07-28 CRWD
@@ -868,6 +901,18 @@ app.conf.beat_schedule = {
     # before the 19:00 stop (~1 min run). It was Sunday 18:00, which ran at
     # Monday 05:00 against pre-market analyses (A1031-1253-7). LLM-heavy →
     # llm bulk lane; 72h expiry so a missed Friday runs at Monday's start.
+    # Weekly forward readouts (log-only, engineering diagnostics): the gate,
+    # conviction, shadow-kind, vol-shadow and fill-lag readouts over 8 weeks
+    # into one file under logs/readouts. Friday 17:37: the stack is down all
+    # weekend (helios-start Mon-Fri 05:00, stop 19:00), and the price cache
+    # refresh (16:45) finishes about 17:08-17:15, so this reads the week's
+    # last closes. One hour expiry: a missed Friday is skipped, not run in
+    # Monday's 05:00 boot window (the next file covers the same 8 weeks).
+    "weekly-readouts": {
+        "task":     "tasks.weekly_readouts",
+        "schedule": crontab(hour=17, minute=37, day_of_week="fri"),
+        "options":  {"queue": "ops", "expires": 3600},
+    },
     "weekly-self-review": {
         "task":     "tasks.weekly_self_review",
         "schedule": crontab(hour=18, minute=0, day_of_week="fri"),
@@ -1403,6 +1448,130 @@ def stale_quote_fallback_shadow(ticker: str, approval_id, attempt: int, stale_ag
         log.warning(f"[{ticker}] quote fallback shadow row failed: {e}")
 
 
+def _quiet_stuck_alert(approval_id) -> None:
+    """A gate-blocked deferred buy that could not be expired stays FAILED
+    "deferred:" with its retry already stamped as run; mark it alerted so the
+    stuck-entry check does not report a retry that never ran. Never raises."""
+    try:
+        _mark_deferred_stuck_alerted(approval_id)
+    except Exception:
+        pass
+
+
+def _deferred_entry_gate(approval: dict) -> bool:
+    """The live stop-out entry gate, and for an ADD the add-to-loser gate,
+    re-run on a deferred OPEN/ADD before its retry claims or executes it. The
+    verdict-time gates (agents/crew.py:_route_to_approval) ran hours earlier;
+    a broker exit on the name since then (a resting stop fill) would otherwise
+    be bought straight back into, and an ADD that was above its average cost
+    at the verdict may open below it. Calls crew._stopout_reentry_shadow,
+    crew._add_loser_check (with ibkr.get_client(); an ADD only) and
+    crew._entry_gate on a result built from the approval (its analyst_json,
+    with the approval's ticker, action and conviction; the triggering item's
+    new_fact comes from its stored provenance), with path "deferred_retry" on
+    the rows and approval_id / approval_at beside it on entry_gate. The trend
+    gate is not re-run: the cached daily bars it reads have not changed since
+    the verdict, so it would only repeat that read. With ADD_LOSER_GATE_MODE
+    "shadow" the add-to-loser record never blocks: it goes on one
+    add_loser_gate_shadow activity row (add_loser_gate, path deferred_retry,
+    approval_id, approval_at) and only the stop-out half can block; "enforce"
+    makes it a gate half; "off" reads nothing.
+
+    Returns True when a gate blocked: the approval is then expired with
+    db.expire_failed_entry (as the age path does), so it is not retried, and
+    the caller returns without executing. Also True when that status write
+    fails or another delivery already moved the row: the gate decided, so the
+    buy is not made. Skipped (False) for anything but OPEN/ADD, and when both
+    halves are off: the stop-out half with STOPOUT_REENTRY_GATE_DAYS 0 or
+    STOPOUT_REENTRY_SHADOW_ENABLED off, the add-to-loser half for an OPEN or
+    with ADD_LOSER_GATE_MODE "off". Any other error fails open (False, with a
+    warning): the retry goes on exactly as before."""
+    ticker = str(approval.get("ticker") or "?").upper()
+    approval_id = approval.get("id")
+    add_loser = stop_rec = None
+    days = 0
+    try:
+        action = str(approval.get("action") or "").upper()
+        if action not in ("OPEN", "ADD"):
+            return False
+        import config
+        days = getattr(config, "STOPOUT_REENTRY_GATE_DAYS", 0)
+        stop_on = bool(getattr(config, "STOPOUT_REENTRY_SHADOW_ENABLED", False) and days and days > 0)
+        from agents.crew import (_add_loser_check, _add_loser_mode, _add_loser_reason, _entry_gate,
+                                 _stopout_reentry_shadow)
+        loser_mode = _add_loser_mode() if action == "ADD" else "off"
+        if not stop_on and loser_mode == "off":
+            return False
+        aj = approval.get("analyst_json")
+        aj = aj if isinstance(aj, dict) else {}
+        conviction = approval.get("conviction")
+        result = {**aj, "ticker": ticker, "action": action,
+                  "conviction": conviction if conviction is not None else aj.get("conviction")}
+        result.pop("trim_exit", None)
+        if stop_on:
+            stop_rec = _stopout_reentry_shadow(ticker, result, path="deferred_retry")
+        if loser_mode != "off":
+            try:
+                import ibkr
+                client = ibkr.get_client()
+            except Exception as e:
+                log.warning(f"retry_deferred_entry: [{ticker}] approval #{approval_id} broker client "
+                            f"unavailable for the add-to-loser check ({type(e).__name__}); not applied")
+                client = None
+            add_loser = _add_loser_check(ticker, result, client)
+        ts = approval.get("timestamp")
+        extra = {"approval_id": approval_id,
+                 "approval_at": ts.isoformat() if hasattr(ts, "isoformat") else (str(ts) if ts else None)}
+        if add_loser is not None and add_loser.get("mode") == "shadow":
+            # Record only: the retry's own read, never a block.
+            try:
+                import db
+                would = add_loser.get("would_block") is True
+                db.log_activity_queued(
+                    "add_loser_gate_shadow", ticker,
+                    f"ADD at retry (shadow): " + (f"would block: {_add_loser_reason(add_loser)}" if would
+                                                 else f"would not block ({add_loser.get('avg_cost_read')}, "
+                                                      f"{add_loser.get('trigger_new_fact_source')})"),
+                    extra={"add_loser_gate": add_loser, "path": "deferred_retry", **extra})
+            except Exception as e:
+                log.warning(f"retry_deferred_entry: [{ticker}] add_loser_gate_shadow row not written: "
+                            f"{type(e).__name__}: {e}")
+            add_loser = None
+        if not stop_on and add_loser is None:
+            return False
+        if not _entry_gate(ticker, result, stop_rec, None, path="deferred_retry", extra=extra,
+                           add_loser=add_loser):
+            return False
+    except Exception as e:
+        log.warning(f"retry_deferred_entry: [{ticker}] approval #{approval_id} entry gate "
+                    f"re-check failed ({type(e).__name__}: {e}); retry goes on")
+        return False
+    try:
+        import db
+        why = []
+        hrs = (stop_rec or {}).get("hours_since")
+        if (stop_rec or {}).get("read") == "ok" and isinstance(hrs, (int, float)) \
+                and not isinstance(hrs, bool) and 0 <= hrs < (days or 0) * 24:
+            why.append(f"exit the bot did not place {hrs:.1f} h ago (gate {days} d)")
+        if (add_loser or {}).get("blocked") is True:
+            why.append(_add_loser_reason(add_loser))
+        what = "; ".join(why) or "blocked"
+        if db.expire_failed_entry(approval_id, f"entry gate at retry: {what}; not executed"):
+            log.info(f"retry_deferred_entry: [{ticker}] approval #{approval_id} blocked by the "
+                     f"entry gate at retry ({what}); expired")
+        else:
+            log.info(f"retry_deferred_entry: [{ticker}] approval #{approval_id} blocked by the "
+                     f"entry gate at retry ({what}); not expired here (already expired or "
+                     f"claimed, or the status write failed); not executed")
+            _quiet_stuck_alert(approval_id)
+    except Exception as e:
+        _quiet_stuck_alert(approval_id)
+        log.warning(f"retry_deferred_entry: [{ticker}] approval #{approval_id} blocked by the "
+                    f"entry gate at retry, but not expired ({type(e).__name__}: {e}); "
+                    f"not executed")
+    return True
+
+
 @app.task(name="tasks.retry_deferred_entry", bind=True, max_retries=0)
 def retry_deferred_entry(self, approval_id: int, gap_retry_attempt: int = 1, price_retry_attempt: int = 1,
                          recheck_attempt: int = 1):
@@ -1433,6 +1602,15 @@ def retry_deferred_entry(self, approval_id: int, gap_retry_attempt: int = 1, pri
     self-correcting, not a tight loop, since each retry target is strictly
     later than the last and real time keeps moving forward (and both the
     gap-confirmation and stale-price paths have their own hard retry cap).
+
+    Before re-sizing or claiming, an OPEN/ADD also goes through the stop-out
+    half of the live entry gate again (_deferred_entry_gate): a broker exit
+    on the name since the verdict expires it, with an ENTRY_GATE_BLOCKED row
+    (entry_gate.path "deferred_retry"). The trend half is not re-run. An ADD
+    is also re-read by the add-to-loser check: with ADD_LOSER_GATE_MODE
+    "enforce" an ADD now below its average cost without a judged new fact is
+    expired the same way; with "shadow" it only writes an
+    add_loser_gate_shadow activity row and the retry goes on.
     """
     import db
     from execution import execute_approved, last_outcome_reason
@@ -1491,6 +1669,13 @@ def retry_deferred_entry(self, approval_id: int, gap_retry_attempt: int = 1, pri
     if reason:
         db.update_approval_status(approval_id, "EXPIRED", reason=f"superseded: {reason}")
         log.info(f"retry_deferred_entry: [{ticker}] approval #{approval_id} dropped: {reason}")
+        return
+
+    # The entry gates again (_deferred_entry_gate): a broker exit since the
+    # verdict (a stop fill) must not be bought straight back into, and an ADD
+    # now below its average cost goes through the add-to-loser gate
+    # (ADD_LOSER_GATE_MODE; in "shadow" a record only). Fails open.
+    if _deferred_entry_gate(approval):
         return
 
     # Re-size against the account as it is now: positions, cash and caps may
@@ -1900,7 +2085,7 @@ def reconcile_unconfirmed_orders(self):
     # Renewed while the run lasts; without Redis the run is skipped rather
     # than run unguarded (audit 00:53, A0053-6).
     _run_singleton("reconcile_unconfirmed_orders",
-                   lambda: _reconcile_unconfirmed_orders_locked(self))
+                   lambda: _late_fill_shadow_buffered(_reconcile_unconfirmed_orders_locked, self))
 
 
 _UNTRACKED_STATE_KEY = "untracked_orders"
@@ -2279,6 +2464,218 @@ def _late_fill_reason(intent: str | None, why: str) -> str:
     return f"{intent + ' ' if intent else ''}Late-fill reconciled ({why})"
 
 
+# Per-order pass counter for the late_fill_held_before row (a late OPEN can
+# be booked over several reconcile passes); the readout de-duplicates by
+# order_id. A failed Redis call leaves pass_no None.
+_LATE_FILL_HELD_PASS_KEY = "helios:late_fill_held_pass:{order_id}"
+_LATE_FILL_HELD_PASS_TTL_S = 14 * 86400
+_LATE_FILL_HELD_EXEC_TIMEOUT_S = 5   # the order's fill re-read; it never drops the session
+# created_at is the DB's NOW() after submission and execution times are whole
+# seconds: the same margin as reconcile's fill lookup, or the first execution
+# is left out (orderId, ticker and side still guard the match).
+_LATE_FILL_HELD_EXEC_MARGIN_S = 300
+
+
+def _late_fill_held_applies(order: dict, approval: dict, mode) -> bool:
+    return (mode in ("shadow", "enforce") and approval.get("action") == "OPEN"
+            and bool(order.get("id")))
+
+
+def _late_fill_held_mode():
+    import config
+    return getattr(config, "LATE_FILL_HELD_BEFORE_MODE", None)
+
+
+def _late_fill_held_decide(order: dict, approval: dict, fill_qty: float, prev_qty: float,
+                           mode: str) -> dict | None:
+    """Roadmap 04ah: what a late fill of an OPEN with a stored held count
+    (orders.held_before_qty) would be booked as. None when no count is
+    stored. Else the row's fields, "action_would" among them: "ADD" only when
+    ALL the old shares are provably still held:
+      - held_now (this process's position cache, ibkr.cached_stock_qty: no
+        request, no reconnect, can't drop the session the stop needs), then
+      - one executions pass after it (ibkr.order_exec_check, bounded, no
+        session drop) since created_at minus _LATE_FILL_HELD_EXEC_MARGIN_S:
+        this order's cumulative fill, the larger of that and the fill booked
+        so far (if the pass fails, the order's whole qty: a still-filling
+        order can't pass for old shares); and no SLD execution of the ticker
+        (a sale since may not be in the cache yet) and no BOT execution of it
+        under another order id,
+      - no other BUY order row for the ticker created or filled since, or
+        still working (db.count_other_buy_orders_since; its shares would read
+        as old), and
+      - held_now - that cumulative fill >= the stored count.
+    Anything unknown gives "OPEN" (today's behaviour). Raises on errors."""
+    action = approval.get("action")
+    ticker = order.get("ticker")
+    import db
+    stored = db.get_order_held_before(order["id"])
+    if stored is None:
+        return None
+    booked = round(float(prev_qty or 0) + float(fill_qty), 4)
+    try:
+        order_qty = float(order.get("qty") or 0)
+    except (TypeError, ValueError):
+        order_qty = 0.0
+    rec = {"order_id": order["id"], "approval_id": approval.get("id"), "ticker": ticker,
+           "stored_held_before": stored, "held_now": None, "held_read": "not_needed",
+           "order_filled_qty": booked, "order_qty": order_qty, "fill_reread": None,
+           "fill_reread_read": "not_needed", "cum_fill_used": None,
+           "sld_execs_since": None, "other_bot_execs_since": None,
+           "other_buys_since": None, "prev_qty": float(prev_qty or 0),
+           "fill_qty": float(fill_qty), "action_today": action, "mode": mode}
+    would = "OPEN"
+    if stored > 0:
+        import ibkr
+        try:
+            rec["held_now"], rec["held_read"] = float(ibkr.cached_stock_qty(ticker)), "ok"
+        except Exception as e:
+            rec["held_read"] = f"error: {type(e).__name__}"
+        if rec["held_read"] == "ok" and not order.get("broker_order_id"):
+            rec["fill_reread_read"] = "no_broker_order_id"
+        elif rec["held_read"] == "ok":
+            from datetime import timedelta
+            since = order.get("created_at")
+            if since is not None:
+                since = since - timedelta(seconds=_LATE_FILL_HELD_EXEC_MARGIN_S)
+            try:
+                chk = ibkr.order_exec_check(order.get("broker_order_id"), ticker, placed_at=since,
+                                            timeout=_LATE_FILL_HELD_EXEC_TIMEOUT_S)
+                rec["fill_reread"] = float(chk["own_bot"])
+                rec["sld_execs_since"] = int(chk["sld"])
+                rec["other_bot_execs_since"] = int(chk["other_bot"])
+                rec["fill_reread_read"] = "ok"
+            except Exception as e:
+                rec["fill_reread_read"] = f"error: {type(e).__name__}"
+        if rec["held_read"] == "ok":
+            rec["cum_fill_used"] = (max(booked, rec["fill_reread"]) if rec["fill_reread_read"] == "ok"
+                                    else max(booked, order_qty))
+            if order.get("created_at") is not None:
+                rec["other_buys_since"] = db.count_other_buy_orders_since(
+                    ticker, order["created_at"], order["id"])
+            if (rec["other_buys_since"] == 0
+                    and not rec["sld_execs_since"] and not rec["other_bot_execs_since"]
+                    and rec["held_now"] - rec["cum_fill_used"] >= stored - 1e-6):
+                would = "ADD"
+    rec["action_would"] = would
+    rec["applied"] = mode == "enforce" and would != action
+    return rec
+
+
+def _late_fill_shared_fresh() -> tuple[dict | None, str]:
+    """One fresh reqPositions read for the shadow rows of a reconcile flush
+    (shared through _LATE_FILL_SHADOW.fresh while _late_fill_shadow_buffered
+    writes them), or a read of its own outside a run. Record only: the
+    decision uses the position cache. Never raises."""
+    cache = getattr(_LATE_FILL_SHADOW, "fresh", None)
+    if cache is not None and "v" in cache:
+        return cache["v"]
+    try:
+        import ibkr
+        out = (ibkr.get_fresh_stock_positions(), "ok")
+    except Exception as e:
+        out = (None, f"error: {type(e).__name__}")
+    if cache is not None:
+        cache["v"] = out
+    return out
+
+
+def _late_fill_held_record(rec: dict) -> None:
+    """The late_fill_held_before row for a decision (_late_fill_held_decide),
+    with its pass number (one Redis round trip: INCR and EXPIRE pipelined on
+    stop_lock's client) and, in shadow, the run's shared fresh position read
+    for comparison. Runs after the stop step. Never raises."""
+    try:
+        rec = dict(rec)
+        ticker = rec.get("ticker")
+        rec["pass_no"] = None
+        try:
+            import stop_lock
+            pipe = stop_lock._redis().pipeline()
+            key = _LATE_FILL_HELD_PASS_KEY.format(order_id=rec["order_id"])
+            pipe.incr(key)
+            pipe.expire(key, _LATE_FILL_HELD_PASS_TTL_S)
+            rec["pass_no"] = int(pipe.execute()[0])
+        except Exception:
+            rec["pass_no"] = None
+        if rec.get("mode") == "shadow":
+            fresh, read = _late_fill_shared_fresh()
+            rec["held_fresh"] = None if fresh is None else float(fresh.get(ticker) or 0.0)
+            rec["held_fresh_read"] = read
+        import db
+        enforce = rec.get("mode") == "enforce"
+        held_now = rec.get("held_now")
+        db.log_activity_queued(
+            "late_fill_held_before", ticker,
+            f"late fill of OPEN order {rec['order_id']}: held {rec['stored_held_before']:g} before "
+            f"the order, {'now ' + format(held_now, 'g') if held_now is not None else 'no read'}; "
+            f"booked as {rec['action_would'] if enforce else rec['action_today']}"
+            + ("" if enforce else f" (would be {rec['action_would']}; shadow)"),
+            "neutral", rec)
+    except Exception as e:
+        log.warning(f"[{rec.get('ticker')}] late_fill_held_before row failed "
+                    f"({type(e).__name__}: {e})")
+
+
+def _late_fill_held_decision(order: dict, approval: dict, fill_qty: float,
+                             prev_qty: float) -> tuple[str | None, dict | None]:
+    """(the action _book_late_fill's stop step decides a late BUY on, the
+    decision record for after the stop), config LATE_FILL_HELD_BEFORE_MODE.
+
+    Today the action is the approval's, so the late shares of an OPEN on a
+    ticker that was already held are booked as a fresh entry: the record is
+    rewritten at this order's level and the whole position re-stopped there,
+    which can lower the old shares' stop. "enforce": _late_fill_held_decide
+    decides here, before the stop (its reads can't drop the session), and
+    its row is written after the stop (_late_fill_held_after_stop). "shadow"
+    and other values: the approval's action and no read here. Never raises."""
+    action = approval.get("action")
+    try:
+        mode = _late_fill_held_mode()
+        if mode != "enforce" or not _late_fill_held_applies(order, approval, mode):
+            return action, None
+        rec = _late_fill_held_decide(order, approval, fill_qty, prev_qty, mode)
+        return (rec["action_would"], rec) if rec else (action, None)
+    except Exception as e:
+        log.warning(f"[{order.get('ticker')}] late-fill held-before check failed "
+                    f"({type(e).__name__}: {e}); booking as {action}")
+        return action, None
+
+
+def _late_fill_held_shadow(order: dict, approval: dict, fill_qty: float, prev_qty: float) -> None:
+    """Shadow mode's decision and row, from the reconcile run's end-of-run
+    flush. Its held_now is read later than enforce's (after every order's
+    stop in the run, not before this one's), so a sale or fill in between
+    shows in it. Changes nothing. Never raises."""
+    try:
+        mode = _late_fill_held_mode()
+        if mode != "shadow" or not _late_fill_held_applies(order, approval, mode):
+            return
+        rec = _late_fill_held_decide(order, approval, fill_qty, prev_qty, mode)
+        if rec:
+            _late_fill_held_record(rec)
+    except Exception as e:
+        log.warning(f"[{order.get('ticker')}] late-fill held-before shadow check failed "
+                    f"({type(e).__name__}: {e})")
+
+
+def _late_fill_held_after_stop(order: dict, approval: dict, fill_qty: float, prev_qty: float,
+                               rec: dict | None) -> None:
+    """Hand the 04ah row work to the reconcile run's end-of-run flush
+    (_late_fill_shadow_add; written at once outside a run): enforce's row
+    for its decision, or shadow's whole check. Never raises."""
+    import functools
+    try:
+        mode = _late_fill_held_mode()
+        if mode == "enforce" and rec:
+            _late_fill_shadow_add(functools.partial(_late_fill_held_record, rec))
+        elif mode == "shadow":
+            _late_fill_shadow_add(functools.partial(_late_fill_held_shadow, order, approval,
+                                                    fill_qty, prev_qty))
+    except Exception as e:
+        log.warning(f"[{order.get('ticker')}] late-fill held-before row not queued: {e}")
+
+
 _APPROVAL_NOT_READ = object()   # _book_late_fill: read the approval itself
 
 
@@ -2318,6 +2715,10 @@ def _book_late_fill(order: dict, fill_qty: float, fill_price: float, total_avg: 
         )
 
     stop_placed: bool | None = False
+    deferred_until = None   # a BUY stop deferred until the cache shows this count
+    expect = None
+    shadow = None           # (path, cache count before the place): the shadow row, written last
+    stop_raised = False     # the BUY stop step raised (the shadow row's stop_placed "raised")
     progress = progress if progress is not None else {}
     if approval is _APPROVAL_NOT_READ:
         approval = db.get_approval_by_id(order["approval_id"]) if order["approval_id"] else None
@@ -2346,33 +2747,54 @@ def _book_late_fill(order: dict, fill_qty: float, fill_price: float, total_avg: 
             # is busy. A stop for only the late shares used to sit beside
             # the first tranche's, and upsert could loosen the recorded
             # stop (audit 22:53, A2253-3).
+            held_shadow_due = False   # roadmap 04ah: its row work runs after the stop step
+            held_rec = None           # enforce's decision, for that row
             try:
                 if _stop_record_is_this_orders(ticker, keep_record_since, total_avg, approval):
                     pass   # the execution path's own record: leave it, cover-only below
-                elif _late_buy_is_fresh(ticker, fill_qty, approval.get("action"), "reconcile"):
-                    # No record, or the record is a closed position's
-                    # leftover (kept up to 2 reconcile cycles): a re-entry
-                    # must not inherit that old level (audit 00:53 A0053-5).
-                    from execution import _stop_anchored_to_fill   # 28323dd review #1
-                    stop_price = _stop_anchored_to_fill(
-                        ticker, float(stop_price), risk_json.get("price_at_sizing"), total_avg)
-                    db.upsert_position_stop(
-                        ticker=ticker, entry_price=total_avg, stop_price=float(stop_price),
-                        stop_method=risk_json.get("stop_method", ""),
-                        bucket=approval.get("thesis_bucket", "Accelerator"),
-                        conviction=approval.get("conviction", 5),
-                        trail_distance_pct=risk_json.get("trailing_stop_distance_pct"),
-                        entry_price_source="fill",
-                    )
-                stop_placed = _reprotect_after_late_sell(ticker, {}, None, from_queue=True)
+                else:
+                    held_shadow_due = True
+                    held_action, held_rec = _late_fill_held_decision(order, approval, fill_qty,
+                                                                     prev_qty)
+                    if _late_buy_is_fresh(ticker, fill_qty, held_action, "reconcile"):
+                        # No record, or the record is a closed position's
+                        # leftover (kept up to 2 reconcile cycles): a re-entry
+                        # must not inherit that old level (audit 00:53 A0053-5).
+                        from execution import _stop_anchored_to_fill   # 28323dd review #1
+                        stop_price = _stop_anchored_to_fill(
+                            ticker, float(stop_price), risk_json.get("price_at_sizing"), total_avg)
+                        db.upsert_position_stop(
+                            ticker=ticker, entry_price=total_avg, stop_price=float(stop_price),
+                            stop_method=risk_json.get("stop_method", ""),
+                            bucket=approval.get("thesis_bucket", "Accelerator"),
+                            conviction=approval.get("conviction", 5),
+                            trail_distance_pct=risk_json.get("trailing_stop_distance_pct"),
+                            entry_price_source="fill",
+                        )
+                mode = _late_fill_mode()
+                if mode == "shadow":
+                    shadow = ("reconcile_late_buy", _late_fill_cache_qty(ticker))
+                expect = (_late_fill_expect(ticker, fill_qty, "reconcile_late_buy")
+                          if mode == "enforce" else None)
+                _REPROTECT_DEFERRED.discard(ticker)
+                stop_placed = _reprotect_after_late_sell(
+                    ticker, {}, None, from_queue=True,
+                    **({"expect_at_least": expect} if expect else {}))
+                if stop_placed is False and ticker in _REPROTECT_DEFERRED:
+                    deferred_until = expect
             except Exception as e:
                 log.error(f"[{ticker}] reconcile_unconfirmed_orders: stop placement failed: {e}")
-                stop_placed = False
+                stop_placed, stop_raised = False, True
             if stop_placed is not True:
                 # None here is a flat read right after a BUY fill (cache
                 # lag), not "nothing held": keep retrying (professor M60).
-                _queue_reprotect(ticker, {"intent": "BUY"}, None)
+                _queue_reprotect(ticker, {"intent": "BUY", **({"expect_at_least": expect}
+                                                              if expect else {})}, None)
         progress["stop_work_done"] = True
+        if stop_price and held_shadow_due:
+            # After the stop step, from the run's end-of-run flush: its reads
+            # can't delay this order's stop or the next order's.
+            _late_fill_held_after_stop(order, approval, fill_qty, prev_qty, held_rec)
         if approval.get("status") == "FAILED":
             db.update_approval_status(order["approval_id"], "APPROVED")
     elif order["side"] == "BUY" and order["approval_id"]:
@@ -2419,12 +2841,23 @@ def _book_late_fill(order: dict, fill_qty: float, fill_price: float, total_avg: 
                     bucket="Accelerator", conviction=5, trail_distance_pct=None,
                     entry_price_source="fill",
                 )
-            stop_placed = _reprotect_after_late_sell(ticker, {}, None, from_queue=True)
+            mode = _late_fill_mode()
+            if mode == "shadow":
+                shadow = ("reconcile_late_manual_buy", _late_fill_cache_qty(ticker))
+            expect = (_late_fill_expect(ticker, fill_qty, "reconcile_late_manual_buy")
+                      if mode == "enforce" else None)
+            _REPROTECT_DEFERRED.discard(ticker)
+            stop_placed = _reprotect_after_late_sell(
+                ticker, {}, None, from_queue=True,
+                **({"expect_at_least": expect} if expect else {}))
+            if stop_placed is False and ticker in _REPROTECT_DEFERRED:
+                deferred_until = expect
         except Exception as e:
             log.error(f"[{ticker}] reconcile_unconfirmed_orders: manual BUY stop failed: {e}")
-            stop_placed = False
+            stop_placed, stop_raised = False, True
         if stop_placed is not True:
-            _queue_reprotect(ticker, {"intent": "BUY"}, None)
+            _queue_reprotect(ticker, {"intent": "BUY", **({"expect_at_least": expect}
+                                                          if expect else {})}, None)
         progress["stop_work_done"] = True
     elif order["side"] == "SELL":
         # A late SELL fill (partial sale or TRIM whose stop was cancelled
@@ -2443,7 +2876,11 @@ def _book_late_fill(order: dict, fill_qty: float, fill_price: float, total_avg: 
         f"{headline} — <b>{ticker}</b>",
         f"{order['side']} {fill_qty:g} shares @ ${fill_price:.2f} — {what}",
     ]
-    if order["side"] == "BUY" or stop_placed is not None:
+    if deferred_until is not None and stop_placed is False:
+        # Deliberately not placed yet (the cache lags the fill), not a failure.
+        alert_lines.append(f"⏳ late BUY fill: stop deferred until the position cache shows "
+                           f"{float(deferred_until):g}; retry queued.")
+    elif order["side"] == "BUY" or stop_placed is not None:
         alert_lines.append(
             "Protective stop placed." if stop_placed else
             "⚠️ Could not place a protective stop automatically — check TWS."
@@ -2452,6 +2889,15 @@ def _book_late_fill(order: dict, fill_qty: float, fill_price: float, total_avg: 
         alerts._send("\n".join(alert_lines))
     except Exception:
         pass
+    if shadow is not None:
+        # Record-only broker reads, after the stop and the alert (and, in a
+        # reconcile run, after every order's stop): on a reconnect they can
+        # take over a minute. A later fill can raise the count and a stop
+        # fill or sale lower it before they run; would_defer compares it with
+        # the cache snapshot taken before the place, and stop_placed says
+        # what the place did.
+        _late_fill_shadow_add((ticker, fill_qty, shadow[0], shadow[1],
+                               "raised" if stop_raised else stop_placed))
 
 
 def _report_stop_work_failed(ticker: str, side: str, queue_order: dict,
@@ -2744,6 +3190,14 @@ def _queue_reprotect(ticker: str, order: dict, fill_price: float | None) -> None
         # No stop record: the stop that rested before the sell, placed only
         # under a fresh price (m606).
         entry["seed_stop"] = float(order["seed_stop"])
+    if order.get("own_stop"):
+        # A BUY's own fill-anchored stop for its new shares: the above-market
+        # guard's fallback when the record's level sits at/above the price.
+        entry["own_stop"] = float(order["own_stop"])
+    if order.get("expect_at_least"):
+        # A late BUY's count the cache must reach before the stop is sized,
+        # for the first _BUY_EXPECT_MAX_TRIES queued tries.
+        entry["expect_at_least"] = float(order["expect_at_least"])
 
     def add(pending):
         old = pending.get(ticker) or {}
@@ -2770,6 +3224,10 @@ def _queue_reprotect(ticker: str, order: dict, fill_price: float | None) -> None
                 pending[ticker].pop("exit_intent", None)
                 pending[ticker].pop("exit_order_id", None)
                 pending[ticker]["had_buy"] = True
+                if entry.get("own_stop"):
+                    pending[ticker]["own_stop"] = entry["own_stop"]
+                if entry.get("expect_at_least"):
+                    pending[ticker]["expect_at_least"] = entry["expect_at_least"]
         else:
             pending[ticker] = entry
             if entry["intent"] in ("RESTORE", "PROFIT_TARGET") and \
@@ -2778,6 +3236,10 @@ def _queue_reprotect(ticker: str, order: dict, fill_price: float | None) -> None
                 # doesn't explain a flat read after the BUY (reviews of b6b6a77,
                 # 153335d). A TRIM or manual sell can, so it doesn't carry it.
                 pending[ticker]["had_buy"] = True
+            if not entry.get("own_stop") and old.get("own_stop"):
+                # A queued BUY's own stop stays the guard's fallback when a
+                # RESTORE, TRIM or bare BUY entry replaces it.
+                pending[ticker]["own_stop"] = old["own_stop"]
             if (entry["intent"] or "").upper() not in ("EXIT", "BACKSTOP", "BUY"):
                 # A RESTORE replacing a queued exit keeps that exit's order for
                 # the flat close (review of 03efab7, as m111). Never a BUY: its
@@ -2936,6 +3398,7 @@ def _review_manual_actions() -> None:
 # position left without a stop should reach Luke in ~20 min, not ~1 h.
 _REPROTECT_MAX_TRIES = 4  # ~20 min of failed placements
 _BUY_FLAT_MAX_TRIES = 2   # ~10 min for a new BUY's position to show up
+_BUY_EXPECT_MAX_TRIES = 2  # queued tries a late BUY's expect_at_least is kept for
 _EXIT_WAIT_MAX = 48       # 5-min reconcile runs a queued flat EXIT waits on its remainder (~4 h)
 
 
@@ -3143,83 +3606,86 @@ def _retry_pending_reprotects() -> None:
     if not pending:
         return
     outcome = {}  # ticker -> (entry seen, entry to keep or None)
-    for ticker, rec in pending.items():
-        # Take the ticker lock here so a busy ticker can be told apart from a
-        # failed placement: busy is not a try (pre-pull review #5, 10-29).
-        try:
-            with stop_lock.ticker_lock(ticker):
-                fn = getattr(_reprotect_after_late_sell, "__wrapped__", _reprotect_after_late_sell)
-                result = fn(ticker, rec, rec.get("fill_price"), from_queue=True)
-        except stop_lock.TickerBusy:
-            log.info(f"[{ticker}] reconcile: queued re-protect skipped, ticker busy; not counted")
-            continue
-        if result == "wait":
-            # The EXIT's remainder is still working: keep the entry, untried,
-            # for up to ~4 h (professor M124).
-            waits = int(rec.get("waits", 0)) + 1
-            if waits < _EXIT_WAIT_MAX:
-                outcome[ticker] = (rec, {**rec, "waits": waits})
-            else:
-                log.warning(f"[{ticker}] reconcile: queued flat EXIT still waiting after {waits} cycles; dropped")
+    # Alerts are sent after the pass (finally, so a later ticker's error
+    # doesn't drop them): a Telegram send can take tens of seconds, and the
+    # next ticker in the pass may have no stop until its re-protect runs.
+    held_alerts: list = []
+    try:
+        for ticker, rec in pending.items():
+            # Take the ticker lock here so a busy ticker can be told apart from a
+            # failed placement: busy is not a try (pre-pull review #5, 10-29).
+            try:
+                with stop_lock.ticker_lock(ticker):
+                    fn = getattr(_reprotect_after_late_sell, "__wrapped__", _reprotect_after_late_sell)
+                    expect = (rec.get("expect_at_least")
+                              if int(rec.get("tries", 0)) < _BUY_EXPECT_MAX_TRIES
+                              and _late_fill_mode() == "enforce" else None)
+                    result = fn(ticker, rec, rec.get("fill_price"), from_queue=True,
+                                **({"expect_at_least": expect} if expect else {}))
+            except stop_lock.TickerBusy:
+                log.info(f"[{ticker}] reconcile: queued re-protect skipped, ticker busy; not counted")
+                continue
+            if result == "wait":
+                # The EXIT's remainder is still working: keep the entry, untried,
+                # for up to ~4 h (professor M124).
+                waits = int(rec.get("waits", 0)) + 1
+                if waits < _EXIT_WAIT_MAX:
+                    outcome[ticker] = (rec, {**rec, "waits": waits})
+                else:
+                    log.warning(f"[{ticker}] reconcile: queued flat EXIT still waiting after {waits} cycles; dropped")
+                    outcome[ticker] = (rec, None)
+                continue
+            tries = int(rec.get("tries", 0)) + 1
+            # A BUY that still reads flat is retried for 2 runs (~10 min; they
+            # are 5 min apart, professor m55/m112), then handed to Luke like a
+            # failed retry (professor M60).
+            flat_buy = result is None and (rec.get("intent") == "BUY" or rec.get("had_buy"))
+            if flat_buy and tries >= _BUY_FLAT_MAX_TRIES:
+                log.error(f"[{ticker}] reconcile: queued BUY stop still reads flat after {tries} tries")
+                held_alerts.append(f"🚨 STOP NOT PLACED — <b>{ticker}</b>\nAfter a BUY the broker "
+                                   f"still shows no position (~10 min), so no stop was placed. Check "
+                                   f"TWS: if the shares are there, place the stop by hand.")
+                open_manual_action(ticker, "the stop after a BUY was never placed", clear_on_flat=False)
                 outcome[ticker] = (rec, None)
-            continue
-        tries = int(rec.get("tries", 0)) + 1
-        # A BUY that still reads flat is retried for 2 runs (~10 min; they
-        # are 5 min apart, professor m55/m112), then handed to Luke like a
-        # failed retry (professor M60).
-        flat_buy = result is None and (rec.get("intent") == "BUY" or rec.get("had_buy"))
-        if flat_buy and tries >= _BUY_FLAT_MAX_TRIES:
-            log.error(f"[{ticker}] reconcile: queued BUY stop still reads flat after {tries} tries")
-            try:
-                import alerts
-                alerts._send(f"🚨 STOP NOT PLACED — <b>{ticker}</b>\nAfter a BUY the broker still "
-                             f"shows no position (~10 min), so no stop was placed. Check TWS: if the "
-                             f"shares are there, place the stop by hand.")
-            except Exception:
-                pass
-            open_manual_action(ticker, "the stop after a BUY was never placed", clear_on_flat=False)
-            outcome[ticker] = (rec, None)
-        elif result is False and tries >= _REPROTECT_MAX_TRIES:
-            # ~20 min of failures: stop retrying (each try cancels and
-            # re-places) and hand it to Luke (professor M79, m112).
-            log.error(f"[{ticker}] reconcile: queued re-protect failed {tries} times; giving up")
-            sign_flip = ticker in _REPROTECT_SIGN_FLIP
-            try:
-                import alerts
+            elif result is False and tries >= _REPROTECT_MAX_TRIES:
+                # ~20 min of failures: stop retrying (each try cancels and
+                # re-places) and hand it to Luke (professor M79, m112).
+                log.error(f"[{ticker}] reconcile: queued re-protect failed {tries} times; giving up")
+                sign_flip = ticker in _REPROTECT_SIGN_FLIP
                 if sign_flip:
                     # A SELL stop on a short adds to it: don't say "place one".
-                    alerts._send(f"🚨 STOP NOT RESTORED — <b>{ticker}</b>\nThe automatic stop "
-                                 f"retry stopped after {tries} tries (~20 min): a fresh read shows "
-                                 f"the position short while the portfolio cache shows it long. "
-                                 f"Check in TWS whether it is long or short before placing "
-                                 f"anything; a SELL stop on a short adds to it.")
+                    held_alerts.append(f"🚨 STOP NOT RESTORED — <b>{ticker}</b>\nThe automatic stop "
+                                       f"retry stopped after {tries} tries (~20 min): a fresh read "
+                                       f"shows the position short while the portfolio cache shows it "
+                                       f"long. Check in TWS whether it is long or short before placing "
+                                       f"anything; a SELL stop on a short adds to it.")
                 else:
-                    alerts._send(f"🚨 STOP NOT RESTORED — <b>{ticker}</b>\nThe automatic stop "
-                                 f"retry failed {tries} times (~20 min) and has stopped. Check the "
-                                 f"position and place a stop in TWS; the stop check keeps flagging "
-                                 f"it until covered.")
-            except Exception:
-                pass
-            open_manual_action(ticker, "check whether the position is long or short (the reads "
-                                       "disagree) before placing a stop" if sign_flip
-                               else "the automatic stop retry gave up")
-            outcome[ticker] = (rec, None)
-        elif result is False or flat_buy:
-            outcome[ticker] = (rec, {**rec, "tries": tries})
-        else:
-            log.info(f"[{ticker}] reconcile: queued re-protect done ({result})")
-            outcome[ticker] = (rec, None)
-
-    def apply(current):
-        for ticker, (seen, keep) in outcome.items():
-            if current.get(ticker) != seen:
-                continue  # re-queued while we worked: the newer entry stays
-            if keep is None:
-                current.pop(ticker, None)
+                    held_alerts.append(f"🚨 STOP NOT RESTORED — <b>{ticker}</b>\nThe automatic stop "
+                                       f"retry failed {tries} times (~20 min) and has stopped. Check "
+                                       f"the position and place a stop in TWS; the stop check keeps "
+                                       f"flagging it until covered.")
+                open_manual_action(ticker, "check whether the position is long or short (the reads "
+                                           "disagree) before placing a stop" if sign_flip
+                                   else "the automatic stop retry gave up")
+                outcome[ticker] = (rec, None)
+            elif result is False or flat_buy:
+                outcome[ticker] = (rec, {**rec, "tries": tries})
             else:
-                current[ticker] = keep
-        return current
-    _reprotect_queue_edit(apply)
+                log.info(f"[{ticker}] reconcile: queued re-protect done ({result})")
+                outcome[ticker] = (rec, None)
+
+        def apply(current):
+            for ticker, (seen, keep) in outcome.items():
+                if current.get(ticker) != seen:
+                    continue  # re-queued while we worked: the newer entry stays
+                if keep is None:
+                    current.pop(ticker, None)
+                else:
+                    current[ticker] = keep
+            return current
+        _reprotect_queue_edit(apply)
+    finally:
+        _send_alert_texts(held_alerts)
 
 
 def _late_buy_is_fresh(ticker: str, fill_qty: float, action: str | None, path: str) -> bool:
@@ -3280,6 +3746,9 @@ def _held_before_fill(ticker: str, fill_qty: float, action: str | None = None,
 # Tickers whose last _reprotect_after_late_sell try was refused because a
 # fresh read showed a short, for the queue's give-up alert (same process).
 _REPROTECT_SIGN_FLIP: set[str] = set()
+# Tickers whose last _reprotect_after_late_sell try was deferred because the
+# cache was below expect_at_least (a lagging read, not a failed placement).
+_REPROTECT_DEFERRED: set[str] = set()
 
 
 def _sign_flip_alert(ticker: str, cache_qty: float, fresh_qty: float) -> None:
@@ -3345,6 +3814,8 @@ def _record_floored_stop(ticker: str, placed_px, unfloored_px, stop_rec: dict) -
     62k). The stop is placed, so a failed write only logs."""
     if not unfloored_px or float(placed_px) <= float(unfloored_px) + 1e-9:
         return
+    if not stop_rec or not stop_rec.get("stop_price"):
+        return   # no record to raise (the seeded path writes its own)
     import db
     try:
         db.update_trailing_stop(ticker, float(placed_px), stop_rec.get("trailing_high"),
@@ -3352,6 +3823,224 @@ def _record_floored_stop(ticker: str, placed_px, unfloored_px, stop_rec: dict) -
     except Exception as e:
         log.error(f"[{ticker}] reconcile: stop placed @ ${float(placed_px):.2f} but the record "
                   f"write failed ({e}); the record stays lower")
+
+
+# The stop re-place guard's price (_reprotect_after_late_sell): this order's
+# own fill when it is at most this old, else a fresh 1-minute bar at most
+# this old, read with this bound; anything else counts as no price.
+_GUARD_PRICE_MAX_AGE_S = 300.0
+_GUARD_PRICE_TIMEOUT_S = 5.0
+
+
+def _guard_price(ticker: str, fill_px, fill_at) -> tuple[float | None, str]:
+    """(price, source) for the stop re-place guard: ("fill") this order's own
+    fill price when fill_at is within _GUARD_PRICE_MAX_AGE_S, else
+    ("minute_bar") ibkr.get_fresh_minute_price in regular hours, bounded by
+    _GUARD_PRICE_TIMEOUT_S and no older than _GUARD_PRICE_MAX_AGE_S, else
+    (None, "outside_rth" or "unread"). No daily-bar fallback. Never raises."""
+    from datetime import datetime, timezone
+    import risk_manager
+    try:
+        px = risk_manager._plausible_price(fill_px)
+        when = fill_at
+        if isinstance(when, str):
+            when = datetime.fromisoformat(when.replace("Z", "+00:00"))
+        if px is not None and isinstance(when, datetime):
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - when).total_seconds() <= _GUARD_PRICE_MAX_AGE_S:
+                return px, "fill"
+    except Exception as e:
+        log.warning(f"[{ticker}] guard fill-time parse failed: {e}")
+    try:
+        import market_data
+        if not market_data.is_market_hours():
+            return None, "outside_rth"
+        import ibkr
+        px = risk_manager._plausible_price(ibkr.get_fresh_minute_price(
+            ticker, max_age_s=_GUARD_PRICE_MAX_AGE_S, timeout_s=_GUARD_PRICE_TIMEOUT_S))
+        if px is not None:
+            return px, "minute_bar"
+    except Exception as e:
+        log.warning(f"[{ticker}] guard price read failed: {e}")
+    return None, "unread"
+
+
+def _record_guarded_stop(ticker: str, placed_px, stop_rec: dict, guard: dict) -> None:
+    """A re-place the above-market guard lowered: the record follows only
+    when the guard's price was this order's own fill; otherwise it keeps its
+    higher level (the alert said which). The stop is placed, so a failed
+    write only logs."""
+    if not guard.get("lowered") or guard.get("source") != "fill":
+        return
+    if not stop_rec or not stop_rec.get("stop_price"):
+        return
+    import db
+    try:
+        db.update_trailing_stop(ticker, float(placed_px), stop_rec.get("trailing_high"),
+                                native_trail=False, strict=True)
+    except Exception as e:
+        log.error(f"[{ticker}] reconcile: guarded stop placed @ ${float(placed_px):.2f} but the "
+                  f"record write failed ({e}); the record stays higher")
+
+
+def _late_fill_mode() -> str:
+    """config LATE_FILL_EXPECT_MODE: "shadow" or "enforce", else "off"."""
+    import config
+    mode = str(getattr(config, "LATE_FILL_EXPECT_MODE", "off") or "off").lower()
+    return mode if mode in ("shadow", "enforce") else "off"
+
+
+def _late_fill_cache_qty(ticker: str) -> tuple[float | None, str]:
+    """The portfolio-cache count _reprotect_after_late_sell compares (the
+    first STK portfolio item of the ticker with a nonzero position, abs;
+    0.0 when there is none), and "ok", "not connected" or "error: <type>".
+    Reads this process's IB object directly, never through get_ib(): with
+    TWS down that would run a reconnect cycle before the stop. Never
+    raises."""
+    import ibkr
+    try:
+        ib = ibkr._ib
+        if ib is None or not ib.isConnected():
+            return None, "not connected"
+        for item in ib.portfolio():
+            if item.contract.secType == "STK" and float(item.position) != 0 \
+                    and item.contract.symbol == ticker:
+                return round(abs(float(item.position)), 4), "ok"
+        return 0.0, "ok"
+    except Exception as e:
+        return None, f"error: {type(e).__name__}"
+
+
+# Shadow late_fill_expect rows waiting for their broker reads: a list while
+# _late_fill_shadow_buffered runs (a reconcile run), else None (written at once).
+import threading as _threading            # noqa: E402
+_LATE_FILL_SHADOW = _threading.local()
+
+
+def _late_fill_shadow_write(item) -> None:
+    """One shadow row: its broker reads and the row write. An item is a
+    late_fill_expect tuple, or a zero-argument callable (the roadmap 04ah
+    rows, _late_fill_held_after_stop) that never raises. Never raises."""
+    if callable(item):
+        try:
+            item()
+        except Exception as e:
+            log.warning(f"reconcile: shadow row failed: {e}")
+        return
+    ticker, fill_qty, path, cache, stop_placed = item
+    try:
+        _late_fill_expect(ticker, fill_qty, path, cache=cache, stop_placed=stop_placed)
+    except Exception as e:
+        log.warning(f"[{ticker}] reconcile: late_fill_expect shadow row failed: {e}")
+
+
+def _late_fill_shadow_add(item: tuple) -> None:
+    """Hold a shadow row for the end of the reconcile run, or write it now
+    when none is running."""
+    buf = getattr(_LATE_FILL_SHADOW, "buf", None)
+    if buf is None:
+        _late_fill_shadow_write(item)
+    else:
+        buf.append(item)
+
+
+def _late_fill_shadow_buffered(fn, *args):
+    """Run fn with shadow rows held, then write them, once fn returns or
+    raises, so one order's record-only broker reads never delay the next
+    order's stop. Nested: the outer run writes them."""
+    if getattr(_LATE_FILL_SHADOW, "buf", None) is not None:
+        return fn(*args)
+    _LATE_FILL_SHADOW.buf = []
+    try:
+        return fn(*args)
+    finally:
+        buf, _LATE_FILL_SHADOW.buf = _LATE_FILL_SHADOW.buf, None
+        _LATE_FILL_SHADOW.fresh = {}   # one shared fresh read for the 04ah rows (_late_fill_shared_fresh)
+        try:
+            for item in buf:
+                _late_fill_shadow_write(item)
+        finally:
+            _LATE_FILL_SHADOW.fresh = None
+
+
+def _late_fill_expect(ticker: str, fill_qty: float, path: str,
+                      cache: tuple[float | None, str] | None = None,
+                      stop_placed=None) -> float | None:
+    """expect_at_least for the whole-position stop after a BUY fill reconcile
+    books late (config LATE_FILL_EXPECT_MODE). This process's
+    ib.positions() is only as fresh as its last event-loop run, so a fresh
+    reqPositions read (deduplicated) comes first; ib.positions() is read
+    right after it, now current (ibkr.get_broker_stock_qty), and is the
+    count used, the fresh read's when it isn't usable. A failed or
+    non-positive fresh read gives None, the old behaviour.
+    _reprotect_after_late_sell then waits (False, the caller queues the
+    retry) while the portfolio cache reads below it, rather than size the
+    stop to a cache that hasn't caught up with the fill. The queued retry
+    keeps the expectation for its first _BUY_EXPECT_MAX_TRIES tries, then
+    drops it (the old behaviour, as for the manual ADD), so the usual give-up
+    alert still comes. One activity row (stage
+    late_fill_expect) per call. Never raises.
+
+    Mode "enforce" returns the count; _book_late_fill reads it before the
+    reprotect, which needs it. "shadow" records would_defer (0 < cache <
+    count, the condition the reprotect waits on) and returns None, so the
+    stop is placed as before: _book_late_fill snapshots the cache before the
+    reprotect (cache, cache_at "before_place") and calls this after the stop
+    and its alert (in a reconcile run, after the whole run: _late_fill_shadow_
+    buffered), so the broker reads never delay protection, with stop_placed
+    (True, False, None or "raised") for the row; called with
+    no snapshot it reads the cache after its own reads (cache_at
+    "after_reads"). Any other mode reads nothing."""
+    mode = _late_fill_mode()
+    if mode == "off":
+        return None
+    import math
+    import db
+    import ibkr
+    rec = {"mode": mode, "path": path, "fill_qty": fill_qty, "fresh_qty": None,
+           "fresh_read": None, "broker_qty": None, "broker_read": None, "source": "none",
+           "expect_at_least": None}
+
+    def usable(x):
+        return x is not None and math.isfinite(x) and x > 1e-6
+    try:
+        rec["fresh_qty"], rec["fresh_read"] = float(ibkr.get_fresh_stock_position(ticker)[0]), "ok"
+    except Exception as e:
+        rec["fresh_read"] = f"error: {type(e).__name__}"
+    if usable(rec["fresh_qty"]):
+        try:
+            rec["broker_qty"], rec["broker_read"] = float(ibkr.get_broker_stock_qty(ticker)), "ok"
+        except Exception as e:
+            rec["broker_read"] = f"error: {type(e).__name__}"
+        if usable(rec["broker_qty"]):
+            rec["source"], rec["expect_at_least"] = "broker_after_fresh", round(rec["broker_qty"], 4)
+        else:
+            rec["source"], rec["expect_at_least"] = "fresh_read", round(rec["fresh_qty"], 4)
+    if mode == "shadow":
+        rec["cache_at"] = "before_place" if cache is not None else "after_reads"
+        rec["stop_placed"] = stop_placed
+        rec["cache_qty"], rec["cache_read"] = cache if cache is not None else _late_fill_cache_qty(ticker)
+        rec["would_defer"] = None
+        if rec["cache_read"] == "ok":
+            rec["would_defer"] = bool(rec["expect_at_least"]) and \
+                0 < rec["cache_qty"] < float(rec["expect_at_least"]) - 1e-6
+    try:
+        if mode == "shadow":
+            what = (f"Late BUY fill (shadow): enforce would wait for {rec['expect_at_least']} "
+                    f"(cache {rec['cache_qty']}); stop sized as before" if rec["would_defer"] else
+                    f"Late BUY fill (shadow): no wait (count {rec['expect_at_least']}, cache "
+                    f"{rec['cache_qty']}); stop sized as before")
+        elif rec["expect_at_least"]:
+            what = (f"Late BUY fill: stop waits for the position read to show "
+                    f"{rec['expect_at_least']} (from the {rec['source'].replace('_', ' ')})")
+        else:
+            what = "Late BUY fill: no fresh count to wait for; stop sized as before"
+        db.log_activity_queued("late_fill_expect", ticker, what,
+                               "neutral" if rec["expect_at_least"] else "negative", rec)
+    except Exception as e:
+        log.warning(f"[{ticker}] late_fill_expect row not written: {e}")
+    return rec["expect_at_least"] if mode == "enforce" else None
 
 
 @locked_by_ticker(lambda ticker, *a, **k: ticker, on_busy=False)
@@ -3376,6 +4065,7 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
     import ibkr
     order = order or {}
     _REPROTECT_SIGN_FLIP.discard(ticker)
+    _REPROTECT_DEFERRED.discard(ticker)
     try:
         pos = next((p for p in ibkr.get_client().get_all_positions() if p.symbol == ticker), None)
         remaining = round(abs(float(pos.qty)), 4) if pos else 0.0
@@ -3413,6 +4103,7 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
         # 2f95331). Not confirmed, so the caller queues a retry.
         log.warning(f"[{ticker}] reconcile: broker shows {remaining:g} shares, expected at least "
                     f"{float(expect_at_least):g}; stop not confirmed yet")
+        _REPROTECT_DEFERRED.add(ticker)
         return False
     if remaining <= 0 and from_queue:
         # A queued retry carries an old fill price, and the rest may have
@@ -3448,7 +4139,13 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
     stop_price = stop_rec.get("stop_price")
     if order.get("intent") == "PROFIT_TARGET" and order.get("stop_price"):
         stop_price = order["stop_price"]
-        db.mark_profit_target_taken(ticker, float(stop_price))
+        try:
+            db.mark_profit_target_taken(ticker, float(stop_price))
+        except Exception as e:
+            # The stop matters more than the flag: place it, and the
+            # caller's own mark (or the next target check) sets the flag.
+            log.error(f"[{ticker}] reconcile: marking the profit target taken failed ({e}); "
+                      f"placing the stop anyway")
     mkt = None
     if not stop_price and order.get("seed_stop"):
         # No record (the sell found none): the pre-cancel stop, only when a
@@ -3485,6 +4182,70 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
     if not stop_price:
         log.error(f"[{ticker}] reconcile: {remaining} shares left after a late sell, no stop on record")
         return False
+
+    guard: dict = {}
+    # Alert texts the floor read and the guard produce before the place; sent
+    # after it (the finally blocks below), since the shares are often bare
+    # by then.
+    held_alerts: list = []
+
+    def floor_and_guard(level, path, resting=None):
+        # Each re-place below cancels all of our stops and places one stop at
+        # the record's level. The floor (live): never below the highest
+        # resting stop it cancels, read before the cancel; other clients'
+        # stops count too, so it only tightens; a resting stop at or above
+        # the price is not a floor (_floor_at_resting_stop). The price is
+        # this order's own fill when recent, else a bounded fresh minute bar
+        # in regular hours, else none (the floor then applies without the
+        # market check). The above-market guard runs in config.STOP_GUARD_MODE
+        # (shadow by default: a row and an info alert, the level unchanged).
+        # The TRIM and manual-sell re-places and the reconcile resize
+        # (_fix_overstop) run it too.
+        # resting: the caller's coverage read (_stops_still_resting rows,
+        # before the cancel), reused by the floor and the guard; [] when it
+        # found none (no floor to read). None: the floor reads them once and
+        # the guard reuses that; a failed read is not repeated. Their alert
+        # texts go to held_alerts, sent after the place.
+        # after_sell_cancel: a late SELL fill or a queued RESTORE / EXIT /
+        # PROFIT_TARGET follows a sale that cancelled the stop, so the shares
+        # may be bare until this place: the guard does not re-read an unread
+        # resting set here (risk_manager._stop_below_market cancel_window).
+        # A late or queued BUY (and the manual ADD, order {}) follows no cancel.
+        import risk_manager
+        after_sell_cancel = bool(order) and order.get("intent") != "BUY"
+        px, source = _guard_price(ticker, exit_avg or fill_price, exit_fill_at)
+        what = f"Re-place after a late fill ({order.get('intent') or 'queued'})"
+        level = float(level)
+        if resting is not None and not resting:
+            floored, rows = level, []
+        else:
+            read: dict = {}
+            floored, _ = risk_manager._floor_at_resting_stop(ticker, level, what, market_price=px,
+                                                             resting=resting, resting_out=read,
+                                                             alerts_out=held_alerts)
+            rows = read.get("rows")
+        # A queued BUY carries its new shares' own stop as the fallback; an
+        # entry without one (queued before it was carried) has none.
+        placed = risk_manager._stop_below_market(ticker, floored, order.get("own_stop"), px, what,
+                                                 path=path, resting=rows,
+                                                 resting_unread=rows is None,
+                                                 cancel_window=after_sell_cancel,
+                                                 record_follows=source == "fill",
+                                                 price_is_fill=source == "fill",
+                                                 alerts_out=held_alerts)
+        guard.update(px=px, source=source, changed=abs(placed - level) > 1e-9,
+                     lowered=placed < floored - 1e-9)
+        return placed
+
+    def place_kw():
+        # market_price lets placement keep tick round-up below the price: as
+        # before when a price was read for the seed or floor; the floor or
+        # guard's price only when one of them changed the level.
+        if mkt:
+            return {"market_price": mkt}
+        if guard.get("changed") and guard.get("px"):
+            return {"market_price": guard["px"]}
+        return {}
     open_orders = None
     try:
         import ibkr
@@ -3512,7 +4273,8 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
         # ours goes on only the shares it leaves. position_stops.stop_price
         # stays ours.
         import execution
-        covered = execution._stops_still_resting(ticker)
+        resting_rows: list = []
+        covered = execution._stops_still_resting(ticker, rows_out=resting_rows)
         if covered is None:
             log.warning(f"[{ticker}] reconcile: resting stops could not be read; queued stop waits")
             return False
@@ -3520,71 +4282,90 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
             log.info(f"[{ticker}] reconcile: {remaining} shares already covered by resting stops "
                      f"({covered:g}); nothing cancelled")
             return True
-        if covered > 0:
-            # Cancel ours, then see what the cancel could not remove.
-            try:
-                manage_cancel_stop_orders_for(ticker)
-            except Exception as e:
-                log.warning(f"[{ticker}] reconcile: queued stop could not cancel stops ({e}); waits")
-                return False
-            left = None
-            for attempt in (1, 2):   # a timed-out read drops the session; the second reconnects
-                try:
-                    left = _resting_sell_stops(ticker)
-                    if attempt == 1 and any(o.get("status") == "PendingCancel" for o in left):
-                        import time
-                        time.sleep(5)   # a slow cancel; same second look as _fix_overstop
-                        continue
-                    break
-                except Exception as e:
-                    log.warning(f"[{ticker}] reconcile: re-read after the cancel failed (try {attempt}/2): {e}")
-            if left is None:
-                # Ours is gone and only cover went down: unprotected is worse
-                # than over-stopped, so stop all of it; _fix_overstop trims.
-                log.warning(f"[{ticker}] reconcile: stops unreadable after the cancel; stopping all {remaining}")
-                left = []
-        else:
-            left = []
-        others = round(sum(o["qty"] for o in left), 4)
-        need = round(remaining - others, 4)
-        if others > 0:
-            prices = ", ".join(f"${float(o['stop_price']):.2f}" if o.get("stop_price") else "?" for o in left)
-            log.warning(f"[{ticker}] reconcile: {others:g} shares stay covered by stop(s) the cancel did not "
-                        f"remove ({prices}); ours @ ${float(stop_price):.2f} goes on {max(need, 0):g}")
-        if need <= 0:
-            return True
         try:
-            result = manage_stop_place(ticker, need, float(stop_price), **({"market_price": mkt} if mkt else {}))
-            db.set_stop_broker_order_id(ticker, result["order_id"])
-            _record_floored_stop(ticker, stop_price, unfloored, stop_rec)
-            _record_seeded_stop(ticker, stop_rec, order, stop_price, need, result)
-            log.info(f"[{ticker}] reconcile: stop @ ${float(stop_price):.2f} placed for {need} shares")
-            return True
-        except Exception as e:
-            log.error(f"[{ticker}] reconcile: stop placement after a late sell failed: {e}")
-            return False
+            # Nothing resting: no floor to read. Covered with no rows back
+            # (never expected): the floor's own single read.
+            stop_price = floor_and_guard(stop_price, "queued_reprotect",
+                                         resting=(resting_rows or None) if covered > 0 else [])
+            if covered > 0:
+                # Cancel ours, then see what the cancel could not remove.
+                try:
+                    manage_cancel_stop_orders_for(ticker)
+                except Exception as e:
+                    log.warning(f"[{ticker}] reconcile: queued stop could not cancel stops ({e}); waits")
+                    return False
+                left = None
+                for attempt in (1, 2):   # a timed-out read drops the session; the second reconnects
+                    try:
+                        left = _resting_sell_stops(ticker)
+                        if attempt == 1 and any(o.get("status") == "PendingCancel" for o in left):
+                            import time
+                            time.sleep(5)   # a slow cancel; same second look as _fix_overstop
+                            continue
+                        break
+                    except Exception as e:
+                        log.warning(f"[{ticker}] reconcile: re-read after the cancel failed (try {attempt}/2): {e}")
+                if left is None:
+                    # Ours is gone and only cover went down: unprotected is worse
+                    # than over-stopped, so stop all of it; _fix_overstop trims.
+                    log.warning(f"[{ticker}] reconcile: stops unreadable after the cancel; stopping all {remaining}")
+                    left = []
+            else:
+                left = []
+            others = round(sum(o["qty"] for o in left), 4)
+            need = round(remaining - others, 4)
+            if others > 0:
+                prices = ", ".join(f"${float(o['stop_price']):.2f}" if o.get("stop_price") else "?" for o in left)
+                log.warning(f"[{ticker}] reconcile: {others:g} shares stay covered by stop(s) the cancel did not "
+                            f"remove ({prices}); ours @ ${float(stop_price):.2f} goes on {max(need, 0):g}")
+            if need <= 0:
+                return True
+            try:
+                result = manage_stop_place(ticker, need, float(stop_price), **place_kw())
+                db.set_stop_broker_order_id(ticker, result["order_id"])
+                _record_floored_stop(ticker, stop_price, unfloored, stop_rec)
+                _record_guarded_stop(ticker, stop_price, stop_rec, guard)
+                _record_seeded_stop(ticker, stop_rec, order, stop_price, need, result)
+                log.info(f"[{ticker}] reconcile: stop @ ${float(stop_price):.2f} placed for {need} shares")
+                return True
+            except Exception as e:
+                log.error(f"[{ticker}] reconcile: stop placement after a late sell failed: {e}")
+                return False
+        finally:
+            _send_alert_texts(held_alerts)   # after the place; once each
     if order.get("intent") != "PROFIT_TARGET":
         # Already covered (e.g. a stop Luke placed after a "place manually"
         # alert, or an earlier try that did land): cancelling it to re-place
         # ours would leave a gap each cycle (professor M79). A profit-target
         # entry still re-places, since it raises the stop.
         import execution
-        covered = execution._stops_still_resting(ticker)
+        late_rows: list = []
+        covered = execution._stops_still_resting(ticker, rows_out=late_rows)
         if covered is not None and covered >= remaining:
             log.info(f"[{ticker}] reconcile: {remaining} shares already covered by resting stops "
                      f"({covered:g}); nothing cancelled")
             return True
+        # The coverage read is reused by the floor and the guard; an unread
+        # one (None) leaves the floor its single read.
+        late_resting = None if covered is None else ((late_rows or None) if covered > 0 else [])
+    else:
+        late_resting = None      # a profit-target re-place: the floor reads once
     try:
-        manage_cancel_stop_orders_for(ticker)
-        result = manage_stop_place(ticker, remaining, float(stop_price), **({"market_price": mkt} if mkt else {}))
-        db.set_stop_broker_order_id(ticker, result["order_id"])
-        _record_floored_stop(ticker, stop_price, unfloored, stop_rec)
-        _record_seeded_stop(ticker, stop_rec, order, stop_price, remaining, result)
-        log.info(f"[{ticker}] reconcile: stop @ ${float(stop_price):.2f} placed for {remaining} shares")
-        return True
-    except Exception as e:
-        log.error(f"[{ticker}] reconcile: stop placement after a late sell failed: {e}")
-        return False
+        stop_price = floor_and_guard(stop_price, "late_sell_reprotect", resting=late_resting)
+        try:
+            manage_cancel_stop_orders_for(ticker)
+            result = manage_stop_place(ticker, remaining, float(stop_price), **place_kw())
+            db.set_stop_broker_order_id(ticker, result["order_id"])
+            _record_floored_stop(ticker, stop_price, unfloored, stop_rec)
+            _record_guarded_stop(ticker, stop_price, stop_rec, guard)
+            _record_seeded_stop(ticker, stop_rec, order, stop_price, remaining, result)
+            log.info(f"[{ticker}] reconcile: stop @ ${float(stop_price):.2f} placed for {remaining} shares")
+            return True
+        except Exception as e:
+            log.error(f"[{ticker}] reconcile: stop placement after a late sell failed: {e}")
+            return False
+    finally:
+        _send_alert_texts(held_alerts)   # after the place; once each
 
 
 # ── New tasks: regime + scanner + stop monitor ────────────────────────────────
@@ -3661,6 +4442,532 @@ def _exit_frame(stop: dict, bars: list[dict]) -> dict:
     return out
 
 
+GAP_RISK_WINDOW = 250                  # overnight gaps per name (251 daily bars)
+GAP_RISK_SNAPSHOT_MAX_AGE_MIN = 15     # book_heat's freshness for the snapshot
+# Corporate-action guard: an overnight |gap| above this is flagged as a
+# possible split or a stored-step artifact (price_history keeps old-scale rows
+# from before a split's refresh; audit-method-notes "Price cache basis"). It
+# is flagged, never dropped: the book replay is reported with and without
+# those nights. A flag for reading the rows, not a threshold on anything.
+GAP_SUSPECT_ABS_PCT = 40.0
+_GAP_RISK_DEFINITIONS = {
+    "units": "percent (10.0 = 10%)",
+    "weight_pct": "snapshot market_value / snapshot total_value x 100 (long positions)",
+    "gap": "open on day t / close on day t-1 - 1, consecutive price_history daily bars",
+    "window": f"the last {GAP_RISK_WINDOW} gaps per name (its last {GAP_RISK_WINDOW + 1} bars)",
+    "percentile": "linear interpolation between order statistics (numpy 'linear')",
+    "stop_below_close_pct": "(close - stop) / close x 100, the name's newest bar's close, "
+                            "position_stops stop",
+    "nights_past_stop": "gaps <= -(stop_below_close_pct) in the name's window",
+    "loss_at_stops_pct_nav": "sum of weight x max(1 - stop / (market_value / qty), 0): "
+                             "book_heat's sum_open_risk measure, in percent",
+    "loss_at_stops_close_basis_pct_nav": "the same with the newest close instead of the "
+                                         "snapshot price",
+    "book_gap": "sum over names of weight x that night's gap, on the nights every "
+                "replayed name has a gap (common nights); no cap at the stops",
+    "suspect_gaps": f"a name's window gaps with |gap| > {GAP_SUSPECT_ABS_PCT:g}%: a possible "
+                    "split or stored-step artifact, flagged and kept in every field above",
+    "_ex_suspect": "the book replay on the common nights left after removing every night on "
+                   "which any replayed name has a suspect gap",
+}
+
+
+def _pctile(sorted_vals: list[float], q: float) -> float | None:
+    """q in [0, 1] of an ascending list, linear between order statistics."""
+    n = len(sorted_vals)
+    if not n:
+        return None
+    pos = q * (n - 1)
+    lo = int(pos)
+    hi = min(lo + 1, n - 1)
+    return sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (pos - lo)
+
+
+def _book_gap_risk(positions: dict, pv, stops: dict, bars: dict, window: int = GAP_RISK_WINDOW) -> dict:
+    """Pure: the book_gap_risk fields from a snapshot's positions_json and
+    total_value (pv), position_stops as {ticker: stop}, and daily bars as
+    {ticker: [{date, open, close}, ...] oldest first, or an Exception when the
+    read failed}. Percent only: no value, cash or share count goes in.
+    Definitions in _GAP_RISK_DEFINITIONS. A name without what a field needs
+    gets None there with a reason. Never raises."""
+    import math
+
+    def num(x):
+        try:
+            x = float(x)
+        except (TypeError, ValueError):
+            return None
+        return x if math.isfinite(x) else None
+
+    def r(x, nd=3):
+        return round(x, nd) if x is not None else None
+    out = {"read": "ok", "reason": None, "positions": [], "n_positions": 0, "n_no_stop": 0,
+           "n_short": 0, "n_unpriced": 0, "invested_pct": None, "unprotected_weight_pct": None,
+           "loss_at_stops_pct_nav": None, "loss_at_stops_close_basis_pct_nav": None,
+           "replay_names": [], "replay_excluded": [], "n_common_nights": 0,
+           "common_first_date": None, "common_last_date": None, "book_gap_p5_pct_nav": None,
+           "book_gap_p1_pct_nav": None, "book_gap_worst_pct_nav": None,
+           "book_gap_worst_date": None, "n_common_nights_any_past_stop": None,
+           "n_suspect_gaps": 0, "suspect_names": [], "suspect_nights": [],
+           "n_common_nights_ex_suspect": None, "book_gap_p5_pct_nav_ex_suspect": None,
+           "book_gap_p1_pct_nav_ex_suspect": None, "book_gap_worst_pct_nav_ex_suspect": None,
+           "book_gap_worst_date_ex_suspect": None,
+           "n_common_nights_any_past_stop_ex_suspect": None}
+    try:
+        pv = num(pv)
+        if not pv or pv <= 0:
+            out.update(read="no_portfolio_value", reason="snapshot has no portfolio value")
+            return out
+        invested = unprot = heat = heat_close = 0.0
+        heat_close_ok = True
+        series: dict = {}
+        weights: dict = {}
+        dist: dict = {}
+        for t, p in sorted((positions or {}).items()):
+            if not isinstance(p, dict):
+                continue
+            qty, mv = num(p.get("qty")), num(p.get("market_value"))
+            if qty is not None and qty < 0:
+                out["n_short"] += 1
+                continue
+            if not qty:
+                continue
+            if mv is None or mv <= 0:
+                out["n_unpriced"] += 1
+                continue
+            w = mv / pv
+            invested += w
+            row = {"ticker": t, "weight_pct": r(w * 100), "stop_below_close_pct": None,
+                   "stop_below_snapshot_pct": None, "close_date": None, "n_gaps": 0,
+                   "first_gap_date": None, "last_gap_date": None, "gap_p5_pct": None,
+                   "gap_p1_pct": None, "gap_worst_pct": None, "gap_worst_date": None,
+                   "nights_past_stop": None, "suspect_gaps": [], "reason": None}
+            out["n_positions"] += 1
+            b = bars.get(t)
+            if isinstance(b, Exception):
+                row["reason"] = f"bars unreadable: {type(b).__name__}"
+                b = []
+            b = [x for x in (b or []) if num(x.get("open")) and num(x.get("close"))
+                 and num(x.get("open")) > 0 and num(x.get("close")) > 0]
+            gaps = [(b[i]["date"], b[i]["open"] / b[i - 1]["close"] - 1) for i in range(1, len(b))]
+            gaps = gaps[-window:]
+            close = num(b[-1]["close"]) if b else None
+            row["close_date"] = b[-1]["date"] if b else None
+            stop = stops.get(str(t).upper())
+            px = mv / qty
+            if stop is None:
+                out["n_no_stop"] += 1
+                unprot += w
+                row["reason"] = row["reason"] or "no position_stops record"
+            else:
+                row["stop_below_snapshot_pct"] = r((1 - stop / px) * 100)
+                heat += w * max(1 - stop / px, 0.0)
+                if close:
+                    row["stop_below_close_pct"] = r((1 - stop / close) * 100)
+                    heat_close += w * max(1 - stop / close, 0.0)
+                else:
+                    heat_close_ok = False
+            if gaps:
+                row["suspect_gaps"] = [{"date": d, "gap_pct": r(g * 100)} for d, g in gaps
+                                       if abs(g) * 100 > GAP_SUSPECT_ABS_PCT]
+                out["n_suspect_gaps"] += len(row["suspect_gaps"])
+                vals = sorted(g for _, g in gaps)
+                worst = min(gaps, key=lambda x: x[1])
+                row.update(n_gaps=len(gaps), first_gap_date=gaps[0][0], last_gap_date=gaps[-1][0],
+                           gap_p5_pct=r(_pctile(vals, 0.05) * 100), gap_p1_pct=r(_pctile(vals, 0.01) * 100),
+                           gap_worst_pct=r(worst[1] * 100), gap_worst_date=worst[0])
+                if stop is not None and close:
+                    d = 1 - stop / close
+                    row["nights_past_stop"] = sum(1 for _, g in gaps if g <= -d)
+                    dist[t] = d
+                series[t] = dict(gaps)
+                weights[t] = w
+            else:
+                row["reason"] = row["reason"] or "no gaps (fewer than 2 usable bars)"
+            if len(gaps) < window and gaps:
+                row["reason"] = row["reason"] or f"short window: {len(gaps)} of {window} gaps"
+            out["positions"].append(row)
+        out["invested_pct"] = r(invested * 100)
+        out["unprotected_weight_pct"] = r(unprot * 100)
+        out["loss_at_stops_pct_nav"] = r(heat * 100, 4)
+        out["loss_at_stops_close_basis_pct_nav"] = r(heat_close * 100, 4) if heat_close_ok else None
+        out["replay_names"] = sorted(series)
+        out["replay_excluded"] = sorted(p["ticker"] for p in out["positions"] if p["ticker"] not in series)
+        out["suspect_names"] = sorted(p["ticker"] for p in out["positions"] if p["suspect_gaps"])
+
+        def replay(nights):
+            """(p5, p1, worst, worst_date, nights any name past its stop), or Nones."""
+            if not nights:
+                return None, None, None, None, None
+            book = [(d, sum(weights[t] * series[t][d] for t in series)) for d in nights]
+            vals = sorted(v for _, v in book)
+            worst = min(book, key=lambda x: x[1])
+            past = sum(1 for d in nights
+                       if any(t in dist and series[t][d] <= -dist[t] for t in series))
+            return (r(_pctile(vals, 0.05) * 100, 4), r(_pctile(vals, 0.01) * 100, 4),
+                    r(worst[1] * 100, 4), worst[0], past)
+        if series:
+            common = sorted(set.intersection(*(set(s) for s in series.values())))
+            out["n_common_nights"] = len(common)
+            if common:
+                p5, p1, w, wd, past = replay(common)
+                out.update(common_first_date=common[0], common_last_date=common[-1],
+                           book_gap_p5_pct_nav=p5, book_gap_p1_pct_nav=p1,
+                           book_gap_worst_pct_nav=w, book_gap_worst_date=wd,
+                           n_common_nights_any_past_stop=past)
+            bad = {d for t in series for d, g in series[t].items()
+                   if abs(g) * 100 > GAP_SUSPECT_ABS_PCT}
+            out["suspect_nights"] = sorted(bad.intersection(common))
+            kept = [d for d in common if d not in bad]
+            p5, p1, w, wd, past = replay(kept)
+            out.update(n_common_nights_ex_suspect=len(kept), book_gap_p5_pct_nav_ex_suspect=p5,
+                       book_gap_p1_pct_nav_ex_suspect=p1, book_gap_worst_pct_nav_ex_suspect=w,
+                       book_gap_worst_date_ex_suspect=wd,
+                       n_common_nights_any_past_stop_ex_suspect=past)
+    except Exception as e:
+        out.update(read=f"error: {type(e).__name__}", reason=str(e)[:200])
+    return out
+
+
+def _gap_risk_inputs():
+    """The newest portfolio snapshot of this env (positions_json, total_value,
+    timestamp), position_stops (ticker, stop_price) and the last
+    GAP_RISK_WINDOW + 1 daily bars (date, open, close) of each long in the
+    snapshot: three SELECTs in one read transaction, each under a 3 s
+    statement timeout, so the record's time is bounded inside its 2 h-expiry
+    host task. None when there is no snapshot; raises on a failed read. No
+    broker call."""
+    import db
+    from config import TRADING_ENV
+    conn = db._get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = 3000")
+            cur.execute("SELECT positions_json, total_value, timestamp FROM portfolio_snapshots "
+                        "WHERE trading_env=%s ORDER BY timestamp DESC LIMIT 1", (TRADING_ENV,))
+            row = cur.fetchone()
+            stops, bars = [], {}
+            if row:
+                cur.execute("SELECT ticker, stop_price FROM position_stops WHERE trading_env=%s",
+                            (TRADING_ENV,))
+                stops = cur.fetchall()
+                held = []
+                for t, p in (row[0] or {}).items():
+                    try:
+                        if float((p or {}).get("qty") or 0) > 0:
+                            held.append(t)
+                    except (TypeError, ValueError, AttributeError):
+                        continue
+                if held:
+                    cur.execute(
+                        "SELECT ticker, date, open, close FROM ("
+                        " SELECT ticker, date, open, close, ROW_NUMBER() OVER "
+                        " (PARTITION BY ticker ORDER BY date DESC) AS rn"
+                        " FROM price_history WHERE ticker = ANY(%s)) ranked "
+                        "WHERE rn <= %s ORDER BY ticker, date", (held, GAP_RISK_WINDOW + 1))
+                    for t, d, o, c in cur.fetchall():
+                        bars.setdefault(t, []).append(
+                            {"date": str(d), "open": float(o) if o is not None else None,
+                             "close": float(c) if c is not None else None})
+    finally:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        db._put_conn(conn)
+    if not row or row[2] is None:
+        return None
+    return {"positions": row[0] or {}, "pv": row[1], "ts": row[2], "stops": stops, "bars": bars}
+
+
+def book_gap_risk_record(today: str | None = None) -> bool:
+    """Record only (config GAP_RISK_RECORD_ENABLED): one activity row (stage
+    book_gap_risk) per ET session day, from position_exit_frame after the
+    close: each held name's last GAP_RISK_WINDOW overnight gaps against
+    today's stop distance, and the book's replayed overnight gap loss
+    (_book_gap_risk). DB reads only (the newest snapshot, position_stops,
+    price_history); no broker or vendor call. Percent only. The row carries
+    the definitions, the window and the bar dates used, so it can be
+    recomputed. Its reads are _gap_risk_inputs' three statements (3 s each).
+    Deduplicated on shadow_key {env}:{ET date}. No threshold,
+    alert, review or trade change. Never raises; returns whether a row was
+    written."""
+    try:
+        import math
+        from datetime import datetime, timezone
+        from zoneinfo import ZoneInfo
+        import db
+        from config import TRADING_ENV, GAP_RISK_RECORD_ENABLED
+        if not GAP_RISK_RECORD_ENABLED:
+            return False
+        today = today or datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+        key = f"{TRADING_ENV}:{today}"
+        done = db.get_activity_shadow_keys("book_gap_risk")
+        if done is not None and key in done:
+            return False
+        rec: dict = {"read": None, "reason": None, "snapshot_at": None, "snapshot_age_min": None}
+        try:
+            inp = _gap_risk_inputs()
+        except Exception as e:
+            inp, rec["read"] = None, f"error: {type(e).__name__}"
+            rec["reason"] = "snapshot or stop records unreadable"
+        if inp is None and rec["read"] is None:
+            rec["read"], rec["reason"] = "no_snapshot", "no portfolio snapshot for this env"
+        if inp is not None:
+            ts = inp["ts"] if inp["ts"].tzinfo else inp["ts"].replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - ts).total_seconds() / 60
+            rec["snapshot_at"] = ts.astimezone(timezone.utc).isoformat()
+            rec["snapshot_age_min"] = round(age, 1)
+            stops = {}
+            for t, sp in inp["stops"]:
+                try:
+                    sp = float(sp)
+                except (TypeError, ValueError):
+                    continue
+                if t and math.isfinite(sp) and sp > 0:
+                    stops[str(t).upper()] = sp
+            rec.update(_book_gap_risk(inp["positions"], inp["pv"], stops, inp.get("bars") or {}))
+            if rec["read"] == "ok" and age > GAP_RISK_SNAPSHOT_MAX_AGE_MIN:
+                rec["read"] = "stale_snapshot"
+                rec["reason"] = (f"newest snapshot {round(age)} min old (over "
+                                 f"{GAP_RISK_SNAPSHOT_MAX_AGE_MIN}); fields computed from it")
+        rec["close_dates"] = sorted({p.get("close_date") for p in rec.get("positions") or []
+                                     if p.get("close_date")})
+        rec["close_is_today"] = rec["close_dates"] == [today] if rec["close_dates"] else None
+        rec.update({"session_date": today, "window_gaps": GAP_RISK_WINDOW,
+                    "definitions": _GAP_RISK_DEFINITIONS, "env": TRADING_ENV, "shadow_key": key})
+        msg = (f"book gap risk: {rec.get('n_positions')} names, invested "
+               f"{rec.get('invested_pct')}%, gap p1 {rec.get('book_gap_p1_pct_nav')}% NAV, "
+               f"worst {rec.get('book_gap_worst_pct_nav')}% NAV")
+        return bool(db.log_activity_direct("book_gap_risk", "", msg, "neutral", rec))
+    except Exception as e:
+        log.warning(f"book gap risk record failed: {e}")
+        return False
+
+
+BOOK_DEPLOYMENT_STATEMENT_TIMEOUT_MS = 3000
+_OFF_WATCHLIST = "(off watchlist)"
+_BOOK_DEPLOYMENT_DEFINITIONS = {
+    "units": "percent of net liquidation (10.0 = 10%)",
+    "source": "portfolio_snapshots: the broker account snapshot (account.portfolio_value, "
+              "account.cash and each position's market_value), newest at or before the record",
+    "invested_pct": "sum of long positions' market_value / total_value x 100",
+    "cash_pct": "cash / total_value x 100",
+    "other_pct": "100 - invested_pct - cash_pct: shorts, unpriced positions and any broker "
+                 "value not in either (none expected for a long-only cash book)",
+    "cash_target_pct": "the cash_target_pct of the newest overall regime row at or before the "
+                       "record (market_regime_log.portfolio_impact_json, set per regime in "
+                       "agents/market_regime.py); the daily digest's cash line shows the same "
+                       "value; no gate or sizing reads it",
+    "gap_pct": "cash_pct - cash_target_pct (positive: more cash than the target)",
+    "sector_weights_pct": "long weight per watchlist sector heading, the grouping "
+                          "risk_manager.check_concentration's theme cap uses; names off the "
+                          f"watchlist under '{_OFF_WATCHLIST}'",
+    "theme_prefix_weights_pct": "the same grouped on the heading prefix before ' — ' "
+                                "(risk_manager._theme_prefix, the theme-group shadow's grouping)",
+    "ai_infra_pct": "long weight of risk_manager.AI_INFRA_TICKERS (the AI-infrastructure cap's set)",
+    "largest_name_weight_pct": "the largest long position's weight",
+}
+# One statement, one round trip: the newest snapshot of this env at or before
+# %(at)s and the newest regime row at or before %(at)s (overall rows only
+# when REGIME_OVERALL_ONLY, as db.get_latest_regime reads).
+_BOOK_DEPLOYMENT_SQL = (
+    "SET TRANSACTION READ ONLY; SET LOCAL statement_timeout = %(ms)s; "
+    "SELECT s.positions_json, s.total_value, s.cash, s.timestamp, r.regime, "
+    "r.portfolio_impact_json->'cash_target_pct', r.timestamp FROM "
+    "(SELECT positions_json, total_value, cash, timestamp FROM portfolio_snapshots "
+    "WHERE trading_env = %(env)s AND timestamp <= %(at)s ORDER BY timestamp DESC LIMIT 1) s "
+    "LEFT JOIN LATERAL (SELECT regime, portfolio_impact_json, timestamp FROM market_regime_log "
+    "WHERE timestamp <= %(at)s {regime_where}ORDER BY timestamp DESC LIMIT 1) r ON true")
+
+
+def _book_deployment(positions: dict, pv, cash, watchlist: dict | None, ai_infra=()) -> dict:
+    """Pure: the book_deployment weights from a snapshot's positions_json,
+    total_value (pv) and cash. Percent only: no value, cash or share count
+    goes out. watchlist: {ticker: {"sector": heading}}, or None when it
+    could not be read (the sector fields are then None). Never raises."""
+    import math
+
+    def num(x):
+        try:
+            x = float(x)
+        except (TypeError, ValueError):
+            return None
+        return x if math.isfinite(x) else None
+
+    def r(x):
+        return round(x * 100, 3) if x is not None else None
+    out = {"read": "ok", "reason": None, "invested_pct": None, "cash_pct": None,
+           "other_pct": None, "n_positions": 0, "n_short": 0, "n_unpriced": 0,
+           "largest_name": None, "largest_name_weight_pct": None, "sector_weights_pct": None,
+           "theme_prefix_weights_pct": None, "ai_infra_pct": None}
+    try:
+        pv = num(pv)
+        if not pv or pv <= 0:
+            out.update(read="no_portfolio_value", reason="snapshot has no portfolio value")
+            return out
+        weights: dict = {}
+        for t, p in sorted((positions or {}).items()):
+            if not isinstance(p, dict):
+                continue
+            qty, mv = num(p.get("qty")), num(p.get("market_value"))
+            if qty is not None and qty < 0:
+                out["n_short"] += 1
+                continue
+            if not qty:
+                continue
+            if mv is None or mv <= 0:
+                out["n_unpriced"] += 1
+                continue
+            weights[str(t).upper()] = mv / pv
+        invested = sum(weights.values())
+        c = num(cash)
+        out.update(n_positions=len(weights), invested_pct=r(invested),
+                   cash_pct=r(c / pv) if c is not None else None,
+                   ai_infra_pct=r(sum(w for t, w in weights.items() if t in set(ai_infra))))
+        if c is not None:
+            out["other_pct"] = round(100 - out["invested_pct"] - out["cash_pct"], 3)
+        else:
+            out["reason"] = "snapshot has no cash"
+        if weights:
+            top = max(sorted(weights), key=lambda t: weights[t])
+            out.update(largest_name=top, largest_name_weight_pct=r(weights[top]))
+        if watchlist is not None:
+            from risk_manager import _theme_prefix
+            sectors: dict = {}
+            prefixes: dict = {}
+            for t, w in weights.items():
+                heading = (watchlist.get(t) or {}).get("sector", "") or ""
+                sectors[heading or _OFF_WATCHLIST] = sectors.get(heading or _OFF_WATCHLIST, 0.0) + w
+                pre = _theme_prefix(heading) or _OFF_WATCHLIST
+                prefixes[pre] = prefixes.get(pre, 0.0) + w
+            out["sector_weights_pct"] = {k: r(v) for k, v in sorted(sectors.items(),
+                                                                    key=lambda kv: (-kv[1], kv[0]))}
+            out["theme_prefix_weights_pct"] = {k: r(v) for k, v in sorted(
+                prefixes.items(), key=lambda kv: (-kv[1], kv[0]))}
+    except Exception as e:   # the class only: a message could carry a value
+        out.update(read=f"error: {type(e).__name__}", reason="weights not computed")
+    return out
+
+
+def _book_deployment_inputs(at, conn=None):
+    """The newest snapshot (positions_json, total_value, cash, timestamp) of
+    this env at or before `at`, and the newest regime row's (regime,
+    cash_target_pct, timestamp) at or before `at`: one execute (read only,
+    statement_timeout BOOK_DEPLOYMENT_STATEMENT_TIMEOUT_MS, one SELECT),
+    rolled back. None when there is no snapshot; raises on a failed read."""
+    import db
+    from config import TRADING_ENV, REGIME_OVERALL_ONLY
+    where = "AND (regime_type = 'overall' OR regime_type IS NULL) " if REGIME_OVERALL_ONLY else ""
+    own = conn is None
+    conn = conn or db._get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(_BOOK_DEPLOYMENT_SQL.format(regime_where=where),
+                        {"ms": int(BOOK_DEPLOYMENT_STATEMENT_TIMEOUT_MS), "env": TRADING_ENV,
+                         "at": at})
+            row = cur.fetchone()
+    finally:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        if own:
+            db._put_conn(conn)
+    if not row or row[3] is None:
+        return None
+    return {"positions": row[0] or {}, "pv": row[1], "cash": row[2], "ts": row[3],
+            "regime": row[4], "cash_target_pct": row[5], "regime_at": row[6]}
+
+
+def book_deployment_fields(inp: dict | None, at, watchlist, ai_infra=()) -> dict:
+    """The book_deployment row's fields from _book_deployment_inputs' result
+    (None: no snapshot). Percent only. Never raises."""
+    import math
+    from datetime import timezone
+
+    def iso(t):
+        if t is None:
+            return None
+        return (t if t.tzinfo else t.replace(tzinfo=timezone.utc)).astimezone(timezone.utc).isoformat()
+    rec = {"source": "portfolio_snapshots", "source_as_of": None, "source_age_min": None,
+           "regime": None, "regime_as_of": None, "cash_target_pct": None, "gap_pct": None}
+    try:
+        if inp is None:
+            rec.update(_book_deployment({}, None, None, None),
+                       read="no_snapshot", reason="no portfolio snapshot for this env")
+            return rec
+        ts = inp["ts"] if inp["ts"].tzinfo else inp["ts"].replace(tzinfo=timezone.utc)
+        rec["source_as_of"] = iso(ts)
+        rec["source_age_min"] = round((at - ts).total_seconds() / 60, 1)
+        rec.update(_book_deployment(inp["positions"], inp["pv"], inp["cash"], watchlist, ai_infra))
+        rec["regime"], rec["regime_as_of"] = inp.get("regime"), iso(inp.get("regime_at"))
+        try:
+            tgt = float(inp.get("cash_target_pct"))
+            tgt = tgt if math.isfinite(tgt) else None
+        except (TypeError, ValueError):
+            tgt = None
+        rec["cash_target_pct"] = tgt
+        if tgt is None:
+            rec["reason"] = rec["reason"] or "no cash_target_pct on the regime row"
+        if tgt is not None and rec.get("cash_pct") is not None:
+            rec["gap_pct"] = round(rec["cash_pct"] - tgt, 3)
+    except Exception as e:   # the class only: a message could carry a value
+        rec.update(read=f"error: {type(e).__name__}", reason="fields not computed")
+    return rec
+
+
+def book_deployment_record(today: str | None = None) -> bool:
+    """Record only (config BOOK_DEPLOYMENT_RECORD_ENABLED): one activity row
+    (stage book_deployment) per ET session day, from position_exit_frame
+    after the close: invested and cash as percent of net liquidation, the
+    regime's cash_target_pct and the gap to it, the position count, sector
+    and largest-name weights (_BOOK_DEPLOYMENT_DEFINITIONS). One bounded DB
+    read (_book_deployment_inputs) and the watchlist file; no broker call.
+    Percent only: no dollar value goes in the row or the log. A failed read
+    writes the row with read "error: <class>". Deduplicated on shadow_key
+    {env}:{ET date}. No threshold, alert, sizing or order change. Never
+    raises; returns whether a row was written."""
+    try:
+        from datetime import datetime, timezone
+        from zoneinfo import ZoneInfo
+        import db
+        from config import TRADING_ENV, BOOK_DEPLOYMENT_RECORD_ENABLED
+        if not BOOK_DEPLOYMENT_RECORD_ENABLED:
+            return False
+        at = datetime.now(timezone.utc)
+        today = today or at.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+        key = f"{TRADING_ENV}:{today}"
+        done = db.get_activity_shadow_keys("book_deployment")
+        if done is not None and key in done:
+            return False
+        try:
+            from knowledge_loader import load_watchlist
+            watchlist, wl_read = load_watchlist(), "ok"
+        except Exception as e:
+            watchlist, wl_read = None, f"error: {type(e).__name__}"
+        try:
+            from risk_manager import AI_INFRA_TICKERS
+        except Exception:
+            AI_INFRA_TICKERS = ()
+        try:
+            rec = book_deployment_fields(_book_deployment_inputs(at), at, watchlist, AI_INFRA_TICKERS)
+        except Exception as e:
+            rec = book_deployment_fields(None, at, None)
+            rec.update(read=f"error: {type(e).__name__}",
+                       reason="snapshot or regime row unreadable")
+        rec.update({"watchlist_read": wl_read, "session_date": today,
+                    "definitions": _BOOK_DEPLOYMENT_DEFINITIONS, "env": TRADING_ENV,
+                    "shadow_key": key})
+        msg = (f"book deployment: invested {rec.get('invested_pct')}%, cash {rec.get('cash_pct')}% "
+               f"vs target {rec.get('cash_target_pct')}% (gap {rec.get('gap_pct')} pp), "
+               f"{rec.get('n_positions')} names, largest {rec.get('largest_name_weight_pct')}%")
+        return bool(db.log_activity_direct("book_deployment", "", msg, "neutral", rec))
+    except Exception as e:
+        log.warning(f"book deployment record failed: {type(e).__name__}")
+        return False
+
+
 @app.task(name="tasks.position_exit_frame")
 def position_exit_frame():
     """Log-only (audit 2026-11-07 11:07 #1): one activity row (stage
@@ -3679,6 +4986,14 @@ def position_exit_frame():
         stops = db.get_all_position_stops(strict=True)
     except Exception as e:
         log.warning(f"position exit frame: position stops unreadable ({e})")
+        try:   # its own reads say what it could not read
+            book_gap_risk_record(today)
+        except Exception as e2:
+            log.warning(f"book gap risk record failed: {e2}")
+        try:   # record only; its own read, fail-open
+            book_deployment_record(today)
+        except Exception as e2:
+            log.warning(f"book deployment record failed: {type(e2).__name__}")
         return
     try:
         broker = {p.symbol for p in _get_client().get_all_positions() if float(p.qty or 0)}
@@ -3705,6 +5020,14 @@ def position_exit_frame():
         except Exception as e:
             log.warning(f"[{ticker}] position exit frame: write failed ({e})")
     log.info(f"position exit frame: {len(stops)} positions")
+    try:   # record only, after every exit frame row; its failure changes none of them
+        book_gap_risk_record(today)
+    except Exception as e:
+        log.warning(f"book gap risk record failed: {e}")
+    try:   # record only, after the gap-risk row; its own read, fail-open
+        book_deployment_record(today)
+    except Exception as e:
+        log.warning(f"book deployment record failed: {type(e).__name__}")
 
 
 def _stop_coverage(positions: dict | None, open_orders: list[dict] | None) -> dict:
@@ -4041,24 +5364,200 @@ def source_yield(days_back: int = 4):
     if counts is None:
         log.warning("source yield: counts unreadable; skipping")
         return
-    for k in range(days_back, 0, -1):
-        day = today - timedelta(days=k)
+    # Per feed within a source (news: google_news / yfinance), so one feed's
+    # outage shows while the other carries the source (11-09/11-10: yfinance
+    # news down, google_news kept "news" level). Added keys only: feeds and
+    # feed_drops; the existing keys are unchanged. An unread breakdown is
+    # None and the row is still written. feeds.news.<feed>.baseline_days can
+    # differ from sources.news.baseline_days: _yield_summary skips a weekday
+    # with no items in any of the rows it is given, which here are the news
+    # feeds only, while sources skips one with no items in any source. Not
+    # read when every day is already written.
+    todo = [today - timedelta(days=k) for k in range(days_back, 0, -1)
+            if f"{db.TRADING_ENV}:{(today - timedelta(days=k)).isoformat()}" not in done]
+    if not todo:
+        return
+    feed_counts = db.get_news_feed_counts(datetime.combine(oldest, dtime(0), et),
+                                          datetime.combine(today, dtime(0), et))
+    for day in todo:
         key = f"{db.TRADING_ENV}:{day.isoformat()}"
-        if key in done:
-            continue
         summary = _yield_summary(day, counts)
         drops = sorted(s for s, r in summary.items() if r["drop"])
+        feeds = feed_drops = None
+        if feed_counts is not None:
+            try:
+                news_feeds = _yield_summary(day, feed_counts)
+                feeds = {"news": news_feeds}
+                feed_drops = sorted(f"news:{f}" for f, r in news_feeds.items() if r["drop"])
+            except Exception as e:
+                log.warning(f"source yield: feed breakdown for {day} failed ({e})")
         try:
             db.log_activity_direct(
                 "source_yield", "", f"source yield {day}: {sum(r['n'] for r in summary.values())} items, "
                 f"{len(drops)} source(s) below half their baseline", "neutral",
                 {"day": day.isoformat(), "shadow_key": key, "sources": summary, "drops": drops,
-                 "computed_at": datetime.now(ZoneInfo("UTC")).isoformat(), "env": db.TRADING_ENV})
+                 "computed_at": datetime.now(ZoneInfo("UTC")).isoformat(), "env": db.TRADING_ENV,
+                 "feeds": feeds, "feed_drops": feed_drops})
         except Exception as e:
             log.warning(f"source yield: write for {day} failed ({e})")
             continue
         if drops:
             log.warning(f"source yield {day}: below half the prior weekdays for {drops}")
+        if feed_drops:
+            log.warning(f"source yield {day}: feed(s) below half the prior weekdays: {feed_drops}")
+
+
+def _feed_health_sessions(counts: list[dict], today) -> list:
+    """NYSE sessions (weekdays, not market_calendar.NYSE_HOLIDAYS) up to and
+    including today that had any item in any source, oldest first. A session
+    with no items at all is the stack down, not a quiet feed, so it is left
+    out (as source_yield does)."""
+    from market_calendar import NYSE_HOLIDAYS
+    totals: dict = {}
+    for r in counts:
+        totals[r["day"]] = totals.get(r["day"], 0) + int(r["n"])
+    return sorted(d for d, n in totals.items()
+                  if n > 0 and d <= today and d.weekday() < 5 and d not in NYSE_HOLIDAYS)
+
+
+def _feed_health_summary(counts: list[dict], today, excluded=()) -> dict:
+    """{source: {n, sessions_judged, zero_sessions, low_sessions,
+    baseline_median, baseline_days, flag}} for the last session up to today.
+
+    baseline_median is the median of the source's last
+    FEED_HEALTH_BASELINE_SESSIONS non-zero sessions BEFORE the run being
+    judged: zero_sessions trailing zeros, or low_sessions trailing sessions
+    each under FEED_HEALTH_LOW_RATIO of the baseline from before them, so the
+    outage is never part of its own baseline. flag "zero" (at least
+    FEED_HEALTH_ZERO_SESSIONS zeros in a row), "low" (at least
+    FEED_HEALTH_LOW_SESSIONS sessions under the ratio), or None; no flag
+    without FEED_HEALTH_MIN_BASELINE_SESSIONS non-zero sessions before the
+    run. Pure; the last session must be today, else {}."""
+    import statistics
+    import config
+    sessions = _feed_health_sessions(counts, today)
+    if not sessions or sessions[-1] != today:
+        return {}
+    by: dict = {}
+    for r in counts:
+        by.setdefault(r["source"], {})[r["day"]] = int(r["n"])
+    keep = int(config.FEED_HEALTH_BASELINE_SESSIONS)
+    need = int(config.FEED_HEALTH_MIN_BASELINE_SESSIONS)
+    ratio = float(config.FEED_HEALTH_LOW_RATIO)
+    out = {}
+    for src, days in sorted(by.items()):
+        if src in excluded:
+            continue
+        series = [days.get(d, 0) for d in sessions]
+
+        def baseline(end):
+            prior = [(d, n) for d, n in zip(sessions[:end], series[:end]) if n > 0][-keep:]
+            if len(prior) < need:
+                return None, [d.isoformat() for d, _ in prior]
+            return float(statistics.median(n for _, n in prior)), [d.isoformat() for d, _ in prior]
+        zeros = 0
+        while zeros < len(series) and series[-1 - zeros] == 0:
+            zeros += 1
+        # The longest trailing run whose every session is under the ratio of
+        # the baseline from before that run. Not a first-failure scan: a
+        # shorter window's baseline still holds the run's own low sessions
+        # (a slow collapse would read as 1). Every k includes the last
+        # session, so a run found is always the trailing one.
+        low, low_base = 0, (None, [])
+        for k in range(1, len(series) + 1):
+            b, bdays = baseline(len(series) - k)
+            if b is not None and all(n < ratio * b for n in series[-k:]):
+                low, low_base = k, (b, bdays)
+        zero_base = baseline(len(series) - zeros) if zeros else (None, [])
+        flag = None
+        if zeros >= int(config.FEED_HEALTH_ZERO_SESSIONS) and zero_base[0] is not None:
+            flag, (base, bdays) = "zero", zero_base
+        elif low >= int(config.FEED_HEALTH_LOW_SESSIONS):
+            flag, (base, bdays) = "low", low_base
+        else:
+            base, bdays = baseline(len(series) - 1)
+        out[src] = {"n": series[-1], "sessions_judged": len(series), "zero_sessions": zeros,
+                    "low_sessions": low, "baseline_median": base, "baseline_days": bdays,
+                    "flag": flag}
+    return out
+
+
+@app.task(name="tasks.feed_health")
+def feed_health():
+    """The ingestion yield watch (config FEED_HEALTH_*; see
+    _feed_health_summary): one feed_health activity row per run with every
+    source's count, baseline and streaks, and one alert listing the flagged
+    sources not yet alerted today (one alert per source per day; classified
+    by alert_policy, critical like the ingestion health check). Reads
+    seen_items only; nothing ingested changes. A no-session day (weekend,
+    holiday, stack down all day) writes and sends nothing. Never raises."""
+    try:
+        import config
+        if not getattr(config, "FEED_HEALTH_ENABLED", False):
+            return
+        from datetime import datetime, time as dtime, timedelta
+        from zoneinfo import ZoneInfo
+        import db
+        et = ZoneInfo("America/New_York")
+        now = datetime.now(et)
+        today = now.date()
+        counts = db.get_seen_item_counts(
+            datetime.combine(today - timedelta(days=int(config.FEED_HEALTH_LOOKBACK_DAYS)), dtime(0), et),
+            datetime.combine(today + timedelta(days=1), dtime(0), et))
+        if counts is None:
+            log.warning("feed health: seen-item counts unreadable; skipping")
+            return
+        excluded = set(getattr(config, "FEED_HEALTH_EXCLUDED_SOURCES", ()))
+        if not getattr(config, "QUIVER_ENABLED", False):
+            excluded.add("congressional")
+        summary = _feed_health_summary(counts, today, excluded)
+        if not summary:
+            log.info(f"feed health: {today} is not a session with items; nothing judged")
+            return
+        flagged = sorted(s for s, r in summary.items() if r["flag"])
+        due = []
+        for src in flagged:
+            key = f"feed_health_alerted_{src}"
+            if db.get_state(key) != today.isoformat():
+                due.append(src)
+        if due:
+            lines = []
+            for src in due:
+                r = summary[src]
+                base = r["baseline_median"]
+                if r["flag"] == "zero":
+                    what = f"0 new items for {r['zero_sessions']} sessions in a row"
+                else:
+                    what = (f"under {float(config.FEED_HEALTH_LOW_RATIO):.0%} of its baseline for "
+                            f"{r['low_sessions']} sessions (today {r['n']})")
+                lines.append(f"• {src}: {what}; baseline {base:g} a session "
+                             f"(median of its last {len(r['baseline_days'])} non-zero sessions)")
+            try:
+                import alerts
+                alerts._send("⚠️ <b>Ingestion yield</b>\n" + "\n".join(lines)
+                             + "\nPolls may still report success. Check the source.")
+            except Exception as e:
+                log.warning(f"feed health alert failed: {e}")
+            for src in due:
+                try:
+                    db.set_state(f"feed_health_alerted_{src}", today.isoformat())
+                except Exception as e:
+                    log.warning(f"feed health: alerted-state write for {src} failed: {e}")
+        if flagged:
+            log.warning(f"feed health {today}: flagged {flagged} (alerted now: {due})")
+        db.log_activity_direct(
+            "feed_health", "", f"feed health {today}: {len(summary)} source(s), "
+            f"{len(flagged)} flagged", "negative" if flagged else "neutral",
+            {"day": today.isoformat(), "env": db.TRADING_ENV, "computed_at": now.isoformat(),
+             "flagged": flagged, "alerted": due, "excluded": sorted(excluded),
+             "sources": summary,
+             "params": {"baseline_sessions": config.FEED_HEALTH_BASELINE_SESSIONS,
+                        "min_baseline_sessions": config.FEED_HEALTH_MIN_BASELINE_SESSIONS,
+                        "zero_sessions": config.FEED_HEALTH_ZERO_SESSIONS,
+                        "low_ratio": config.FEED_HEALTH_LOW_RATIO,
+                        "low_sessions": config.FEED_HEALTH_LOW_SESSIONS}})
+    except Exception as e:
+        log.warning(f"feed health failed: {type(e).__name__}: {e}")
 
 
 _FUNNEL_SWING_MIN_N = 50   # screens in the day, and in the prior 7 days
@@ -4844,6 +6343,20 @@ def _backstop_retry_skipped(ticker: str, why: str) -> None:
         pass
 
 
+def _send_alert_texts(texts: list) -> None:
+    """Send alert texts a caller held back while a position had no stop (a
+    Telegram send can take tens of seconds), then empty the list, so a later
+    call (a finally) doesn't send them twice. Never raises. The same job as
+    risk_manager._send_guard_alerts, for the guard's alerts_out texts."""
+    while texts:
+        text = texts.pop(0)
+        try:
+            import alerts
+            alerts._send(text)
+        except Exception as e:
+            log.warning(f"held alert failed: {e}")
+
+
 @locked_by_ticker(lambda ticker, *a, **k: ticker, on_busy=False)
 def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) -> bool | None:
     """Market-sell the full position when its stop level is breached and no
@@ -4860,6 +6373,9 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
     dropping the problem.
     """
     stops_cancelled = False
+    # Alerts from between the cancel and the market SELL: sent once the SELL
+    # is placed, or on the way out (finally) when it isn't.
+    held_alerts: list = []
     try:
         import ibkr
         import db
@@ -4967,13 +6483,9 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
         if resting > 0:
             log.error(f"[{ticker}] Backstop: stops for {resting:g} of {owned:g} shares still "
                       f"resting after the cancel; selling only the rest")
-            try:
-                import alerts
-                alerts._send(f"⚠️ BACKSTOP — <b>{ticker}</b>\nA stop for {resting:g} of "
-                             f"{owned:g} shares would not cancel; only the uncovered shares "
-                             f"are sold. Check TWS.")
-            except Exception:
-                pass
+            held_alerts.append(f"⚠️ BACKSTOP — <b>{ticker}</b>\nA stop for {resting:g} of "
+                               f"{owned:g} shares would not cancel; only the uncovered shares "
+                               f"are sold. Check TWS.")
             owned = round(owned - resting, 4)
             if owned <= 0:
                 return False
@@ -4986,13 +6498,9 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
         if working > 0:
             log.warning(f"[{ticker}] Backstop: a SELL for {working:g} shares is still working; "
                         f"selling only what it doesn't cover")
-            try:
-                import alerts
-                alerts._send(f"⚠️ BACKSTOP — <b>{ticker}</b>\nA market SELL for {working:g} of "
-                             f"{owned:g} shares is still working, so only the rest is sold. "
-                             f"Check TWS if it doesn't fill.")
-            except Exception:
-                pass
+            held_alerts.append(f"⚠️ BACKSTOP — <b>{ticker}</b>\nA market SELL for {working:g} of "
+                               f"{owned:g} shares is still working, so only the rest is sold. "
+                               f"Check TWS if it doesn't fill.")
             owned = round(owned - working, 4)
             if owned <= 0:
                 return False
@@ -5057,6 +6565,9 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
         log.warning(f"[{ticker}] BACKSTOP SELL executed: {filled} shares @ ~${fill_price:.2f}")
         return True
     except Exception as e:
+        # The held texts first ("only the uncovered shares are sold"), as
+        # before, then this path's own; the finally then finds none.
+        _send_alert_texts(held_alerts)
         log.error(f"[{ticker}] Backstop sell FAILED: {e}")
         if not _is_retry:
             _schedule_backstop_retry(ticker, alert)
@@ -5074,6 +6585,10 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
         else:
             _backstop_retry_skipped(ticker, f"the retry failed before any stop was cancelled ({e})")
         return False
+    finally:
+        # After the sale is booked (orders row, trade row, stop record): a
+        # worker killed during the sends leaves nothing unbooked.
+        _send_alert_texts(held_alerts)
 
 
 @app.task(name="tasks.retry_backstop_sell", bind=True, max_retries=0)
@@ -6522,6 +8037,19 @@ def _check_c6_bar_outcomes(today=None) -> int:
         return 0
 
 
+@app.task(name="tasks.verdict_vote_draw", soft_time_limit=470, time_limit=490)
+def verdict_vote_draw(payload: dict) -> str:
+    """One shadow re-draw of a routed OPEN/ADD's stored prompt (agents/
+    verdict_vote.py), on SHADOW_LLM_QUEUE. Record only: it writes at most one
+    verdict_vote_shadow row and enqueues the next draw; it never routes.
+    Returns at once when config.VERDICT_VOTE_SHADOW_ENABLED is off.
+    Results are kept (no ignore_result) so task_track_started writes the
+    STARTED key with the llm@ hostname that the research shadows' lane checks
+    wait on; the result is a short status string under the default TTL."""
+    from agents.verdict_vote import run
+    return run(payload)
+
+
 @app.task(name="tasks.c6_bar_shadow", ignore_result=True, soft_time_limit=20, time_limit=30)
 def c6_bar_shadow(payload: dict) -> None:
     """Log-only c6 bar shadow row (agents/c6_shadow.py), enqueued on ops by
@@ -6917,9 +8445,84 @@ def refresh_sp500_fundamentals(self):
         raise self.retry(exc=e, countdown=600)
 
 
+def _fundamentals_change_record(since) -> None:
+    """Record only (config FUNDAMENTALS_FREEZE_*): after a refresh, how many
+    tickers' target or forward EPS changed (db.count_fundamentals_changes),
+    the run of ET days in a row whose refresh had at most
+    FUNDAMENTALS_FREEZE_MAX_CHANGED changed (system_state
+    fundamentals_unchanged_streak_<env>, JSON {streak, day, before}), one
+    fundamentals_changes activity row, and at FUNDAMENTALS_FREEZE_REFRESHES
+    or more a WARN and one alert per ET day (fundamentals_freeze_alerted_<env>).
+    A re-run or retry on the same ET day compares against the previous day's
+    rows (count_fundamentals_changes) and replaces that day's step in the run
+    rather than adding one. A refresh with no ticker that has an earlier row
+    leaves the run as it was. Nothing fetched or stored changes. Never
+    raises."""
+    try:
+        import config
+        import db
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        c = db.count_fundamentals_changes(since)
+        if c is None:
+            log.warning("fundamentals changes: count unreadable; not recorded")
+            return
+        import json
+        env = db.TRADING_ENV
+        streak_key = f"fundamentals_unchanged_streak_{env}"
+        today = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+        try:
+            st = json.loads(db.get_state(streak_key) or "{}")
+            last_streak, last_day = int(st.get("streak", 0)), st.get("day")
+            before = int(st.get("before", 0))
+        except (TypeError, ValueError, AttributeError):
+            last_streak, last_day, before = 0, None, 0
+        # A second run today redoes today's step from the run before it.
+        prior = before if last_day == today else last_streak
+        judged = c["tickers"] - c["no_prior"]
+        if judged <= 0:
+            streak = last_streak
+        else:
+            streak = prior + 1 if c["changed"] <= int(config.FUNDAMENTALS_FREEZE_MAX_CHANGED) else 0
+            db.set_state(streak_key, json.dumps({"streak": streak, "day": today, "before": prior}))
+        flagged = judged > 0 and streak >= int(config.FUNDAMENTALS_FREEZE_REFRESHES)
+        alerted = False
+        if flagged:
+            log.warning(f"fundamentals: {c['changed']} of {judged} tickers' target or forward EPS "
+                        f"changed, {streak} refreshes in a row; the source may be frozen")
+            alert_key = f"fundamentals_freeze_alerted_{env}"
+            if db.get_state(alert_key) != today:
+                try:
+                    import alerts
+                    mid = alerts._send(f"⚠️ <b>Fundamentals unchanged</b>\n{c['changed']} of {judged} "
+                                 f"tickers' analyst target or forward EPS changed, {streak} refreshes "
+                                 f"in a row. The refresh still reports success; the source may be "
+                                 f"frozen. Check fundamentals_history.")
+                    alerted = mid is not None      # _send returns None when it fails
+                except Exception as e:
+                    log.warning(f"fundamentals freeze alert failed: {e}")
+                db.set_state(alert_key, today)
+        db.log_activity_direct(
+            "fundamentals_changes", "", f"fundamentals refresh: {c['changed']} of {judged} tickers "
+            f"changed target or forward EPS (unchanged run {streak})",
+            "negative" if flagged else "neutral",
+            {**c, "judged": judged, "unchanged_streak": streak, "flagged": flagged,
+             "alerted": alerted, "env": env, "since": since.isoformat() if hasattr(since, "isoformat") else since,
+             "params": {"refreshes": config.FUNDAMENTALS_FREEZE_REFRESHES,
+                        "max_changed": config.FUNDAMENTALS_FREEZE_MAX_CHANGED}})
+    except Exception as e:
+        log.warning(f"fundamentals change record failed: {type(e).__name__}: {e}")
+
+
 @app.task(name="tasks.refresh_fundamentals", bind=True, max_retries=2)
 def refresh_fundamentals(self):
-    """Nightly refresh of fundamental metrics for the watchlist (free, via yfinance)."""
+    """Nightly refresh of fundamental metrics for the watchlist (free, via
+    yfinance). Then, record only, the count of tickers whose target or
+    forward EPS changed (_fundamentals_change_record)."""
+    from datetime import datetime, timedelta, timezone
+    # A minute's margin for worker/DB clock skew (recorded_at is the DB's
+    # NOW()); the previous refresh is a day earlier, a retry 5 min later.
+    started = datetime.now(timezone.utc) - timedelta(seconds=60)
     try:
         from ingestion.fundamentals import refresh_all_fundamentals
         count = refresh_all_fundamentals()
@@ -6929,6 +8532,7 @@ def refresh_fundamentals(self):
         log.error(f"refresh_fundamentals failed: {e}")
         _heartbeat_fail("fundamentals", str(e))
         raise self.retry(exc=e, countdown=300)
+    _fundamentals_change_record(started)
 
 
 def _get_stale_ingestion_sources() -> list[str]:
@@ -7312,6 +8916,79 @@ def _plan_exited(plan: dict, held: dict) -> bool | None:
         return None
 
 
+_PLAN_COMPILED_FIRST_KEY = "helios:plan_compiled_first:{plan_id}:{level}"
+
+
+def _plan_compiled_hit_record(plan: dict, price, today, r, held: dict, now=None) -> dict | None:
+    """Record only (config PLAN_COMPILED_HIT_SHADOW_ENABLED): one
+    plan_compiled_hit activity row when one of the plan's compiled levels
+    (agents.plans.compiled_level_state) is crossed for the first time since
+    the plan was made. A level's first-crossed time is kept in Redis
+    (_PLAN_COMPILED_FIRST_KEY, PLAN_COMPILED_HIT_FIRST_TTL_S) and set only
+    after the row is written, so a failed write is retried next tick. Only
+    plans with compiled levels (levels_source set; NULL for held_seed plans
+    and before 11-04). The row: env, plan_id, plan_source, levels_source,
+    held, price_source ("snapshot" for a held name, else None), newly_crossed
+    and per level crossed / direction / first_crossed_at / pct_vs_level /
+    reason; no price. Queues nothing, touches no PLAN_LEVEL_HIT field.
+    Returns the row's extra, or None. Never raises."""
+    try:
+        import config
+        if not getattr(config, "PLAN_COMPILED_HIT_SHADOW_ENABLED", False):
+            return None
+        if not plan.get("levels_source"):
+            return None
+        import db
+        from datetime import datetime, timezone
+        from agents.plans import compiled_level_state
+        now = now or datetime.now(timezone.utc)
+        state = compiled_level_state(plan, price, today)
+        newly = []
+        for name, rec in state.items():
+            key = _PLAN_COMPILED_FIRST_KEY.format(plan_id=plan["id"], level=name)
+            first = r.get(key)
+            if isinstance(first, bytes):
+                first = first.decode()
+            rec["first_crossed_at"] = first
+            if rec["crossed"] is True and first is None:
+                rec["first_crossed_at"] = now.isoformat(timespec="seconds")
+                newly.append(name)
+        if not newly:
+            return None
+        extra = {"env": config.TRADING_ENV, "plan_id": plan["id"], "plan_source": plan.get("source"),
+                 "levels_source": plan.get("levels_source"), "held": plan["ticker"] in held,
+                 "price_source": "snapshot" if price is not None else None,
+                 "newly_crossed": newly, "levels": state}
+        ok = db.log_activity_direct(
+            "plan_compiled_hit", plan["ticker"],
+            f"plan {plan['id']}: compiled {', '.join(newly)} first crossed; record only",
+            "neutral", extra)
+        if not ok:
+            return None
+        ttl = int(getattr(config, "PLAN_COMPILED_HIT_FIRST_TTL_S", 120 * 86400))
+        for name in newly:
+            r.set(_PLAN_COMPILED_FIRST_KEY.format(plan_id=plan["id"], level=name),
+                  state[name]["first_crossed_at"], nx=True, ex=ttl)
+        return extra
+    except Exception as e:
+        log.debug(f"[{plan.get('ticker')}] plan compiled-hit record failed: {type(e).__name__}: {e}")
+        return None
+
+
+# A plan's date hits (agents.plans.level_hits: catalyst_passed, horizon_end)
+# happen once per plan: once the date has passed it stays passed, so the
+# watcher logs each one once per plan, not once a day. The key outlives any
+# plan horizon (the hit fires after the date). Price kinds (invalidation,
+# target) keep the one-day key: the price can cross again.
+_PLAN_DATE_HIT_KINDS = ("catalyst_passed", "horizon_end")
+_PLAN_DATE_HIT_TTL_S = 365 * 86400
+_PLAN_PRICE_HIT_TTL_S = 86400
+
+
+def _plan_hit_ttl(kind: str) -> int:
+    return _PLAN_DATE_HIT_TTL_S if kind in _PLAN_DATE_HIT_KINDS else _PLAN_PRICE_HIT_TTL_S
+
+
 @app.task(name="tasks.watch_plan_levels")
 def watch_plan_levels():
     """Log-only (audit A2114-4/-7): during market hours, check every active
@@ -7342,8 +9019,15 @@ def watch_plan_levels():
         logged = 0
         for plan in plans_now:
             price = held.get(plan["ticker"])   # None when not held (no position price)
+            # Record only: the compiled levels level_hits doesn't watch. Never raises.
+            _plan_compiled_hit_record(plan, price, today, r, held)
             for kind, level in level_hits(plan, price, today):
-                if not r.set(f"helios:plan_hit:{plan['id']}:{kind}", "1", nx=True, ex=86400):
+                hit_key = f"helios:plan_hit:{plan['id']}:{kind}"
+                # Claimed with the one-day TTL and lengthened only once the row
+                # is written (an id back). A spilled or degraded write keeps the
+                # one-day claim (tried again the next day, not every tick, so a
+                # DB outage doesn't spill a copy per tick).
+                if not r.set(hit_key, "1", nx=True, ex=_PLAN_PRICE_HIT_TTL_S):
                     continue
                 from config import PLAN_LEVEL_REVIEW_ENABLED
                 # At most one queued review per ticker per ET day, whatever
@@ -7351,9 +9035,16 @@ def watch_plan_levels():
                 # could stack sells).
                 queued = bool(PLAN_LEVEL_REVIEW_ENABLED and plan["ticker"] in held and r.set(
                     f"helios:plan_review:{plan['ticker']}:{today.isoformat()}", "1", nx=True, ex=86400))
+                # A date hit is logged once per plan, except while reviews are
+                # on and this one's review wasn't queued (the day's cap taken,
+                # no fresh held price, or not held yet): then the one-day key,
+                # so it gets its review on a later day.
+                hit_ttl = _plan_hit_ttl(kind)
+                if PLAN_LEVEL_REVIEW_ENABLED and not queued:
+                    hit_ttl = _PLAN_PRICE_HIT_TTL_S
                 # An unheld name has no snapshot price: "no price" and a null
                 # price, not "$0.00" (audit 2026-11-17 #11).
-                db.log_signal(plan["ticker"], "PLAN_LEVEL_HIT", 0.0,
+                row_id = db.log_signal(plan["ticker"], "PLAN_LEVEL_HIT", 0.0,
                               f"plan {plan['id']}: {kind} ({level}) "
                               + (f"at ${price:.2f}; " if price is not None else "no price; ")
                               + ("review queued" if queued else "would re-review"),
@@ -7361,7 +9052,16 @@ def watch_plan_levels():
                                           "price": price, "plan_source": plan.get("source"),
                                           "review_queued": queued,
                                           "exited_since_plan": _plan_exited(plan, held),
+                                          # From exit-basis: date kinds once per plan.
+                                          "hit_dedupe": ("once_per_plan"
+                                                         if hit_ttl == _PLAN_DATE_HIT_TTL_S
+                                                         else "daily"),
                                           **shadow_versions()})
+                if row_id is None:
+                    log.warning(f"[{plan['ticker']}] PLAN_LEVEL_HIT plan {plan['id']} {kind}: row not "
+                                f"written (spilled or degraded); one-day key kept")
+                elif hit_ttl != _PLAN_PRICE_HIT_TTL_S:
+                    r.expire(hit_key, hit_ttl)
                 if queued:
                     review_plan_level_hit.apply_async(
                         args=[plan["ticker"], kind, str(level), price],
@@ -7609,6 +9309,9 @@ _EARNINGS_CONSENSUS_SOFT_LIMIT_S = 20 * 60
 # The loop stops fetching this long before the soft limit, so the run ends
 # with a row per ticker and a heartbeat instead of at the limit.
 _EARNINGS_CONSENSUS_DEADLINE_MARGIN_S = 2 * 60
+# The per-event record after the fetch (ingestion/earnings_events.py) writes
+# for at most this long, well inside the margin above.
+_EARNINGS_EVENTS_BUDGET_S = 60
 
 
 @app.task(name="tasks.refresh_earnings_consensus", bind=True, max_retries=0,
@@ -7620,14 +9323,26 @@ def refresh_earnings_consensus(self):
     gap in the series, and a retry can't fill it with that day's values.
     At the soft time limit, SoftTimeLimitExceeded reaches the except below
     and records the failed heartbeat."""
+    snapshots: dict = {}
     try:
         from ingestion.earnings_consensus import refresh_all_earnings_consensus
         counts = refresh_all_earnings_consensus(
-            deadline_s=_EARNINGS_CONSENSUS_SOFT_LIMIT_S - _EARNINGS_CONSENSUS_DEADLINE_MARGIN_S)
+            deadline_s=_EARNINGS_CONSENSUS_SOFT_LIMIT_S - _EARNINGS_CONSENSUS_DEADLINE_MARGIN_S,
+            on_record=snapshots.__setitem__)
         _heartbeat_ok("earnings_consensus", counts.get("written", 0))
     except Exception as e:
         log.warning(f"refresh_earnings_consensus failed: {type(e).__name__}: {e}")
         _heartbeat_fail("earnings_consensus", f"{type(e).__name__}: {e}")
+        return
+    # Record only (ingestion/earnings_events.py): per-event pre/post rows
+    # from the same snapshots, no further fetch. Inside the deadline margin,
+    # bounded by its own budget; never raises.
+    try:
+        from ingestion.earnings_events import record_events
+        import db
+        record_events(snapshots, db.TRADING_ENV, budget_s=_EARNINGS_EVENTS_BUDGET_S)
+    except Exception as e:
+        log.warning(f"earnings event record failed: {type(e).__name__}: {e}")
 
 
 @app.task(name="tasks.refresh_macro_calendar", bind=True, max_retries=2)
@@ -7951,6 +9666,33 @@ def _stop_fix_alert_due(ticker: str, msg: str) -> bool:
         return True
 
 
+def _overstop_guarded_level(ticker: str, stop_price, last: float, resting: list | None,
+                            alerts_out: list | None = None) -> float:
+    """The recorded stop through the above-market guard
+    (risk_manager._stop_below_market, config.STOP_GUARD_MODE; shadow by
+    default: a row and an info alert, the level unchanged) for the reconcile
+    resize. The callers' refusal of a recorded stop not below the last price
+    runs first, so the guard sees a level below last and returns it; it
+    guards the placement if that order changes. last is the caller's own
+    read, not a fill; resting is the caller's resting-stop read. alerts_out:
+    the guard's alert texts are appended there for the caller to send after
+    its place (_send_alert_texts), not sent between its cancel and place.
+    Never raises: a failure returns stop_price as given."""
+    try:
+        import risk_manager
+        return risk_manager._stop_below_market(ticker, float(stop_price), None, last,
+                                               "Reconcile stop resize", path="overstop_resize",
+                                               resting=resting, price_is_fill=False,
+                                               alerts_out=alerts_out,
+                                               # The resize may have just cancelled.
+                                               # No effect today: resting is always
+                                               # the caller's read, never unread.
+                                               cancel_window=True)
+    except Exception as e:
+        log.warning(f"[{ticker}] reconcile resize guard failed ({type(e).__name__}: {e})")
+        return stop_price
+
+
 def _fix_refused_over_position(ticker: str, mine: list, refused, held: float,
                                stop_price: float, last: float, recheck_try: int = 1) -> str:
     """_fix_overstop when recorded stops that refused a cancel are, while
@@ -7983,10 +9725,15 @@ def _fix_refused_over_position(ticker: str, mine: list, refused, held: float,
     ours = sum(float(o["qty"]) for o in stuck if o.get("status") not in cancelling_now)
     need = round(held - ours, 4)
     if need > 0:
-        result = manage_stop_place(ticker, need, float(stop_price), market_price=last)
-        db.set_stop_broker_order_id(ticker, result["order_id"])
+        guard_alerts: list = []   # sent after the place, or if it raises
+        try:
+            placed = float(_overstop_guarded_level(ticker, stop_price, last, stuck, guard_alerts))
+            result = manage_stop_place(ticker, need, placed, market_price=last)
+            db.set_stop_broker_order_id(ticker, result["order_id"])
+        finally:
+            _send_alert_texts(guard_alerts)
         return (f"🔧 {ticker}: the refused stop(s) over the {held:g} held cancelled on retry; "
-                f"placed a stop for {need:g} @ ${float(stop_price):.2f}")
+                f"placed a stop for {need:g} @ ${placed:.2f}")
     if ours > held + 1e-6:
         # Ours alone are now over the position: the re-check trims them.
         queued = _queue_stop_coverage_recheck(ticker, recheck_try)
@@ -8148,9 +9895,15 @@ def _fix_overstop(ticker: str, fresh_qty: float | None = None, allow_cancel: boo
                         f"{stuck_qty:g} ours vs {held:g} held); nothing cancelled")
         else:
             need = round(held - (resting - cancelling_qty), 4)
+            stuck = list(mine)
         if need > 0:
-            result = manage_stop_place(ticker, need, float(stop_price), market_price=last)
-            db.set_stop_broker_order_id(ticker, result["order_id"])
+            guard_alerts: list = []   # sent after the place, or if it raises
+            try:
+                stop_price = _overstop_guarded_level(ticker, stop_price, last, stuck, guard_alerts)
+                result = manage_stop_place(ticker, need, float(stop_price), market_price=last)
+                db.set_stop_broker_order_id(ticker, result["order_id"])
+            finally:
+                _send_alert_texts(guard_alerts)
     except Exception as e:
         return f"🚨 {ticker}: {label}; fix failed ({e}) — check TWS now"
     pending = ""
@@ -8595,9 +10348,13 @@ def _account_flat_gate() -> tuple[bool, str]:
     return True, ""
 
 
+PARTIAL_STOP_SLIPPAGE_STAGE = "stop_slippage_partial"
+
+
 def _log_stop_slippage(ticker: str, stop_price, fill: dict | None, source: str,
                        stop_order_id=None, prev_close=None, trailing_active=None,
-                       stop_method=None) -> bool:
+                       stop_method=None, stage: str = "stop_slippage", ident=None,
+                       extra: dict | None = None) -> bool:
     """Log-only record of how far a protective SELL stop filled from its stop
     price. After a gap a stop fills at market, below the stop, while the risk
     cap assumes the stop price is the fill. Writes one activity_feed row
@@ -8630,8 +10387,14 @@ def _log_stop_slippage(ticker: str, stop_price, fill: dict | None, source: str,
 
     prev_close: the caller's value, else the newest price_history close dated
     before the fill's ET date (prev_close_date); prev_close_null_reason says
-    why it is null. Nothing is sent or changed. Never raises; returns whether
-    a row was written."""
+    why it is null.
+
+    stage, ident, extra: the defaults write the stop_slippage row above.
+    _book_partial_stop_fills passes PARTIAL_STOP_SLIPPAGE_STAGE, an ident
+    naming the booking (the shadow_key's last part; deduplicated within that
+    stage) and extra fields merged into the row, with a fill built from the
+    one booked execution. Nothing is sent or changed. Never raises; returns
+    whether a row was written."""
     try:
         import math
         from datetime import datetime, time as _time
@@ -8663,11 +10426,12 @@ def _log_stop_slippage(ticker: str, stop_price, fill: dict | None, source: str,
             at_open = et.weekday() < 5 and _time(9, 30) <= t < _time(9, 35)
         else:
             fill_time = None
-        ident = stop_order_id if stop_order_id else (fill_time.isoformat() if fill_time else None)
+        if ident is None:
+            ident = stop_order_id if stop_order_id else (fill_time.isoformat() if fill_time else None)
         if ident is None:
             ident = datetime.now(_ny).date().isoformat()
         key = f"{TRADING_ENV}:{ticker}:{ident}"
-        done = db.get_activity_shadow_keys("stop_slippage")
+        done = db.get_activity_shadow_keys(stage)
         if done is not None and key in done:
             return False
         shares_total = fill.get("filled_qty")
@@ -8745,8 +10509,9 @@ def _log_stop_slippage(ticker: str, stop_price, fill: dict | None, source: str,
         stop, price, shares = record_stop, vwap, shares_total
         slip = (price - stop) / stop * 100
         return bool(db.log_activity(
-            "stop_slippage", ticker,
-            f"stop fill {ticker}: stop ${stop:.2f}, filled ${price:.2f} ({slip:+.2f}%)",
+            stage, ticker,
+            ("partial " if stage == PARTIAL_STOP_SLIPPAGE_STAGE else "")
+            + f"stop fill {ticker}: stop ${stop:.2f}, filled ${price:.2f} ({slip:+.2f}%)",
             "neutral",
             {"ticker": ticker, "stop_price": stop, "fill_price": price,
              "slippage_pct": round(slip, 4),
@@ -8769,6 +10534,7 @@ def _log_stop_slippage(ticker: str, stop_price, fill: dict | None, source: str,
              "stop_method": stop_method,
              "prev_close_date": pc_date, "prev_close_source": pc_source,
              "prev_close_null_reason": pc_reason,
+             **(extra or {}),
              "shadow_key": key, **shadow_versions()}))
     except Exception as e:
         log.debug(f"[{ticker}] stop slippage log failed: {e}")
@@ -8836,6 +10602,187 @@ def _cache_stop_triggers(working: list[dict], now=None) -> None:
         db.set_state(_STOP_TRIGGER_CACHE_KEY.format(env=TRADING_ENV), json.dumps(keep, sort_keys=True))
     except Exception as e:
         log.debug(f"stop trigger cache update failed: {e}")
+
+
+_SELL_SEEN_KEY = "broker_sell_seen_{env}"   # {"day": ET date, "seen": [order keys]}
+_SELL_SEEN_MAX = 500
+_SELL_WATCH_OPEN = (9, 25)     # ET; resting stops fill in regular hours
+_SELL_WATCH_CLOSE = (16, 30)
+
+
+def _sell_watch_due(now=None) -> bool:
+    """A weekday between _SELL_WATCH_OPEN and _SELL_WATCH_CLOSE, New York time."""
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+    et = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo("America/New_York"))
+    return et.weekday() < 5 and _SELL_WATCH_OPEN <= (et.hour, et.minute) <= _SELL_WATCH_CLOSE
+
+
+def _sell_seen_read(day: str) -> list:
+    """Order keys already recorded today, in the order they were recorded.
+    Raises on a failed read (db.get_state_strict), so the caller writes
+    nothing rather than repeat every row of the day. An older day, or content
+    that doesn't parse, reads as empty (with a warning for the latter): at
+    worst that day's rows are written once more, and the next write repairs
+    the state."""
+    import db
+    from config import TRADING_ENV
+    raw = db.get_state_strict(_SELL_SEEN_KEY.format(env=TRADING_ENV), "") or ""
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict) or not isinstance(data.get("seen", []), list):
+            raise ValueError("not a mapping with a seen list")
+    except (ValueError, TypeError) as e:
+        log.warning(f"watch_broker_sells: seen state unreadable ({e}); starting the day's set again")
+        return []
+    if data.get("day") != day:
+        return []
+    return [str(k) for k in data.get("seen") or []]
+
+
+def _sell_seen_write(day: str, seen: list) -> None:
+    """Keeps the newest _SELL_SEEN_MAX keys, in the order they were recorded."""
+    import db
+    from config import TRADING_ENV
+    db.set_state(_SELL_SEEN_KEY.format(env=TRADING_ENV),
+                 json.dumps({"day": day, "seen": list(seen)[-_SELL_SEEN_MAX:]}))
+
+
+def _watch_broker_sells_body(now=None) -> list[dict]:
+    """Record-only (config BROKER_SELL_WATCH_ENABLED): writes one activity row
+    (stage broker_sell_seen) the first time a SELL execution appears today
+    that the bot did not log as its own order (db.recorded_sell_order_ids):
+    a resting stop fill or a sale made at the broker. An order counts as the
+    bot's when its permId is among the logged perm_ids or its orderId among
+    the logged order_ids (a bot SELL row is written before its fill wait
+    with no permId; get_recent_sell_fill excludes the same way). While a bot
+    SELL for the ticker is pending (unconfirmed today, in its fill wait, or
+    filled and not booked), or that can't be read, the order is left for the
+    next run, so a bot sale not logged yet is never recorded. The bot otherwise
+    learns of such an exit only when reconcile_stop_orders books it, about
+    15-30 min later (its 900 s schedule and two-cycle confirmation); this
+    row says when it was first seen. Records the ticker, the order's
+    permId/orderId, its first and last execution times, the lag from the
+    first execution to this row and whether the newest portfolio snapshot
+    still holds the name. No price or quantity. A failed read of the day's
+    recorded keys writes nothing that run.
+
+    Reads only: today's executions (one reqExecutions), the bot's logged
+    sells, pending-sell markers and the snapshot. Places, cancels and books
+    nothing: trades, trade_outcomes and position_stops are still written by
+    reconcile alone, and nothing reads these rows. Never raises; returns
+    the records written."""
+    written: list[dict] = []
+    try:
+        try:
+            from config import BROKER_SELL_WATCH_ENABLED
+        except ImportError:
+            return written
+        if not BROKER_SELL_WATCH_ENABLED:
+            return written
+        from datetime import datetime, timezone
+        now = now or datetime.now(timezone.utc)
+        if not _sell_watch_due(now):
+            return written
+        import db
+        import ibkr
+        from config import TRADING_ENV
+        try:
+            execs = ibkr.get_today_sell_executions()
+        except Exception as e:
+            log.warning(f"watch_broker_sells: execution read failed ({type(e).__name__}); next run retries")
+            return written
+        if not execs:
+            return written
+        from zoneinfo import ZoneInfo
+        day = now.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+        try:
+            seen = _sell_seen_read(day)
+        except Exception as e:
+            log.warning(f"watch_broker_sells: seen-state read failed ({type(e).__name__}); "
+                        f"nothing written this run")
+            return written
+        try:
+            pending = (set(db.awaiting_fill_sell_tickers()) | set(db.trade_pending_sell_tickers())
+                       | {o["ticker"] for o in db.get_unconfirmed_orders()
+                          if o.get("side") == "SELL" and o.get("created_at") is not None
+                          and o["created_at"].astimezone(ZoneInfo("America/New_York")).date().isoformat()
+                          == day})
+        except Exception:
+            pending = None
+        recorded_by_ticker: dict = {}
+        new_seen = list(seen)
+        for ex in execs:
+            ticker = ex.get("ticker")
+            perm, oid = ex.get("perm_id"), ex.get("order_id")
+            key = f"{ticker}:perm:{perm}" if perm else f"{ticker}:oid:{oid}"
+            if not ticker or key in new_seen:
+                continue
+            if ticker not in recorded_by_ticker:
+                try:
+                    recorded_by_ticker[ticker] = db.recorded_sell_order_ids(ticker)
+                except Exception:
+                    recorded_by_ticker[ticker] = None
+            rec_ids = recorded_by_ticker[ticker]
+            if rec_ids is None:
+                continue                 # unknown which sells are the bot's: look again next run
+            order_ids, perm_ids = rec_ids
+            if (perm and perm in perm_ids) or oid in order_ids:
+                new_seen.append(key)     # the bot's own logged order
+                continue
+            if pending is None or ticker in pending:
+                continue                 # a bot SELL may not be logged yet: classify next run
+            if stop_lock.held_elsewhere(ticker) is not False:
+                # A stop change is under way (a profit-target sale writes its
+                # order row only after the remainder's stop), or the lock
+                # can't be read: classify next run.
+                continue
+            first, last = ex.get("first_exec_at"), ex.get("last_exec_at")
+            try:
+                held, held_reason, _pos = _broker_held(ticker)
+            except Exception:
+                held, held_reason = None, "error"
+            rec = {"env": TRADING_ENV, "ticker": ticker, "perm_id": perm, "order_id": oid,
+                   "first_exec_at": first.isoformat() if first else None,
+                   "last_exec_at": last.isoformat() if last else None,
+                   "exec_time_source": ex.get("time_source"), "n_execs": ex.get("n_execs"),
+                   "seen_at": now.isoformat(),
+                   "seen_lag_s": round((now - first).total_seconds(), 1) if first else None,
+                   "held_in_snapshot": held, "held_read": held_reason}
+            ok = db.log_activity_direct(
+                "broker_sell_seen", ticker,
+                f"Broker SELL seen for {ticker} (order {perm or oid}), first executed "
+                f"{rec['first_exec_at']}; not booked until reconcile; record only", "neutral", rec)
+            if ok:
+                new_seen.append(key)
+                written.append(rec)
+        if new_seen != seen:
+            try:
+                _sell_seen_write(day, new_seen)
+            except Exception as e:
+                log.debug(f"watch_broker_sells: seen-state write failed: {e}")
+    except Exception as e:
+        log.warning(f"watch_broker_sells failed: {type(e).__name__}: {e}")
+    return written
+
+
+@app.task(name="tasks.watch_broker_sells", bind=True, max_retries=0)
+def watch_broker_sells(self):
+    """Record-only fill watch, every 2 min in market hours: see
+    _watch_broker_sells_body. One run at a time."""
+    _run_singleton("watch_broker_sells", lambda: _watch_broker_sells_body(), max_hold_s=300)
+
+
+@app.task(name="tasks.weekly_readouts", bind=True, max_retries=0)
+def weekly_readouts(self):
+    """Weekly forward readouts, Friday 17:37 ET: one markdown file under
+    logs/readouts and one weekly_readouts activity row (see
+    weekly_readouts.py). Read-only on the DB, sends nothing. One run at a
+    time."""
+    import weekly_readouts as _wr
+    _run_singleton("weekly_readouts", lambda: _wr.run(), max_hold_s=1800)
 
 
 @app.task(name="tasks.reconcile_stop_orders", bind=True, max_retries=2)
@@ -8973,14 +10920,27 @@ def _book_partial_stop_fills(held_long: dict, records: list[dict], pending_sell_
     that write fails, and a spilled trade row keeps the booking); the
     stale-stop path nets them out (_net_of_partial_bookings). Each booking gets
     one Telegram message. No stop_slippage row: that table keeps one row per
-    whole exit, written by the stale-stop path. The trade outcome stays open
-    until the final exit. Nothing is sent to the broker. Never raises; returns
-    the messages for the reconcile log."""
+    whole exit, written by the stale-stop path, whose price is the VWAP of all
+    the day's unrecorded sells (a same-day partial's execution included). A
+    booking whose trade row was written gets a row in its own stage instead
+    (PARTIAL_STOP_SLIPPAGE_STAGE, record only, one per booking),
+    so no execution is counted twice in stop_slippage. Its fill_price is the
+    booked order's VWAP over all of that day's executions at booking time
+    (get_recent_sell_fill splits by order, not by execution), so a second
+    same-day booking of the same permId carries the blended price
+    (fill_price_basis "order_day_vwap_at_booking"; the trade row uses the
+    same price). shadow_key:
+    {env}:{ticker}:partial:{fill ET date}:{permId}:{booked shares for that
+    permId that day}; the date keeps a GTC stop's bookings on different days
+    apart (the booked state resets each ET day). The trade outcome
+    stays open until the final exit. Nothing is sent to the broker. Never
+    raises; returns the messages for the reconcile log."""
     msgs: list[str] = []
     try:
         import db
         import ibkr
         from datetime import datetime, timezone
+        from zoneinfo import ZoneInfo
         from config import TRADING_ENV
         if not held_long or pending_sell_tickers is None:
             return msgs
@@ -9011,6 +10971,8 @@ def _book_partial_stop_fills(held_long: dict, records: list[dict], pending_sell_
             gap = round(net.get(ticker, 0.0) - float(qty), 4)
             if float(qty) <= 0 or gap <= 0 or ticker in pending_sell_tickers or ticker in skip:
                 continue
+            if stop_lock.held_elsewhere(ticker) is not False:
+                continue   # a stop change (e.g. a profit-target sale) may not have written its rows yet
             recorded = db.recorded_sell_order_ids(ticker)
             if recorded is None:
                 continue
@@ -9059,7 +11021,24 @@ def _book_partial_stop_fills(held_long: dict, records: list[dict], pending_sell_
                 gap = round(gap - q, 4)
                 # No stop_slippage row here: those rows carry all of the day's
                 # unrecorded sells (their documented meaning), which the stale
-                # path's row still does. A per-lot row is Luke's call (04z).
+                # path's row still does. Whether partial exits get one is
+                # Luke's call (04z). Record only, in its own stage: this one
+                # execution against the record's stop and its own trigger.
+                rec = rec_by.get(ticker) or {}
+                _log_stop_slippage(
+                    ticker, rec.get("stop_price"),
+                    {"fill_price": float(o["price"]), "filled_qty": q, "fill_time": ft,
+                     "fill_time_source": o.get("fill_time_source"),
+                     "order_ids": [o["order_id"]], "by_order": [{**o, "qty": q}]},
+                    "partial_stop_fill", rec.get("broker_order_id"),
+                    trailing_active=rec.get("trailing_active"),
+                    stop_method=rec.get("stop_method"),
+                    stage=PARTIAL_STOP_SLIPPAGE_STAGE,
+                    ident=(f"partial:{ft.astimezone(ZoneInfo("America/New_York")).date().isoformat()}:"
+                           f"{perm}:{round(booked[perm], 4):g}"),
+                    extra={"perm_id": perm, "booked_qty_for_perm": round(booked[perm], 4),
+                           "fill_time_source": o.get("fill_time_source"),
+                           "fill_price_basis": "order_day_vwap_at_booking"})
                 msg = (f"Untracked partial exit for {ticker} (resting stop or manual): SELL {q:g} "
                        f"@ ${float(o['price']):.2f}; {float(qty):g} still held")
                 msgs.append(msg)

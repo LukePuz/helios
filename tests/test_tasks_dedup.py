@@ -22,6 +22,16 @@ _OLD = "2000-01-01T00:00:00+00:00"   # a marker armed long ago
 
 
 @pytest.fixture(autouse=True)
+def _no_price_read():
+    """The stop re-place guard (tasks._reprotect_after_late_sell) reads a
+    price: patched to no price here, so these tests place as before and
+    never reach IBKR. A test that needs a price patches its own."""
+    with patch("ibkr.get_latest_price", return_value=None), \
+         patch("ibkr.get_fresh_minute_price", return_value=None):
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _no_sell_in_its_fill_wait():
     """The stale-stop branch also waits on SELLs still in their fill wait
     (db.awaiting_fill_sell_tickers) and on filled SELLs whose trade row is
@@ -551,6 +561,36 @@ class TestReconcileUnconfirmedOrders:
         upsert.assert_not_called()
         queued.assert_called_once()
 
+    def test_late_buy_keeps_the_record_under_the_shipped_late_fill_shadow(self):
+        """The same with LATE_FILL_EXPECT_MODE "shadow" (the shipped default):
+        the cache snapshot reads ibkr._ib, not the position read the decision
+        uses, and the record-only broker reads come after the stop step."""
+        import config
+        client = self._client(244)
+        ib = MagicMock()
+        ib.isConnected.return_value = False
+        with patch.object(config, "LATE_FILL_EXPECT_MODE", "shadow"), patch("ibkr._ib", ib), \
+             patch("db.get_unconfirmed_orders", return_value=[self._order()]), \
+             patch("ibkr.get_fill_for_order",
+                   return_value={"filled_qty": 144.0, "fill_price": 181.3}), \
+             patch("db.log_trade"), patch("db.update_order_fill"), \
+             patch("db.get_approval_by_id", return_value=self._approval()), \
+             patch("ibkr.get_client", return_value=client), \
+             patch("db.get_position_stop", return_value={"stop_price": 160.0}), \
+             patch("db.upsert_position_stop") as upsert, \
+             patch("tasks._reprotect_after_late_sell", return_value=False), \
+             patch("tasks._queue_reprotect") as queued, \
+             patch("tasks._retry_pending_reprotects"), \
+             patch("ibkr.get_fresh_stock_position", return_value=(244.0, 181.3)), \
+             patch("ibkr.get_broker_stock_qty", return_value=244.0), \
+             patch("ibkr.cached_stock_qty", return_value=244.0), \
+             patch("db.log_activity_queued"), \
+             patch("db.update_approval_status"), patch("alerts._send"):
+            tasks.reconcile_unconfirmed_orders.run()
+        client.get_all_positions.assert_called_once()
+        upsert.assert_not_called()
+        queued.assert_called_once_with("CRWD", {"intent": "BUY"}, None)   # no expectation in shadow
+
     def test_late_buy_replaces_a_closed_positions_leftover_record(self):
         """A0053-5: nothing held before this fill, so an existing record is a
         closed position's leftover and must not set the new stop."""
@@ -800,14 +840,17 @@ class TestReconcileUnconfirmedOrders:
         _, place, _ = self._run_sell([MagicMock(symbol="CRWD", qty=20)],
                                      intent="PROFIT_TARGET", stop_price=181.0)
         self.extra["taken"].assert_called_once_with("CRWD", 181.0)
-        self.extra["open_orders"].assert_called_once()   # working-sell read, no cover check
+        # working-sell read (no cover check), then the no-loosen floor read before the cancel
+        assert self.extra["open_orders"].call_count == 2
         place.assert_called_once_with("CRWD", 20.0, 181.0)
 
     def test_late_trim_keeps_recorded_stop_and_target_open(self):
         from unittest.mock import MagicMock
         _, place, _ = self._run_sell([MagicMock(symbol="CRWD", qty=20)], intent="TRIM")
         self.extra["taken"].assert_not_called()
-        assert self.extra["open_orders"].call_count == 2   # working sells, then resting cover
+        # working sells and resting cover; the floor and the guard reuse the
+        # cover read (no third read before the cancel, review S1)
+        assert self.extra["open_orders"].call_count == 2
         place.assert_called_once_with("CRWD", 20.0, 150.0)
 
     def test_late_partial_sell_reprotects_the_remainder(self):
@@ -815,7 +858,9 @@ class TestReconcileUnconfirmedOrders:
         sale, so a late fill used to leave the rest with no stop."""
         from unittest.mock import MagicMock
         cancel, place, send = self._run_sell([MagicMock(symbol=self._order()["ticker"], qty=20)])
-        assert self.extra["open_orders"].call_count == 2   # read, found nothing working or resting
+        # working sells and resting cover (nothing found, so no floor to read:
+        # review S1)
+        assert self.extra["open_orders"].call_count == 2
         cancel.assert_called_once()
         place.assert_called_once_with(self._order()["ticker"], 20.0, 150.0)
         assert "Protective stop placed." in send.call_args.args[0]

@@ -407,9 +407,10 @@ def test_buy_add_passes_the_fill_price_to_the_whole_position_stop(action):
                               "stop_loss_price": 90.0}}
     seen = {}
 
-    def whole(ticker, stop, filled, status=None, market_price=None, action=None, held_before=None):
+    def whole(ticker, stop, filled, status=None, market_price=None, action=None, held_before=None,
+              price_is_fill=None):
         seen["market_price"], seen["action"] = market_price, action
-        seen["held_before"] = held_before
+        seen["held_before"], seen["price_is_fill"] = held_before, price_is_fill
         raise RuntimeError("stop here")
     with patch("ibkr.get_ib"), patch("ibkr.get_client"), \
          patch("risk_manager.RiskManager") as rm_cls, \
@@ -431,6 +432,7 @@ def test_buy_add_passes_the_fill_price_to_the_whole_position_stop(action):
     assert seen.get("market_price") == 101.5
     assert seen.get("action") == action
     assert seen.get("held_before") == 5.0   # the pre-order count is passed through (04af)
+    assert seen.get("price_is_fill") is True   # a fill price: the guard's record follows
 
 
 # ── 5. Profit-target mark guard ─────────────────────────────────────────
@@ -1246,7 +1248,8 @@ def test_add_with_disagreeing_reads_keeps_the_record_and_stops_only_the_fill():
                               "stop_loss_price": 90.0}}
     reason = "the broker's position reads disagree (5 fresh, 7 cached) right after the fill"
 
-    def whole(ticker, stop, filled, status=None, market_price=None, action=None, held_before=None):
+    def whole(ticker, stop, filled, status=None, market_price=None, action=None, held_before=None,
+              price_is_fill=None):
         status["prior_unreadable"] = True
         status["unknown_reason"] = reason
         return stop, None

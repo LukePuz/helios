@@ -424,6 +424,34 @@ class TestMarketHoursGate:
         restore.assert_called_once_with(approval["ticker"], floor=None)
         assert "stop restored" in execution.last_outcome_reason()
 
+    def test_sell_with_an_unconfirmed_cancel_leaves_the_stop_down(self):
+        """A market-closed cancel that place_market_order couldn't confirm
+        (PendingCancel after the poll, or a Cancelled only a rejection set)
+        may still fill: no stop restore, an unconfirmed orders row for
+        reconcile."""
+        import ibkr
+        for status in ("PendingCancel", ibkr.CANCEL_REJECTED_STATUS):
+            approval = _approval(action="TRIM", shares_initial=40)
+            with patch("ibkr.get_ib"), \
+                 patch("ibkr.get_client") as mock_client, \
+                 patch("ibkr.place_market_order",
+                       return_value={"order_id": 9, "filled_qty": 0, "fill_price": None,
+                                     "status": status}), \
+                 patch("tasks.manage_cancel_stop_orders_for", return_value=1), \
+                 patch("ibkr.get_latest_price", return_value=100.0), \
+                 patch("market_data.get_priced_quote", return_value=None), \
+                 patch("execution._restore_stop_after_failed_sell") as restore, \
+                 patch("execution._finish_dead_sell_row") as finish_dead, \
+                 patch("execution._log_unconfirmed_order") as unconfirmed, \
+                 patch("db.log_order"), patch("alerts._send"):
+                mock_client.return_value.get_open_position.return_value = MagicMock(qty=100)
+                assert execution.execute_approved(approval) is False
+            restore.assert_not_called()
+            finish_dead.assert_not_called()
+            unconfirmed.assert_called_once()
+            assert unconfirmed.call_args.kwargs["status"] == "unconfirmed"
+            assert execution.last_outcome_reason().startswith("unconfirmed")
+
 
 class TestStalePriceBuyGuard:
     """Regression coverage for the 2026-07-29 TER incident: right at market
@@ -1009,9 +1037,13 @@ class TestAddStopsWholePosition:
             client.get_open_position.return_value = MagicMock(qty=pos_qty, avg_entry_price=avg)
         fresh = (pos_qty, avg) if fresh is None else fresh
         fresh_kw = ({"side_effect": fresh} if isinstance(fresh, Exception) else {"return_value": fresh})
+        # Queued rows (the shipped shadow rows: add_stop_qty, the stop guard)
+        # are kept off the writer thread, which calls log_activity_direct on
+        # its own schedule and would race the tests' direct-row mocks.
         with patch("db.get_position_stop", return_value=prior), \
              patch("ibkr.get_client", return_value=client), \
              patch("ibkr.get_fresh_stock_position", **fresh_kw) as fresh_read, \
+             patch("db.log_activity_queued"), \
              patch("tasks.manage_cancel_stop_orders_for") as cancel:
             result = execution._whole_position_stop("NVDA", new_stop, filled, status=status,
                                                     action=action, held_before=held_before)
@@ -2063,6 +2095,7 @@ def test_failed_unconfirmed_order_row_is_kept_for_reconcile_and_alerted():
          patch("config.USE_BRACKET_ORDERS", False), \
          patch("db.log_order", side_effect=failing_log_order) as log_order, \
          patch("db._spill") as spill, \
+         patch("db.log_activity_queued"), \
          patch("db.get_state", side_effect=lambda k, d=None: states.get(k, d)), \
          patch("db.set_state", side_effect=lambda k, v: states.__setitem__(k, v)), \
          patch("tasks.open_manual_action"), \

@@ -113,6 +113,18 @@ POLL_INTERVAL_SECONDS = 300  # 5 minutes (portfolio snapshots)
 # Risk rules — authoritative source; risk_manager.py reads these
 # ---------------------------------------------------------------------------
 DRAWDOWN_HALT_PCT = 0.10   # Halt all trading if portfolio drops 10% from start
+# The per-buy drawdown check's baseline (RiskManager.is_halted) when it is
+# unusable: "unparseable" (the stored mark is not a number; is_halted raises
+# on it, so every caller fails closed), "non_finite" (inf, -inf or nan; the
+# check runs on it unchanged: inf blocks as an implausible account value,
+# -inf and nan do not block) or "non_positive" (<= 0, stored or the start
+# value it falls back to; the check does not block). "shadow": one hwm_guard
+# activity row and at most one alert per reason per day (no dollar values,
+# sent off the buy path), and in each case the check does exactly what it did
+# before. "enforce": also blocks this buy (halt_unknown, not latched) in all
+# three. Read case-insensitively; an unknown value logs and runs as shadow.
+# Not read from .env.
+HWM_GUARD_MODE = "shadow"
 
 # Per-bucket position caps (initial entry ceiling)
 MAX_POSITION_PCT_COMPOUNDER  = 0.12   # 12% at entry; allow up to 15% via gains
@@ -123,6 +135,14 @@ MAX_POSITION_PCT_MOONSHOT    = 0.02   # 2% hard cap always
 MAX_SINGLE_THEME_PCT   = 0.35   # 35% per sector/thesis
 MAX_AI_INFRA_PCT       = 0.60   # 60% total AI infrastructure exposure
 MAX_MOONSHOT_TOTAL_PCT = 0.10   # 10% total moonshots
+# A theme or moonshot-total sub-check of risk_manager.check_concentration
+# that raises leaves that cap unset, so the buy is sized at full. "shadow"
+# (default): unchanged sizing, plus one risk_subcheck_fail activity row
+# (would_fail_closed true) and an alert at most hourly per sub-check and
+# process. "enforce": that cap becomes 0 (no room), as the outer position
+# read error already does. Any other value reads as "shadow". Not read
+# from .env.
+RISK_SUBCHECK_FAIL_MODE = "shadow"
 
 # Cash-reserve cap — a single trade's initial tranche may spend at most this
 # fraction of *current cash on hand*, not portfolio value. Because the cap
@@ -189,6 +209,32 @@ MOONSHOT_MAX_LOSS_PCT = 0.20
 # wide-stop trade, never loosens it beyond the existing % caps. 2% is the
 # midpoint of Minervini's publicly stated 1.25-2.5% per-trade risk range.
 RISK_PCT_PER_TRADE = 0.02
+
+# Record-only volatility shadows on the legacy sizing path (gap hunt
+# 2026-11-21: buys with 20-day realised vol above 60% lost more than 10% vs
+# SPY within 20 sessions 23% of the time, under 40% 3%; stops sat at a median
+# 0.71 of the 20-session 1-sigma move). When on, size_position adds two keys
+# to the sizing dict (and so to pending_approvals.risk_json):
+#   vol_target_shadow -- the position weight at which weight x rvol20 equals
+#     VOL_TARGET_CONTRIBUTION, its ratio to the weight after this order, and
+#     the shares this order could buy within it;
+#   stop_vol -- the stop distance in ATR multiples and in 20-session sigmas.
+# The weights are restated in crew (agents/crew.py, just before the
+# approval is written) at the final share count, after the concentration,
+# correlation and micro-name cuts: weights_at "final_order" (else
+# "size_position"), with shares_at_sizing and order_weight_at_sizing kept.
+# A deferred buy re-sized at execution (tasks.retry_deferred_entry) can buy
+# fewer shares; like risk_json's own shares_initial, the record keeps the
+# approved order. Simulations and dry runs (RiskManager(simulation=True) or
+# log_fallback=False: the c6 shadow, the swap check, sizing_dryrun) skip
+# it. rvol20 = sample stdev of the last VOL_TARGET_WINDOW_SESSIONS daily log
+# returns on completed price_history bars, times sqrt(252); stale_sessions
+# counts weekdays since the last cached bar. Nothing reads either key:
+# shares, stops and orders are the same with this on or off, and there is
+# no live switch. 0.02 = a 5% position in a 40%-vol name.
+VOL_TARGET_SIZING_SHADOW_ENABLED = True
+VOL_TARGET_CONTRIBUTION = 0.02
+VOL_TARGET_WINDOW_SESSIONS = 20
 
 # Trailing stop activation thresholds
 TRAILING_STOP_ACTIVATE: dict[str, float] = {
@@ -459,6 +505,36 @@ BUY_NEW_FACT_WINDOW = os.getenv("BUY_NEW_FACT_WINDOW", "24h").strip().lower()
 # 10-13; Luke dropped it 10-29 (D2). true turns the poller and the
 # scanner lookup back on once a key exists.
 QUIVER_ENABLED = os.getenv("QUIVER_ENABLED", "false").lower() == "true"
+# Ingestion yield watch (tasks.feed_health, weekdays 18:40 ET): new items per
+# source per NYSE session (seen_items) against the median of the source's
+# last FEED_HEALTH_BASELINE_SESSIONS non-zero sessions before the run being
+# judged, so an outage never becomes its own baseline (the 11-13..11-20
+# analyst-ratings freeze: polls "succeeded" with 0 items, and source_yield's
+# trailing mean fell under its floor within 2 days). A source alerts at 0 for
+# FEED_HEALTH_ZERO_SESSIONS sessions in a row, or under FEED_HEALTH_LOW_RATIO
+# of its baseline for FEED_HEALTH_LOW_SESSIONS, once per source per day, with
+# one feed_health row per run. Nothing ingested changes. A source needs
+# FEED_HEALTH_MIN_BASELINE_SESSIONS non-zero sessions in the look-back to be
+# judged. news_title is news's per-item title key (it mirrors news), and
+# congressional is skipped while QUIVER_ENABLED is off. Not read from .env.
+FEED_HEALTH_ENABLED = True
+FEED_HEALTH_BASELINE_SESSIONS = 10
+FEED_HEALTH_MIN_BASELINE_SESSIONS = 5
+FEED_HEALTH_ZERO_SESSIONS = 2
+FEED_HEALTH_LOW_RATIO = 0.2
+FEED_HEALTH_LOW_SESSIONS = 3
+FEED_HEALTH_LOOKBACK_DAYS = 60
+FEED_HEALTH_EXCLUDED_SOURCES = ("news_title",)
+# Fundamentals freeze watch (tasks.refresh_fundamentals, record only): after
+# each refresh, how many tickers' target_mean_price or forward_eps changed
+# from their previous fundamentals_history row (a fundamentals_changes
+# row). forward_pe moves with the price every day, so it can't show a freeze
+# (all 75 targets and EPS unchanged 10-26..10-29, unflagged). At most
+# FUNDAMENTALS_FREEZE_MAX_CHANGED changed on FUNDAMENTALS_FREEZE_REFRESHES
+# refreshes in a row: a WARN and one alert a day. Nothing fetched or stored
+# changes. Not read from .env.
+FUNDAMENTALS_FREEZE_REFRESHES = 2
+FUNDAMENTALS_FREEZE_MAX_CHANGED = 0
 # Brief sections that change what the analyst sees (professor M37-M39, Q35).
 # On from 10-30 (Luke D12, 10-29: needed for plan-following); false turns
 # either back off.
@@ -494,6 +570,46 @@ STOPOUT_REENTRY_SHADOW_ENABLED = True
 # gate below reads its trend check: false skips the read and so also turns off
 # the trend gate. Not read from .env.
 ENTRY_QUALITY_SHADOW_ENABLED = True
+# Story de-duplication and staleness shadow (record only;
+# agents/story_dedup.py). Each event analysis records on its verdict's
+# provenance.trigger.story_dedup a story key (normalised title plus source
+# domain), the earlier event verdict on the same ticker and story (same URL
+# or same key) within STORY_DEDUP_WINDOW_HOURS, the item's age at decision
+# time, and would_skip_duplicate / would_skip_stale labels at these cut-offs.
+# 24 h for both matches BUY_NEW_FACT_WINDOW, the age past which an item
+# already stops counting as a new fact. Nothing is skipped and the prompt,
+# brief and routing are unchanged. Not read from .env.
+STORY_DEDUP_SHADOW_ENABLED = True
+STORY_DEDUP_WINDOW_HOURS = 24
+STORY_STALE_CUTOFF_HOURS = 24
+# Read-through record (record only; agents/crew.py:_read_through_record). When
+# an event is analysed, one activity row (stage read_through) lists the
+# related symbols the brief names for the event's ticker
+# (context_engine._find_related_symbols over SYMBOLS) and which of them the
+# book holds, from the positions already read for the brief, once per source
+# item and held ticker. No held review is queued; the brief, prompt and
+# routing are unchanged. Not read from .env.
+READ_THROUGH_RECORD_ENABLED = True
+# Target anchoring and fundamentals staleness (record only;
+# agents/target_anchor.py). Every analyst verdict's decision.target_anchor:
+# the bull target against the street target and blended fair value the brief
+# showed (parsed from the prompt sent), and whether the fundamentals' quarter
+# values were first seen before the last earnings print. One bounded
+# read-only DB read; nothing gates or routes on it. Not read from .env.
+TARGET_ANCHOR_RECORD_ENABLED = True
+# Held-exit candidates (record only; agents/held_exit.py). Every trim/exit
+# rule row (TRIM_EXIT_RULE, one per held review) records what four fixed
+# code-side exit rules would say on the last completed close: below both the
+# 50- and 200-day averages, below the active plan's structural stop (and,
+# beside it, its invalidation price), a time stop (held at least
+# HELD_EXIT_TIME_STOP_SESSIONS sessions and not above the entry price), and a
+# drawdown of at least HELD_EXIT_DRAWDOWN_ATR x ATR14 from the highest close
+# since entry, with the raw numbers. One price_history read and one
+# trade_plans read; nothing is sold and trim_exit.decide never reads it.
+# Not read from .env.
+HELD_EXIT_SHADOW_ENABLED = True
+HELD_EXIT_TIME_STOP_SESSIONS = 20
+HELD_EXIT_DRAWDOWN_ATR = 3.0
 # Live entry gates (agents/crew.py:_entry_gate, from deploy-2026-11-23). An
 # OPEN/ADD that has passed the rebuy cooldown is skipped, with one
 # ENTRY_GATE_BLOCKED signals row, when (a) the ticker's newest exit the bot
@@ -517,6 +633,174 @@ ENTRY_TREND_GATE_MAX_BAR_AGE_DAYS = 5
 # stands down in an up-market. A failed or stale market read does not block.
 # Empty string turns the condition off (gate on the stock alone).
 ENTRY_TREND_GATE_MARKET_TICKER = "SPY"
+# Add-to-loser gate (agents/crew.py:_add_loser_check, read by _entry_gate;
+# also on a deferred ADD's retry, tasks._deferred_entry_gate), for the written
+# rule "never add to a losing position without a new catalyst"
+# (knowledge/risk_rules.md). An ADD whose price is more than
+# ADD_LOSER_GATE_MIN_PCT percent below the broker's average cost for the
+# position would block unless the triggering news item itself has the
+# screener's new_fact True. A new-fact item elsewhere in the new-fact gate's
+# window does not count. A verdict with no news item (a held review, the daily
+# scan, a drop watch) has no new fact, except a drop-watch review while
+# DIP_REVIEW_COUNTS_AS_NEW_FACT is on. An unjudged flag (a keyword-fallback
+# screen, a missing flag, a stale-entry recheck) never blocks, and neither
+# does a failed position or price read or a name not held. OPEN, sells,
+# stops and sizing are untouched. What counts as a catalyst for this rule is
+# Luke's, so ADD_LOSER_GATE_MODE:
+#   "shadow"  (default) the record (with would_block) goes on the ADD
+#             approval's risk_json.add_loser_gate, or an add_loser_gate_shadow
+#             activity row on a deferred retry; nothing blocks;
+#   "enforce" a would_block ADD is skipped with one ENTRY_GATE_BLOCKED row
+#             (decision.entry_gate.add_loser), and a deferred one expired;
+#   "off"     no read, no field.
+# Any other value reads as "shadow". Not read from .env.
+ADD_LOSER_GATE_MODE = "shadow"
+ADD_LOSER_GATE_MIN_PCT = 0.0
+# Per-lot R at an ADD's stop (record only; execution._record_add_lot_r). When
+# a BUY's stop is placed over an existing stop record (the whole-position
+# re-stop of an ADD, or the stale-record branch that rewrites the record at
+# the new shares' stop), one activity row (stage add_lot_r) records, for each
+# open lot, R at the placed stop = (entry - placed stop) / (entry - the lot's
+# own initial stop), in ratios only, with the largest and the count above
+# ADD_LOT_R_THRESHOLD. The stop itself is unchanged. Not read from .env.
+ADD_LOT_R_SHADOW_ENABLED = True
+ADD_LOT_R_THRESHOLD = 1.2
+# Reward-to-risk against the placed stop (record only): every OPEN/ADD that
+# reaches the approval record gets risk_json["rr_vs_stop"]
+# (agents/crew.py:_rr_vs_stop), the reward to the model's target over the risk
+# to the stop sizing placed, the stop distance in % and in ATR, and
+# would_block labels at each RR_VS_STOP_LABEL_THRESHOLDS value (r_to_target
+# under it). The entry UDR gate reads the model's own ratio, whose downside is
+# the model's downside_scenario, not this stop. The thresholds are fixed
+# illustrative labels, not gates. Nothing routes or sizes on the field. Not
+# read from .env.
+RR_VS_STOP_SHADOW_ENABLED = True
+RR_VS_STOP_LABEL_THRESHOLDS = (1.5, 2.0)
+# Above-market guard on whole-position stops (risk_manager._stop_below_market:
+# the ADD merge, the late-fill / queued re-place in
+# tasks._reprotect_after_late_sell, the TRIM and manual-sell re-places, and
+# the reconcile resize in tasks._fix_overstop). "shadow": one activity row (stage
+# stop_above_market_guard, outcome would_*) and an info alert say what the
+# guard would place when the level is at or above the price; the stop and
+# the record are unchanged. "enforce": the guard places that instead. Not
+# read from .env. When the no-loosen floor's resting-stop read fails
+# (resting_unread), shadow makes no broker call and judges from the fallback
+# stop alone (row resting_read "reread_skipped_shadow"; "floor_read_failed"
+# before), so order-path timing is unchanged. Enforce makes one bounded
+# re-read (risk_manager._reread_resting_stops, at most
+# _GUARD_REREAD_TIMEOUT_S + 1 s, never reconnecting): "reread_ok" or
+# "reread_failed". It never re-reads between a stop cancel and its re-place
+# ("reread_skipped_window", fallback alone). The TRIM and manual-sell
+# re-places and the reconcile resize pass their rows (or []), so they never
+# have an unread set.
+# Enforce prerequisites, open decisions:
+# (1) the late-sell / queued RESTORE, EXIT and PROFIT_TARGET re-place
+#     follows the sale's cancel, so it never re-reads and judges from the
+#     fallback alone: accept that gap, or allow the re-read there (up to
+#     _GUARD_REREAD_TIMEOUT_S + 1 s more with the shares possibly bare);
+# (2) a re-read timeout goes through ibkr._bounded_req, which drops the
+#     shared session (the open-orders request key), so the cancel and place
+#     after it reconnect: give the re-read a timeout path that keeps the
+#     session, or accept the drop;
+# (3) reread_ok is unreachable after a timeout or connect failure. Each
+#     broker-caused failure of the floor read leaves ibkr._ib None or
+#     disconnected (the _bounded_req timeout drops it, a get_ib connect or
+#     heartbeat failure sets None, so does a mid-request disconnect), and the
+#     re-read never reconnects, so it raises ConnectionError at once:
+#     reread_failed is then the behaviour from before the re-read. Allow one
+#     bounded reconnect (its connect time added to the window), or accept
+#     the gap.
+STOP_GUARD_MODE = "shadow"
+
+# Recheck contradiction (record only; agents/crew.py:_recheck_contradiction_record).
+# Every OPEN/ADD past the rebuy cooldown in _route_to_approval records the most
+# recent non-buy verdict (HOLD, WATCH, PASS, TRIM, EXIT, SELL) on the same
+# ticker in this env within RECHECK_CONTRADICTION_WINDOW_HOURS: its kind, the
+# model's own action, source (stale_entry_recheck, held_review, plan_level,
+# event, daily_scan, chat, unknown), age in hours, conviction and whether it
+# was a recheck, plus would_block: that verdict was a stale-entry recheck or a
+# held review and the current verdict's triggering item is not a new fact. A
+# plan-level review (plan_level_review) is classed plan_level, not
+# held_review, so it does not count toward would_block: a definition choice
+# that is Luke's (the raw trigger path is recorded). One read of signals
+# (db.get_recent_verdicts). Written as risk_json.recheck_contradiction, or in
+# the decision of the routing row that ended the route before sizing. Nothing
+# blocks on it; whether it becomes a gate is Luke's. Not read from .env.
+RECHECK_CONTRADICTION_SHADOW_ENABLED = True
+RECHECK_CONTRADICTION_WINDOW_HOURS = 4
+
+# Same-day consensus (record only; agents/crew.py:_same_day_consensus_record).
+# Every OPEN/ADD past the rebuy cooldown in _route_to_approval records the
+# ticker's earlier analyst verdicts today (ET midnight up to the route, this
+# env, the current verdict excluded; scripts/fire_test.py verdicts are
+# counted, as their analyst rows carry no marker): their count, how
+# many were buy-grade (the stored final_pass_to_risk on an OPEN/ADD verdict:
+# the analyst's own pass, as decided when each was written) and that share,
+# how many the model itself called a passing buy, median conviction and UDR,
+# and the distinct stories among them (story_dedup story_key, where present);
+# and, from the same read, the count, buy-grade count and share over the
+# last 24 h (route - 24 h up to the route), as many buys route before 10:00
+# ET when the ET day holds few verdicts.
+# One read of signals (db.get_same_day_verdicts, the last 24 h) under
+# SAME_DAY_CONSENSUS_READ_TIMEOUT_MS, at most SAME_DAY_CONSENSUS_LIMIT rows; a
+# slower or failed read is recorded and the route goes on. Written as
+# risk_json.same_day_consensus, or in the decision of the routing row that
+# ended the route. Nothing reads it to decide; any gate, threshold or N is
+# Luke's (04be). Not read from .env.
+SAME_DAY_CONSENSUS_RECORD_ENABLED = True
+SAME_DAY_CONSENSUS_READ_TIMEOUT_MS = 500
+SAME_DAY_CONSENSUS_LIMIT = 200
+
+# News timeline (record only; agents/news_timeline.py). After each analyst
+# verdict on NEWS_TIMELINE_PATHS, a side thread (never the verdict path)
+# reads the ticker's news_log headlines and screener rows for the 7 days
+# before the verdict and writes an activity row (stage "news_timeline"): the
+# newest stories (deduped, about 10) with their screener decision, a title
+# tone tag (agents.screener.title_tone) and whether each title reached the
+# prompt that was sent, plus counts over the whole window. Nothing reads it
+# to decide; showing a timeline in the brief is Luke's call. Not read from .env.
+NEWS_TIMELINE_RECORD_ENABLED = True
+NEWS_TIMELINE_PATHS = ("event", "daily_scan")
+
+# The whole-position stop after an ADD fill is sized from this process's
+# ib.positions() count (ibkr.get_broker_stock_qty): account-wide, synced at
+# connect and updated by TWS position messages as of this process's last
+# event-loop run. It is not the orders worker's count that refuses an
+# oversized SELL (a separate connection). Since 7ba0857 it should equal the
+# deduplicated fresh reqPositions read that decides the path, so it is a
+# safety net against a duplicated fresh read (11-13: the cache read 1, a
+# fresh read with a duplicated row 4, the broker 2; the stop for 4 was
+# refused and NVDA had no stop for about 2 min), not an independent third
+# source. An unreadable, zero, short or non-finite count keeps the old
+# sizing and alerts; a count below the reads or not above the fill alerts.
+# One activity row (stage add_stop_qty) per whole-position ADD records the
+# counts. False sizes from the reads as before. Not read from .env.
+ADD_STOP_QTY_FROM_BROKER = True
+# The stop for what a profit-target partial sale leaves is sized from this
+# process's ib.positions() count (ibkr.get_broker_stock_qty, read after the
+# sale's fill wait and one more event-loop run), not the portfolio cache read
+# seconds after the sale, which can still show the shares just sold, so the
+# stop is refused. An unreadable, zero, short or non-finite count keeps the
+# old sizing and alerts; a count below the expected remainder alerts. One
+# activity row (stage pt_stop_qty) per re-place. False sizes from the cache
+# as before. Not read from .env.
+PT_STOP_QTY_FROM_BROKER = True
+# A BUY fill reconcile books late (reconcile_unconfirmed_orders) waits for
+# the portfolio cache to show at least the current count before its
+# whole-position stop is placed (expect_at_least, as the manual ADD path
+# does), so a lagging cache doesn't leave the late shares unstopped. The
+# count: a fresh deduplicated reqPositions read, then ib.positions() right
+# after it (used when usable, else the fresh read's); a failed fresh read
+# means no expectation, as before. One activity row (stage late_fill_expect)
+# per late BUY. Deferring changes stop timing (a fresh OPEN's visible shares
+# wait up to one reconcile cycle), so it ships in shadow first:
+# "shadow": the stop is placed as before, with no expectation; the broker
+# reads and the row run after it (record-only, so they never delay the
+# stop), with would_defer from the cache count snapshotted before the place
+# (as _reprotect_after_late_sell compares it) against the broker count. "enforce": the
+# stop waits, and the queued retry keeps the count for 2 tries. "off" (or any
+# other value): no reads, as before. Not read from .env.
+LATE_FILL_EXPECT_MODE = "shadow"
 # When a monitored stop level is breached and NO protective stop exists at
 # the broker, execute a market sell of the full position instead of only
 # alerting. Only ever reduces exposure; set False to fall back to alert-only.
@@ -661,6 +945,15 @@ IMPLAUSIBLE_HALT_REASON_PREFIX = "Auto: account value under half the HWM"
 import os as _os
 USE_BRACKET_ORDERS = _os.getenv("USE_BRACKET_ORDERS", "false").lower() == "true"
 
+# ibkr.cancel_stop_orders_for with 2+ stops: send every cancel first, then
+# poll them all in one loop bounded by the same 5 s (ibkr._cancel_stops_parallel),
+# instead of cancel-and-poll one stop at a time ((N-1) x 5 s more unprotected
+# time). Same confirmation rule, return value and order matching; when a
+# cancelOrder raises, the same cancels are sent (the raise still stops the
+# sending). An ib.sleep raise or a disconnect mid-loop can differ (one ib, not
+# get_ib per stop). One stop runs today's path either way. Not read from .env.
+CANCEL_PARALLEL_ENABLED = False
+
 # ---------------------------------------------------------------------------
 # Swing-trading cutover, Phase 4/5 (2026-10-11) -- setup-gate sizing/stops
 # ---------------------------------------------------------------------------
@@ -698,6 +991,14 @@ ETF_FUNDAMENTALS_CAP_EXEMPT = os.getenv("ETF_FUNDAMENTALS_CAP_EXEMPT", "true").l
 # it on: it adds analyst runs and a new trigger (audit A0903-1 step 3).
 PLAN_LEVEL_REVIEW_ENABLED = os.getenv("PLAN_LEVEL_REVIEW_ENABLED", "false").lower() == "true"
 
+# Record only: on the same watch_plan_levels tick, one plan_compiled_hit
+# activity row the first time the price or calendar crosses one of the plan's
+# compiled levels (structural_stop, t1, t2, add_trigger, time_stop), which
+# PLAN_LEVEL_HIT does not watch. Queues nothing, changes no PLAN_LEVEL_HIT
+# field, and nothing reads the rows.
+PLAN_COMPILED_HIT_SHADOW_ENABLED = True
+PLAN_COMPILED_HIT_FIRST_TTL_S = 120 * 86400   # how long a level's first-crossed time is kept
+
 # Analyst add-ons (Luke, 2026-11-08 evening). All analyst input, so all off
 # until Luke turns them on (live or as an A/B arm); with all three off the
 # rendered prompt and brief are byte-identical to before.
@@ -708,6 +1009,19 @@ ANALYST_SCENARIOS_ENABLED = os.getenv("ANALYST_SCENARIOS_ENABLED", "false").lowe
 # fills event_plan (hold through / trim before / exit before, expected move,
 # what result breaks the thesis, what it does after the print).
 ANALYST_EVENT_PLAN_ENABLED = os.getenv("ANALYST_EVENT_PLAN_ENABLED", "false").lower() == "true"
+# Price cache rescale (ingestion/price_history.py:_store_bars). The nightly
+# yfinance fetch is split-adjusted but rewrites only the trailing year, so
+# after a split the older cached rows stay on the old scale. Before each
+# upsert the fetched and stored closes are compared on overlapping dates; a
+# median ratio beyond 10% that sits within 2% of a split factor, with at
+# least 90% of the dates within 2% of it, is a split basis change. True:
+# rescale the stored rows the fetch doesn't overwrite, in the same
+# transaction (one price_cache_rescale activity row, applied true). False
+# (default, record only): a price_cache_rescale row with applied false and
+# the plain upsert. A gap that is no split factor, or not uniform, is never
+# rescaled (price_cache_scale_gap row). scripts/rescale_stale_head.py repairs
+# by hand. Not read from .env.
+PRICE_CACHE_RESCALE_ENABLED = False
 # PRICE HISTORY brief section: recent daily closes, weekly closes, distance
 # from the 20-day and 52-week highs, today's move and volume against average
 # (context_engine._price_history_section).
@@ -740,6 +1054,16 @@ SUBSCORE_TEXT_IMPUTE_ENABLED = os.getenv("SUBSCORE_TEXT_IMPUTE_ENABLED", "false"
 # Which one the plan metrics use is packet G75, so this stays off until then.
 PLAN_CLOSE_ON_EXIT = os.getenv("PLAN_CLOSE_ON_EXIT", "false").lower() == "true"
 
+# Record only (agents/plans._reseed_record): when a NEW_PLAN or SEEDED plan is
+# written, one read of the ticker's previous plan (capped at 500 ms, fail-open)
+# says whether that plan was closed by an invalidation breach while the same
+# position stayed held (reseeded_after_invalidate). Off: no read and no record.
+PLAN_RESEED_RECORD_ENABLED = True
+# The reseed flag's window in hours from the breach. None: no window (the
+# hours are recorded, so any window can be applied later). Choosing one is
+# Luke's.
+PLAN_RESEED_WINDOW_HOURS = None
+
 # The prompt's YOUR TRACK RECORD block counts closed trades entered on or after
 # this date (YYYY-MM-DD). Empty, the default, keeps the current behaviour: all
 # closed trades, so 2027 verdicts would see pilot outcomes (professor C35). It
@@ -765,6 +1089,38 @@ CATALYST_MONTH_MIDPOINT_ENABLED = os.getenv("CATALYST_MONTH_MIDPOINT_ENABLED", "
 # a bar of 6 (agents/c6_shadow.py); tasks._check_c6_bar_outcomes adds its
 # forward returns. No live threshold or order changes either way.
 C6_BAR_SHADOW_ENABLED = os.getenv("C6_BAR_SHADOW_ENABLED", "true").lower() == "true"
+
+# Record only: a routed OPEN/ADD (pass_to_risk True) gets 2 more analyst draws
+# on its stored prompt (byte-exact by prompt_sha), same model and options,
+# after routing, one task per draw on llm_p3 (after llm_p2), each waiting
+# while the live LLM lanes have work. One activity_feed row, stage
+# verdict_vote_shadow, records the draws and their vote (agents/
+# verdict_vote.py); nothing reads it back. Off: a draw already running is
+# not preempted, so a live analysis landing mid-draw waits up to one call
+# (~3 min); about 15-20 extra GPU minutes a day. Not read from .env.
+VERDICT_VOTE_SHADOW_ENABLED = False
+
+# Record only: when an ADD writes the broker's average cost as the stop
+# record's entry_price (execution._whole_position_stop), one activity_feed
+# row, stage entry_basis, compares it with the fill-weighted average of the
+# bot's own fills over the open lots and says where the trail arm, profit
+# target and breakeven sit measured from those fills (execution.entry_basis).
+# Nothing written to position_stops changes. Not read from .env.
+ENTRY_BASIS_RECORD_ENABLED = True
+
+# Record only (tasks.book_gap_risk_record, from position_exit_frame after the
+# close): one book_gap_risk row per session with each held name's historical
+# overnight gaps against today's stop distance, and the book's replayed
+# overnight gap loss, all in percent. No threshold, alert or trade change.
+GAP_RISK_RECORD_ENABLED = True
+
+# Record only (tasks.book_deployment_record, from position_exit_frame after
+# the close, after book_gap_risk): one book_deployment row per session with
+# invested and cash as percent of net liquidation, the regime's
+# cash_target_pct and the gap to it, the position count and the sector and
+# largest-name weights. Percentages only. No threshold, alert, sizing or
+# order change; nothing reads it. Not read from .env.
+BOOK_DEPLOYMENT_RECORD_ENABLED = True
 
 # Risk-per-trade-of-equity by LIVE setup category (Breakout/Catalyst/
 # Continuation) -- the SETUP_GATES_ENABLED equivalent of RISK_PCT_PER_TRADE
@@ -809,6 +1165,41 @@ CATEGORY_SOFT_CEILING_PCT: dict[str, tuple[float, float]] = {
 # fit the remaining budget -- mirroring how the existing cash-reserve cap
 # partial-sizes a trade instead of hard-blocking it outright.
 PORTFOLIO_HEAT_CAP_PCT = 0.07
+
+# Record-only book heat at each buy (agents/crew.py:_book_heat_record),
+# written to risk_json as book_heat just before the approval: each held
+# position's qty x (snapshot price - its position_stops stop) / portfolio
+# value, their sum before and after this order at its final share count,
+# n_positions, the largest single risk, and the order's risk in 20-session
+# sigmas from the vol record. Reads the newest portfolio snapshot (at most
+# 15 minutes old) and position_stops; no broker call. Fractions only.
+# Nothing reads it and nothing enforces it on the legacy path; any heat cap
+# there is a separate decision.
+BOOK_HEAT_SHADOW_ENABLED = True
+
+# Record-only fill watch (tasks.watch_broker_sells, every 2 min in market
+# hours): a broker_sell_seen activity row the first time a SELL execution the
+# bot did not log as its own order (a resting stop fill or a sale at the
+# broker) shows up in today's executions. Reconcile still books the exit
+# 15-30 min later; nothing reads these rows, and nothing is placed, cancelled
+# or booked. No price or quantity on the row.
+BROKER_SELL_WATCH_ENABLED = True
+
+# A BUY that fills after its wait is booked by reconcile (tasks._book_late_fill),
+# which decides from the approval's action whether the late shares opened a
+# position or added to one. An OPEN on a ticker that was already held is then
+# booked as a fresh entry: the stop record is rewritten at this order's level
+# and the whole position re-stopped there, which can lower the old shares'
+# stop (roadmap 04ah). execute_approved now stores the held count before the
+# order on its order row (orders.held_before_qty). "shadow" (default): a
+# late_fill_held_before activity row says what the stored count would change;
+# the booking is unchanged. "enforce": an OPEN whose stored count is above 0,
+# with the old shares still held, is booked as an ADD (the record and its
+# level kept). Any other value: today's behaviour, no read, no write.
+# Enforce reads before the late shares' stop: the stored count (3 s DB bound),
+# the position cache, one executions pass (5 s bound) and the other-BUY count
+# (3 s): up to ~11 s more before that stop. Shadow does them after the run.
+LATE_FILL_HELD_BEFORE_MODE = "shadow"
 
 # ---------------------------------------------------------------------------
 # Ollama model config

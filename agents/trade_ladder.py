@@ -443,14 +443,25 @@ def refresh_all_ladders() -> int:
     from knowledge_loader import get_all_tickers
 
     updated = 0
+    dcf_entries = []   # record only (agents/valuation_audit.py); read by nothing
     for ticker in get_all_tickers():
         try:
             ladder = build_trade_ladder(ticker)
             if ladder:
                 db.upsert_trade_ladder(ticker, ladder)
                 updated += 1
+                try:
+                    from agents.valuation_audit import dcf_branch_entry
+                    dcf_entries.append(dcf_branch_entry(ticker, db.get_fundamentals(ticker), ladder))
+                except Exception as e:
+                    dcf_entries.append({"ticker": ticker, "reason": f"error: {type(e).__name__}"})
         except Exception as e:
             log.warning(f"[{ticker}] trade ladder build failed: {e}")
+    try:
+        from agents.valuation_audit import log_dcf_branch
+        log_dcf_branch(dcf_entries)
+    except Exception as e:
+        log.debug(f"dcf branch record failed: {e}")
     return updated
 
 

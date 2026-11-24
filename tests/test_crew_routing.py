@@ -521,6 +521,7 @@ class TestConvictionSwap:
              patch("catalyst_service.gates.catalyst_gate_check", return_value={"approved": True}), \
              patch("execution.execute_manual", return_value={"success": True}) as mock_sell, \
              patch("market_data.is_market_hours", return_value=True), \
+             patch("db.log_signal"), \
              patch("alerts._send") as mock_alert:
             mock_rm_cls.return_value.size_position.side_effect = [
                 self._cash_blocked_sizing(), self._funded_sizing(),

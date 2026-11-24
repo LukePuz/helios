@@ -2,6 +2,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time as _time
 from datetime import datetime, timedelta, timezone
@@ -917,6 +918,21 @@ _MIGRATIONS: list[tuple[int, str]] = [
     # spill file (audit 2026-11-10 16:53 #11). Widening a varchar doesn't
     # rewrite the table.
     (89, "ALTER TABLE activity_feed ALTER COLUMN stage TYPE VARCHAR(40);"),
+    # signals had only its primary key, so every per-ticker verdict read
+    # (get_recent_verdicts, get_latest_signal_for, recent_event_verdicts, the
+    # shadows) and every time-window read (canary counts, screen funnel,
+    # recent signals) was a sequential scan over ~99k rows. Built
+    # CONCURRENTLY, so writes continue during the build; init_db runs these
+    # outside a transaction (_apply_concurrent_index). Additive: no query's
+    # result changes.
+    (90, "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_signals_symbol_ts "
+         "ON signals (symbol, timestamp DESC);"),
+    (91, "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_signals_ts ON signals (timestamp DESC);"),
+    # The long count the cache showed just before a BUY's order went out
+    # (execution._held_before_order), so a late fill of an OPEN can tell an
+    # already-held ticker from a fresh entry (roadmap 04ah). NULL for orders
+    # before this migration, SELLs, manual orders and an unreadable count.
+    (92, "ALTER TABLE orders ADD COLUMN IF NOT EXISTS held_before_qty DECIMAL;"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -928,6 +944,240 @@ CREATE TABLE IF NOT EXISTS schema_version (
 
 
 _MIGRATION_LOCK_TIMEOUT = "30s"
+# A migration of this form is built without blocking writes, which Postgres
+# allows only outside a transaction block.
+_CONCURRENT_INDEX_RE = re.compile(
+    r"^\s*CREATE\s+INDEX\s+CONCURRENTLY\s+IF\s+NOT\s+EXISTS\s+(\w+)\s+ON\s", re.I)
+# Supabase's transaction pooler: a session SET there can land on a server
+# connection another client then uses, so concurrent builds refuse it.
+_TRANSACTION_POOLER_PORT = 6543
+
+
+# One concurrent build at a time across processes (two runners racing could
+# drop the other's valid index or record an invalid one): a session advisory
+# lock on this constant key, taken without waiting.
+_CONCURRENT_INDEX_LOCK_KEY = 0x48454C494F5331   # the bytes of "HELIOS1"
+
+
+def _index_validity(cur, name: str) -> bool | None:
+    """pg_index.indisvalid of public.<name>: True, False (an invalid leftover
+    of a failed or cancelled build) or None (no such index)."""
+    cur.execute("SELECT i.indisvalid FROM pg_index i "
+                "WHERE i.indexrelid = to_regclass('public.' || %s)", (name,))
+    row = cur.fetchone()
+    return None if row is None else bool(row[0])
+
+
+def _apply_concurrent_index(conn, version: int, sql: str) -> bool:
+    """Apply one CREATE INDEX CONCURRENTLY migration outside a transaction.
+
+    Postgres refuses CONCURRENTLY inside a transaction block, so: commit, then
+    autocommit on; a session lock_timeout (_MIGRATION_LOCK_TIMEOUT, RESET
+    after) bounds the waits on other sessions; a session advisory lock
+    (_CONCURRENT_INDEX_LOCK_KEY, taken without waiting, released in finally)
+    keeps two runners from building at once, and a run that can't take it
+    skips with a WARNING. A leftover INVALID index of the same name (IF NOT
+    EXISTS would skip it forever) is dropped first. After the CREATE the
+    index must read valid before schema_version is written.
+
+    Unlike the other migrations a failure does not fail the boot: an index
+    only speeds reads, so it is logged at ERROR, an invalid leftover dropped,
+    the version left unrecorded, and the next init_db retries. A connection
+    lost mid-build is handled the same way. Refused on the transaction pooler
+    port (a session SET there can reach another client). Returns True when
+    the index is valid and its version recorded."""
+    name = _CONCURRENT_INDEX_RE.match(sql).group(1)
+    if int(os.getenv("SUPABASE_PORT", "5432")) == _TRANSACTION_POOLER_PORT:
+        logging.warning(f"migration {version} ({name}) not applied: CREATE INDEX CONCURRENTLY "
+                        f"needs a session connection, not the transaction pooler on "
+                        f"{_TRANSACTION_POOLER_PORT}; the next init_db on the session port retries")
+        return False
+    try:
+        conn.commit()                 # no open transaction may remain for CONCURRENTLY
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s)", (_CONCURRENT_INDEX_LOCK_KEY,))
+            row = cur.fetchone()
+            if not (row and row[0]):
+                logging.warning(f"migration {version} ({name}) skipped: another session holds the "
+                                f"concurrent-index lock; the next init_db retries")
+                return False
+            try:                      # the lock is held from here: unlocked in finally
+                cur.execute(f"SET lock_timeout = '{_MIGRATION_LOCK_TIMEOUT}'")
+                try:
+                    if _index_validity(cur, name) is False:
+                        logging.warning(f"migration {version}: dropping invalid index {name} "
+                                        f"before rebuilding")
+                        cur.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {name}")
+                    cur.execute(sql)
+                    valid = _index_validity(cur, name)
+                    if valid is not True:
+                        raise RuntimeError(f"index {name} reads {'missing' if valid is None else 'invalid'} "
+                                           f"after the build")
+                    cur.execute("INSERT INTO schema_version (version) VALUES (%s) ON CONFLICT DO NOTHING",
+                                (version,))
+                    return True
+                except Exception as e:
+                    logging.error(f"migration {version} ({name}) failed, boot continues, retried next "
+                                  f"init_db: {type(e).__name__}: {e}")
+                    try:
+                        if _index_validity(cur, name) is False:
+                            cur.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {name}")
+                    except Exception as e2:
+                        logging.error(f"migration {version}: invalid {name} not dropped: {e2}")
+                    return False
+            finally:
+                for stmt, args in (("RESET lock_timeout", None),
+                                   ("SELECT pg_advisory_unlock(%s)", (_CONCURRENT_INDEX_LOCK_KEY,))):
+                    try:
+                        cur.execute(stmt, args)
+                    except Exception:
+                        pass
+    except Exception as e:
+        # A lost connection (or a cursor error outside the build): not fatal.
+        logging.error(f"migration {version} ({name}) not applied: {type(e).__name__}: {e}")
+        return False
+    finally:
+        try:
+            if not conn.closed:
+                conn.autocommit = False
+        except Exception:
+            pass
+
+
+def apply_concurrent_index_migrations(dry_run: bool = False) -> list[tuple[int, str]]:
+    """The pending CREATE INDEX CONCURRENTLY migrations only (scripts/
+    apply_concurrent_indexes.py), so they can be built in a quiet window
+    ahead of a boot; init_db then finds them recorded. No other migration
+    runs. dry_run only reads (no CREATE TABLE): schema_version is read when
+    it exists. Returns [(version, status)], status one of "pending",
+    "pending (a real run is refused on port 6543)", "applied", "failed",
+    "already applied"."""
+    refused = int(os.getenv("SUPABASE_PORT", "5432")) == _TRANSACTION_POOLER_PORT
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            if dry_run:
+                cur.execute("SELECT to_regclass('public.schema_version') IS NOT NULL")
+                exists = cur.fetchone()[0]
+            else:
+                cur.execute(_SCHEMA_VERSION_TABLE)
+                exists = True
+            applied = set()
+            if exists:
+                cur.execute("SELECT version FROM schema_version")
+                applied = {row[0] for row in cur.fetchall()}
+        if dry_run:
+            conn.rollback()
+        else:
+            conn.commit()
+        out = []
+        for version, sql in _MIGRATIONS:
+            if not _CONCURRENT_INDEX_RE.match(sql):
+                continue
+            if version in applied:
+                out.append((version, "already applied"))
+            elif dry_run:
+                out.append((version, "pending (a real run is refused on port 6543)" if refused
+                            else "pending"))
+            else:
+                out.append((version, "applied" if _apply_concurrent_index(conn, version, sql) else "failed"))
+        return out
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        _put_conn(conn)
+
+
+# The table (and, for ADD COLUMN, the column) a plain migration touches, for
+# apply_one_migration's dry run.
+_ALTER_TABLE_RE = re.compile(r"^\s*ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(\w+)", re.I)
+_ADD_COLUMN_RE = re.compile(
+    r"^\s*ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+(\w+)\s", re.I)
+# A Postgres duration, the only form the timeouts are interpolated in as.
+_TIMEOUT_RE = re.compile(r"^[1-9]\d{0,6}(ms|s|min)$")
+
+
+def apply_one_migration(version: int, dry_run: bool = False, lock_timeout: str = "5s",
+                        statement_timeout: str = "60s") -> dict:
+    """Apply exactly one plain migration from _MIGRATIONS ahead of a boot
+    (scripts/apply_migration.py), the way init_db does: its SQL and the
+    schema_version row in one transaction, so init_db later skips it. Its own
+    SET LOCAL lock_timeout and statement_timeout (shorter than init_db's
+    _MIGRATION_LOCK_TIMEOUT by default) bound the wait for the table lock.
+    A CREATE INDEX CONCURRENTLY migration is refused (apply_concurrent_indexes.py
+    builds those); an unknown version raises ValueError.
+
+    dry_run only reads, in a READ ONLY transaction rolled back at the end:
+    whether the version is recorded, for ADD COLUMN whether the column exists,
+    and the locks other sessions hold on the table right now.
+
+    Returns {"version", "sql", "status", ...}; status is one of "applied",
+    "already applied", "pending" (dry run), "refused: ...", "failed: ...".
+    """
+    for name, value in (("lock_timeout", lock_timeout), ("statement_timeout", statement_timeout)):
+        if not _TIMEOUT_RE.match(str(value)):
+            raise ValueError(f"{name} must look like 5s, 500ms or 1min, not {value!r}")
+    sql = dict(_MIGRATIONS).get(version)
+    if sql is None:
+        raise ValueError(f"no migration {version} in db._MIGRATIONS")
+    out = {"version": version, "sql": sql}
+    if _CONCURRENT_INDEX_RE.match(sql):
+        out["status"] = "refused: a CREATE INDEX CONCURRENTLY migration (use scripts/apply_concurrent_indexes.py)"
+        return out
+    table = _ALTER_TABLE_RE.match(sql)
+    column = _ADD_COLUMN_RE.match(sql)
+    conn = _get_conn()
+    try:
+        if dry_run:
+            with conn.cursor() as cur:
+                cur.execute("SET TRANSACTION READ ONLY")
+                cur.execute(f"SET LOCAL statement_timeout = '{statement_timeout}'")
+                cur.execute("SELECT to_regclass('public.schema_version') IS NOT NULL")
+                recorded = False
+                if cur.fetchone()[0]:
+                    cur.execute("SELECT 1 FROM schema_version WHERE version = %s", (version,))
+                    recorded = cur.fetchone() is not None
+                out["recorded"] = recorded
+                if column:
+                    cur.execute("SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' "
+                                "AND table_name = %s AND column_name = %s",
+                                (column.group(1).lower(), column.group(2).lower()))
+                    out["column_exists"] = cur.fetchone() is not None
+                if table:
+                    cur.execute("SELECT l.mode, l.granted FROM pg_locks l "
+                                "WHERE l.relation = to_regclass('public.' || %s) "
+                                "AND l.pid <> pg_backend_pid()", (table.group(1).lower(),))
+                    out["other_locks"] = [f"{m}{'' if g else ' (waiting)'}" for m, g in cur.fetchall()]
+            conn.rollback()
+            out["status"] = "already applied" if out["recorded"] else "pending"
+            return out
+        with conn.cursor() as cur:
+            cur.execute(_SCHEMA_VERSION_TABLE)
+        conn.commit()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM schema_version WHERE version = %s", (version,))
+                if cur.fetchone() is not None:
+                    conn.rollback()
+                    out["status"] = "already applied"
+                    return out
+                cur.execute(f"SET LOCAL lock_timeout = '{lock_timeout}'")
+                cur.execute(f"SET LOCAL statement_timeout = '{statement_timeout}'")
+                cur.execute(sql)
+                cur.execute("INSERT INTO schema_version (version) VALUES (%s)", (version,))
+            conn.commit()
+            out["status"] = "applied"
+        except Exception as e:
+            conn.rollback()
+            out["status"] = f"failed: {type(e).__name__}: {str(e).strip()[:200]}"
+        return out
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        _put_conn(conn)
 
 
 def init_db() -> None:
@@ -945,6 +1195,10 @@ def init_db() -> None:
         newly_applied = []
         for version, sql in _MIGRATIONS:
             if version in applied:
+                continue
+            if _CONCURRENT_INDEX_RE.match(sql):
+                if _apply_concurrent_index(conn, version, sql):
+                    newly_applied.append(version)
                 continue
             with conn.cursor() as cur:
                 # An ALTER waits for ACCESS EXCLUSIVE; with no lock timeout a
@@ -1398,14 +1652,18 @@ def get_latest_signal_for(ticker: str, with_trigger: bool = False,
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
+            latest = ("SELECT id, timestamp FROM signals "
+                      "WHERE symbol=%s AND signal NOT IN %s "
+                      # Paper verdicts must not drive live decisions (professor M35).
+                      # NULL = rows from before migration 51.
+                      "AND (trading_env=%s OR (trading_env IS NULL AND COALESCE(reasoning, '') NOT LIKE %s)) "
+                      "ORDER BY timestamp DESC LIMIT 1")
+            # The row is picked first and its provenance read by id after,
+            # so the trigger JSON is read for one row, not every candidate.
             cur.execute(
-                "SELECT signal, confidence, timestamp"
-                + (", id, provenance->'trigger'" if with_trigger else "") + " FROM signals "
-                "WHERE symbol=%s AND signal NOT IN %s "
-                # Paper verdicts must not drive live decisions (professor M35).
-                # NULL = rows from before migration 51.
-                "AND (trading_env=%s OR (trading_env IS NULL AND COALESCE(reasoning, '') NOT LIKE %s)) "
-                "ORDER BY timestamp DESC LIMIT 1",
+                "SELECT s.signal, s.confidence, s.timestamp"
+                + (", s.id, s.provenance->'trigger'" if with_trigger else "")
+                + f" FROM ({latest}) k JOIN signals s ON s.id = k.id",
                 (ticker, _NON_ANALYST_SIGNALS, TRADING_ENV, DEGRADED_SIGNAL_PREFIX + '%'),
             )
             row = cur.fetchone()
@@ -1691,6 +1949,98 @@ def get_last_executed_approval(ticker: str, hours: int, strict: bool = False) ->
     finally:
         _put_conn(conn)
 
+
+
+def get_open_lots_initial_stops(ticker: str, strict: bool = False) -> list[dict]:
+    """The ticker's open lots in this environment (trade_outcomes rows with no
+    exit, not orphaned), oldest first: [{lot_id, approval_id, action,
+    entry_price, entry_date, fill_risk_per_share, stop_loss_price}], with the
+    approval's stop. Read by the record-only per-lot R at an ADD's stop
+    (execution._record_add_lot_r). strict: raise on a DB error instead of
+    returning []."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT t.id, t.approval_id, t.action, t.entry_price, t.entry_date, "
+                "t.fill_risk_per_share, p.stop_loss_price "
+                "FROM trade_outcomes t LEFT JOIN pending_approvals p ON p.id = t.approval_id "
+                "WHERE t.ticker=%s AND t.trading_env=%s AND t.exit_date IS NULL "
+                "AND t.orphaned_at IS NULL ORDER BY t.entry_date, t.id",
+                (ticker, TRADING_ENV),
+            )
+            rows = cur.fetchall()
+
+        def _f(v):
+            return float(v) if v is not None else None
+        return [{"lot_id": r[0], "approval_id": r[1], "action": r[2], "entry_price": _f(r[3]),
+                 "entry_date": r[4].isoformat() if hasattr(r[4], "isoformat") else r[4],
+                 "fill_risk_per_share": _f(r[5]), "stop_loss_price": _f(r[6])} for r in rows]
+    except Exception as e:
+        logging.error(f"get_open_lots_initial_stops({ticker}) failed: {e}")
+        if strict:
+            raise
+        return []
+    finally:
+        _put_conn(conn)
+
+
+_OPEN_LOT_FILLS_LIMIT = 500
+
+
+def get_open_lot_fills(ticker: str, strict: bool = False) -> dict:
+    """One bounded read for the record-only entry_basis row (execution.
+    _record_entry_basis): the ticker's open lots in this environment
+    (trade_outcomes, no exit, not orphaned) with their BUY orders' fills, and
+    the SELL trades since the oldest open lot's entry (a partial exit leaves
+    its lot open), oldest first. {"lots": [{approval_id, entry_date,
+    outcome_entry, fills: [(fill_price, filled_qty)]}], "sells": [{ts, qty}],
+    "truncated": the read hit its row limit}.
+    strict: raise on a DB error instead of returning empty lists."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = '3s'")
+            cur.execute(
+                "WITH lots AS (SELECT id, approval_id, entry_date, entry_price FROM trade_outcomes "
+                "  WHERE ticker=%s AND trading_env=%s AND exit_date IS NULL AND orphaned_at IS NULL) "
+                "SELECT 'lot', l.entry_date, l.approval_id, l.entry_price, o.fill_price, o.filled_qty "
+                "  FROM lots l LEFT JOIN orders o ON o.approval_id = l.approval_id AND o.side = 'BUY' "
+                "  AND o.ticker = %s AND o.trading_env = %s AND o.fill_price IS NOT NULL "
+                "  AND o.filled_qty > 0 "
+                "UNION ALL "
+                "SELECT 'sell', t.timestamp, NULL, NULL, NULL, t.quantity FROM trades t "
+                "  WHERE t.symbol=%s AND t.trading_env=%s AND t.side='SELL' "
+                "  AND t.timestamp >= (SELECT min(entry_date) FROM lots) "
+                f"ORDER BY 2 LIMIT {_OPEN_LOT_FILLS_LIMIT}",
+                (ticker, TRADING_ENV, ticker, TRADING_ENV, ticker, TRADING_ENV),
+            )
+            rows = cur.fetchall()
+        conn.rollback()
+
+        def _f(v):
+            return float(v) if v is not None else None
+        lots: dict = {}
+        sells = []
+        for kind, ts, approval_id, outcome_entry, fill, qty in rows:
+            if kind == "sell":
+                if _f(qty):
+                    sells.append({"ts": ts, "qty": abs(_f(qty))})
+                continue
+            lot = lots.setdefault((approval_id, ts), {"approval_id": approval_id, "entry_date": ts,
+                                                      "outcome_entry": _f(outcome_entry),
+                                                      "fills": []})
+            if fill is not None and qty is not None:
+                lot["fills"].append((_f(fill), _f(qty)))
+        return {"lots": list(lots.values()), "sells": sells,
+                "truncated": len(rows) >= _OPEN_LOT_FILLS_LIMIT}
+    except Exception as e:
+        logging.error(f"get_open_lot_fills({ticker}) failed: {e}")
+        if strict:
+            raise
+        return {"lots": [], "sells": [], "truncated": False}
+    finally:
+        _put_conn(conn)
 
 
 def get_last_broker_exit(ticker: str, days: int, strict: bool = False) -> dict | None:
@@ -2224,6 +2574,35 @@ def get_seen_item_counts(start, end) -> list[dict] | None:
             return [{"source": s, "day": d, "n": int(n)} for s, d, n in cur.fetchall()]
     except Exception as e:
         logging.error(f"get_seen_item_counts failed: {e}")
+        return None
+    finally:
+        if conn is not None:
+            _put_conn(conn)
+
+
+def get_news_feed_counts(start, end) -> list[dict] | None:
+    """New news items per feed per ET day in [start, end), from
+    seen_items (source news): [{source: "google_news" | "yfinance", day, n}].
+    The feed comes from the seen id the news poller wrote: a Google News RSS
+    item is seen by its news.google.com link; a yfinance item by its uuid or,
+    without one, its title (ingestion/news.py), so anything else is yfinance.
+    A Google item with no link is seen by its title and so counts as
+    yfinance here; left as is (the RSS feed gives every item a link).
+    None on a failed read."""
+    conn = None
+    try:
+        conn = _get_conn()
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = 15000")
+            cur.execute(
+                "SELECT CASE WHEN external_id LIKE 'https://news.google.com/%%' THEN 'google_news' "
+                "ELSE 'yfinance' END, (first_seen AT TIME ZONE 'America/New_York')::date, COUNT(*) "
+                "FROM seen_items WHERE source = 'news' AND first_seen >= %s AND first_seen < %s "
+                "GROUP BY 1, 2",
+                (start, end))
+            return [{"source": s, "day": d, "n": int(n)} for s, d, n in cur.fetchall()]
+    except Exception as e:
+        logging.error(f"get_news_feed_counts failed: {e}")
         return None
     finally:
         if conn is not None:
@@ -2859,8 +3238,10 @@ def get_active_plans() -> list[dict]:
         _put_conn(conn)
 
 
-def get_active_plan(ticker: str) -> dict | None:
-    """The ticker's active shadow trade plan (migration 63), or None."""
+def get_active_plan(ticker: str, strict: bool = False) -> dict | None:
+    """The ticker's active shadow trade plan (migration 63), or None.
+    strict: raise on a DB error instead of returning None (the held-exit
+    shadow tells "no plan" from "unknown")."""
     conn = _get_conn()
     try:
         rows = _select_plans(conn, "WHERE ticker=%s AND trading_env=%s AND status='active' "
@@ -2868,6 +3249,8 @@ def get_active_plan(ticker: str) -> dict | None:
         return rows[0] if rows else None
     except Exception as e:
         logging.error(f"get_active_plan failed: {e}")
+        if strict:
+            raise
         return None
     finally:
         _put_conn(conn)
@@ -2943,7 +3326,8 @@ def outcome_closed_since(ticker: str, since, entered_since=None) -> dict | None:
     """The newest trade_outcomes row on the ticker (this environment) that
     was entered at or after `entered_since` (default `since`; less 5 minutes
     for clock skew) and exited after `since`, by the exit fill time where
-    known, else exit_date, as {"id", "exit_date"}, or None. An older position
+    known, else exit_date, as {"id", "exit_date", "exit_at" (the exit fill
+    time where known, else exit_date), "exit_source"}, or None. An older position
     closed late by reconcile doesn't count (professor m480); a revised plan
     passes its first version's created_at as `entered_since`, since its trade
     was entered before the revision (M282). Raises on a DB error, so a caller
@@ -2954,14 +3338,47 @@ def outcome_closed_since(ticker: str, since, entered_since=None) -> dict | None:
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, exit_date FROM trade_outcomes WHERE ticker=%s AND trading_env=%s "
+                "SELECT id, exit_date, COALESCE(exit_fill_at, exit_date), exit_source "
+                "FROM trade_outcomes WHERE ticker=%s AND trading_env=%s "
                 "AND exit_date IS NOT NULL AND COALESCE(exit_fill_at, exit_date) > %s "
                 "AND entry_date >= %s - INTERVAL '5 minutes' ORDER BY exit_date DESC LIMIT 1",
                 (ticker, TRADING_ENV, since, entered_since),
             )
             row = cur.fetchone()
-        return {"id": row[0], "exit_date": row[1]} if row else None
+        return ({"id": row[0], "exit_date": row[1], "exit_at": row[2], "exit_source": row[3]}
+                if row else None)
     finally:
+        _put_conn(conn)
+
+
+def last_closed_plan(ticker: str, timeout_ms: int = 500) -> dict | None:
+    """The ticker's newest plan that is no longer active (this environment):
+    {"id", "source", "status", "close_reason", "closed_at", "entry_price",
+    "invalidation_price"} (prices as floats), or None. The statement is
+    capped at timeout_ms. Raises on a DB error or a timeout, so a caller
+    can tell "no earlier plan" from "unknown"."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SET LOCAL statement_timeout = {int(timeout_ms)}")
+            cur.execute(
+                "SELECT id, source, status, close_reason, closed_at, entry_price, invalidation_price "
+                "FROM trade_plans WHERE ticker=%s AND trading_env=%s AND status <> 'active' "
+                "ORDER BY id DESC LIMIT 1",
+                (ticker, TRADING_ENV),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return {"id": row[0], "source": row[1], "status": row[2], "close_reason": row[3],
+                "closed_at": row[4],
+                "entry_price": float(row[5]) if row[5] is not None else None,
+                "invalidation_price": float(row[6]) if row[6] is not None else None}
+    finally:
+        try:
+            conn.rollback()        # ends the read and its SET LOCAL
+        except Exception:
+            pass
         _put_conn(conn)
 
 
@@ -3043,38 +3460,113 @@ def get_position_stop(ticker: str, strict: bool = False) -> dict | None:
 
 
 def get_recent_verdicts(ticker: str, hours: int = 72, limit: int = 20,
-                        strict: bool = False) -> list[dict]:
+                        strict: bool = False, with_trigger: bool = False) -> list[dict]:
     """Analyst verdicts on ticker in the last `hours` (this env; legacy NULL-env
     rows count, degraded ones don't), newest first: [{timestamp, signal,
     conviction, udr}]. udr is the model's stated upside/downside ratio from
-    signals.decision when recorded."""
+    signals.decision when recorded. with_trigger: each row also carries
+    signal_id, its provenance trigger's path and source (trigger_path,
+    trigger_source) and the model's own action before any coercion
+    (decision.model_action), for the recheck-contradiction record."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
+            # Rows picked by id first, decision read for those rows only: a
+            # sort under LIMIT otherwise reads the jsonb of every matching row.
             cur.execute(
-                "SELECT timestamp, signal, confidence, "
-                "decision->'model_output'->>'upside_downside_ratio' FROM signals "
+                "SELECT s.timestamp, s.signal, s.confidence, "
+                "s.decision->'model_output'->>'upside_downside_ratio'"
+                + (", s.id, s.provenance->'trigger'->>'path', s.provenance->'trigger'->>'source', "
+                   "s.decision->>'model_action'" if with_trigger else "") + " FROM ("
+                "SELECT id, timestamp FROM signals "
                 "WHERE symbol=%s AND signal NOT IN %s "
                 "AND (trading_env=%s OR (trading_env IS NULL AND COALESCE(reasoning, '') NOT LIKE %s)) "
                 "AND timestamp > NOW() - make_interval(hours => %s) "
-                "ORDER BY timestamp DESC LIMIT %s",
+                "ORDER BY timestamp DESC LIMIT %s) k JOIN signals s ON s.id = k.id "
+                "ORDER BY k.timestamp DESC",
                 (ticker, _NON_ANALYST_SIGNALS, TRADING_ENV, DEGRADED_SIGNAL_PREFIX + '%', hours, limit),
             )
             rows = cur.fetchall()
         out = []
-        for ts, sig, conf, udr in rows:
+        for row in rows:
+            ts, sig, conf, udr = row[:4]
             try:
                 udr = float(udr) if udr is not None else None
             except (TypeError, ValueError):
                 udr = None
-            out.append({"timestamp": ts, "signal": sig,
-                        "conviction": round(float(conf or 0) * 10), "udr": udr})
+            rec = {"timestamp": ts, "signal": sig,
+                   "conviction": round(float(conf or 0) * 10), "udr": udr}
+            if with_trigger:
+                rec.update(signal_id=row[4], trigger_path=row[5], trigger_source=row[6],
+                           model_action=row[7])
+            out.append(rec)
         return out
     except Exception as e:
         logging.error(f"get_recent_verdicts({ticker}) failed: {e}")
         if strict:
             raise
         return []
+    finally:
+        _put_conn(conn)
+
+
+def get_same_day_verdicts(ticker: str, since, until, limit: int = 200,
+                          timeout_ms: int = 1500) -> list[dict]:
+    """Analyst verdicts on ticker with since <= timestamp < until, filtered as
+    get_recent_verdicts (this env, legacy NULL-env rows count, degraded ones
+    don't, no routing or log-only kinds), newest first, at most `limit`.
+    scripts/fire_test.py verdicts are counted: its analyst row carries no
+    marker (only its pending_approvals reasoning is "[TEST RUN] ..."):
+    [{signal_id, timestamp, signal, conviction, udr, final_pass_to_risk,
+    model_action, model_pass_to_risk, story_key}]. conviction is confidence
+    x 10, None when the row has no confidence. final_pass_to_risk and
+    model_pass_to_risk are the stored decision flags (None when the row
+    predates them); story_key is provenance.trigger.story_dedup.story_key
+    (None when absent). One round trip (SET LOCAL statement_timeout and the
+    SELECT sent together) under timeout_ms; read only (rolled back). Raises
+    on any error, a timeout included: the caller records it."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SET LOCAL statement_timeout = %s; "
+                "SELECT s.id, s.timestamp, s.signal, s.confidence, "
+                "s.decision->'model_output'->>'upside_downside_ratio', "
+                "s.decision->>'final_pass_to_risk', s.decision->>'model_action', "
+                "s.decision->>'model_pass_to_risk', "
+                "s.provenance->'trigger'->'story_dedup'->>'story_key' FROM ("
+                "SELECT id, timestamp FROM signals "
+                "WHERE symbol=%s AND signal NOT IN %s "
+                "AND (trading_env=%s OR (trading_env IS NULL AND COALESCE(reasoning, '') NOT LIKE %s)) "
+                "AND timestamp >= %s AND timestamp < %s "
+                "ORDER BY timestamp DESC LIMIT %s) k JOIN signals s ON s.id = k.id "
+                "ORDER BY k.timestamp DESC",
+                (int(timeout_ms), ticker, _NON_ANALYST_SIGNALS, TRADING_ENV,
+                 DEGRADED_SIGNAL_PREFIX + '%', since, until, int(limit)),
+            )
+            rows = cur.fetchall()
+        conn.rollback()
+
+        def flag(v):
+            return {"true": True, "false": False}.get(str(v).lower()) if v is not None else None
+        out = []
+        for sid, ts, sig, conf, udr, fpass, maction, mpass, story in rows:
+            try:
+                udr = float(udr) if udr is not None else None
+            except (TypeError, ValueError):
+                udr = None
+            out.append({"signal_id": sid, "timestamp": ts, "signal": sig,
+                        "conviction": round(float(conf) * 10) if conf is not None else None,
+                        "udr": udr,
+                        "final_pass_to_risk": flag(fpass), "model_action": maction,
+                        "model_pass_to_risk": flag(mpass), "story_key": story})
+        return out
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
     finally:
         _put_conn(conn)
 
@@ -3087,14 +3579,17 @@ def get_recent_verdict_levels(ticker: str, hours: int = 24, limit: int = 100) ->
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
+            # Ids first, decision for those rows only (as get_recent_verdicts).
             cur.execute(
-                "SELECT timestamp, decision->'model_output'->>'expected_return_pct', "
-                "decision->'model_output'->>'expected_downside_pct', "
-                "decision->'model_output'->'catalyst'->>'date' FROM signals "
+                "SELECT s.timestamp, s.decision->'model_output'->>'expected_return_pct', "
+                "s.decision->'model_output'->>'expected_downside_pct', "
+                "s.decision->'model_output'->'catalyst'->>'date' FROM ("
+                "SELECT id, timestamp FROM signals "
                 "WHERE symbol=%s AND signal NOT IN %s "
                 "AND (trading_env=%s OR (trading_env IS NULL AND COALESCE(reasoning, '') NOT LIKE %s)) "
                 "AND timestamp > NOW() - make_interval(hours => %s) "
-                "ORDER BY timestamp DESC LIMIT %s",
+                "ORDER BY timestamp DESC LIMIT %s) k JOIN signals s ON s.id = k.id "
+                "ORDER BY k.timestamp DESC",
                 (ticker, _NON_ANALYST_SIGNALS, TRADING_ENV, DEGRADED_SIGNAL_PREFIX + '%', hours, limit),
             )
             return [{"timestamp": ts, "expected_return_pct": r, "expected_downside_pct": d,
@@ -3127,11 +3622,16 @@ def get_latest_verdicts(days: int | None = None, tickers: list[str] | None = Non
             args.append(list(tickers))
         with conn.cursor() as cur:
             cur.execute("SET LOCAL statement_timeout = 10000")
+            # The newest row per ticker is picked by id first and its JSON
+            # read after: DISTINCT ON otherwise reads decision and provenance
+            # for every verdict in the window before discarding all but one.
             cur.execute(
-                "SELECT DISTINCT ON (symbol) symbol, id, timestamp, signal, confidence, "
-                "decision->>'model_action', decision->'udr_structural', decision->'pending_entry', "
-                "decision->'model_output', provenance->'plan' FROM signals "
-                "WHERE " + " AND ".join(where) + " ORDER BY symbol, timestamp DESC, id DESC",
+                "SELECT s.symbol, s.id, s.timestamp, s.signal, s.confidence, "
+                "s.decision->>'model_action', s.decision->'udr_structural', s.decision->'pending_entry', "
+                "s.decision->'model_output', s.provenance->'plan' FROM ("
+                "SELECT DISTINCT ON (symbol) id, symbol, timestamp FROM signals "
+                "WHERE " + " AND ".join(where) + " ORDER BY symbol, timestamp DESC, id DESC"
+                ") k JOIN signals s ON s.id = k.id ORDER BY k.symbol, k.timestamp DESC, k.id DESC",
                 tuple(args),
             )
             rows = cur.fetchall()
@@ -4101,6 +4601,53 @@ def log_fundamentals_history(ticker: str, metrics: dict) -> None:
         _put_conn(conn)
 
 
+def count_fundamentals_changes(since, prior_before=None) -> dict | None:
+    """For the tickers with a fundamentals_history row recorded at or after
+    since (one refresh): {"tickers": how many, "changed": how many whose
+    latest target_mean_price or forward_eps differs from their last row
+    before prior_before, "no_prior": how many have no row before it}.
+    prior_before defaults to the start of since's ET day, so a re-run or
+    retry of the same day's refresh compares against the previous day's
+    rows, not against the run it repeats. Read only. None on a failed read
+    (a missing migration-60 column included)."""
+    conn = None
+    try:
+        if prior_before is None:
+            from zoneinfo import ZoneInfo
+            et = ZoneInfo("America/New_York")
+            day = since.astimezone(et).date()
+            prior_before = datetime(day.year, day.month, day.day, tzinfo=et)
+        conn = _get_conn()
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = 15000")
+            cur.execute(
+                "WITH latest AS (SELECT DISTINCT ON (ticker) ticker, target_mean_price tp, "
+                "forward_eps fe FROM fundamentals_history WHERE recorded_at >= %s "
+                "ORDER BY ticker, recorded_at DESC), "
+                "prev AS (SELECT DISTINCT ON (h.ticker) h.ticker, h.target_mean_price tp, "
+                "h.forward_eps fe FROM fundamentals_history h JOIN latest l ON l.ticker = h.ticker "
+                "WHERE h.recorded_at < %s ORDER BY h.ticker, h.recorded_at DESC) "
+                "SELECT COUNT(*), COUNT(*) FILTER (WHERE p.ticker IS NOT NULL AND "
+                "(l.tp IS DISTINCT FROM p.tp OR l.fe IS DISTINCT FROM p.fe)), "
+                "COUNT(*) FILTER (WHERE p.ticker IS NULL) "
+                "FROM latest l LEFT JOIN prev p ON p.ticker = l.ticker",
+                (since, prior_before))
+            n, changed, no_prior = cur.fetchone()
+        conn.rollback()
+        return {"tickers": int(n), "changed": int(changed), "no_prior": int(no_prior)}
+    except Exception as e:
+        logging.error(f"count_fundamentals_changes failed: {e}")
+        try:
+            if conn is not None:
+                conn.rollback()
+        except Exception:
+            pass
+        return None
+    finally:
+        if conn is not None:
+            _put_conn(conn)
+
+
 def get_fundamentals_history(ticker: str, limit: int = 400) -> list[dict]:
     conn = _get_conn()
     try:
@@ -4227,23 +4774,83 @@ def upsert_price_bars(ticker: str, bars: list[dict]) -> int:
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
-            for b in bars:
-                cur.execute(
-                    """
-                    INSERT INTO price_history (ticker, date, open, high, low, close, volume)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT (ticker, date) DO UPDATE SET
-                        open=EXCLUDED.open, high=EXCLUDED.high, low=EXCLUDED.low,
-                        close=EXCLUDED.close, volume=EXCLUDED.volume
-                    """,
-                    (ticker, b["date"], b["open"], b["high"], b["low"], b["close"], b["volume"]),
-                )
+            _upsert_price_bars_cur(cur, ticker, bars)
         conn.commit()
         return len(bars)
     except Exception as e:
         conn.rollback()
         logging.error(f"upsert_price_bars({ticker}) failed: {e}")
         return 0
+    finally:
+        _put_conn(conn)
+
+
+def _upsert_price_bars_cur(cur, ticker: str, bars: list[dict]) -> None:
+    """upsert_price_bars' insert loop on an open cursor (no commit)."""
+    for b in bars:
+        cur.execute(
+            """
+            INSERT INTO price_history (ticker, date, open, high, low, close, volume)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (ticker, date) DO UPDATE SET
+                open=EXCLUDED.open, high=EXCLUDED.high, low=EXCLUDED.low,
+                close=EXCLUDED.close, volume=EXCLUDED.volume
+            """,
+            (ticker, b["date"], b["open"], b["high"], b["low"], b["close"], b["volume"]),
+        )
+
+
+def rescale_and_upsert_price_bars(ticker: str, k: float, bars: list[dict], volume_k: float | None = None,
+                                  check: tuple | None = None) -> dict | None:
+    """In one transaction, under pg_advisory_xact_lock(hashtext('ph:' ||
+    ticker)): re-read check's stored close (check = (date, close) from
+    ingestion/price_history._scale_check) and abort if it is gone or changed;
+    multiply open/high/low/close by k and divide volume by volume_k (default
+    k; rounded) on every stored row the upsert won't overwrite, i.e. dated
+    before the oldest fetched date, or on or before the newest one and not a
+    fetched date; then upsert bars as upsert_price_bars does. One
+    transaction, so a failed upsert can't leave the old rows rescaled under an
+    unrescaled window (the next night would rescale them again). Returns
+    {"rows", "first", "last", "upserted"} (rows rescaled and their date
+    range), or None on a failure or an abort, with nothing changed."""
+    def pos(x):
+        return isinstance(x, (int, float)) and not isinstance(x, bool) and x > 0
+    if not bars or not pos(k):
+        return None
+    vk = volume_k if pos(volume_k) else k
+    dates = sorted({str(b["date"])[:10] for b in bars})
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext('ph:' || %s))", (ticker,))
+            if check is not None:
+                cd, cc = check
+                cur.execute("SELECT close FROM price_history WHERE ticker=%s AND date=%s", (ticker, cd))
+                row = cur.fetchone()
+                now = float(row[0]) if row and row[0] is not None else None
+                if now is None or not pos(cc) or abs(now / float(cc) - 1) > 1e-9:
+                    logging.warning(f"rescale_and_upsert_price_bars({ticker}): stored close on {cd} "
+                                    f"changed since the check; not rescaled")
+                    conn.rollback()
+                    return None
+            cur.execute(
+                "UPDATE price_history SET open=open*%s, high=high*%s, low=low*%s, close=close*%s, "
+                "volume=ROUND(volume/%s) WHERE ticker=%s AND (date < %s OR "
+                "(date <= %s AND NOT (date = ANY(%s::date[])))) RETURNING date",
+                (k, k, k, k, vk, ticker, dates[0], dates[-1], dates),
+            )
+            changed = sorted(r[0] for r in cur.fetchall())
+            _upsert_price_bars_cur(cur, ticker, bars)
+        conn.commit()
+        return {"rows": len(changed), "first": str(changed[0]) if changed else None,
+                "last": str(changed[-1]) if changed else None, "upserted": len(bars)}
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception as e2:
+            logging.error(f"rescale_and_upsert_price_bars({ticker}) rollback failed: {e2}")
+        logging.error(f"rescale_and_upsert_price_bars({ticker}) failed: {e}")
+        return None
     finally:
         _put_conn(conn)
 
@@ -4345,13 +4952,20 @@ def log_order(
     submitted_at=None,
     submit_price: float | None = None,
     reconcile_note: str | None = None,
+    held_before_qty: float | None = None,
+    written: dict | None = None,
 ) -> int:
     """Logs a newly-placed order. Returns the local orders.id (-1 on failure).
     submitted_at: when the order was sent (default: now, the logging time);
     submit_price: the quote at submission, where the caller has one;
     reconcile_note: written with the row when given (AWAITING_FILL_NOTE for a
     row written before the fill wait). The missing-column fallback below
-    drops it along with submitted_at and submit_price."""
+    drops it along with submitted_at and submit_price.
+    held_before_qty (roadmap 04ah, migration 92): stored with the row when
+    given. If only that column is missing, the row is written without it
+    (no other column dropped) before the older fallbacks are tried.
+    written (optional dict): written["held_before_qty"] is set True when the
+    count went in with the row, False otherwise."""
     rec = {"ticker": ticker, "side": side, "order_type": order_type, "qty": qty,
            "broker_order_id": broker_order_id, "stop_price": stop_price,
            "decision_price": decision_price, "approval_id": approval_id, "status": status,
@@ -4367,21 +4981,40 @@ def log_order(
             perm_id or None)
     note_col, note_val, note_args = ((", reconcile_note", ",%s", (reconcile_note[:40],))
                                      if reconcile_note is not None else ("", "", ()))
+    if written is not None:
+        written["held_before_qty"] = False
+
+    def insert_full(with_held: bool) -> int:
+        held_col, held_val, held_args = ((", held_before_qty", ",%s", (float(held_before_qty),))
+                                         if with_held else ("", "", ()))
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO orders
+                    (broker_order_id, trading_env, ticker, side, order_type, qty, limit_price,
+                     stop_price, decision_price, approval_id, parent_order_id, status, intent,
+                     perm_id, submitted_at, submit_price{note_col}{held_col})
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,COALESCE(%s, NOW()),%s{note_val}{held_val})
+                RETURNING id
+                """,
+                base + (submitted_at, submit_price) + note_args + held_args,
+            )
+            return cur.fetchone()[0]
     try:
         try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"""
-                    INSERT INTO orders
-                        (broker_order_id, trading_env, ticker, side, order_type, qty, limit_price,
-                         stop_price, decision_price, approval_id, parent_order_id, status, intent,
-                         perm_id, submitted_at, submit_price{note_col})
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,COALESCE(%s, NOW()),%s{note_val})
-                    RETURNING id
-                    """,
-                    base + (submitted_at, submit_price) + note_args,
-                )
-                order_id = cur.fetchone()[0]
+            if held_before_qty is None:
+                order_id = insert_full(False)
+            else:
+                try:
+                    order_id = insert_full(True)
+                    if written is not None:
+                        written["held_before_qty"] = True
+                except psycopg2.errors.UndefinedColumn as e:
+                    if not _is_missing_column(e, "held_before_qty"):
+                        raise
+                    # Migration 92 not applied yet: the same row without the count.
+                    conn.rollback()
+                    order_id = insert_full(False)
         except psycopg2.errors.UndefinedColumn:
             # Migration 75 not applied yet: keep the order row without them,
             # but with its reconcile_note (migration 76) where that column
@@ -4934,14 +5567,117 @@ _missing_column_warned: set = set()
 
 def _is_missing_column(e: Exception, column: str) -> bool:
     """True when e is Postgres's UndefinedColumn for column (its migration
-    not applied yet), warning once per process per column."""
-    if not isinstance(e, psycopg2.errors.UndefinedColumn) or column not in str(e):
+    not applied yet), warning once per process per column. Matched on the
+    server's primary message (str(e) when there is no diag) as a whole
+    identifier, so "filled_at" doesn't match a missing "filled_at_source";
+    quoted ("col") and table-qualified (orders.col) forms both match."""
+    if not isinstance(e, psycopg2.errors.UndefinedColumn):
+        return False
+    try:
+        text = getattr(getattr(e, "diag", None), "message_primary", None) or str(e)
+    except Exception:
+        text = str(e)
+    if not re.search(rf"(?<![A-Za-z0-9_]){re.escape(column)}(?![A-Za-z0-9_])", text or ""):
         return False
     if column not in _missing_column_warned:
         _missing_column_warned.add(column)
         logging.warning(f"column {column} is missing (migration pending); "
                         f"rows are written and read without it")
     return True
+
+
+def set_order_held_before(order_row_id: int, qty: float) -> bool:
+    """Store a BUY order's held count before it went out on its orders row
+    (migration 92). False when not written (no row, a missing column, a DB
+    error). Never raises."""
+    conn = None
+    try:
+        conn = _get_conn()
+        with conn.cursor() as cur:
+            # Short bound: it runs on order and stop paths (roadmap 04ah).
+            cur.execute("SET LOCAL statement_timeout = 3000")
+            cur.execute("UPDATE orders SET held_before_qty = %s WHERE id = %s AND trading_env = %s",
+                        (float(qty), int(order_row_id), TRADING_ENV))
+            n = cur.rowcount
+        conn.commit()
+        return n > 0
+    except Exception as e:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        if not _is_missing_column(e, "held_before_qty"):
+            logging.error(f"set_order_held_before({order_row_id}) failed: {e}")
+        return False
+    finally:
+        if conn is not None:
+            _put_conn(conn)
+
+
+def count_other_buy_orders_since(ticker: str, since, exclude_id: int) -> int | None:
+    """BUY orders rows for ticker (this env), other than exclude_id, whose
+    shares could read as held before this order: created or filled at or
+    after since, or still working (submitted, unconfirmed or partial: an
+    earlier BUY that fills afterwards), except a cancelled or rejected one
+    with nothing filled. None on a failed read (the caller treats that as
+    "unknown"). Roadmap 04ah. Never raises."""
+    conn = None
+    try:
+        conn = _get_conn()
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = 3000")
+            cur.execute(
+                "SELECT count(*) FROM orders WHERE ticker = %s AND side = 'BUY' "
+                "AND trading_env = %s AND id <> %s "
+                "AND (created_at >= %s OR filled_at >= %s "
+                "     OR status IN ('submitted', 'unconfirmed', 'partial')) "
+                "AND NOT (status IN ('cancelled', 'rejected') AND COALESCE(filled_qty, 0) = 0)",
+                (ticker, TRADING_ENV, int(exclude_id), since, since))
+            n = cur.fetchone()[0]
+        conn.rollback()
+        return int(n)
+    except Exception as e:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        logging.error(f"count_other_buy_orders_since({ticker}) failed: {e}")
+        return None
+    finally:
+        if conn is not None:
+            _put_conn(conn)
+
+
+def get_order_held_before(order_row_id: int) -> float | None:
+    """The held count stored by set_order_held_before, or None: not stored
+    (an older order, a failed write), a missing column, or a failed read.
+    None means "unknown", and the caller keeps today's behaviour. Never
+    raises."""
+    conn = None
+    try:
+        conn = _get_conn()
+        with conn.cursor() as cur:
+            # Short bound: it runs on order and stop paths (roadmap 04ah).
+            cur.execute("SET LOCAL statement_timeout = 3000")
+            cur.execute("SELECT held_before_qty FROM orders WHERE id = %s AND trading_env = %s",
+                        (int(order_row_id), TRADING_ENV))
+            row = cur.fetchone()
+        conn.rollback()
+        return float(row[0]) if row and row[0] is not None else None
+    except Exception as e:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        if not _is_missing_column(e, "held_before_qty"):
+            logging.error(f"get_order_held_before({order_row_id}) failed: {e}")
+        return None
+    finally:
+        if conn is not None:
+            _put_conn(conn)
 
 
 def update_order_fill(order_id: int, fill_price: float, filled_qty: float, status: str,
@@ -6404,25 +7140,30 @@ def flag_orphan_outcomes(held: set[str]) -> tuple[int, int]:
         _put_conn(conn)
 
 
-def recent_event_verdicts(ticker: str, minutes: int = 15) -> list[dict]:
+def recent_event_verdicts(ticker: str, minutes: int = 15, strict: bool = False) -> list[dict]:
     """Event-triggered analyst verdicts on the ticker in the last `minutes`
-    (this env), newest first: [{timestamp, title, url, model_action}].
-    Debounce shadow, A0700-2."""
+    (this env), newest first: [{timestamp, title, url, model_action,
+    signal_id, source}]. Debounce shadow, A0700-2; the story de-dup shadow
+    (agents/story_dedup.py) reads it with strict=True, which raises on a DB
+    error instead of returning []."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT timestamp, provenance->'trigger'->>'title', provenance->'trigger'->>'url', "
-                "decision->>'model_action' FROM signals "
+                "decision->>'model_action', id, provenance->'trigger'->>'source' FROM signals "
                 "WHERE symbol=%s AND trading_env=%s AND provenance->'trigger'->>'path' = 'event' "
                 "AND signal NOT IN %s "
                 "AND timestamp > NOW() - make_interval(mins => %s) ORDER BY timestamp DESC",
                 (ticker, TRADING_ENV, _NON_ANALYST_SIGNALS, minutes),
             )
-            return [{"timestamp": ts, "title": t, "url": u, "model_action": a}
-                    for ts, t, u, a in cur.fetchall()]
+            return [{"timestamp": ts, "title": t, "url": u, "model_action": a,
+                     "signal_id": sid, "source": src}
+                    for ts, t, u, a, sid, src in cur.fetchall()]
     except Exception as e:
         logging.error(f"recent_event_verdicts({ticker}) failed: {e}")
+        if strict:
+            raise
         return []
     finally:
         _put_conn(conn)
@@ -6467,10 +7208,13 @@ def recent_model_udrs(ticker: str, n: int = 2) -> list[float | None]:
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
+            # Ids first, decision for those rows only (as get_recent_verdicts).
             cur.execute(
-                "SELECT decision->'model_output'->>'upside_downside_ratio' FROM signals "
+                "SELECT s.decision->'model_output'->>'upside_downside_ratio' FROM ("
+                "SELECT id, timestamp FROM signals "
                 "WHERE symbol=%s AND signal NOT IN %s AND decision IS NOT NULL AND trading_env=%s "
-                "ORDER BY timestamp DESC LIMIT %s",
+                "ORDER BY timestamp DESC LIMIT %s) k JOIN signals s ON s.id = k.id "
+                "ORDER BY k.timestamp DESC",
                 (ticker, _NON_ANALYST_SIGNALS, TRADING_ENV, n),
             )
             out = []
@@ -6586,6 +7330,48 @@ def get_next_earnings(ticker: str, strict: bool = False):
         return None
     finally:
         _put_conn(conn)
+
+
+def get_earnings_claim_dates(ticker: str, as_of, timeout_ms: int = 500) -> dict:
+    """Every earnings date this DB knows for ticker, by source, for the
+    record-only earnings-claim check (earnings_claim.py):
+    {"earnings_calendar": [...], "earnings_calendar_history": [...],
+    "earnings_consensus_history": [...]}, each a sorted list of distinct
+    dates. earnings_calendar is its current rows (past and future); the two
+    history tables are limited to rows recorded or fetched at or before
+    as_of; earnings_consensus_history is the stored yfinance
+    next_earnings_date. One round trip (SET LOCAL statement_timeout and the
+    SELECT together) under timeout_ms; read only (rolled back). Raises on any
+    error, a timeout included: the caller records it."""
+    out = {"earnings_calendar": [], "earnings_calendar_history": [],
+           "earnings_consensus_history": []}
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SET LOCAL statement_timeout = %s; "
+                "SELECT DISTINCT 'earnings_calendar', earnings_date FROM earnings_calendar "
+                "WHERE ticker=%s AND earnings_date IS NOT NULL "
+                "UNION SELECT DISTINCT 'earnings_calendar_history', earnings_date "
+                "FROM earnings_calendar_history WHERE ticker=%s AND recorded_at <= %s "
+                "UNION SELECT DISTINCT 'earnings_consensus_history', next_earnings_date "
+                "FROM earnings_consensus_history WHERE ticker=%s AND source='yfinance' "
+                "AND next_earnings_date IS NOT NULL AND fetched_at <= %s",
+                (int(timeout_ms), ticker, ticker, as_of, ticker, as_of),
+            )
+            rows = cur.fetchall()
+        conn.rollback()
+    finally:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        _put_conn(conn)
+    for src, d in rows:
+        out[src].append(d)
+    for v in out.values():
+        v.sort()
+    return out
 
 
 def get_earnings_around(tickers: list[str], days_ahead: int = 4, days_back: int = 4) -> dict:

@@ -439,6 +439,9 @@ def _gather(result: dict, cfg: dict, now: datetime, *, path: str, event: dict | 
     if last_pct is not None and last_pct > 0 and dist is not None and dist > 0:
         inputs["gap_vs_stop"] = round(last_pct / dist, 4)
     inputs.update(_gap_vs_stop_event(inputs, earnings_date))
+    inputs.update(_held_trend_fields(ticker, now, price, entry, reads))
+    inputs["held_exit_candidates"] = _held_exit_fields(ticker, now, entry, inputs.get("opened_at"),
+                                                       reads)
 
     if action not in SELL_ACTIONS:
         return inputs
@@ -480,6 +483,88 @@ def _gather(result: dict, cfg: dict, now: datetime, *, path: str, event: dict | 
             inputs["earnings_calendar_date"] = _iso(row[0])
             inputs["earnings_calendar_confirmed"] = bool(row[1])
     return inputs
+
+
+def _held_trend_fields(ticker: str, now: datetime, price, entry, reads: dict) -> dict:
+    """Record only (decide() never reads these): the held name's price
+    structure on cached daily bars, read as the live entry gate reads it
+    (agents.crew._entry_trend_check, one price_history read, no fetch), so a
+    later held-position exit rule mirroring that gate can be scored on rows
+    written before it exists. held_below_both_sma is True only on an ok read
+    with the last close below both the 50- and 200-day averages, None when
+    either is unknown. unrealized_pct is price over the broker entry price,
+    None without both or when the price equals the entry (crew._get_positions
+    falls back to the entry price when the broker gives none).
+    reads["held_trend"] records the read's outcome. Never raises: a
+    record-only field must not withhold a sale through apply's except."""
+    out = {"held_trend": None, "held_below_both_sma": None, "unrealized_pct": None}
+    try:
+        if (isinstance(price, (int, float)) and isinstance(entry, (int, float))
+                and entry > 0 and price > 0 and price != entry):
+            out["unrealized_pct"] = round((price / entry - 1) * 100, 4)
+        from agents.crew import _entry_trend_check
+        trend = _entry_trend_check(ticker, now=now)
+        if not isinstance(trend, dict):
+            reads["held_trend"] = f"error:{type(trend).__name__}"
+            return out
+        read = str(trend.get("read"))
+        reads["held_trend"] = read.replace("error: ", "error:")
+        out["held_trend"] = trend
+        b50, b200 = trend.get("below_sma50"), trend.get("below_sma200")
+        if read == "ok" and isinstance(b50, bool) and isinstance(b200, bool):
+            out["held_below_both_sma"] = b50 and b200
+    except Exception as e:
+        reads["held_trend"] = f"error:{type(e).__name__}"
+    return out
+
+
+_HELD_EXIT_BAR_ROWS = 260
+
+
+def _held_exit_fields(ticker: str, now: datetime, entry, opened_at, reads: dict) -> dict | None:
+    """Record only (decide() never reads it): agents.held_exit.candidates on
+    the cached daily bars (one db.get_price_history read, today's unfinished
+    bar dropped, non-finite bars carried forward or dropped as the entry
+    trend check does), the broker entry price, the stop record's opened_at
+    as the entry's ET date (kept across ADDs, so the first fill), and the
+    active trade plan (one db.get_active_plan read). reads["held_exit"] and
+    reads["held_exit_plan"] record each read's outcome. None when
+    HELD_EXIT_SHADOW_ENABLED is off. Never raises: a record-only field must
+    not withhold a sale through apply's except."""
+    try:
+        import config
+        if not getattr(config, "HELD_EXIT_SHADOW_ENABLED", False):
+            reads["held_exit"] = "off"
+            return None
+        import db
+        from agents import held_exit
+        from agents.catalyst_time import ET
+        from agents.market_regime import completed_bars
+        from agents.trade_ladder import _sanitize_bars
+        try:
+            raw = list(db.get_price_history(ticker, days=_HELD_EXIT_BAR_ROWS, strict=True) or [])
+            bars = _sanitize_bars(completed_bars(raw, now=now))
+            bars = [b for b in bars if all(isinstance(b.get(k), (int, float)) and math.isfinite(b[k])
+                                           for k in ("high", "low", "close"))]
+            reads["held_exit"] = "ok" if bars else "no_cached_bars"
+        except Exception as e:
+            bars, reads["held_exit"] = [], f"error:{type(e).__name__}"
+        try:
+            plan, plan_read = db.get_active_plan(ticker, strict=True), "ok"
+        except Exception as e:
+            plan, plan_read = None, f"error:{type(e).__name__}"
+        reads["held_exit_plan"] = plan_read
+        opened = _ts(opened_at)
+        rec = held_exit.candidates(
+            bars, entry_price=entry, entry_date=opened.astimezone(ET).date() if opened else None,
+            plan=plan, plan_read=plan_read,
+            time_stop_sessions=int(config.HELD_EXIT_TIME_STOP_SESSIONS),
+            drawdown_atr=float(config.HELD_EXIT_DRAWDOWN_ATR))
+        rec["read"] = reads["held_exit"]
+        return rec
+    except Exception as e:
+        reads["held_exit"] = f"error:{type(e).__name__}"
+        return {"version": None, "read": reads["held_exit"]}
 
 
 def _log_row(inputs: dict, outputs: dict, cfg: dict) -> int | None:

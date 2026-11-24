@@ -25,7 +25,9 @@ class FakeOrders:
     """An in-memory orders + trades table behind the db.* order functions,
     with the same guards as the SQL."""
 
-    def __init__(self, fail_early_write=False, early_write_lands_anyway=False):
+    def __init__(self, fail_early_write=False, early_write_lands_anyway=False,
+                 held_column_missing=False):
+        self.held_column_missing = held_column_missing   # migration 92 not applied
         self.rows: dict[int, dict] = {}
         self.trades: list[dict] = []
         self.fail_early_write = fail_early_write
@@ -39,7 +41,9 @@ class FakeOrders:
     def log_order(self, ticker, side, order_type, qty, broker_order_id=None, limit_price=None,
                   stop_price=None, decision_price=None, approval_id=None, parent_order_id=None,
                   status="submitted", intent=None, perm_id=None, submitted_at=None,
-                  submit_price=None, reconcile_note=None):
+                  submit_price=None, reconcile_note=None, held_before_qty=None, written=None):
+        if written is not None:
+            written["held_before_qty"] = False
         if self.fail_early_write and reconcile_note == AWAIT and not self.early_write_lands_anyway:
             return -1
         rid, self._next = self._next, self._next + 1
@@ -50,7 +54,10 @@ class FakeOrders:
                           "status": status, "reconcile_note": reconcile_note,
                           "filled_qty": None, "fill_price": None, "submitted_at": submitted_at,
                           "submit_price": submit_price, "trading_env": db.TRADING_ENV,
-                          "created_at": datetime.now(timezone.utc)}
+                          "created_at": datetime.now(timezone.utc),
+                          "held_before_qty": None if self.held_column_missing else held_before_qty}
+        if written is not None and held_before_qty is not None and not self.held_column_missing:
+            written["held_before_qty"] = True
         if self.early_write_lands_anyway and reconcile_note == AWAIT:
             return -1
         return rid

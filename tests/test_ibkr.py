@@ -9,8 +9,10 @@ in about one real second and gave up -- logging "no fill" for a BUY that
 filled for real 12 seconds later, live and untracked at the broker.
 """
 import time
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 import pytest
+from ib_async.objects import TradeLogEntry
 
 import ibkr
 
@@ -371,11 +373,30 @@ class _FakeStopOrder:
         self.auxPrice = 100.0
 
 
+class _LoggedStatus:
+    """orderStatus whose status changes append a trade.log entry with error
+    code 0, as ib_async's orderStatus handler does; cancel_order confirms a
+    Cancelled from that entry."""
+
+    def __init__(self, log, status):
+        self._log, self._status = log, status
+
+    @property
+    def status(self):
+        return self._status
+
+    @status.setter
+    def status(self, value):
+        self._status = value
+        self._log.append(TradeLogEntry(datetime.now(timezone.utc), value, "", 0))
+
+
 class _FakeStopTrade:
     def __init__(self, symbol, order_id, status="PreSubmitted"):
         self.contract = MagicMock(symbol=symbol)
         self.order = _FakeStopOrder(order_id)
-        self.orderStatus = MagicMock(status=status)
+        self.log = []
+        self.orderStatus = _LoggedStatus(self.log, status)
 
 
 class TestCancelStopOrdersForVerification:

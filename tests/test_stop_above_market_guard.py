@@ -134,7 +134,7 @@ def test_kept_record_above_the_market_no_longer_places_above_it():
     (stop, whole), _, rows, alerts, cancel, _ = _add(L197, [_stp(L198)], FILL_1113)
     assert stop == L198 and stop < FILL_1113
     assert whole == (95.0, 2.0)
-    cancel.assert_called_once_with("NVDA")
+    cancel.assert_called_once_with("NVDA", stuck_out=[])
     assert len(rows) == 1
     _, ticker, _, sentiment, extra = rows[0]
     assert ticker == "NVDA" and sentiment == "negative" and extra["mode"] == "enforce"
@@ -183,7 +183,7 @@ def test_normal_merge_is_unchanged():
     assert stop == L198 and whole == (95.0, 2.0)
     assert rows == [] and alerts == []
     assert reads.call_count == 1          # the floor's read only
-    cancel.assert_called_once_with("NVDA")
+    cancel.assert_called_once_with("NVDA", stuck_out=[])
 
 
 @pytest.mark.usefixtures("enforce")
@@ -240,7 +240,7 @@ def test_quote_price_under_a_working_l197_keeps_l197():
     (stop, _), _, rows, alerts, cancel, _ = _add(L197, [_stp(L197), _stp(L198)], FILL_1113,
                                                  price_is_fill=False)
     assert stop == L197
-    cancel.assert_called_once_with("NVDA")       # the merge itself goes ahead as before
+    cancel.assert_called_once_with("NVDA", stuck_out=[])       # the merge itself goes ahead as before
     assert rows[0][4]["outcome"] == "resting_at_or_above_price"
     assert rows[0][4]["n_resting_at_or_above"] == 1 and rows[0][4]["stale_check"] == "made"
     assert len(alerts) == 1 and "PRICE LOOKS OLD" in alerts[0]

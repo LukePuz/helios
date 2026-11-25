@@ -1196,6 +1196,35 @@ def place_stop_order(ticker: str, qty: float, stop_price: float,
     return {"order_id": trade.order.orderId, "stop_price": stop_price}
 
 
+# The last status each cancel in this process ended on, by orderId, for the
+# stuck warning in cancel_stop_orders_for (cancel_order's return stays a
+# bool). Capped; the oldest entries go first.
+_LAST_CANCEL_STATUS: dict[int, str] = {}
+_LAST_CANCEL_STATUS_MAX = 256
+
+
+def _record_cancel_status(order_id, status) -> None:
+    try:
+        _LAST_CANCEL_STATUS.pop(order_id, None)
+        _LAST_CANCEL_STATUS[order_id] = status
+        while len(_LAST_CANCEL_STATUS) > _LAST_CANCEL_STATUS_MAX:
+            _LAST_CANCEL_STATUS.pop(next(iter(_LAST_CANCEL_STATUS)))
+    except Exception:
+        pass
+
+
+def _status_after_raise(trade) -> str:
+    """The status to keep for a stop whose cancel went out but whose poll
+    raised: "Filled" when the trade already reads Filled, else "SentUnknown"
+    (the cancel may or may not have landed). Never raises."""
+    try:
+        if trade.orderStatus.status == "Filled":
+            return "Filled"
+    except Exception:
+        pass
+    return "SentUnknown"
+
+
 def cancel_order(order_id: int, _poll_seconds: int = 5, symbol: str | None = None,
                  perm_id: int | None = None) -> bool:
     """Cancel an open order by orderId. Returns True only if the broker
@@ -1229,7 +1258,17 @@ def cancel_order(order_id: int, _poll_seconds: int = 5, symbol: str | None = Non
     across clientIds, so a trade with this orderId on another ticker (or
     with another permId, when both are known) is refused with an error
     instead of cancelled.
+
+    The poll is _poll_after_cancel's: a Cancelled / ApiCancelled counts only
+    when trade.log carries a cancel's code (0 or 202), since ib_async also
+    sets Cancelled locally on a rejected cancel (10148, 161, 10147); that
+    one is polled to the bound and returns False. Filled and Inactive end
+    the poll at once and return False (not cancelled). The status it ended
+    on is kept in _LAST_CANCEL_STATUS for the caller's warning ("NotFound"
+    when no open trade matched). _poll_seconds below 1 reads once, so the
+    log check always runs.
     """
+    _poll_seconds = max(1, int(_poll_seconds))
     ib = get_ib()
     for trade in ib.openTrades():
         if trade.order.orderId == order_id:
@@ -1241,21 +1280,44 @@ def cancel_order(order_id: int, _poll_seconds: int = 5, symbol: str | None = Non
                           f"permId={perm_id or '?'} asked for; not cancelled")
                 continue
             ib.cancelOrder(trade.order)
-            for _ in range(_poll_seconds):
-                ib.sleep(1)
-                status = trade.orderStatus.status
-                if status in ("Cancelled", "ApiCancelled"):
-                    log.info(f"Cancel confirmed for orderId={order_id} "
-                             f"({trade.order.action} {trade.order.totalQuantity} "
-                             f"{trade.contract.symbol}) status={status}")
-                    return True
-            log.warning(f"Cancel sent for orderId={order_id} but status is still "
-                        f"'{status}' after {_poll_seconds}s — broker likely ignored "
-                        f"it (owned by a different clientId) or hasn't resolved yet; "
-                        f"needs manual cancel/verification in TWS")
+            try:
+                status = _poll_after_cancel(ib, trade, _poll_seconds)
+            except Exception:
+                # The cancel went out: not "NotSent". Kept for the caller's
+                # stuck list, then the same exception goes on.
+                _record_cancel_status(order_id, _status_after_raise(trade))
+                raise
+            _record_cancel_status(order_id, status)
+            if status in _CANCEL_CONFIRMED_STATUSES:
+                log.info(f"Cancel confirmed for orderId={order_id} "
+                         f"({trade.order.action} {trade.order.totalQuantity} "
+                         f"{trade.contract.symbol}) status={status}")
+                return True
+            log.warning(_cancel_not_confirmed_line(order_id, trade, status, _poll_seconds))
             return False
+    _record_cancel_status(order_id, "NotFound")
     log.warning(f"cancel_order: orderId={order_id} not found among open orders")
     return False
+
+
+def _cancel_not_confirmed_line(order_id, trade, status, poll_seconds) -> str:
+    """The warning for a cancel the broker did not confirm, by status."""
+    what = (f"orderId={order_id} ({trade.order.action} {trade.order.totalQuantity} "
+            f"{trade.contract.symbol})")
+    if status not in ("Filled", "Inactive", CANCEL_REJECTED_STATUS):
+        return (f"Cancel sent for orderId={order_id} but status is still '{status}' after "
+                f"{poll_seconds}s — broker likely ignored it (owned by a different "
+                f"clientId) or hasn't resolved yet; needs manual cancel/verification in TWS")
+    if status == "Filled":
+        return (f"Cancel sent for {what} but the order FILLED during the cancel "
+                f"(status Filled) — shares were sold; check the position in TWS")
+    if status == "Inactive":
+        return (f"Cancel sent for {what}; the order went Inactive (dead at the broker, "
+                f"not a confirmed cancel) — verify in TWS")
+    return (f"Cancel sent for {what} but it was rejected (status {CANCEL_REJECTED_STATUS}: "
+            f"a Cancelled set by an order error, not by the broker's cancel) after "
+            f"{poll_seconds}s — the order may still be working; needs manual "
+            f"cancel/verification in TWS")
 
 
 def _price_or_none(v) -> float | None:
@@ -1357,16 +1419,21 @@ def _cancel_stops_parallel(ib, ticker: str, matches: list, _poll_seconds: int = 
     one-second sleeps, so the total wait is the one-stop wait, not N of them.
 
     Per stop, the rule is cancel_order's: confirmed only on Cancelled or
-    ApiCancelled within the window (a PendingCancel, a fill or anything else
-    is not confirmed); an orderId not found, or found only on another ticker
+    ApiCancelled within the window that trade.log confirms
+    (_cancel_confirmed_by_log; a rejected cancel's Cancelled is polled on to
+    the window and not confirmed); Filled and Inactive stop that stop's poll,
+    not confirmed; a PendingCancel or anything else is not confirmed; an orderId not found, or found only on another ticker
     or permId, is not confirmed. A cancelOrder that raises stops the sending,
     as the raise did in the one-at-a-time loop, so when cancelOrder raises the
     same cancels are sent as on that path: that stop and the ones after it are
     not sent and are not confirmed. A raise while finding the next stop
     (openTrades) does the same. Either way the ones already sent are still
     polled and warned on, and the exception is returned for the caller to
-    re-raise after the poll. A trade already sent a cancel is never matched
-    or polled twice. Returns (confirmed
+    re-raise after the poll. A raise inside the poll ends it: each stop not
+    yet settled is kept as Filled if it reads Filled, else SentUnknown (its
+    cancel was sent), and that exception (or an earlier send's) is returned
+    the same way. A trade already sent a cancel is never matched or polled
+    twice. Returns (confirmed
     count, the orderIds not confirmed in match order, the exception or None)."""
     confirmed = 0
     not_ok: set[int] = set()            # indexes into matches
@@ -1379,6 +1446,7 @@ def _cancel_stops_parallel(ib, ticker: str, matches: list, _poll_seconds: int = 
             trade = _find_cancel_target(ib, oid, ticker,
                                         int(getattr(order, "permId", 0) or 0) or None, skip=sent)
             if trade is None:
+                _record_cancel_status(oid, "NotFound")
                 log.warning(f"cancel_order: orderId={oid} not found among open orders")
                 not_ok.add(i)
                 continue
@@ -1388,35 +1456,63 @@ def _cancel_stops_parallel(ib, ticker: str, matches: list, _poll_seconds: int = 
                       f"no further cancels sent, the ones sent are polled")
             first_exc = e
             not_ok.update(range(i, len(matches)))
+            for j in range(i, len(matches)):
+                _record_cancel_status(matches[j].orderId, "NotSent")
             break
         sent.add(id(trade))
         pending.append((i, oid, trade))
     status: dict[int, str] = {}
-    for _ in range(_poll_seconds):
-        if not pending:
-            break
-        ib.sleep(1)
-        still = []
+    done: set[int] = set()              # indexes the poll already settled
+    try:
+        for _ in range(_poll_seconds):
+            if not pending:
+                break
+            ib.sleep(1)
+            still = []
+            for i, oid, trade in pending:
+                status[i] = trade.orderStatus.status
+                if status[i] in ("Filled", "Inactive"):
+                    # Ended without a cancel: not confirmed, stop polling it.
+                    _record_cancel_status(oid, status[i])
+                    log.warning(_cancel_not_confirmed_line(oid, trade, status[i], _poll_seconds))
+                    not_ok.add(i)
+                    done.add(i)
+                elif (status[i] in _CANCEL_CONFIRMED_STATUSES
+                      and _cancel_confirmed_by_log(trade, status[i])):
+                    _record_cancel_status(oid, status[i])
+                    log.info(f"Cancel confirmed for orderId={oid} "
+                             f"({trade.order.action} {trade.order.totalQuantity} "
+                             f"{trade.contract.symbol}) status={status[i]}")
+                    confirmed += 1
+                    done.add(i)
+                else:
+                    if status[i] in _CANCEL_CONFIRMED_STATUSES:
+                        status[i] = CANCEL_REJECTED_STATUS   # set by an order error
+                    still.append((i, oid, trade))
+            pending = still
+    except Exception as e:
+        # A raise inside the poll (ib.sleep, a disconnect): every stop still
+        # being polled had its cancel sent, so it is kept as Filled when it
+        # reads Filled, else SentUnknown, and the exception is returned for
+        # the caller to re-raise after its stuck list is filled.
+        log.error(f"[{ticker}] the cancel poll raised {type(e).__name__}: {e}")
         for i, oid, trade in pending:
-            status[i] = trade.orderStatus.status
-            if status[i] in ("Cancelled", "ApiCancelled"):
-                log.info(f"Cancel confirmed for orderId={oid} "
-                         f"({trade.order.action} {trade.order.totalQuantity} "
-                         f"{trade.contract.symbol}) status={status[i]}")
-                confirmed += 1
-            else:
-                still.append((i, oid, trade))
-        pending = still
+            if i in done:
+                continue
+            _record_cancel_status(oid, _status_after_raise(trade))
+            not_ok.add(i)
+        if first_exc is None:
+            first_exc = e
+        return confirmed, [matches[i].orderId for i in sorted(not_ok)], first_exc
     for i, oid, trade in pending:
-        log.warning(f"Cancel sent for orderId={oid} but status is still "
-                    f"'{status.get(i, trade.orderStatus.status)}' after {_poll_seconds}s — broker "
-                    f"likely ignored it (owned by a different clientId) or hasn't resolved yet; "
-                    f"needs manual cancel/verification in TWS")
+        st = status.get(i, trade.orderStatus.status)
+        _record_cancel_status(oid, st)
+        log.warning(_cancel_not_confirmed_line(oid, trade, st, _poll_seconds))
         not_ok.add(i)
     return confirmed, [matches[i].orderId for i in sorted(not_ok)], first_exc
 
 
-def cancel_stop_orders_for(ticker: str) -> int:
+def cancel_stop_orders_for(ticker: str, stuck_out: list | None = None) -> int:
     """Cancel all open SELL stop orders for a ticker. Returns the count
     the broker actually CONFIRMED cancelled, not just requested.
 
@@ -1444,10 +1540,21 @@ def cancel_stop_orders_for(ticker: str) -> int:
     confirmation rule, return value and stuck warning. A cancelOrder that
     raises stops the sending as before (then the same cancels are sent); a
     raise while finding the next stop does too. The ones already sent are
-    polled, then the exception is re-raised. The paths can differ on an
-    ib.sleep raise or a disconnect mid-loop (one ib here, get_ib per stop
-    there). One stop always
-    runs the loop below.
+    polled, then the exception is re-raised; a raise inside that poll ends
+    it, and the stops not yet settled count as not cancelled (Filled if
+    they read Filled, else SentUnknown). The paths can differ on a
+    disconnect mid-loop (one ib here, get_ib per stop there). One stop
+    always runs the loop below; a cancel_order that raises there also stops
+    the loop (this stop and the rest count as not cancelled: cancel_order
+    keeps Filled or SentUnknown when its own poll raised after the send, the
+    rest are NotSent), and the exception
+    is re-raised after stuck_out is filled.
+
+    stuck_out (optional list): filled with (orderId, status) for each stop
+    that did not cancel, before any raise, so a caller placing over them
+    knows. status is the one cancel_order or the parallel poll ended on
+    (_LAST_CANCEL_STATUS: "Filled", "Inactive", "PendingCancel", "NotFound",
+    "NotSent", "SentUnknown", ...), or None when none was kept.
     """
     ib = get_ib()
     matches = [
@@ -1456,6 +1563,10 @@ def cancel_stop_orders_for(ticker: str) -> int:
         and trade.order.action == "SELL"
         and trade.order.orderType in ("STP", "STP LMT", "TRAIL")
     ]
+    # Only this call's statuses name the stuck stops: an older call's
+    # "Filled" for a reused orderId must not label a resting stop sold.
+    for order in matches:
+        _LAST_CANCEL_STATUS.pop(order.orderId, None)
     confirmed = 0
     stuck = []
     first_exc = None
@@ -1463,34 +1574,64 @@ def cancel_stop_orders_for(ticker: str) -> int:
         # All cancels sent, then one poll (config.CANCEL_PARALLEL_ENABLED).
         confirmed, stuck, first_exc = _cancel_stops_parallel(ib, ticker, matches)
     else:
-        for order in matches:
+        for i, order in enumerate(matches):
             # orderIds repeat across clientIds: name the order fully, or
             # cancel_order could match another ticker's order with this id.
-            if cancel_order(order.orderId, symbol=ticker,
-                            perm_id=int(getattr(order, "permId", 0) or 0) or None):
+            try:
+                ok = cancel_order(order.orderId, symbol=ticker,
+                                  perm_id=int(getattr(order, "permId", 0) or 0) or None)
+            except Exception as e:
+                # As the parallel path: no further cancels; this stop and the
+                # rest count as not cancelled ("NotSent" unless this one's
+                # status was kept), so stuck_out still names an earlier
+                # stop's Filled before the raise below.
+                log.error(f"[{ticker}] cancelling orderId={order.orderId} raised "
+                          f"{type(e).__name__}: {e}; no further cancels sent")
+                first_exc = e
+                for rest in matches[i:]:
+                    if rest.orderId not in _LAST_CANCEL_STATUS:
+                        _record_cancel_status(rest.orderId, "NotSent")
+                    stuck.append(rest.orderId)
+                break
+            if ok:
                 confirmed += 1
             else:
                 stuck.append(order.orderId)
     if stuck:
-        log.warning(
-            f"[{ticker}] {len(stuck)} stop order(s) did NOT actually cancel "
-            f"(orderIds={stuck}) — likely owned by a different clientId. Any "
-            f"new stop placed now will overlap with these, not replace them. "
-            f"Cancel manually in TWS."
-        )
+        st = {oid: _LAST_CANCEL_STATUS.get(oid) for oid in stuck}
+        filled = [oid for oid in stuck if st[oid] == "Filled"]
+        rest = [oid for oid in stuck if st[oid] != "Filled"]
+        if filled:
+            log.error(
+                f"[{ticker}] {len(filled)} stop order(s) FILLED while being cancelled "
+                f"(orderIds={filled}; status Filled) — shares were sold. Check the "
+                f"position in TWS before any new stop is sized on it."
+            )
+        if rest:
+            named = ", ".join(f"{oid}={st[oid] or 'unknown'}" for oid in rest)
+            log.warning(
+                f"[{ticker}] {len(rest)} stop order(s) did NOT actually cancel "
+                f"(orderIds={rest}; status {named}) — likely owned by a different clientId or a "
+                f"rejected cancel. Any new stop placed now will overlap with these, "
+                f"not replace them. Cancel manually in TWS."
+            )
+    if stuck_out is not None:
+        stuck_out[:] = [(oid, _LAST_CANCEL_STATUS.get(oid)) for oid in stuck]
     if first_exc is not None:
         raise first_exc
     return confirmed
 
 
-def get_completed_orders() -> list[dict]:
+def get_completed_orders(timeout: float | None = None) -> list[dict]:
     """Today's completed orders (this TWS session only; the nightly restart
     clears them): [{perm_id, ticker, action, status, filled_qty}]. TWS sends
     no orderId for these, so they match on permId (professor M127). Raises
-    on a broker error."""
+    on a broker error. timeout: a shorter bound than _REQ_TIMEOUT_S
+    (_bounded_req; a timeout still drops the session)."""
     ib = get_ib()
     out = []
-    for trade in _bounded_req(ib, "reqCompletedOrders", ib.reqCompletedOrders, False):
+    for trade in _bounded_req(ib, "reqCompletedOrders", ib.reqCompletedOrders, False,
+                              timeout=timeout):
         o = trade.order
         filled = getattr(o, "filledQuantity", None)
         try:

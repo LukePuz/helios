@@ -527,7 +527,14 @@ def _held_exit_fields(ticker: str, now: datetime, entry, opened_at, reads: dict)
     bar dropped, non-finite bars carried forward or dropped as the entry
     trend check does), the broker entry price, the stop record's opened_at
     as the entry's ET date (kept across ADDs, so the first fill), and the
-    active trade plan (one db.get_active_plan read). reads["held_exit"] and
+    active trade plan (one db.get_active_plan read). The entry price is the
+    broker's blended average cost (crew._get_positions avg_entry_price), so
+    the time stop pairs first-fill sessions with a cost an ADD moves; the
+    record names that basis (entry_price_basis "broker_avg_cost"). The first
+    fill's own cost has no read on this path (position_stops.entry_price is
+    rewritten by every buy, ADDs included; only opened_at is kept), and no
+    query is added here: first_fill_price and its source are None, with
+    first_fill_price_reason "no_read_on_path". reads["held_exit"] and
     reads["held_exit_plan"] record each read's outcome. None when
     HELD_EXIT_SHADOW_ENABLED is off. Never raises: a record-only field must
     not withhold a sale through apply's except."""
@@ -559,7 +566,9 @@ def _held_exit_fields(ticker: str, now: datetime, entry, opened_at, reads: dict)
             bars, entry_price=entry, entry_date=opened.astimezone(ET).date() if opened else None,
             plan=plan, plan_read=plan_read,
             time_stop_sessions=int(config.HELD_EXIT_TIME_STOP_SESSIONS),
-            drawdown_atr=float(config.HELD_EXIT_DRAWDOWN_ATR))
+            drawdown_atr=float(config.HELD_EXIT_DRAWDOWN_ATR),
+            entry_basis="broker_avg_cost", first_fill_price=None, first_fill_source=None,
+            first_fill_reason="no_read_on_path")
         rec["read"] = reads["held_exit"]
         return rec
     except Exception as e:

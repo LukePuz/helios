@@ -438,6 +438,8 @@ def run_scan(regime_packet: dict | None = None) -> dict:
 
     candidates:   list[dict] = []
     disqualified: list[dict] = []
+    # Each watchlist name's tier, for the scan tier funnel row (record only).
+    watchlist_tiers = {t: e.get("tier") for t, e in watchlist.items()}
     threshold = _regime_threshold(regime)
     from agents.market_regime import completed_bars
 
@@ -448,7 +450,8 @@ def run_scan(regime_packet: dict | None = None) -> dict:
         bars = completed_bars(_fetch_bars(ticker, days=220))
         if not bars:
             log.warning(f"[{ticker}] Disqualified: no price data available")
-            disqualified.append({"ticker": ticker, "reason": "No price data available", "composite_score": 0})
+            disqualified.append({"ticker": ticker, "reason": "No price data available", "composite_score": 0,
+                                 "skip": "no_price_data"})
             continue
 
         # Earnings blackout — skip if earnings within the blackout window, cap
@@ -459,7 +462,8 @@ def run_scan(regime_packet: dict | None = None) -> dict:
             import db as _db
             if _BLACKOUT and _db.is_near_earnings(ticker, days=_BLACKOUT):
                 log.info(f"[{ticker}] Skipped — earnings within {_BLACKOUT} days")
-                disqualified.append({"ticker": ticker, "reason": f"Earnings within {_BLACKOUT} days (blackout)", "composite_score": 0})
+                disqualified.append({"ticker": ticker, "reason": f"Earnings within {_BLACKOUT} days (blackout)", "composite_score": 0,
+                                     "skip": "earnings_blackout"})
                 continue
         except Exception as e:
             log.warning(f"[{ticker}] Earnings blackout check failed, not applied: {e}")
@@ -541,6 +545,7 @@ def run_scan(regime_packet: dict | None = None) -> dict:
                 "reason": reason,
                 "composite_score": composite,
                 "priority": "PASS",     # other entries are skips (no price, blackout)
+                "skip": "below_floor",  # the funnel stage (agents/scan_funnel.py)
             })
         else:
             candidates.append(candidate)
@@ -588,6 +593,7 @@ def run_scan(regime_packet: dict | None = None) -> dict:
         "candidates":     candidates,
         "disqualified":   disqualified,
         "scan_notes":     scan_notes,
+        "watchlist_tiers": watchlist_tiers,
     }
 
 

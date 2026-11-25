@@ -233,6 +233,16 @@ class OrdersCallUnknown(Exception):
     call may or may not have happened."""
 
 
+class OrdersCallFailed(Exception):
+    """The broker call raised on the orders worker, which sent back what it
+    knew before the raise (manage_cancel_stop_orders_for with stuck_out).
+    error_type: the worker's exception class name."""
+
+    def __init__(self, error: str):
+        super().__init__(error)
+        self.error_type = str(error).split(":", 1)[0] or "Exception"
+
+
 _EXPIRED = {"_expired": True}
 
 
@@ -281,11 +291,25 @@ def _broker_place_stop_order(self, ticker: str, qty: float, stop_price: float,
 
 
 @app.task(name="tasks._broker_cancel_stop_orders_for", bind=True, max_retries=1)
-def _broker_cancel_stop_orders_for(self, ticker: str, deadline: float | None = None):
+def _broker_cancel_stop_orders_for(self, ticker: str, deadline: float | None = None,
+                                   detail: bool = False):
+    """detail: {"confirmed": count, "stuck": [orderId, status] for each stop
+    that did not cancel} instead of the count (manage_cancel_stop_orders_for's
+    stuck_out; JSON turns ibkr's tuples into lists). When the cancel raises,
+    {"confirmed": None, "stuck": what it filled before the raise, "error":
+    "<type>: <message>"}, so a stop that FILLED before the raise is not lost
+    in transit; the caller raises from it."""
     if not _mark_started(self) or _past(deadline):
         return _EXPIRED
     import ibkr
-    return ibkr.cancel_stop_orders_for(ticker)
+    if not detail:
+        return ibkr.cancel_stop_orders_for(ticker)
+    stuck: list = []
+    try:
+        confirmed = ibkr.cancel_stop_orders_for(ticker, stuck_out=stuck)
+    except Exception as e:
+        return {"confirmed": None, "stuck": stuck, "error": f"{type(e).__name__}: {e}"}
+    return {"confirmed": confirmed, "stuck": stuck}
 
 
 @app.task(name="tasks._broker_cancel_order", bind=True, max_retries=1)
@@ -421,13 +445,29 @@ def manage_stop_place(ticker: str, qty: float, stop_price: float, timeout: int =
     return result
 
 
-def manage_cancel_stop_orders_for(ticker: str, timeout: int = 30) -> int:
-    """Cancel all resting stop orders for a ticker — see manage_stop_place."""
+def manage_cancel_stop_orders_for(ticker: str, timeout: int = 30,
+                                  stuck_out: list | None = None) -> int:
+    """Cancel all resting stop orders for a ticker — see manage_stop_place.
+    stuck_out (optional list): filled with (orderId, status) for each stop
+    that did not cancel (ibkr.cancel_stop_orders_for); through the orders
+    worker each pair arrives as a list, and a worker from before the
+    statuses sends bare orderIds (execution._stuck_pairs reads all three).
+    A cancel that raised on the worker raises OrdersCallFailed here, after
+    stuck_out is filled (in the worker itself ibkr's own exception, also
+    after)."""
     stop_lock.assert_held(ticker)  # professor M69
     if _is_orders_worker():
         import ibkr
-        return ibkr.cancel_stop_orders_for(ticker)
-    return _orders_call(_broker_cancel_stop_orders_for, [ticker], timeout=timeout)
+        if stuck_out is None:
+            return ibkr.cancel_stop_orders_for(ticker)
+        return ibkr.cancel_stop_orders_for(ticker, stuck_out=stuck_out)
+    if stuck_out is None:
+        return _orders_call(_broker_cancel_stop_orders_for, [ticker], timeout=timeout)
+    out = _orders_call(_broker_cancel_stop_orders_for, [ticker], {"detail": True}, timeout=timeout)
+    stuck_out[:] = out.get("stuck") or []
+    if out.get("error"):
+        raise OrdersCallFailed(out["error"])   # after stuck_out, as ibkr does in process
+    return out["confirmed"]
 
 
 def manage_place_trailing_stop(ticker: str, qty: float, trail_amount: float | None = None,
@@ -3198,6 +3238,10 @@ def _queue_reprotect(ticker: str, order: dict, fill_price: float | None) -> None
         # A late BUY's count the cache must reach before the stop is sized,
         # for the first _BUY_EXPECT_MAX_TRIES queued tries.
         entry["expect_at_least"] = float(order["expect_at_least"])
+    if order.get("exit_source"):
+        # An EXIT/BACKSTOP that filled its whole count but was kept for a
+        # position check: its flat close keeps the sale's own label.
+        entry["exit_source"] = order["exit_source"]
 
     def add(pending):
         old = pending.get(ticker) or {}
@@ -3216,6 +3260,9 @@ def _queue_reprotect(ticker: str, order: dict, fill_price: float | None) -> None
                 # The flat close needs the exit's own order (professor m111).
                 pending[ticker]["exit_intent"] = entry["intent"]
                 pending[ticker]["exit_order_id"] = entry["order_id"]
+                pending[ticker].pop("exit_source", None)
+                if entry.get("exit_source"):
+                    pending[ticker]["exit_source"] = entry["exit_source"]
                 pending[ticker].pop("had_buy", None)   # the exit explains a flat read
             elif entry["intent"] == "BUY":
                 # New shares: an old exit's fill must never close what reads
@@ -3223,6 +3270,7 @@ def _queue_reprotect(ticker: str, order: dict, fill_price: float | None) -> None
                 # stop (M80) but gets the BUY's flat-read retry and alert.
                 pending[ticker].pop("exit_intent", None)
                 pending[ticker].pop("exit_order_id", None)
+                pending[ticker].pop("exit_source", None)
                 pending[ticker]["had_buy"] = True
                 if entry.get("own_stop"):
                     pending[ticker]["own_stop"] = entry["own_stop"]
@@ -3249,6 +3297,8 @@ def _queue_reprotect(ticker: str, order: dict, fill_price: float | None) -> None
                 elif old.get("exit_intent"):
                     pending[ticker].update(exit_intent=old["exit_intent"],
                                            exit_order_id=old.get("exit_order_id"))
+                if old.get("exit_source") and pending[ticker].get("exit_intent"):
+                    pending[ticker]["exit_source"] = old["exit_source"]
         return pending
     _reprotect_queue_edit(add)
 
@@ -3402,12 +3452,56 @@ _BUY_EXPECT_MAX_TRIES = 2  # queued tries a late BUY's expect_at_least is kept f
 _EXIT_WAIT_MAX = 48       # 5-min reconcile runs a queued flat EXIT waits on its remainder (~4 h)
 
 
-def _close_queued_flat_exit(ticker: str, rec: dict) -> bool:
+def _hold_or_send(held_alerts: list | None, text: str) -> None:
+    """Add an alert text to the caller's held list, sent after its pass and
+    outside the ticker lock (_retry_pending_reprotects); with no list, send
+    it now. Never raises."""
+    if held_alerts is not None:
+        held_alerts.append(text)
+        return
+    try:
+        import alerts
+        alerts._send(text)
+    except Exception as e:
+        log.warning(f"alert send failed: {e}")
+
+
+def _queued_exit_not_flat(ticker: str, rec: dict, left: float, held_alerts: list | None) -> None:
+    """The portfolio cache reads flat after a filled EXIT/BACKSTOP, but this
+    process's pushed position read (ib.positions()) shows shares or a short:
+    a throttled alert, handed to the caller's held_alerts, and a manual
+    action (clear_on_flat=False: a flat read is what is in doubt), so the
+    wait is not silent. Nothing is placed: which read is right is for Luke
+    to check in TWS. Never raises."""
+    intent = rec.get("intent") or "sell"
+    short = left < 0
+    what = (f"the pushed position read shows a SHORT of {-left:g} shares" if short
+            else f"the pushed position read shows {left:g} shares")
+    log.warning(f"[{ticker}] reconcile: queued flat {intent} order filled and the portfolio cache "
+                f"reads flat, but {what}; record and outcome kept, waiting")
+    try:
+        if not _reconcile_alert_due(f"queued_exit_not_flat_{ticker}"):
+            return
+        _hold_or_send(held_alerts,
+                      f"{'🚨' if short else '⚠️'} POSITION READS DISAGREE — <b>{ticker}</b>\nThe "
+                      f"{intent} sale filled. The portfolio cache reads flat, but {what}. The stop "
+                      f"record and the outcome are kept and nothing is placed automatically. "
+                      + ("Check TWS now: no SELL stop goes on a short." if short else
+                         "Check TWS: if it shows the shares, place a stop for them; if it shows "
+                         "flat, nothing is needed."))
+        open_manual_action(ticker, f"check the position after the {intent}: the portfolio cache "
+                                   f"reads flat but {what}", clear_on_flat=False)
+    except Exception as e:
+        log.warning(f"[{ticker}] queued flat exit alert failed: {e}")
+
+
+def _close_queued_flat_exit(ticker: str, rec: dict, held_alerts: list | None = None) -> bool:
     """A queued re-protect of a part-filled EXIT/BACKSTOP found the position
     flat. The stale-stop branch can't close it: the sale may have deleted the
     stop record, and when it hasn't (a part-filled backstop keeps it), that
     branch leaves this order's own fills out and would read no_fill (professor
-    M124; review of f464bd7). Returns True to keep waiting.
+    M124; review of f464bd7). Returns True to keep waiting. Its alerts go to
+    held_alerts (the retry pass's), sent after the pass, outside the lock.
     - Order row filled: close at its cumulative average fill, then drop any
       stop record.
     - Remainder still working at the broker, or a lookup failed: wait.
@@ -3427,6 +3521,19 @@ def _close_queued_flat_exit(ticker: str, rec: dict) -> bool:
     if not row:
         return False
     if row["status"] == "filled" and row.get("fill_price"):
+        # The cache read flat, and it lags a fill by minutes: confirm with the
+        # pushed position read before the record goes, or shares an ADD bought
+        # inside the lag lose it (audit 2026-11-22 08:56 #3). Shares or a
+        # failed read: wait (alerted once the reads disagree); nothing placed.
+        from execution import _pushed_shares_held
+        left = _pushed_shares_held(ticker)
+        if left is None:
+            log.warning(f"[{ticker}] reconcile: queued flat {rec.get('intent')} order filled, but "
+                        f"the position read failed; waiting")
+            return True
+        if abs(left) > 1e-6:
+            _queued_exit_not_flat(ticker, rec, left, held_alerts)
+            return True
         # Only this exit's own position: a record or an open outcome newer than
         # the order belongs to a position opened since, and closing it here
         # would book the old exit's price (review of 6f48241).
@@ -3446,8 +3553,11 @@ def _close_queued_flat_exit(ticker: str, rec: dict) -> bool:
                         f"exists; its flat close is left to the stale-stop branch")
             return False
         try:
+            # A sale that filled its whole count but was kept for a position
+            # check carries its own label (model_exit, backstop_sell).
             db.close_trade_outcome(ticker, exit_price=row["fill_price"],
-                                   exit_source=f"late_{(rec.get('intent') or 'sell').lower()}",
+                                   exit_source=(rec.get("exit_source")
+                                                or f"late_{(rec.get('intent') or 'sell').lower()}"),
                                    exit_price_source="fill", exit_fill_at=row.get("filled_at"),
                                    exit_fill_at_source=row.get("filled_at_source"))
             db.delete_position_stop(ticker)
@@ -3467,11 +3577,11 @@ def _close_queued_flat_exit(ticker: str, rec: dict) -> bool:
             # (review of 11e2f26). Luke decides; one throttled alert.
             try:
                 if _reconcile_alert_due(f"flat_exit_working_{ticker}"):
-                    import alerts
-                    alerts._send(f"🚨 SELL STILL WORKING ON A FLAT POSITION — <b>{ticker}</b>\nThe "
-                                 f"broker shows no shares, but the rest of our {rec.get('intent')} order "
-                                 f"is still working. If it fills it opens a SHORT. Check TWS and cancel "
-                                 f"it if the shares are gone.")
+                    _hold_or_send(held_alerts,
+                                  f"🚨 SELL STILL WORKING ON A FLAT POSITION — <b>{ticker}</b>\nThe "
+                                  f"broker shows no shares, but the rest of our {rec.get('intent')} order "
+                                  f"is still working. If it fills it opens a SHORT. Check TWS and cancel "
+                                  f"it if the shares are gone.")
             except Exception as e:
                 log.warning(f"[{ticker}] reconcile: flat-with-working-sell alert failed: {e}")
             return True
@@ -3621,6 +3731,7 @@ def _retry_pending_reprotects() -> None:
                               if int(rec.get("tries", 0)) < _BUY_EXPECT_MAX_TRIES
                               and _late_fill_mode() == "enforce" else None)
                     result = fn(ticker, rec, rec.get("fill_price"), from_queue=True,
+                                pass_alerts=held_alerts,
                                 **({"expect_at_least": expect} if expect else {}))
             except stop_lock.TickerBusy:
                 log.info(f"[{ticker}] reconcile: queued re-protect skipped, ticker busy; not counted")
@@ -4050,7 +4161,8 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
                                expect_at_least: float | None = None,
                                exit_avg: float | None = None,
                                exit_fill_at=None,
-                               exit_fill_at_source: str | None = None) -> bool | None | str:
+                               exit_fill_at_source: str | None = None,
+                               pass_alerts: list | None = None) -> bool | None | str:
     """After a late SELL fill, finish what the selling path would have done
     (professor M-3, 2026-10-28):
     - nothing left: delete the stop record and close the outcome at the fill
@@ -4111,9 +4223,11 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
         # stale-stop branch, which logs the real exit (A2253-2). A part-filled
         # EXIT/BACKSTOP deleted that record, so close from its order (M124).
         exit_rec = (order if (order.get("intent") or "").upper() in ("EXIT", "BACKSTOP") else
-                    {"intent": order["exit_intent"], "order_id": order.get("exit_order_id")}
+                    {"intent": order["exit_intent"], "order_id": order.get("exit_order_id"),
+                     "exit_source": order.get("exit_source")}
                     if order.get("exit_intent") else None)
-        if exit_rec and _close_queued_flat_exit(ticker, exit_rec):
+        # pass_alerts: the retry pass's held alerts, sent after it, outside the lock.
+        if exit_rec and _close_queued_flat_exit(ticker, exit_rec, held_alerts=pass_alerts):
             return "wait"
         return None
     if remaining <= 0:
@@ -5983,6 +6097,7 @@ def run_daily_scan(self):
         scan_result = run_scan(regime)
         candidates  = scan_result.get("candidates", [])
         high_medium = [c for c in candidates if c["priority"] in ("HIGH", "MEDIUM")]
+        max_per_run = 5
 
         log.info(f"Daily scan: {len(high_medium)} candidates to analyze")
         try:
@@ -5991,9 +6106,18 @@ def run_daily_scan(self):
             log.debug(f"scan summary failed: {e}")
         if high_medium:
             analyze_candidates.apply_async(
-                args=[high_medium], kwargs={"max_per_run": 5},
+                args=[high_medium], kwargs={"max_per_run": max_per_run},
                 queue=LLM_QUEUE_BULK, expires=LLM_EVENT_EXPIRES_SECONDS,
             )
+        try:
+            # Record only, after the enqueue: one row per pass, counts by
+            # watchlist tier (agents/scan_funnel.py). Never raises.
+            from agents.scan_funnel import record as _record_scan_funnel
+            _record_scan_funnel(scan_result, high_medium, regime, max_per_run,
+                                enqueued=bool(high_medium), task_id=self.request.id,
+                                attempt=self.request.retries)
+        except Exception as e:
+            log.warning(f"scan tier funnel row failed: {e}")
     except Exception as e:
         log.error(f"run_daily_scan failed: {e}")
         raise self.retry(exc=e, countdown=300)
@@ -6357,6 +6481,21 @@ def _send_alert_texts(texts: list) -> None:
             log.warning(f"held alert failed: {e}")
 
 
+def _position_left_after_sale(ticker: str, pre: float | None) -> str | None:
+    """None when the pushed position read after a sale that reads as complete
+    (execution._pushed_left_after_sale: this process's ib.positions(), no
+    reqPositions, read again once if it still shows the pre-sale count pre)
+    shows ticker flat; otherwise why it may not be flat, for the log and
+    alert: the read failed, or it shows shares or a short. Never raises."""
+    from execution import _left_text, _pushed_left_after_sale
+    left = _pushed_left_after_sale(ticker, pre)
+    if left is None:
+        return "the position read after the sale failed"
+    if abs(left) > 1e-6:
+        return _left_text(left)
+    return None
+
+
 @locked_by_ticker(lambda ticker, *a, **k: ticker, on_busy=False)
 def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) -> bool | None:
     """Market-sell the full position when its stop level is breached and no
@@ -6474,6 +6613,11 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
                                                 "(or its guard could not be checked)")
                 return False
 
+        # The pushed count before the sale (no request; before the cancel):
+        # the read after the fill is compared with it, so a position message
+        # that lands late gets one more settle instead of a false alert.
+        from execution import _pushed_shares_held
+        pre_pushed = _pushed_shares_held(ticker)
         stops_cancelled = True  # set before the call: a raise inside it may follow a cancel
         manage_cancel_stop_orders_for(ticker)  # belt-and-braces before selling
         # A stop that wouldn't cancel still protects its shares, and selling
@@ -6553,6 +6697,33 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
                 # subtraction stops a second sale (professor, M128 class).
                 log.warning(f"[{ticker}] Backstop sell part-filled ({filled:g} of {owned:g}); "
                             f"outcome and stop record kept")
+            elif (left := _position_left_after_sale(
+                    ticker, pre_pushed if pre_pushed is not None else qty)) is not None:
+                # The sale's count came from the cache, which lags a fill by
+                # minutes: an ADD just filled is missing from it (audit
+                # 2026-11-22 08:56 #3). Shares left, or a failed read: record
+                # and outcome kept, and the sale queued like a part-filled
+                # EXIT, so the queued re-protect puts the recorded stop on
+                # what is held, or, when flat, closes the outcome from this
+                # order's fill as a backstop sale (_close_queued_flat_exit).
+                log.error(f"[{ticker}] Backstop sell filled {filled:g} of {owned:g}, but {left}; "
+                          f"outcome and stop record kept")
+                queued = False
+                try:
+                    _queue_reprotect(ticker, {"intent": "BACKSTOP",
+                                              "id": local_id if isinstance(local_id, int) and local_id > 0
+                                              else None,
+                                              "exit_source": "backstop_sell"}, fill_price)
+                    queued = True
+                except Exception as e:
+                    log.error(f"[{ticker}] Could not queue the re-protect after the backstop sale: {e}")
+                held_alerts.append(f"⚠️ BACKSTOP MAY HAVE LEFT SHARES — <b>{ticker}</b>\nSold "
+                                   f"{filled:g}, but {left}. The stop record is kept; "
+                                   + ("the shares held get the recorded stop on the next reconcile "
+                                      "cycle, or the exit closes from this sale's fill once flat."
+                                      if queued else
+                                      "the re-protect could NOT be queued. Check TWS and protect "
+                                      "the shares."))
             else:
                 db.delete_position_stop(ticker)
                 try:
@@ -8302,6 +8473,12 @@ def refresh_price_history(self):
         except Exception as e:
             log.warning(f"pending entries hook failed: {e}")
         try:
+            # Record only: gate-blocked buys' reclaim and forward moves, on the same bars.
+            from agents.crew import _check_entry_gate_reclaims
+            _check_entry_gate_reclaims()
+        except Exception as e:
+            log.warning(f"entry gate reclaim hook failed: {e}")
+        try:
             _log_plan_cross_section()   # log-only snapshot; never fails this task
         except Exception as e:
             log.warning(f"plan cross-section hook failed: {e}")
@@ -9748,7 +9925,7 @@ def _fix_refused_over_position(ticker: str, mine: list, refused, held: float,
                   on_busy=lambda: "over-stop fix skipped: ticker busy (next cycle)")
 def _fix_overstop(ticker: str, fresh_qty: float | None = None, allow_cancel: bool = True,
                   max_qty: float | None = None, recheck_try: int = 1,
-                  no_cancel_reason: str | None = None) -> str:
+                  no_cancel_reason: str | None = None, outcome_out: dict | None = None) -> str:
     """Re-read under the lock and make resting SELL stops cover exactly the
     position at the recorded stop. Over-covered: cancel, re-read what is
     still resting (a cross-client stop may refuse to cancel, A2253-6) and
@@ -9779,7 +9956,12 @@ def _fix_overstop(ticker: str, fresh_qty: float | None = None, allow_cancel: boo
     later fix doesn't cancel them again: it cancels only the other stops, by
     id, and sizes ours to the shares the refused stops leave (none, with a
     🚨, when they cover the position alone), so coverage settles instead of
-    every fix cancelling our stop and re-sending the doomed cancel."""
+    every fix cancelling our stop and re-sending the doomed cancel.
+
+    outcome_out (optional dict): "disagree_over_cover" is set to the line
+    (no emoji) when stops exceed the position but nothing was cancelled
+    because the position reads disagree, for recheck_stop_coverage to look
+    again. The returned text is the same either way."""
     import db
     import execution
     import ibkr
@@ -9808,9 +9990,11 @@ def _fix_overstop(ticker: str, fresh_qty: float | None = None, allow_cancel: boo
         return f"🚨 {ticker}: broker shows a SHORT of {signed:g}; no stop placed — check TWS now"
     if capped and resting >= held - 1e-6:
         how = "exceed" if resting > held + 1e-6 else "already match"
-        return (f"🚨 {ticker}: resting stops for {resting:g} shares {how} the smaller position "
-                f"read ({held:g}) while the reads disagree; nothing added or cancelled — "
-                f"check the position and its stops in TWS")
+        body = (f"{ticker}: resting stops for {resting:g} shares {how} the smaller position "
+                f"read ({held:g}) while the reads disagree; nothing added or cancelled")
+        if outcome_out is not None and resting > held + 1e-6:
+            outcome_out["disagree_over_cover"] = body
+        return f"🚨 {body} — check the position and its stops in TWS"
     if abs(resting - held) <= 1e-6:
         return f"{ticker}: stop coverage fine on re-check ({resting:g} vs {held:g})"
     stop_price = (db.get_position_stop(ticker) or {}).get("stop_price")
@@ -9834,8 +10018,10 @@ def _fix_overstop(ticker: str, fresh_qty: float | None = None, allow_cancel: boo
         return (f"{ticker}: {label}; {no_cancel_reason}, so nothing cancelled — "
                 f"reconcile checks it")
     if (from_fresh or not allow_cancel or max_qty is not None) and resting > held:
-        return (f"🚨 {ticker}: {label} while the position reads disagree; "
-                f"nothing cancelled — check the stops in TWS")
+        body = f"{ticker}: {label} while the position reads disagree; nothing cancelled"
+        if outcome_out is not None:
+            outcome_out["disagree_over_cover"] = body
+        return f"🚨 {body} — check the stops in TWS"
     try:
         if resting > held:
             import risk_manager
@@ -10037,7 +10223,15 @@ def recheck_stop_coverage(ticker: str, attempt: int = 1):
                 # minute: look again (the chain stays capped).
                 _queue_stop_coverage_recheck(ticker, attempt + 1)
                 return
-            msg = _fix_overstop_safe(ticker, recheck_try=attempt + 1, **reads)
+            fix_out: dict = {}
+            msg = _fix_overstop_safe(ticker, recheck_try=attempt + 1, outcome_out=fix_out, **reads)
+            over = fix_out.get("disagree_over_cover")
+            if over and _queue_stop_coverage_recheck(ticker, attempt + 1):
+                # The cache can still show an ADD's pre-fill count after a
+                # minute: look again while the chain lasts (capped), not
+                # leave the over-stop to a reconcile with agreeing reads.
+                # The last try keeps the 🚨.
+                msg = f"⚠️ {over} yet; re-checking in 60 s"
     except stop_lock.TickerBusy:
         if _queue_stop_coverage_recheck(ticker, attempt + 1):
             log.info(f"[{ticker}] stop coverage re-check: ticker busy; again in 60 s")
@@ -10049,6 +10243,112 @@ def recheck_stop_coverage(ticker: str, attempt: int = 1):
             alerts._send(f"STOP RECONCILE — {msg}")
         except Exception:
             pass
+
+
+# The completed-orders read behind an orphan cancel's line: one per reconcile
+# run, shared by its orphans, and short so sections 2-3 (the naked-position
+# stops) aren't held up. A timeout still drops the session (_bounded_req: the
+# read shares a fixed request key with open orders and positions).
+_ORPHAN_STATUS_READ_TIMEOUT_S = 5.0
+
+
+def _orphan_broker_state(o: dict, cache: dict | None) -> tuple[str | None, float | None]:
+    """(status, filled_qty) of an orphaned stop after its cancel, from today's
+    completed orders (by permId): the completed row's status and filled
+    quantity, ("Working", None) when it is not among them, (None, None) when
+    it can't be told (no permId, a failed or timed-out read). The cancel ran
+    on the orders worker, so its poll status is not in this process. cache
+    holds the run's one read ("rows"; None after a failure); None reads
+    without sharing."""
+    perm = o.get("perm_id")
+    if not perm:
+        return None, None
+    cache = {} if cache is None else cache
+    if "rows" not in cache:
+        try:
+            import ibkr
+            cache["rows"] = ibkr.get_completed_orders(timeout=_ORPHAN_STATUS_READ_TIMEOUT_S)
+        except Exception as e:
+            cache["rows"] = None
+            log.warning(f"[{o.get('ticker')}] orphan stop {o.get('order_id')}: completed-orders "
+                        f"read failed ({type(e).__name__}); status unknown this run")
+    if cache["rows"] is None:
+        return None, None
+    for c in cache["rows"]:
+        if c.get("perm_id") == int(perm):
+            return c.get("status") or None, c.get("filled_qty")
+    return "Working", None
+
+
+def _orphan_filled_line(o: dict, status: str | None, filled) -> str | None:
+    """The line for an orphaned stop that sold shares (Filled, or part filled
+    before its cancel): with no position held, a short. None if it didn't."""
+    what = f"SELL {o['qty']} {o['ticker']} orderId={o['order_id']}"
+    try:
+        part = float(filled or 0) > 0
+    except (TypeError, ValueError):
+        part = False
+    if status == "Filled":
+        return (f"🚨 Orphaned stop FILLED while being cancelled: {what} (status Filled) — "
+                f"shares were sold with no position held; check TWS for a short")
+    if part:
+        return (f"🚨 Orphaned stop part-FILLED ({float(filled):g} filled, status {status}): "
+                f"{what} — shares were sold with no position held; check TWS for a short")
+    return None
+
+
+def _orphan_cancel_fail_line(o: dict, status: str | None, filled=None) -> str:
+    """The action line for an orphaned stop whose cancel was not confirmed,
+    by the broker's status. A fill on a flat account is a short."""
+    sold = _orphan_filled_line(o, status, filled)
+    if sold:
+        return sold
+    what = f"SELL {o['qty']} {o['ticker']} orderId={o['order_id']}"
+    if status in ("Cancelled", "ApiCancelled"):
+        return (f"Orphaned stop cancel not confirmed in time: {what} now reads {status} at "
+                f"the broker; the next cycle checks it is gone")
+    if status == "Inactive":
+        return (f"Could NOT cancel orphaned stop: {what} is Inactive at the broker (status "
+                f"Inactive, not a confirmed cancel) — verify in TWS")
+    return (f"Could NOT cancel orphaned stop: {what} (status {status or 'unknown'}) — likely "
+            f"owned by a different clientId or the cancel was rejected, needs manual cancel "
+            f"in TWS")
+
+
+def _cancel_orphan_stop(o: dict, pending_key: str, all_actions: list, new_actions: list,
+                        completed: dict | None = None) -> None:
+    """reconcile_stop_orders section 1: cancel an orphaned stop confirmed on
+    two cycles. A cancel the broker doesn't confirm keeps pending_key, so the
+    next cycle retries; its line names the broker's status and alerts at
+    most once per orderId per throttle window (cancel_fail_<orderId>). Either
+    way a stop that sold shares (filled, or part filled before the cancel)
+    gets the check-for-a-short line. completed: the run's shared
+    completed-orders read (_orphan_broker_state)."""
+    import db
+    if manage_cancel_order(o["order_id"], symbol=o["ticker"], perm_id=o.get("perm_id")):
+        status, filled = _orphan_broker_state(o, completed)
+        msg = _orphan_filled_line(o, status, filled) or (
+               f"Cancelled ORPHANED stop: SELL {o['qty']} {o['ticker']} "
+               f"@ ${o['stop_price'] or 0:.2f} (no position held on 2 consecutive "
+               f"checks — would have shorted)")
+        all_actions.append(msg)
+        db.set_state(pending_key, "")
+        # Found 2026-07-27: this was deliberately left unthrottled
+        # on the assumption a successful cancel can't recur for
+        # the same order -- SNDK proved that wrong (a cross-
+        # clientId order whose status transiently reads
+        # "cancelled" in cancel_order's own check without the
+        # cancel actually sticking at the broker), firing the
+        # identical message ~33x in one trading day. Same
+        # order_id-keyed throttle as the other two branches below.
+        if _reconcile_alert_due(f"orphan_cancelled_{o['order_id']}"):
+            new_actions.append(msg)
+    else:
+        status, filled = _orphan_broker_state(o, completed)
+        msg = _orphan_cancel_fail_line(o, status, filled)
+        all_actions.append(msg)
+        if _reconcile_alert_due(f"cancel_fail_{o['order_id']}"):
+            new_actions.append(msg)
 
 
 def _reconcile_alert_due(issue_key: str) -> bool:
@@ -11318,6 +11618,7 @@ def _reconcile_stop_orders_body(self):
         # 1. Orphaned broker stops — stop order with no position on TWO
         # consecutive cycles → cancel. A single missing-this-cycle reading
         # just arms the marker and waits.
+        orphan_completed: dict = {}   # one completed-orders read per run (_orphan_broker_state)
         for o in stops:
             if o["ticker"] not in held and flat_confirmed and o["ticker"] not in skip_flat:
                 pending_key = f"orphan_pending_{o['ticker']}"
@@ -11328,29 +11629,8 @@ def _reconcile_stop_orders_body(self):
                     continue
                 if o["ticker"] in wait_flat:
                     continue   # empty reads not yet confirmed over 3 cycles
-                if manage_cancel_order(o["order_id"], symbol=o["ticker"], perm_id=o.get("perm_id")):
-                    msg = (f"Cancelled ORPHANED stop: SELL {o['qty']} {o['ticker']} "
-                           f"@ ${o['stop_price'] or 0:.2f} (no position held on 2 consecutive "
-                           f"checks — would have shorted)")
-                    all_actions.append(msg)
-                    db.set_state(pending_key, "")
-                    # Found 2026-07-27: this was deliberately left unthrottled
-                    # on the assumption a successful cancel can't recur for
-                    # the same order -- SNDK proved that wrong (a cross-
-                    # clientId order whose status transiently reads
-                    # "cancelled" in cancel_order's own check without the
-                    # cancel actually sticking at the broker), firing the
-                    # identical message ~33x in one trading day. Same
-                    # order_id-keyed throttle as the other two branches below.
-                    if _reconcile_alert_due(f"orphan_cancelled_{o['order_id']}"):
-                        new_actions.append(msg)
-                else:
-                    msg = (f"Could NOT cancel orphaned stop: SELL {o['qty']} {o['ticker']} "
-                           f"orderId={o['order_id']} — likely owned by a different clientId, "
-                           f"needs manual cancel in TWS")
-                    all_actions.append(msg)
-                    if _reconcile_alert_due(f"cancel_fail_{o['order_id']}"):
-                        new_actions.append(msg)
+                _cancel_orphan_stop(o, pending_key, all_actions, new_actions,
+                                    completed=orphan_completed)
 
         # 2. Stale DB stop records with no position → reconcile the exit
         # against today's broker execution history, THEN delete. Requires
@@ -11410,6 +11690,14 @@ def _reconcile_stop_orders_body(self):
             pending_sell_tickers |= db.awaiting_fill_sell_tickers()
             # A filled SELL whose trade row reconcile hasn't booked yet.
             pending_sell_tickers |= db.trade_pending_sell_tickers()
+            # A queued EXIT/BACKSTOP re-protect owns its flat close: it closes
+            # from the sale's own order row (_close_queued_flat_exit), which
+            # this path leaves out as a recorded sell, so closing here would
+            # orphan the outcome as no_fill (audit 2026-11-22 08:56 #3).
+            pending_sell_tickers |= {
+                t for t, e in json.loads(db.get_state(_REPROTECT_STATE_KEY) or "{}").items()
+                if (e.get("intent") or "").upper() in ("EXIT", "BACKSTOP") or e.get("exit_intent")
+            }
         except Exception as e:
             # Unknown is not "none pending": skip stale records this cycle (M126).
             log.warning(f"reconcile_stop_orders: unconfirmed-SELL check failed; stale records wait a cycle: {e}")

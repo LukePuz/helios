@@ -216,6 +216,16 @@ def _no_entry_quality_row(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_reclaim_book_io(monkeypatch):
+    """An entry gate block stores a record-only reclaim shadow record
+    (agents/crew.py:_entry_gate_reclaim_record) in system_state under a Redis
+    lock. Stubbed as "not stored" (no Redis or DB) unless a test restores it;
+    tests/test_entry_gate_reclaim_shadow.py does."""
+    from agents import crew
+    monkeypatch.setattr(crew, "_reclaim_book_edit", lambda fn, wait_s=None: False)
+
+
+@pytest.fixture(autouse=True)
 def _no_vol_shadow_read(monkeypatch):
     """size_position's record-only volatility shadows read cached bars from
     price_history. Stubbed as "no cached bars" (no DB read) unless a test
@@ -260,6 +270,15 @@ def _no_news_timeline(monkeypatch):
     tests queue nothing; tests/test_news_timeline.py turns it on."""
     import config
     _switch_off(monkeypatch, config, "NEWS_TIMELINE_RECORD_ENABLED", False)
+
+
+@pytest.fixture(autouse=True)
+def _no_scan_tier_funnel(monkeypatch):
+    """Each daily scan writes a record-only tier funnel row after its
+    enqueue (agents/scan_funnel.py). Off here so existing scan tests write
+    nothing; tests/test_scan_tier_funnel.py turns it on."""
+    import config
+    _switch_off(monkeypatch, config, "SCAN_TIER_FUNNEL_RECORD_ENABLED", False)
 
 
 @pytest.fixture(autouse=True)
@@ -362,7 +381,7 @@ def _no_held_exit_reads(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _explicit_switches(request, monkeypatch, _no_entry_quality_row, _no_recheck_contradiction_read,
-                       _no_same_day_consensus_read, _no_news_timeline,
+                       _no_same_day_consensus_read, _no_news_timeline, _no_scan_tier_funnel,
                        _entry_gates_off, _no_add_lot_r_read, _no_add_stop_qty_from_broker,
                        _no_more_stop_qty_from_broker, _no_story_dedup_read,
                        _no_plan_compiled_hit_row, _no_late_fill_held_before, _no_held_exit_reads):

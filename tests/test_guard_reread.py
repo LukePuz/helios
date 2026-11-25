@@ -266,7 +266,7 @@ def _add_and_place(reread=None, reread_effect=None, guard_off=False, real_reread
          patch("market_data.is_market_hours", return_value=True), \
          patch("tasks._reconcile_alert_due", return_value=True), \
          patch("db.log_activity_queued"), patch("alerts._send"), \
-         patch("tasks.manage_cancel_stop_orders_for", side_effect=lambda t: seq.cancel(t)):
+         patch("tasks.manage_cancel_stop_orders_for", side_effect=lambda t, **k: seq.cancel(t)):
         stop, whole = execution._whole_position_stop("NVDA", L199, 1, status={},
                                                      market_price=FILL, action="ADD",
                                                      held_before=1, price_is_fill=True)

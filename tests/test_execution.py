@@ -223,6 +223,138 @@ class TestSellClampAndDrift:
         mock_order.assert_not_called()
 
 
+class TestPostSellPositionRead:
+    """Audit 2026-11-22 08:56 #3: an EXIT was sized from the portfolio cache,
+    which lags a fill by minutes. After an ADD inside the lag it sold only the
+    old shares, deleted the stop record and closed the outcome: the added
+    shares had no stop and no record. The pushed ib.positions() read
+    (ibkr.get_broker_stock_qty, never reqPositions) now sizes the EXIT at the
+    larger count, and a full fill deletes the record only when that read,
+    after the settle wait, shows the position flat."""
+
+    def _run(self, pushed, cache=42.0, action="EXIT", filled=None):
+        """pushed: the position reads in call order (a qty, or an exception)."""
+        approval = _approval(action=action, shares_initial=10 if action == "TRIM" else 999)
+        client = MagicMock()
+        client.get_open_position.return_value = MagicMock(qty=cache)
+        sold, events = {}, []
+
+        def place(ticker, side, qty, *a, **k):
+            sold["qty"] = qty
+            events.append("sell")
+            return {"order_id": 1, "fill_price": 100.0,
+                    "filled_qty": qty if filled is None else filled}
+
+        reads = list(pushed)
+
+        def read(ticker, settle=False):
+            events.append(("read", ticker, settle))
+            r = reads.pop(0)
+            if isinstance(r, BaseException):
+                raise r
+            return r
+
+        ib = MagicMock()
+        # Only the waits after the sale: the sell path's own ib.sleep calls
+        # (around the stop cancel) come before it.
+        ib.sleep.side_effect = lambda s: events.append(("sleep", s)) if "sell" in events else None
+        with patch("ibkr.get_ib", return_value=ib), \
+             patch("ibkr.get_client", return_value=client), \
+             patch("ibkr.get_broker_stock_qty", side_effect=read), \
+             patch("ibkr.get_fresh_stock_positions") as req_positions, \
+             patch("ibkr.cancel_stop_orders_for", return_value=0), \
+             patch("ibkr.place_market_order", side_effect=place), \
+             patch("ibkr.get_latest_price", return_value=100.0), \
+             patch("market_data.get_priced_quote", return_value=None), \
+             patch("config.USE_BRACKET_ORDERS", False), \
+             patch("db.log_trade"), patch("db.log_order", return_value=7), \
+             patch("db.update_order_fill"), patch("db.delete_position_stop") as delete, \
+             patch("db.close_trade_outcome") as close, patch("db.log_trade_outcome"), \
+             patch("tasks._queue_reprotect") as queue, patch("alerts._send") as alert, \
+             patch("alerts.send_trade_alert"):
+            execution.execute_approved(approval)
+        req_positions.assert_not_called()   # no reqPositions on these paths
+        return sold.get("qty"), events, delete, close, queue, alert
+
+    def test_clean_exit_unchanged(self):
+        qty, events, delete, close, queue, alert = self._run([42.0, 0.0])
+        assert qty == 42.0
+        delete.assert_called_once_with("NVDA"); close.assert_called_once()
+        assert close.call_args.kwargs["exit_source"] == "model_exit"
+        queue.assert_not_called(); alert.assert_not_called()
+        # Sizing read before the sale; after it, the settle wait, then the read.
+        assert [e for e in events if e != "sell" and e[0] == "read"] == [("read", "NVDA", True)] * 2
+        i = events.index("sell")
+        assert events[i + 1:] == [("sleep", execution.POST_SELL_SETTLE_S), ("read", "NVDA", True)]
+
+    def test_stale_low_cache_sells_the_pushed_count(self):
+        qty, _, delete, close, queue, _ = self._run([50.0, 0.0])
+        assert qty == 50.0
+        delete.assert_called_once_with("NVDA"); queue.assert_not_called()
+
+    def test_a_lower_pushed_read_does_not_shrink_the_exit(self):
+        qty, *_ = self._run([30.0, 0.0])
+        assert qty == 42.0
+
+    def test_failed_sizing_read_uses_the_cache(self):
+        qty, _, delete, *_ = self._run([RuntimeError("not connected"), 0.0])
+        assert qty == 42.0
+        delete.assert_called_once_with("NVDA")
+
+    def test_shares_left_after_a_full_fill_keep_the_record_and_protect_them(self):
+        # The ADD fills after the sizing read: the read after the sale shows
+        # its shares still held.
+        qty, _, delete, close, queue, alert = self._run([42.0, 8.0])
+        assert qty == 42.0
+        delete.assert_not_called(); close.assert_not_called()
+        queue.assert_called_once()
+        assert queue.call_args.args[:2] == (
+            "NVDA", {"intent": "EXIT", "id": 7, "exit_source": "model_exit"})
+        text = alert.call_args[0][0]
+        assert "MAY HAVE LEFT SHARES" in text and "8 shares still held" in text
+
+    def test_a_failed_read_after_the_sale_keeps_the_record(self):
+        qty, _, delete, close, queue, alert = self._run([42.0, RuntimeError("not connected")])
+        delete.assert_not_called(); close.assert_not_called()
+        queue.assert_called_once()
+        assert queue.call_args.args[1]["exit_source"] == "model_exit"
+        assert "read after the sale failed" in alert.call_args[0][0]
+
+    def test_a_late_position_message_gets_one_more_settle(self):
+        """Review of 578ada2 (SF-2): the first read after the fill still
+        shows the pre-sale count; one more settle and read before deciding."""
+        qty, events, delete, close, queue, alert = self._run([42.0, 42.0, 0.0])
+        delete.assert_called_once_with("NVDA"); queue.assert_not_called(); alert.assert_not_called()
+        i = events.index("sell")
+        assert events[i + 1:] == [("sleep", execution.POST_SELL_SETTLE_S), ("read", "NVDA", True),
+                                  ("sleep", execution.POST_SELL_RESETTLE_S), ("read", "NVDA", True)]
+        qty, events, delete, close, queue, alert = self._run([42.0, 42.0, 42.0])
+        delete.assert_not_called(); queue.assert_called_once()
+        assert "42 shares still held" in alert.call_args[0][0]
+
+    def test_no_second_settle_when_the_first_read_moved(self):
+        qty, events, *_ = self._run([50.0, 8.0])
+        assert events.count(("read", "NVDA", True)) == 2   # sizing + one after the sale
+
+    def test_a_short_after_the_sale_is_worded_as_a_short(self):
+        qty, _, delete, close, queue, alert = self._run([42.0, -3.0])
+        delete.assert_not_called()
+        text = alert.call_args[0][0]
+        assert "SHORT of 3 shares" in text and "still held" not in text
+
+    def test_part_filled_exit_reads_nothing_after_the_sale(self):
+        qty, events, delete, close, queue, alert = self._run([42.0], filled=20.0)
+        assert events == [("read", "NVDA", True), "sell"]   # sizing only, no settle wait
+        delete.assert_not_called(); queue.assert_called_once()
+        assert queue.call_args.args[1] == {"intent": "EXIT", "id": 7}   # no label: unchanged
+        assert "PART-FILLED" in alert.call_args[0][0]
+
+    def test_trim_sizing_reads_no_pushed_position(self):
+        qty, events, *_ = self._run([], action="TRIM")
+        assert qty == 10.0
+        assert events == ["sell"]
+
+
 class TestHaltCheckFailsClosed:
     def test_a_failed_halt_check_blocks_the_buy(self):
         """Audit A1031-1053-2: an unchecked halt must not let a buy through."""
@@ -1060,14 +1192,14 @@ class TestAddStopsWholePosition:
                                             action="ADD")
         assert stop == 163.68                 # never below the old stop
         assert add == (174.98, 2.0)           # the fresh read's quantity and cost
-        cancel.assert_called_once_with("NVDA")
+        cancel.assert_called_once_with("NVDA", stuck_out=[])
         act.assert_not_called()               # not a stale record
 
     def test_cache_without_the_ticker_on_an_add_uses_the_fresh_read(self):
         (stop, add), cancel = self._run({"stop_price": 98.0}, filled=5, fresh=(15.0, 104.0),
                                         action="ADD", cache_error=Exception("No open position in NVDA"))
         assert (stop, add) == (98.0, (104.0, 15.0))
-        cancel.assert_called_once_with("NVDA")
+        cancel.assert_called_once_with("NVDA", stuck_out=[])
 
     def test_cache_without_the_ticker_on_an_open_keeps_the_old_fallback(self):
         (stop, add), cancel = self._run({"stop_price": 98.0}, filled=5,
@@ -1136,7 +1268,7 @@ class TestAddStopsWholePosition:
         (stop, add), cancel = self._run({"stop_price": 98.0}, pos_qty=5, avg=100.0, filled=2,
                                         fresh=(7.0, 101.0), action="ADD")
         assert (stop, add) == (98.0, (101.0, 7.0))
-        cancel.assert_called_once_with("NVDA")
+        cancel.assert_called_once_with("NVDA", stuck_out=[])
 
     def test_fresh_read_below_the_cache_keeps_the_old_stop(self):
         """Review of 04af: a fresh read below the cache is ambiguous (a stale
@@ -1185,7 +1317,7 @@ class TestAddStopsWholePosition:
         (stop, add), cancel = self._run({"stop_price": 98.0}, pos_qty=7, avg=101.0, filled=2,
                                         fresh=(7.0, 101.0), action="ADD", held_before=5.0)
         assert (stop, add) == (98.0, (101.0, 7.0))
-        cancel.assert_called_once_with("NVDA")
+        cancel.assert_called_once_with("NVDA", stuck_out=[])
 
     def test_unknown_held_before_skips_the_check(self):
         (stop, add), _ = self._run({"stop_price": 98.0}, pos_qty=5, filled=2, fresh=(5.0, 100.0),
@@ -1212,7 +1344,7 @@ class TestAddStopsWholePosition:
                                             new_stop=146.24, filled=1, fresh=(2.0, 174.98),
                                             action="OPEN", held_before=1.0)
         assert (stop, add) == (163.68, (174.98, 2.0))
-        cancel.assert_called_once_with("NVDA")
+        cancel.assert_called_once_with("NVDA", stuck_out=[])
         self.fresh_read.assert_called_once()
         act.assert_not_called()
 
@@ -1299,7 +1431,7 @@ class TestAddStopsWholePosition:
         (stop, add), cancel = self._run({"stop_price": 146.24}, pos_qty=1, avg=186.96, filled=1,
                                         new_stop=137.15, fresh=(2.0, 193.70), action="ADD")
         assert (stop, add) == (146.24, (193.70, 2.0))
-        cancel.assert_called_once_with("NVDA")
+        cancel.assert_called_once_with("NVDA", stuck_out=[])
 
     def test_fresh_above_the_cache_without_a_fresh_cost_uses_the_cache_cost(self):
         (stop, add), _ = self._run({"stop_price": 98.0}, pos_qty=5, avg=100.0, filled=2,
@@ -1334,7 +1466,7 @@ class TestAddStopsWholePosition:
         (stop, add), cancel = self._run({"stop_price": 98.0})
         assert stop == 98.0            # old stop was higher: never loosen
         assert add == (105.0, 15.0)    # avg cost, full quantity
-        cancel.assert_called_once_with("NVDA")
+        cancel.assert_called_once_with("NVDA", stuck_out=[])
 
     def test_add_raises_the_stop_when_the_new_one_is_higher(self):
         (stop, _), _ = self._run({"stop_price": 90.0}, new_stop=97.0)

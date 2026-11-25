@@ -219,6 +219,7 @@ def test_backstop_sale_gets_an_orders_row_and_a_part_fill_waits_for_reconcile():
              patch("ibkr.get_open_orders", return_value=[]), \
              patch("ibkr.place_market_order",
                    return_value={"order_id": 77, "filled_qty": filled, "fill_price": 140.0}), \
+             patch("ibkr.get_broker_stock_qty", return_value=0.0), patch("ibkr.get_ib"), \
              patch("db.log_trade"), patch("db.delete_position_stop") as delete, \
              patch("db.log_order", return_value=5) as log_order, \
              patch("db.update_order_fill") as upd, \
@@ -231,6 +232,91 @@ def test_backstop_sale_gets_an_orders_row_and_a_part_fill_waits_for_reconcile():
         # A part fill keeps the stop record: a broker-cancelled remainder
         # leaves held shares the next cycle must see (professor, M128 class).
         assert delete.called is closes
+
+
+def test_backstop_full_fill_keeps_the_record_unless_the_position_reads_flat():
+    """Audit 2026-11-22 08:56 #3: the backstop sold the cache's count, which
+    can miss an ADD just filled, then deleted the record for all shares. Now
+    the pushed position read (after the settle wait, never reqPositions)
+    must show flat; otherwise the record and outcome stay and the sale is
+    queued, so the queued close books it as a backstop sale once flat."""
+    import execution
+    client = MagicMock()
+    client.get_all_positions.return_value = [MagicMock(symbol="AMD", qty=10)]
+    err = RuntimeError("not connected")
+    # Reads: the pre-sale count (before the cancel), then after the fill.
+    for reads, deletes, why, sleeps in (
+            ([10.0, 0.0], True, None, [execution.POST_SELL_SETTLE_S]),
+            ([10.0, 5.0], False, "5 shares still held", [execution.POST_SELL_SETTLE_S]),
+            ([10.0, err], False, "read after the sale failed", [execution.POST_SELL_SETTLE_S]),
+            ([10.0, -2.0], False, "SHORT of 2 shares", [execution.POST_SELL_SETTLE_S]),
+            # The sale's position message lands late: the first read still
+            # shows the pre-sale count, one more settle, then flat.
+            ([10.0, 10.0, 0.0], True, None,
+             [execution.POST_SELL_SETTLE_S, execution.POST_SELL_RESETTLE_S]),
+            ([10.0, 10.0, 10.0], False, "10 shares still held",
+             [execution.POST_SELL_SETTLE_S, execution.POST_SELL_RESETTLE_S]),
+            ([err, 10.0, 0.0], True, None,    # no pre-sale read: the cache's 10
+             [execution.POST_SELL_SETTLE_S, execution.POST_SELL_RESETTLE_S])):
+        kw = {"side_effect": list(reads)}
+        ib = MagicMock()
+        with patch("ibkr.get_client", return_value=client), \
+             patch("market_data.is_market_hours", return_value=True), \
+             patch("tasks.manage_cancel_stop_orders_for"), \
+             patch("ibkr.get_open_orders", return_value=[]), \
+             patch("ibkr.place_market_order",
+                   return_value={"order_id": 77, "filled_qty": 10, "fill_price": 140.0}), \
+             patch("ibkr.get_ib", return_value=ib), \
+             patch("ibkr.get_broker_stock_qty", **kw) as read, \
+             patch("ibkr.get_fresh_stock_positions") as req_positions, \
+             patch("tasks._queue_reprotect") as queue, \
+             patch("db.log_trade"), patch("db.delete_position_stop") as delete, \
+             patch("db.log_order", return_value=5), patch("db.update_order_fill"), \
+             patch("db.close_trade_outcome") as close, patch("alerts._send") as send:
+            assert tasks._execute_backstop_sell("AMD", TestBackstopSellReads._alert) is True
+        req_positions.assert_not_called()
+        assert [c.args for c in read.call_args_list] == [("AMD",)] * len(reads)
+        assert all(c.kwargs == {"settle": True} for c in read.call_args_list)
+        assert [c.args[0] for c in ib.sleep.call_args_list] == sleeps
+        assert delete.called is deletes and close.called is deletes
+        if why:
+            queue.assert_called_once_with(
+                "AMD", {"intent": "BACKSTOP", "id": 5, "exit_source": "backstop_sell"}, 140.0)
+            texts = [c.args[0] for c in send.call_args_list]
+            assert any("MAY HAVE LEFT SHARES" in t and why in t for t in texts)
+        else:
+            queue.assert_not_called()
+            send.assert_not_called()
+
+
+def test_a_kept_backstop_sale_closes_as_a_backstop_sale_once_flat():
+    """Review of 9a541b8 (must-fix): the kept backstop row is 'filled', so
+    without a queued entry nothing closed it and the stale-stop branch
+    orphaned the outcome. The queued entry closes it from the order's fill
+    with the sale's own label."""
+    import json
+    state = {}
+    with patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
+         patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+         patch("stop_lock._redis", side_effect=RuntimeError("no redis")):
+        tasks._queue_reprotect("AMD", {"intent": "BACKSTOP", "id": 5, "exit_source": "backstop_sell"}, 140.0)
+    rec = json.loads(state[tasks._REPROTECT_STATE_KEY])["AMD"]
+    assert rec["exit_source"] == "backstop_sell" and rec["order_id"] == 5
+    client = MagicMock()
+    client.get_all_positions.return_value = []
+    with patch("ibkr.get_client", return_value=client), \
+         patch("ibkr.get_broker_stock_qty", return_value=0.0), \
+         patch("ibkr.get_fresh_stock_positions") as req_positions, \
+         patch("db.get_position_stop", return_value={"stop_price": 150.0, "opened_at": _T0 - _td(days=2)}), \
+         patch("db.get_open_outcomes", return_value=[{"ticker": "AMD", "entry_date": _T0 - _td(days=2)}]), \
+         patch("db.get_order_fill_state", return_value={"status": "filled", "fill_price": 140.0,
+                                                         "broker_order_id": 77, "created_at": _T0}), \
+         patch("db.close_trade_outcome") as close, patch("db.delete_position_stop") as delete:
+        assert tasks._reprotect_after_late_sell("AMD", rec, rec["fill_price"], from_queue=True) is None
+    req_positions.assert_not_called()
+    assert close.call_args.kwargs["exit_source"] == "backstop_sell"
+    assert close.call_args.kwargs["exit_price"] == 140.0
+    delete.assert_called_once_with("AMD")
 
 
 def test_backstop_does_not_sell_shares_a_working_sell_already_covers():
@@ -446,10 +532,14 @@ from datetime import datetime as _dt, timedelta as _td, timezone as _tz
 _T0 = _dt(2026, 10, 30, 15, 0, tzinfo=_tz.utc)
 
 
-def _queued_flat(intent, row, open_orders=(), stop=None, order_id=5, outcomes=()):
+def _queued_flat(intent, row, open_orders=(), stop=None, order_id=5, outcomes=(), pushed=0.0,
+                 exit_source=None):
     client = MagicMock()
     client.get_all_positions.return_value = []
+    rec = {"intent": intent, "order_id": order_id, **({"exit_source": exit_source} if exit_source else {})}
     with patch("ibkr.get_client", return_value=client), \
+         patch("ibkr.get_broker_stock_qty", **({"side_effect": pushed} if isinstance(pushed, Exception)
+                                               else {"return_value": pushed})), \
          patch("db.get_position_stop", return_value=stop), \
          patch("db.get_order_fill_state", **({"side_effect": row} if isinstance(row, Exception)
                                             else {"return_value": row})), \
@@ -457,8 +547,7 @@ def _queued_flat(intent, row, open_orders=(), stop=None, order_id=5, outcomes=()
          patch("ibkr.get_recent_sell_fill") as fill, patch("db.delete_position_stop"), \
          patch("db.get_open_outcomes", return_value=list(outcomes)), \
          patch("db.close_trade_outcome") as close, patch("alerts._send") as alert:
-        r = tasks._reprotect_after_late_sell("CRWD", {"intent": intent, "order_id": order_id}, 175.0,
-                                             from_queue=True)
+        r = tasks._reprotect_after_late_sell("CRWD", rec, 175.0, from_queue=True)
     fill.assert_not_called()   # never the execution-blend lookup
     return r, close, alert
 
@@ -471,6 +560,165 @@ def test_queued_flat_exit_closes_at_its_orders_average_fill():
     close.assert_called_once_with("CRWD", exit_price=171.5, exit_source="late_exit", exit_price_source="fill", exit_fill_at=None,
                                   exit_fill_at_source=None)
     alert.assert_not_called()
+
+
+def test_queued_flat_exit_waits_when_the_position_read_shows_shares_or_fails():
+    """Audit 2026-11-22 08:56 #3: the cache reads flat but lags a fill; the
+    record and outcome stay until the pushed position read agrees, and the
+    next cycle protects what the cache then shows."""
+    filled = {"status": "filled", "fill_price": 171.5, "broker_order_id": 77, "created_at": _T0}
+    for pushed in (8.0, RuntimeError("not connected")):
+        r, close, alert = _queued_flat("EXIT", filled, pushed=pushed)
+        assert r == "wait"
+        close.assert_not_called()
+
+
+def test_queued_flat_exit_alerts_when_the_position_read_shows_shares_or_a_short():
+    """Review of 578ada2 (SF-1): the ~4 h wait was silent."""
+    filled = {"status": "filled", "fill_price": 171.5, "broker_order_id": 77, "created_at": _T0}
+    for pushed, due, text in ((8.0, True, "shows 8 shares"), (-3.0, True, "SHORT of 3 shares"),
+                              (8.0, False, None)):
+        with patch("tasks._reconcile_alert_due", return_value=due) as gate, \
+             patch("tasks.open_manual_action") as manual:
+            r, close, alert = _queued_flat("EXIT", filled, pushed=pushed)
+        assert r == "wait"
+        close.assert_not_called()
+        gate.assert_called_once_with("queued_exit_not_flat_CRWD")
+        if text:
+            msg = alert.call_args[0][0]
+            assert "POSITION READS DISAGREE" in msg and text in msg
+            # Says which read shows flat, and places nothing itself.
+            assert "portfolio cache reads flat" in msg and "nothing is placed automatically" in msg
+            assert "after 2 cycles" not in msg
+            assert manual.call_args.kwargs == {"clear_on_flat": False} and text in manual.call_args[0][1]
+        else:
+            alert.assert_not_called(); manual.assert_not_called()   # throttled
+
+
+def _queued_flat_entry(pushed, waits, row=None):
+    """A queued EXIT entry with the placement path's reads patched, so a
+    placement would go through if anything reached it."""
+    client = MagicMock()
+    client.get_all_positions.return_value = []          # the cache reads flat
+    row = row or {"status": "filled", "fill_price": 171.5, "broker_order_id": 77, "created_at": _T0}
+    with patch("ibkr.get_client", return_value=client), \
+         patch("ibkr.get_broker_stock_qty", return_value=pushed), \
+         patch("ibkr.get_fresh_stock_positions") as req_positions, \
+         patch("ibkr.get_open_orders", return_value=[]), \
+         patch("db.get_order_fill_state", return_value=row), \
+         patch("db.get_position_stop", return_value={"stop_price": 150.0, "opened_at": _T0 - _td(days=2)}), \
+         patch("db.get_open_outcomes", return_value=[]), \
+         patch("execution._stops_still_resting", return_value=0.0), \
+         patch("tasks._resting_sell_stops", return_value=[]), \
+         patch("tasks.manage_cancel_stop_orders_for") as cancel, \
+         patch("tasks.manage_stop_place", return_value={"order_id": 3}) as place, \
+         patch("db.set_stop_broker_order_id"), \
+         patch("db.close_trade_outcome") as close, patch("db.delete_position_stop") as delete, \
+         patch("tasks._reconcile_alert_due", return_value=False), patch("alerts._send"):
+        r = tasks._reprotect_after_late_sell(
+            "CRWD", {"intent": "EXIT", "order_id": 5, "exit_source": "model_exit", "waits": waits},
+            171.0, from_queue=True)
+    req_positions.assert_not_called()
+    return r, place, cancel, close, delete
+
+
+def test_queued_flat_exit_never_places_a_stop_from_the_pushed_read():
+    """Review of 3f57f1c (must-fix): waits counts every kind of wait, so a
+    protect-after-2-waits step could put a stop on shares already sold when
+    this process's pushed read lagged the remainder's fill. The queued close
+    only ever waits, closes or drops."""
+    for pushed in (8.0, -3.0):
+        for waits in (0, 1, 2, 3, 10, 47):
+            r, place, cancel, close, delete = _queued_flat_entry(pushed, waits)
+            assert r == "wait"
+            place.assert_not_called(); cancel.assert_not_called()
+            close.assert_not_called(); delete.assert_not_called()
+    r, place, cancel, close, delete = _queued_flat_entry(0.0, 3)    # flat by both reads: closes
+    assert r is None
+    place.assert_not_called(); close.assert_called_once(); delete.assert_called_once_with("CRWD")
+    assert not hasattr(tasks, "_QUEUED_EXIT_PROTECT_AFTER_WAITS")
+
+
+@pytest.mark.parametrize("row, pushed, open_orders, text", [
+    ({"status": "filled", "fill_price": 171.5, "broker_order_id": 77, "created_at": _T0}, 8.0, [],
+     "POSITION READS DISAGREE"),
+    ({"status": "partial", "fill_price": 171.5, "broker_order_id": 77}, 0.0,
+     [{"order_id": 77, "status": "Submitted"}], "SELL STILL WORKING ON A FLAT POSITION"),
+])
+def test_queued_flat_exit_alerts_go_out_after_the_pass_outside_the_lock(row, pushed, open_orders, text):
+    """Review of 3f57f1c: a Telegram send can take tens of seconds; the
+    queued close's alerts join the pass's held alerts, sent after it."""
+    import contextlib
+    import json
+    events = []
+    state = {tasks._REPROTECT_STATE_KEY: json.dumps(
+        {"CRWD": {"intent": "EXIT", "order_id": 5, "exit_source": "model_exit", "nonce": "n"}})}
+
+    @contextlib.contextmanager
+    def lock(ticker):
+        events.append("lock")
+        yield
+        events.append("unlock")
+
+    client = MagicMock()
+    client.get_all_positions.return_value = []
+    with patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
+         patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+         patch("stop_lock._redis", side_effect=RuntimeError("no redis")), \
+         patch("stop_lock.ticker_lock", side_effect=lock), \
+         patch("ibkr.get_client", return_value=client), \
+         patch("ibkr.get_broker_stock_qty", return_value=pushed), \
+         patch("ibkr.get_open_orders", return_value=open_orders), \
+         patch("db.get_order_fill_state", return_value=row), \
+         patch("db.get_position_stop", return_value=None), \
+         patch("db.get_open_outcomes", return_value=[]), \
+         patch("tasks._reconcile_alert_due", return_value=True), \
+         patch("tasks.open_manual_action"), \
+         patch("tasks.manage_stop_place") as place, patch("db.close_trade_outcome") as close, \
+         patch("alerts._send", side_effect=lambda t: events.append(("send", t))):
+        tasks._retry_pending_reprotects()
+    place.assert_not_called(); close.assert_not_called()
+    sends = [e for e in events if isinstance(e, tuple)]
+    assert len(sends) == 1 and text in sends[0][1]
+    assert events.index("unlock") < events.index(sends[0])        # sent after the lock is released
+    assert json.loads(state[tasks._REPROTECT_STATE_KEY])["CRWD"]["waits"] == 1
+
+
+def test_a_kept_exit_closes_as_a_model_exit():
+    """Review of 9a541b8 (SF-2): the kept EXIT closed as late_exit, which
+    mislabels a whole-count model exit in the study data."""
+    filled = {"status": "filled", "fill_price": 171.5, "broker_order_id": 77, "created_at": _T0}
+    r, close, _ = _queued_flat("EXIT", filled, exit_source="model_exit")
+    assert r is None
+    assert close.call_args.kwargs["exit_source"] == "model_exit"
+    assert close.call_args.kwargs["exit_price"] == 171.5
+    r, close, _ = _queued_flat("EXIT", filled)   # a part-filled EXIT's entry: unchanged
+    assert close.call_args.kwargs["exit_source"] == "late_exit"
+
+
+def test_exit_source_rides_along_when_a_restore_or_target_replaces_the_exit():
+    import json
+    for first, second in (({"intent": "EXIT", "id": 5, "exit_source": "model_exit"}, {"intent": "RESTORE"}),
+                          ({"intent": "PROFIT_TARGET", "stop_price": 180.0},
+                           {"intent": "EXIT", "id": 5, "exit_source": "model_exit"})):
+        state = {}
+        with patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
+             patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+             patch("stop_lock._redis", side_effect=RuntimeError("no redis")):
+            tasks._queue_reprotect("CRWD", first, 171.0)
+            tasks._queue_reprotect("CRWD", second, None)
+        rec = json.loads(state[tasks._REPROTECT_STATE_KEY])["CRWD"]
+        assert rec["exit_intent"] == "EXIT" and rec["exit_order_id"] == 5
+        assert rec["exit_source"] == "model_exit"
+    state = {}
+    with patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
+         patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+         patch("stop_lock._redis", side_effect=RuntimeError("no redis")):
+        tasks._queue_reprotect("CRWD", {"intent": "PROFIT_TARGET", "stop_price": 180.0}, 171.0)
+        tasks._queue_reprotect("CRWD", {"intent": "EXIT", "id": 5, "exit_source": "model_exit"}, None)
+        tasks._queue_reprotect("CRWD", {"intent": "BUY"}, None)   # new shares: the old exit's label goes
+    rec = json.loads(state[tasks._REPROTECT_STATE_KEY])["CRWD"]
+    assert "exit_source" not in rec and "exit_intent" not in rec
 
 
 def test_queued_flat_exit_waits_while_its_remainder_works_or_a_lookup_fails():
@@ -531,6 +779,7 @@ def test_a_queued_profit_target_keeps_a_later_exits_order_for_the_flat_close():
     client = MagicMock()
     client.get_all_positions.return_value = []
     with patch("ibkr.get_client", return_value=client), \
+         patch("ibkr.get_broker_stock_qty", return_value=0.0), \
          patch("db.get_position_stop", return_value=None), \
          patch("db.get_open_outcomes", return_value=[]), patch("db.delete_position_stop"), \
          patch("db.get_order_fill_state", return_value={"status": "filled", "fill_price": 171.5,
@@ -638,6 +887,7 @@ def test_a_queued_flat_backstop_with_its_kept_record_closes_from_its_fill():
     client = MagicMock()
     client.get_all_positions.return_value = []
     with patch("ibkr.get_client", return_value=client), \
+         patch("ibkr.get_broker_stock_qty", return_value=0.0), \
          patch("db.get_position_stop", return_value={"stop_price": 150.0, "opened_at": _T0 - _td(days=2)}), \
          patch("db.get_open_outcomes", return_value=[{"ticker": "CRWD", "entry_date": _T0 - _td(days=2)}]), \
          patch("db.get_order_fill_state", return_value={"status": "filled", "fill_price": 171.5,
@@ -670,6 +920,7 @@ def test_the_newer_position_check_waits_when_a_read_fails():
     for stop_kw, outcomes_kw in (({"side_effect": RuntimeError("db")}, {"return_value": []}),
                                  ({"return_value": None}, {"side_effect": RuntimeError("db")})):
         with patch("ibkr.get_client", return_value=client), \
+             patch("ibkr.get_broker_stock_qty", return_value=0.0), \
              patch("db.get_order_fill_state", return_value=filled), \
              patch("db.get_position_stop", **stop_kw) as stop, \
              patch("db.get_open_outcomes", **outcomes_kw) as outcomes, \

@@ -463,9 +463,14 @@ def test_the_alert_goes_on_a_daemon_thread_and_a_hanging_send_does_not_delay_the
             out = _rm().is_halted()
             took = time.monotonic() - t0
             assert started.wait(5)
+            th = [t for t in threading.enumerate() if t.name.startswith("hwm-guard-alert-")]
+            # Let the send finish under the patches: a send that gives up
+            # restores the dedupe key with db.set_state.
+            release.set()
+            for t in th:
+                t.join(5)
         assert out is False and took < 2
         assert send.call_args.kwargs == {"severity": alert_policy.CRITICAL}
-        th = [t for t in threading.enumerate() if t.name.startswith("hwm-guard-alert-")]
         assert th and all(t.daemon for t in th)
     finally:
         release.set()

@@ -209,6 +209,16 @@ Records:
                       The line tallies timing_read, a street figure in the
                       brief, fundamentals_predate_last_print, fv_confidence,
                       target_equals_fv and target_equals_street.
+  scan_tier_funnel    activity rows (agents/scan_funnel.py), one per daily scan
+                      pass (09:35 ET Mon-Fri) after its enqueue. FAIL: a row
+                      missing a required key, a tier missing a stage count, or
+                      a tier (or the total) whose watchlist_in isn't the sum
+                      of its drops, sent_to_analyst and unclassified. WARN: a
+                      non-zero unclassified or not_in_watchlist, a
+                      watchlist_error, or no row when a session day's scan
+                      fell in the window (10:30 ET by now). With
+                      SCAN_TIER_FUNNEL_RECORD_ENABLED off: OK with no rows,
+                      FAIL on any. The line tallies regime and enqueue.
   watchlist_parse     watchlist.md ticker rows that knowledge_loader.load_watchlist
                       does not parse (its own "row not parsed" warning, caught
                       from a fresh load in this process): such a ticker is out
@@ -289,6 +299,14 @@ FEED_HEALTH_STAGE = "feed_health"
 FEED_HEALTH_REQUIRED = ("day", "env", "computed_at", "flagged", "alerted", "excluded", "sources",
                         "params")
 FEED_HEALTH_START, FEED_HEALTH_DUE = time(18, 40), time(18, 50)   # beat 18:40 ET, Mon-Fri
+SCAN_FUNNEL_STAGE = "scan_tier_funnel"
+SCAN_FUNNEL_REQUIRED = ("env", "day", "shadow_key", "computed_at", "regime", "threshold",
+                        "max_per_run", "earnings_blackout_days", "enqueue", "watchlist_error",
+                        "stages", "by_tier", "total", "not_in_watchlist")
+SCAN_FUNNEL_COUNTS = ("watchlist_in", "regime_suppressed", "no_price_data", "earnings_blackout",
+                      "below_floor", "below_regime_threshold", "over_run_cap", "sent_to_analyst",
+                      "unclassified")
+SCAN_FUNNEL_START, SCAN_FUNNEL_DUE = time(9, 35), time(10, 30)   # beat 09:35 ET, Mon-Fri
 FEED_STAGE = "source_yield"
 FEED_REQUIRED = ("feeds", "feed_drops")
 EARNINGS_STAGE = "earnings_event_record"
@@ -1015,6 +1033,86 @@ def check_feed_health(rows, env: str, since: datetime, now: datetime,
     return chk
 
 
+def _funnel_sum_ok(counts) -> bool | None:
+    """watchlist_in equals the drops, sent_to_analyst and unclassified; None
+    when a count is missing or not a number."""
+    if not isinstance(counts, dict):
+        return None
+    vals = [counts.get(k) for k in SCAN_FUNNEL_COUNTS]
+    if any(isinstance(v, bool) or not isinstance(v, int) for v in vals):
+        return None
+    return vals[0] == sum(vals[1:])
+
+
+def check_scan_tier_funnel(rows, env: str, since: datetime, now: datetime,
+                           enabled: bool = True) -> dict:
+    """rows: activity rows; only SCAN_FUNNEL_STAGE is read. See the module
+    docstring. The sum identity is checked per tier and on the total."""
+    chk = _new(SCAN_FUNNEL_STAGE, f"activity_feed stage {SCAN_FUNNEL_STAGE}",
+               "required keys " + ", ".join(SCAN_FUNNEL_REQUIRED) + "; per tier and total, "
+               "watchlist_in = drops + sent_to_analyst + unclassified; one row per daily scan "
+               "(09:35 ET)")
+    days, broken, warn = set(), [], []
+    for r, extra in _env_rows(rows, SCAN_FUNNEL_STAGE, env):
+        chk["rows"] += 1
+        chk["triggered"] += 1
+        if any(k not in extra for k in SCAN_FUNNEL_REQUIRED):
+            chk["missing"].append(r.get("id"))
+            continue
+        days.add(str(extra.get("day")))
+        _read(chk, "regime", extra.get("regime"))
+        _read(chk, "enqueue", extra.get("enqueue"))
+        groups = dict(extra.get("by_tier") or {})
+        groups["total"] = extra.get("total")
+        for name, counts in groups.items():
+            ok = _funnel_sum_ok(counts)
+            if ok is not True:
+                broken.append(f"row {r.get('id')} {name}"
+                              + (" (a stage count missing)" if ok is None else ""))
+            elif counts.get("unclassified"):
+                warn.append(f"row {r.get('id')} {name}: {counts['unclassified']} unclassified")
+        if extra.get("not_in_watchlist"):
+            warn.append(f"row {r.get('id')}: {extra['not_in_watchlist']} not in the watchlist")
+        if extra.get("watchlist_error"):
+            warn.append(f"row {r.get('id')}: watchlist error")
+    if not enabled:
+        if chk["rows"]:
+            chk["status"] = "FAIL"
+            chk["why"] = (f"SCAN_TIER_FUNNEL_RECORD_ENABLED is off in this clone but "
+                          f"{chk['rows']} row(s) exist: the deploy did not load the switch the "
+                          f"rows were written under")
+        else:
+            chk["status"], chk["why"] = "OK", "SCAN_TIER_FUNNEL_RECORD_ENABLED off: no rows expected"
+        return chk
+    if broken:
+        chk["extra_fail"].append("sum identity broken: " + "; ".join(broken))
+    due = _refresh_days_due(since, now, SCAN_FUNNEL_START, SCAN_FUNNEL_DUE)
+    chk["notes"].append(f"daily scans due in the window: {len(due)}"
+                        + (f" ({', '.join(d.isoformat() for d in due)})" if due else ""))
+    no_row = [d.isoformat() for d in due if d.isoformat() not in days]
+    if chk["rows"] and no_row:
+        chk["notes"].append(f"due day(s) with no row: {', '.join(no_row)}")
+    chk["notes"].extend(warn)
+    if chk["rows"] == 0 and not due:
+        chk["status"], chk["why"] = "OK", "no daily scan due in the window yet"
+        return chk
+    _finish(chk)
+    if chk["rows"] == 0:
+        chk["why"] = f"no row, with {len(due)} daily scan(s) due in the window"
+    elif chk["status"] == "OK" and (warn or no_row):
+        chk["status"] = "WARN"
+        chk["why"] = "; ".join(warn + ([f"due day(s) with no row: {', '.join(no_row)}"]
+                                       if no_row else []))
+    return chk
+
+
+def scan_tier_funnel_enabled() -> bool:
+    """SCAN_TIER_FUNNEL_RECORD_ENABLED as this clone's config.py loads it
+    (False when config lacks it)."""
+    import config
+    return bool(getattr(config, "SCAN_TIER_FUNNEL_RECORD_ENABLED", False))
+
+
 def feed_health_enabled() -> bool:
     """FEED_HEALTH_ENABLED as this clone's config.py loads it (False when
     config lacks it)."""
@@ -1660,7 +1758,8 @@ def _fetch(since: datetime, env: str):
             cur.execute("SELECT id, stage, ticker, extra_json FROM activity_feed "
                         "WHERE ts >= %s AND stage = ANY(%s)",
                         (since, list(ACTIVITY_STAGES) + list(ALARM_STAGES)
-                         + [VOTE_STAGE, FUNDAMENTALS_STAGE, DCF_BRANCH_STAGE, FEED_HEALTH_STAGE, FEED_STAGE,
+                         + [VOTE_STAGE, FUNDAMENTALS_STAGE, DCF_BRANCH_STAGE, FEED_HEALTH_STAGE,
+                            SCAN_FUNNEL_STAGE, FEED_STAGE,
                             EARNINGS_STAGE, READ_THROUGH_STAGE, NEWS_TIMELINE_STAGE]))
             activity = [{"id": i, "stage": s, "ticker": t, "extra": e}
                         for i, s, t, e in cur.fetchall()]
@@ -1752,7 +1851,8 @@ def run_checks(gate_rows, trim_rows, event_rows, approvals, activity, exits, hou
                vote_on: bool = False, watchlist=None, consensus_on: bool = True,
                feed_health_on: bool = True, verdict_rows=(), target_anchor_on: bool = True,
                news_timeline=(True, ("event", "daily_scan")), plan_reseed_on: bool = True,
-               screened_out_rows=(), own_ticker_sha: str | None = None):
+               screened_out_rows=(), own_ticker_sha: str | None = None,
+               scan_funnel_on: bool = True):
     checks = [check_entry_gate(gate_rows), check_story_dedup(event_rows),
               check_source_mix(event_rows),
               *check_approvals(approvals),
@@ -1764,6 +1864,7 @@ def run_checks(gate_rows, trim_rows, event_rows, approvals, activity, exits, hou
               check_fundamentals_changes(activity, env, since, now),
               check_dcf_branch(activity, env, since, now),
               check_feed_health(activity, env, since, now, feed_health_on),
+              check_scan_tier_funnel(activity, env, since, now, scan_funnel_on),
               check_source_yield_feeds(activity, env, since), check_earnings_events(activity, env),
               check_read_through(activity, env), check_earnings_claim(verdict_rows),
               check_catalyst_kind(verdict_rows),
@@ -1803,7 +1904,8 @@ def main() -> None:
                                    news_timeline=news_timeline_config(),
                                    plan_reseed_on=plan_reseed_enabled(),
                                    screened_out_rows=_fetch_screened_out(since, TRADING_ENV),
-                                   own_ticker_sha=own_ticker_patterns_sha())
+                                   own_ticker_sha=own_ticker_patterns_sha(),
+                                   scan_funnel_on=scan_tier_funnel_enabled())
     text = readout(checks, since, TRADING_ENV, _git_head(ROOT), now, unmatched)
     if args.out:
         with open(args.out, "w") as f:

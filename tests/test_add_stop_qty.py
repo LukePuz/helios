@@ -44,7 +44,7 @@ def test_1113_sequence_sizes_the_stop_from_the_broker(on):
     reads, is used, and that is alerted, never a silent undersize."""
     (stop, (avg, qty)), rows, alerts, _, cancel = _wps(2.0)
     assert stop == 146.24 and qty == 2.0
-    cancel.assert_called_once_with("NVDA")
+    cancel.assert_called_once_with("NVDA", stuck_out=[])
     assert len(rows) == 1
     r = rows[0]
     assert r["source"] == "broker" and r["broker_read"] == "ok"
@@ -240,7 +240,7 @@ def _execute_1113(monkeypatch, enabled):
 
 def test_1113_add_places_one_stop_for_the_broker_count(monkeypatch):
     place, cancel, db_fns = _execute_1113(monkeypatch, True)
-    cancel.assert_called_once_with("NVDA")
+    cancel.assert_called_once_with("NVDA", stuck_out=[])
     assert place.call_args_list == [call("NVDA", 2.0, 146.24, market_price=162.63)]
     rows = [c.args[4] for c in db_fns["log_activity_queued"].call_args_list
             if c.args and c.args[0] == "add_stop_qty"]

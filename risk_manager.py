@@ -990,6 +990,40 @@ def _send_guard_alerts(ticker: str, texts: list) -> None:
             log.warning(f"[{ticker}] stop guard alert failed: {e}")
 
 
+def _hwm_guard_send(key: str, prev, wrote: str, text: str) -> None:
+    """RiskManager._hwm_guard's alert, run on its daemon thread. key: the
+    dedupe key the guard already wrote; wrote: the value it wrote (today,
+    ET); prev: what the key held before. A failed send (alerts._send raised
+    or returned None) puts prev back, verified, so the next unusable-mark
+    check that day sends again, but only while the key still reads `wrote`
+    (a later day's or another writer's value is left alone; the read and the
+    write are not atomic). A process exit before the send still loses that
+    day's alert (the thread is a daemon). Never raises."""
+    try:
+        import alerts
+        import alert_policy
+        sent = alerts._send(text, severity=alert_policy.CRITICAL) is not None
+    except Exception as e:
+        log.warning(f"hwm guard alert failed: {type(e).__name__}: {e}")
+        sent = False
+    if sent:
+        return
+    try:
+        import db
+        now = db.get_state(key)
+        if now != wrote:
+            log.warning(f"hwm guard alert not sent; {key} now reads {now!r}, not {wrote!r}: "
+                        f"left as it is")
+            return
+        if key in db.set_state_verified([(key, prev if prev is not None else "")]):
+            log.warning(f"hwm guard alert not sent, and {key} could not be put back: "
+                        f"no more alerts for this reason today")
+        else:
+            log.warning(f"hwm guard alert not sent; {key} put back so the next check sends it")
+    except Exception as e:
+        log.warning(f"hwm guard dedupe key restore failed: {type(e).__name__}: {e}")
+
+
 def _stop_guard_row(ticker: str, message: str, extra: dict) -> None:
     """The stop_above_market_guard activity row; queued write. Never raises."""
     try:
@@ -1597,7 +1631,7 @@ class RiskManager:
         dedupe key (system_state hwm_guard_alerted_<env>_<reason>) is written
         first and verified; only then is the alert sent, on a daemon thread,
         so the buy path never waits on Telegram and a failed write sends
-        nothing. Returns True in enforce (halt_unknown set: this buy is
+        nothing; a failed send puts the key back (_hwm_guard_send). Returns True in enforce (halt_unknown set: this buy is
         blocked, nothing latched), else False, the check then going on
         exactly as it did before the guard. Never raises. Simulation
         writes and sends nothing."""
@@ -1627,17 +1661,15 @@ class RiskManager:
             from zoneinfo import ZoneInfo
             today = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
             key = f"hwm_guard_alerted_{TRADING_ENV}_{reason}"
-            if db.get_state(key) != today and key not in db.set_state_verified([(key, today)]):
+            prev = db.get_state(key)
+            if prev != today and key not in db.set_state_verified([(key, today)]):
                 if enforce:
                     tail = "This buy was blocked (not latched), as every buy will be until it is fixed."
                 else:
                     tail = (effect or "The check ran as before.") + " (shadow)"
                 text = (f"⚠️ <b>HIGH-WATER MARK UNUSABLE</b> ({TRADING_ENV})\n{subject} {what}. "
                         f"{tail} Check system_state high_water_mark_{TRADING_ENV}.")
-                import alerts
-                import alert_policy
-                threading.Thread(target=alerts._send, args=(text,),
-                                 kwargs={"severity": alert_policy.CRITICAL}, daemon=True,
+                threading.Thread(target=_hwm_guard_send, args=(key, prev, today, text), daemon=True,
                                  name=f"hwm-guard-alert-{reason}").start()
         except Exception as e:
             log.warning(f"hwm guard record failed: {type(e).__name__}: {e}")
@@ -1649,11 +1681,17 @@ class RiskManager:
             return True
         return False
 
-    def is_halted(self) -> bool:
+    def is_halted(self, alert: bool = True, latch_out: dict | None = None) -> bool:
         """
         Halt if (a) the persisted manual/auto halt flag is set, or
         (b) drawdown from the persisted high-water mark exceeds the limit.
         Baselines live in the system_state table so every process agrees.
+
+        alert=False skips only the latch's Telegram alert (the caller sends
+        one that carries the numbers); the flag write, the halt row, the
+        warning and the return are unchanged. latch_out, when given, is
+        filled with {"drawdown_pct", "limit_pct", "saved"} only when this
+        call latched the halt; it is left untouched otherwise.
 
         Keys are trading_env-scoped (high_water_mark_paper vs
         high_water_mark_live, etc.) -- found 2026-08-14: a shared
@@ -1749,23 +1787,27 @@ class RiskManager:
                                   drawdown_pct=round(drawdown, 4), verified=halt_saved)
             except Exception:
                 pass
+            if latch_out is not None:
+                latch_out.update(drawdown_pct=drawdown, limit_pct=DRAWDOWN_HALT_PCT,
+                                 saved=halt_saved)
             # The latch used to be silent: only the 30-min task alerted, at its
             # own MAX_DRAWDOWN_PCT. One alert per latch: a set flag returns
             # above, before this branch. Percentages only. Never raises.
-            try:
-                import alerts
-                alerts._send(
-                    f"🚨 <b>TRADING HALTED — DRAWDOWN LIMIT</b> ({TRADING_ENV}, per-buy check)\n"
-                    f"Drawdown: -{drawdown:.1%} from the high-water mark "
-                    f"(limit {DRAWDOWN_HALT_PCT:.0%}).\n"
-                    f"No new buys. Sells and stops are unaffected. /resume clears the flag, "
-                    f"but each buy re-checks and halts again while the drawdown is at or past "
-                    f"the limit."
-                    + ("" if halt_saved else "\n⚠️ The halt flag could not be confirmed saved; "
-                       "check /status and send /halt if it isn't set.")
-                )
-            except Exception as e:
-                log.warning(f"Per-buy halt alert failed: {e}")
+            if alert:
+                try:
+                    import alerts
+                    alerts._send(
+                        f"🚨 <b>TRADING HALTED — DRAWDOWN LIMIT</b> ({TRADING_ENV}, per-buy check)\n"
+                        f"Drawdown: -{drawdown:.1%} from the high-water mark "
+                        f"(limit {DRAWDOWN_HALT_PCT:.0%}).\n"
+                        f"No new buys. Sells and stops are unaffected. /resume clears the flag, "
+                        f"but each buy re-checks and halts again while the drawdown is at or past "
+                        f"the limit."
+                        + ("" if halt_saved else "\n⚠️ The halt flag could not be confirmed saved; "
+                           "check /status and send /halt if it isn't set.")
+                    )
+                except Exception as e:
+                    log.warning(f"Per-buy halt alert failed: {e}")
             return True
 
         # Ratchet the high-water mark up as the portfolio grows

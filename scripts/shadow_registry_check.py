@@ -259,6 +259,17 @@ STAGES = (
     {"stage": "read_through", "card": "read-through to held names",
      "switch": "READ_THROUGH_RECORD_ENABLED", "expect_rows": "conditional",
      "sources": (_stage("read_through"),)},
+    # Nightly after the price refresh, per gate-blocked buy: a reclaim row once,
+    # forward rows at 5/10/20 sessions, an expired row. No trigger named: the
+    # first row of a block comes sessions after it, so a block with no row yet
+    # is not "silent".
+    {"stage": "entry_gate_reclaim_shadow", "card": "reclaim of gate-blocked buys",
+     "switch": "ENTRY_GATE_RECLAIM_SHADOW_ENABLED", "expect_rows": "conditional",
+     "sources": (_stage("entry_gate_reclaim_shadow"),)},
+    # One row per daily scan pass (09:35 ET, Mon-Fri), after its enqueue.
+    {"stage": "scan_tier_funnel", "card": "daily scan funnel by watchlist tier",
+     "switch": "SCAN_TIER_FUNNEL_RECORD_ENABLED", "expect_rows": "always",
+     "sources": (_stage("scan_tier_funnel"),)},
     # On decision.catalyst_check of every full verdict; non-null only when the
     # catalyst names earnings with a day date and the dates read worked. The
     # trigger's "earnings" match is a subset of the writer's wording rule.

@@ -1024,7 +1024,7 @@ def test_recheck_trims_a_reverted_cancel(_recheck):
          patch("tasks._fix_overstop_safe", return_value="🔧 NVDA: trimmed") as fix, \
          patch("alerts._send") as send:
         tasks.recheck_stop_coverage("NVDA")
-    fix.assert_called_once_with("NVDA", recheck_try=2)
+    fix.assert_called_once_with("NVDA", recheck_try=2, outcome_out={})
     assert _sent(send, "STOP RECONCILE — 🔧 NVDA") == 1
     _recheck.assert_not_called()
 
@@ -1035,7 +1035,7 @@ def test_recheck_with_coverage_fine_sends_nothing(_recheck):
                return_value="NVDA: stop coverage fine on re-check (3 vs 3)") as fix, \
          patch("alerts._send") as send:
         tasks.recheck_stop_coverage("NVDA")
-    fix.assert_called_once_with("NVDA", recheck_try=2)
+    fix.assert_called_once_with("NVDA", recheck_try=2, outcome_out={})
     send.assert_not_called()
 
 

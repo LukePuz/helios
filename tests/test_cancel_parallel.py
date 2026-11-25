@@ -3,13 +3,34 @@ get every cancelOrder first and one poll loop bounded by the one-stop 5 s;
 the confirmation rule, the return value, the order matching and the stuck
 warning are the same as the one-at-a-time path. One stop runs today's path."""
 import logging
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
+from ib_async.objects import TradeLogEntry
+
 import config
 import ibkr
+
+
+class _LoggedStatus:
+    """orderStatus whose status changes append a trade.log entry with error
+    code 0, as ib_async's orderStatus handler does; cancel_order confirms a
+    Cancelled from that entry."""
+
+    def __init__(self, log, status):
+        self._log, self._status = log, status
+
+    @property
+    def status(self):
+        return self._status
+
+    @status.setter
+    def status(self, value):
+        self._status = value
+        self._log.append(TradeLogEntry(datetime.now(timezone.utc), value, "", 0))
 
 
 class _Trade:
@@ -17,7 +38,8 @@ class _Trade:
         self.order = SimpleNamespace(orderId=oid, permId=perm if perm is not None else 1000 + oid,
                                      action=action, orderType=order_type, totalQuantity=1.0)
         self.contract = SimpleNamespace(symbol=symbol)
-        self.orderStatus = SimpleNamespace(status="PreSubmitted")
+        self.log = []
+        self.orderStatus = _LoggedStatus(self.log, "PreSubmitted")
 
 
 DONE = ("Filled", "Cancelled", "ApiCancelled", "Inactive")
@@ -142,12 +164,19 @@ def test_pending_cancel_then_revert_is_not_confirmed(caplog):
     assert seq[0] == par[0] == 1 and par[3] == seq[3] and "orderIds=[1]" in par[3][0]
 
 
-def test_a_stop_that_fills_during_the_cancel_is_reported_as_today(caplog):
+def test_a_stop_that_fills_during_the_cancel_is_reported_as_filled(caplog):
+    """Not confirmed either way; the warning says it FILLED (shares sold),
+    not "cancel manually", and the fill ends that stop's poll at once."""
     make = lambda: _FakeIB([_Trade(1), _Trade(2)], {1: (1, "Filled"), 2: (1, "Cancelled")})
     seq, par = _both(make, caplog)
     assert seq[0] == par[0] == 1
-    assert par[3] == seq[3] and "orderIds=[1]" in par[3][0]
-    assert any("orderId=1 but status is still 'Filled'" in r.getMessage() for r in caplog.records)
+    assert par[3] == seq[3] == []           # no "did NOT actually cancel" line for a fill
+    assert seq[2].t == 2
+    assert par[2].t == 1
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("orderId=1 (SELL 1.0 NVDA) but the order FILLED during the cancel" in m for m in msgs)
+    assert any("stop order(s) FILLED while being cancelled (orderIds=[1]; status Filled)" in m
+               for m in msgs)
 
 
 def test_cancel_error_on_the_second_of_three_stops_the_sending_like_today(caplog):

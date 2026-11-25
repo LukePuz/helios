@@ -65,7 +65,7 @@ def test_next_add_floors_at_the_old_shares_resting_stop():
                                                      held_before=2)
     assert stop == L197                          # not max(new, record) = L198
     assert whole == (95.0, 3.0)
-    cancel.assert_called_once_with("NVDA")
+    cancel.assert_called_once_with("NVDA", stuck_out=[])
 
 
 # ── breakeven ────────────────────────────────────────────────────────────────

@@ -1079,6 +1079,30 @@ class TestStaleStopReconciliation:
                 tasks.reconcile_stop_orders.run()
         return mock_fill, mock_log_trade, mock_close_outcome, mock_delete, mock_alert
 
+    @pytest.mark.parametrize("entry, waits", [
+        ({"intent": "EXIT", "order_id": 5, "exit_source": "model_exit"}, True),
+        ({"intent": "BACKSTOP", "order_id": 5, "exit_source": "backstop_sell"}, True),
+        ({"intent": "RESTORE", "exit_intent": "EXIT", "exit_order_id": 5}, True),
+        ({"intent": "RESTORE"}, False),
+    ])
+    def test_a_queued_exit_owns_the_flat_close(self, entry, waits):
+        """Review of 9a541b8 (SF-2): a kept EXIT/BACKSTOP sale is closed by
+        its queued entry from its own order row. This branch leaves that
+        order out as a recorded sell, so it would orphan the outcome as
+        no_fill with a false alert."""
+        import json
+        state = {tasks._REPROTECT_STATE_KEY: json.dumps({"DDOG": entry})}
+        fill = {"filled_qty": 84.0, "fill_price": 227.80}
+        self._run(state, fill_return=fill)                                  # arms the marker
+        mock_fill, mock_log_trade, mock_close_outcome, mock_delete, mock_alert = \
+            self._run(state, fill_return=fill)
+        if waits:
+            mock_fill.assert_not_called(); mock_log_trade.assert_not_called()
+            mock_close_outcome.assert_not_called(); mock_delete.assert_not_called()
+            mock_alert.assert_not_called()
+        else:
+            mock_log_trade.assert_called_once(); mock_delete.assert_called_once_with("DDOG")
+
     def test_single_cycle_miss_does_not_reconcile_yet(self):
         """A single missing-this-cycle reading must only arm the pending
         marker, not touch trade/outcome/stop records at all -- this is
@@ -1511,7 +1535,7 @@ def test_identical_requeue_during_retry_pass_survives():
          patch("stop_lock._redis", side_effect=RuntimeError("no redis")):
         tasks._queue_reprotect("AMD", {"intent": "RESTORE", "stop_price": 90.0}, 100.0)
 
-        def work(ticker, rec, fill, from_queue=False):
+        def work(ticker, rec, fill, from_queue=False, **_):
             tasks._queue_reprotect("AMD", {"intent": "RESTORE", "stop_price": 90.0}, 100.0)
             return True
         with patch("tasks._reprotect_after_late_sell", side_effect=work):

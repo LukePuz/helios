@@ -59,7 +59,7 @@ def test_normal_add_writes_no_row():
     with patch("tasks._resting_sell_stops", return_value=[]):
         out, status, rows, cancel = _run(cache_qty=2, fresh=(2.0, 95.0), held_before=1.0)
     assert out == (89.3, (90.0, 2.0)) and "stale_record" not in status
-    cancel.assert_called_once_with("NVDA")
+    cancel.assert_called_once_with("NVDA", stuck_out=[])
     assert rows == []
 
 

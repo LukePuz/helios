@@ -301,14 +301,14 @@ def test_add_stop_is_floored_at_a_higher_resting_trail():
     (stop, add), cancel, send = _add([_stp(101.0)])
     assert stop == 101.0
     assert add == (105.0, 15.0)
-    cancel.assert_called_once_with("NVDA")
+    cancel.assert_called_once_with("NVDA", stuck_out=[])
     send.assert_not_called()
 
 
 def test_add_floor_read_failure_keeps_the_level_and_alerts():
     (stop, _), cancel, send = _add(None, read_effect=TimeoutError("read timed out"))
     assert stop == 98.0
-    cancel.assert_called_once_with("NVDA")
+    cancel.assert_called_once_with("NVDA", stuck_out=[])
     assert _sent(send, "STOP FLOOR UNREAD") == 1
 
 

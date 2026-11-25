@@ -24,7 +24,16 @@ forward or dropped as the entry trend check does):
                            completed sessions (the entry's ET date counts as
                            session 1) with the close at or below the entry
                            price; sessions are cached bars, so a gap in the
-                           price cache undercounts them
+                           price cache undercounts them. Mixed basis: the
+                           sessions count from the first fill (the stop
+                           record's opened_at, kept across ADDs) while the
+                           entry price is the broker's blended average cost
+                           (entry_price_basis "broker_avg_cost"), which an ADD
+                           moves. The first fill's own cost is recorded beside
+                           it (first_fill_price) when the caller has it; the
+                           live caller has no read for it, so it is None with
+                           first_fill_price_reason saying why. Which cost a
+                           time stop should use is a research choice (Luke).
   atr_drawdown             the highest close since the entry date minus the
                            close is at least HELD_EXIT_DRAWDOWN_ATR times ATR14
 
@@ -87,12 +96,18 @@ def _cand(would, reason=None) -> dict:
 
 def candidates(bars: list[dict], *, entry_price, entry_date, plan: dict | None,
                plan_read: str = "ok", time_stop_sessions: int = 20,
-               drawdown_atr: float = 3.0) -> dict:
+               drawdown_atr: float = 3.0, entry_basis: str | None = None,
+               first_fill_price=None, first_fill_source: str | None = None,
+               first_fill_reason: str | None = None) -> dict:
     """The record from completed, finite daily bars (oldest first, each with
     date/high/low/close), the lot's entry price and entry date (ET date of
     the first fill), and the active plan (None: no plan) with plan_read the
     plan read's outcome. Pure; the backfill calls it on bars cut at each
-    day. Never raises on bad values (they give None labels)."""
+    day. Never raises on bad values (they give None labels).
+    Record only, beside the decision fields (no candidate reads them):
+    entry_basis names what entry_price is (e.g. "broker_avg_cost");
+    first_fill_price, its source and, when it is None, first_fill_reason
+    record the first fill's own cost, with close_vs_first_fill_pct."""
     bars = [b for b in (bars or []) if _f(b.get("close")) is not None
             and _f(b.get("high")) is not None and _f(b.get("low")) is not None]
     entry = _f(entry_price)
@@ -108,7 +123,15 @@ def candidates(bars: list[dict], *, entry_price, entry_date, plan: dict | None,
            "sma50": None, "sma200": None, "pct_vs_sma50": None, "pct_vs_sma200": None,
            "highest_close_since_entry": None, "highest_close_date": None, "atr14": None,
            "drawdown_from_high_pct": None, "drawdown_from_high_atr": None,
-           "plan": None, "plan_read": plan_read}
+           "plan": None, "plan_read": plan_read,
+           "entry_price_basis": entry_basis, "entry_date_basis": "first_fill",
+           "first_fill_price": None, "first_fill_price_source": None,
+           "first_fill_price_reason": None, "close_vs_first_fill_pct": None}
+    ff = _f(first_fill_price)
+    if ff is not None and ff > 0:
+        rec["first_fill_price"], rec["first_fill_price_source"] = ff, first_fill_source
+    else:
+        rec["first_fill_price_reason"] = first_fill_reason or "not_given"
     c = {}
     if not bars:
         for k in CANDIDATES:
@@ -121,6 +144,8 @@ def candidates(bars: list[dict], *, entry_price, entry_date, plan: dict | None,
     rec["last_bar_date"], rec["last_close"] = str(bars[-1].get("date"))[:10], round(last, 4)
     if entry is not None:
         rec["close_vs_entry_pct"] = round((last / entry - 1) * 100, 4)
+    if rec["first_fill_price"] is not None:
+        rec["close_vs_first_fill_pct"] = round((last / rec["first_fill_price"] - 1) * 100, 4)
 
     # (a) both averages
     smas = {}

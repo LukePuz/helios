@@ -633,6 +633,17 @@ ENTRY_TREND_GATE_MAX_BAR_AGE_DAYS = 5
 # stands down in an up-market. A failed or stale market read does not block.
 # Empty string turns the condition off (gate on the stock alone).
 ENTRY_TREND_GATE_MARKET_TICKER = "SPY"
+# Reclaim shadow for gate-blocked buys (agents/crew.py:_entry_gate_reclaim_record
+# and _check_entry_gate_reclaims). Record only: when the entry gate blocks a
+# buy, one record per ticker goes to system_state
+# entry_gate_reclaim_shadow_<env>; the nightly price refresh then logs, on
+# completed bars, the first session every gate that blocked it would pass
+# again (stage entry_gate_reclaim_shadow) and the name's move 5/10/20 sessions
+# after the block. A record expires ENTRY_GATE_RECLAIM_SHADOW_SESSIONS
+# sessions after its block. Nothing here changes a gate outcome, a prompt,
+# routing or sizing.
+ENTRY_GATE_RECLAIM_SHADOW_ENABLED = True
+ENTRY_GATE_RECLAIM_SHADOW_SESSIONS = 20
 # Add-to-loser gate (agents/crew.py:_add_loser_check, read by _entry_gate;
 # also on a deferred ADD's retry, tasks._deferred_entry_gate), for the written
 # rule "never add to a losing position without a new catalyst"
@@ -761,6 +772,13 @@ SAME_DAY_CONSENSUS_LIMIT = 200
 # to decide; showing a timeline in the brief is Luke's call. Not read from .env.
 NEWS_TIMELINE_RECORD_ENABLED = True
 NEWS_TIMELINE_PATHS = ("event", "daily_scan")
+
+# Scan tier funnel (record only; agents/scan_funnel.py). After each daily
+# scan's enqueue, one activity row (stage "scan_tier_funnel") with, per
+# watchlist tier, how many names went in, how many each pre-analyst filter
+# dropped and how many were sent to the analyst. Counts only. Nothing reads
+# it to decide. Off: no row and no counting. Not read from .env.
+SCAN_TIER_FUNNEL_RECORD_ENABLED = True
 
 # The whole-position stop after an ADD fill is sized from this process's
 # ib.positions() count (ibkr.get_broker_stock_qty): account-wide, synced at

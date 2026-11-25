@@ -4,7 +4,10 @@ Engineering diagnostic, not a study analysis. Sections:
 
   held_exit     TRIM_EXIT_RULE rows' decision.held_exit_candidates: fires
                 per candidate rule (True / False / None), and the forward
-                return after a fire vs no fire, per rule.
+                return after a fire vs no fire, per rule. The time stop's
+                basis is mixed: sessions from the first fill, cost = the
+                broker's blended average (entry_price_basis); the rows that
+                name a basis and that carry a first-fill cost are counted.
   story_dedup   event verdicts' provenance.trigger.story_dedup, per trigger
                 source: would_skip_duplicate, would_skip_stale, either, and
                 analysed (neither), plus a missing record and read errors.
@@ -117,11 +120,14 @@ def section_held_exit(trim_rows, bars, since, env, head) -> str:
     from agents.held_exit import CANDIDATES
     counts = {c: Counter() for c in CANDIDATES}
     missing, fwd = 0, []
+    basis, first_fill = Counter(), 0
     for symbol, ts, rec in trim_rows:
         cands = _as_dict(_as_dict(rec).get("candidates"))
         if not cands:
             missing += 1
             continue
+        basis[_as_dict(rec).get("entry_price_basis") or "not recorded"] += 1
+        first_fill += _as_dict(rec).get("first_fill_price") is not None
         for c in CANDIDATES:
             v = _as_dict(cands.get(c)).get("would_exit")
             counts[c][_tri(v)] += 1
@@ -136,6 +142,12 @@ def section_held_exit(trim_rows, bars, since, env, head) -> str:
         k = counts[c]
         lines.append(f"| {c} | {k['true']} | {k['false']} | {k['unknown']} | "
                      f"{_pct(k['true'], k['true'] + k['false'])} |")
+    lines += ["", "time_stop basis: sessions count from the first fill (the stop record's "
+              "opened_at, kept across ADDs); the cost it compares with is entry_price_basis. "
+              "Rows by entry_price_basis: "
+              + (", ".join(f"{b} {n}" for b, n in sorted(basis.items())) or "none")
+              + f"; rows with a first-fill cost: {first_fill}. Which cost a time stop should "
+              "use is a research choice (Luke)."]
     return "\n".join(lines) + "\n\n" + _forward(fwd, bars, since, env, head)
 
 

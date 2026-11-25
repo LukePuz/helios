@@ -114,6 +114,7 @@ def _backstop(place_effect, open_orders, retry=False):
          patch("tasks.manage_cancel_stop_orders_for", side_effect=_recorder(events, "cancel")), \
          patch("ibkr.get_open_orders", return_value=open_orders), \
          patch("ibkr.place_market_order", side_effect=place), \
+         patch("ibkr.get_broker_stock_qty", return_value=0.0), patch("ibkr.get_ib"), \
          patch("db.log_trade", side_effect=_recorder(events, "log_trade")), \
          patch("db.delete_position_stop", side_effect=_recorder(events, "delete_stop")), \
          patch("db.log_order", side_effect=_recorder(events, "log_order", ret=5)), \

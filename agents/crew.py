@@ -1292,6 +1292,16 @@ def process_event(event: dict) -> dict:
 # Scanner-driven path (batch candidates from daily scan)
 # ---------------------------------------------------------------------------
 
+def _select_for_analysis(candidates: list[dict], max_per_run: int = 5) -> list[dict]:
+    """The scanner candidates process_candidates analyzes: every HIGH, then
+    every MEDIUM, each in the order given, capped at max_per_run. Shared
+    with the daily scan's tier funnel row (agents/scan_funnel.py) so its
+    count of names sent to the analyst can't drift from this."""
+    high = [c for c in candidates if c.get("priority") == "HIGH"]
+    medium = [c for c in candidates if c.get("priority") == "MEDIUM"]
+    return (high + medium)[:max_per_run]
+
+
 def process_candidates(candidates: list[dict], max_per_run: int = 5) -> list[dict]:
     """
     Analyze a batch of scanner candidates and queue actionable ones for approval.
@@ -1310,9 +1320,7 @@ def process_candidates(candidates: list[dict], max_per_run: int = 5) -> list[dic
     log.info(f"Processing {len(candidates)} candidates in {regime.get('regime')} regime")
 
     # Only analyze HIGH priority and top MEDIUM
-    high     = [c for c in candidates if c.get("priority") == "HIGH"]
-    medium   = [c for c in candidates if c.get("priority") == "MEDIUM"]
-    to_analyze = (high + medium)[:max_per_run]
+    to_analyze = _select_for_analysis(candidates, max_per_run)
 
     if not to_analyze:
         log.info("No candidates to analyze")
@@ -3452,6 +3460,79 @@ def _add_loser_check(ticker: str, result: dict, client) -> dict | None:
         return rec
 
 
+def _stopout_gate_hit(s: dict, days) -> bool:
+    """The stop-out half of _entry_gate's rule: s (a _stopout_reentry_shadow
+    record, or the same keys) blocks when its read is ok and the exit is
+    0 <= hours_since < days * 24 old. A negative age (exit time ahead of the
+    clock) does not block. Shared with the reclaim shadow
+    (_check_entry_gate_reclaims), so both read one rule."""
+    hrs = s.get("hours_since")
+    return bool(s.get("read") == "ok" and isinstance(hrs, (int, float))
+                and not isinstance(hrs, bool) and 0 <= hrs < days * 24)
+
+
+def _trend_gate_eval(t: dict, max_age, market_ticker) -> tuple[bool, dict]:
+    """The trend half of _entry_gate's rule on t (an _entry_trend_check
+    record): (blocked, the entry_gate.trend record). Reads the market ticker
+    (_entry_trend_check) only when the stock itself would be blocked. Shared
+    with the reclaim shadow (_check_entry_gate_reclaims), so both read one
+    rule. Raises only what _entry_gate's own try already caught."""
+    age = t.get("bar_age_days")
+    fresh = isinstance(age, int) and not isinstance(age, bool) and 0 <= age <= max_age
+    would = (t.get("read") == "ok" and fresh
+             and t.get("below_sma50") is True and t.get("below_sma200") is True)
+    # Bars that look like an unadjusted split (_split_discontinuity)
+    # give averages on mixed price scales: such a read never blocks.
+    suspect = t.get("split_suspect") is True
+    market = None
+    market_down = True   # no market ticker: the stock condition alone decides
+    market_raw = True    # the market condition before the market's own split check
+    if would and market_ticker:
+        # Read only when the stock itself would be blocked (also when
+        # its bars are split-suspect, as a record). Its own try: a
+        # failure here must not drop a stop-out block too.
+        market_down = market_raw = False
+        try:
+            m = _entry_trend_check(market_ticker)
+            m_age = m.get("bar_age_days")
+            m_fresh = (isinstance(m_age, int) and not isinstance(m_age, bool)
+                       and 0 <= m_age <= max_age)
+            m_would = m.get("read") == "ok" and m_fresh and m.get("below_sma200") is True
+            m_suspect = m.get("split_suspect") is True
+            market_raw = m_would
+            market_down = m_would and not m_suspect
+            market = {"ticker": market_ticker, "read": m.get("read"), "bar_age_days": m_age,
+                      "below_sma200": m.get("below_sma200"),
+                      "pct_vs_sma200": m.get("pct_vs_sma200"), "downtrend": market_down,
+                      "split_suspect": m.get("split_suspect"),
+                      "split_suspect_date": m.get("split_suspect_date"),
+                      "split_suspect_ratio": m.get("split_suspect_ratio"),
+                      # the block withheld only by the market's own split suspicion
+                      "split_fail_open": bool(not suspect and m_would and m_suspect)}
+        except Exception as e:
+            market_down = market_raw = False
+            market = {"ticker": market_ticker, "read": f"error: {type(e).__name__}",
+                      "bar_age_days": None, "below_sma200": None, "pct_vs_sma200": None,
+                      "downtrend": False, "split_suspect": None, "split_suspect_date": None,
+                      "split_suspect_ratio": None, "split_fail_open": False}
+    # The block the stock's split suspicion withheld: everything else
+    # held, on the market's raw condition (a split-suspect SPY below
+    # its 200-day still counts, so that case leaves a record).
+    split_fail_open = bool(would and suspect and market_raw)
+    hit = bool(would and not suspect and market_down)
+    gate_trend = {"read": t.get("read"), "bar_age_days": age, "max_bar_age_days": max_age,
+                  "below_sma50": t.get("below_sma50"), "below_sma200": t.get("below_sma200"),
+                  "pct_vs_sma50": t.get("pct_vs_sma50"),
+                  "pct_vs_sma200": t.get("pct_vs_sma200"), "market": market,
+                  "split_suspect": t.get("split_suspect"),
+                  "split_suspect_date": t.get("split_suspect_date"),
+                  "split_suspect_ratio": t.get("split_suspect_ratio"),
+                  "split_suspect_rule": t.get("split_suspect_rule"),
+                  "split_suspect_factor": t.get("split_suspect_factor"),
+                  "split_fail_open": split_fail_open, "blocked": hit}
+    return hit, gate_trend
+
+
 def _entry_gate(ticker: str, result: dict, stop_rec: dict | None, trend: dict | None,
                 path: str | None = None, extra: dict | None = None,
                 add_loser: dict | None = None,
@@ -3484,13 +3565,15 @@ def _entry_gate(ticker: str, result: dict, stop_rec: dict | None, trend: dict | 
     verdict and the next open.
 
     add_loser, when given (_add_loser_check, an ADD with ADD_LOSER_GATE_MODE
-    "enforce"; the route passes none in "shadow"), is recorded as
+    "enforce"; in "shadow" the route passes none here and puts the record in
+    row_extra as add_loser_gate instead, record only), is recorded as
     entry_gate.add_loser and blocks when its blocked is True: the ADD is more
     than ADD_LOSER_GATE_MIN_PCT below the average cost and the triggering
     item, judged, is not a new fact.
 
     row_extra's keys go into the ENTRY_GATE_BLOCKED row's decision beside
-    entry_gate (the recheck-contradiction record); they never decide."""
+    entry_gate (the recheck-contradiction and same-day-consensus records, and
+    add_loser_gate for a shadow-mode ADD); they never decide."""
     try:
         try:
             from config import STOPOUT_REENTRY_GATE_DAYS as days
@@ -3517,68 +3600,15 @@ def _entry_gate(ticker: str, result: dict, stop_rec: dict | None, trend: dict | 
         if days and days > 0:
             s = stop_rec or {}
             hrs = s.get("hours_since")
-            # A negative age (exit time ahead of the clock) does not block.
-            hit = (s.get("read") == "ok" and isinstance(hrs, (int, float))
-                   and not isinstance(hrs, bool) and 0 <= hrs < days * 24)
+            hit = _stopout_gate_hit(s, days)
             gate["stopout"] = {"days": days, "read": s.get("read"), "hours_since": hrs,
                                "exit_at": s.get("exit_at"), "blocked": hit}
             if hit:
                 blocks.append(f"{hrs:.1f} h after an exit the bot did not place (gate {days} d)")
         if trend_on:
             t = trend or {}
-            age = t.get("bar_age_days")
-            fresh = isinstance(age, int) and not isinstance(age, bool) and 0 <= age <= max_age
-            would = (t.get("read") == "ok" and fresh
-                     and t.get("below_sma50") is True and t.get("below_sma200") is True)
-            # Bars that look like an unadjusted split (_split_discontinuity)
-            # give averages on mixed price scales: such a read never blocks.
-            suspect = t.get("split_suspect") is True
-            market = None
-            market_down = True   # no market ticker: the stock condition alone decides
-            market_raw = True    # the market condition before the market's own split check
-            if would and market_ticker:
-                # Read only when the stock itself would be blocked (also when
-                # its bars are split-suspect, as a record). Its own try: a
-                # failure here must not drop a stop-out block too.
-                market_down = market_raw = False
-                try:
-                    m = _entry_trend_check(market_ticker)
-                    m_age = m.get("bar_age_days")
-                    m_fresh = (isinstance(m_age, int) and not isinstance(m_age, bool)
-                               and 0 <= m_age <= max_age)
-                    m_would = m.get("read") == "ok" and m_fresh and m.get("below_sma200") is True
-                    m_suspect = m.get("split_suspect") is True
-                    market_raw = m_would
-                    market_down = m_would and not m_suspect
-                    market = {"ticker": market_ticker, "read": m.get("read"), "bar_age_days": m_age,
-                              "below_sma200": m.get("below_sma200"),
-                              "pct_vs_sma200": m.get("pct_vs_sma200"), "downtrend": market_down,
-                              "split_suspect": m.get("split_suspect"),
-                              "split_suspect_date": m.get("split_suspect_date"),
-                              "split_suspect_ratio": m.get("split_suspect_ratio"),
-                              # the block withheld only by the market's own split suspicion
-                              "split_fail_open": bool(not suspect and m_would and m_suspect)}
-                except Exception as e:
-                    market_down = market_raw = False
-                    market = {"ticker": market_ticker, "read": f"error: {type(e).__name__}",
-                              "bar_age_days": None, "below_sma200": None, "pct_vs_sma200": None,
-                              "downtrend": False, "split_suspect": None, "split_suspect_date": None,
-                              "split_suspect_ratio": None, "split_fail_open": False}
-            # The block the stock's split suspicion withheld: everything else
-            # held, on the market's raw condition (a split-suspect SPY below
-            # its 200-day still counts, so that case leaves a record).
-            split_fail_open = bool(would and suspect and market_raw)
-            hit = bool(would and not suspect and market_down)
-            gate["trend"] = {"read": t.get("read"), "bar_age_days": age, "max_bar_age_days": max_age,
-                             "below_sma50": t.get("below_sma50"), "below_sma200": t.get("below_sma200"),
-                             "pct_vs_sma50": t.get("pct_vs_sma50"),
-                             "pct_vs_sma200": t.get("pct_vs_sma200"), "market": market,
-                             "split_suspect": t.get("split_suspect"),
-                             "split_suspect_date": t.get("split_suspect_date"),
-                             "split_suspect_ratio": t.get("split_suspect_ratio"),
-                             "split_suspect_rule": t.get("split_suspect_rule"),
-                             "split_suspect_factor": t.get("split_suspect_factor"),
-                             "split_fail_open": split_fail_open, "blocked": hit}
+            hit, gate["trend"] = _trend_gate_eval(t, max_age, market_ticker)
+            market = gate["trend"]["market"]
             if hit:
                 blocks.append(f"close {t.get('pct_vs_sma50')}% vs the 50-day and "
                               f"{t.get('pct_vs_sma200')}% vs the 200-day average"
@@ -3607,10 +3637,469 @@ def _entry_gate(ticker: str, result: dict, stop_rec: dict | None, trend: dict | 
         log.info(f"[{ticker}] {reason}")
         _log_route_exit(ticker, "ENTRY_GATE_BLOCKED", result, reason,
                         {"entry_gate": gate, **(row_extra or {})})
+        try:
+            # Record only, after the block row. Its own try: a raise here must
+            # never reach the except below, which would let the buy through.
+            _entry_gate_reclaim_record(ticker, result, gate, trend)
+        except Exception as e:
+            log.warning(f"[{ticker}] entry gate reclaim record failed: {type(e).__name__}: {e}")
         return True
     except Exception as e:
         log.warning(f"[{ticker}] entry gate failed ({type(e).__name__}: {e}); not applied")
         return False
+
+
+# Reclaim shadow for gate-blocked buys (config ENTRY_GATE_RECLAIM_SHADOW_*).
+# Record only: one record per blocked ticker in system_state under this key;
+# the nightly check logs activity_feed rows under _RECLAIM_STAGE.
+_ENTRY_GATE_RECLAIM_KEY = "entry_gate_reclaim_shadow_{env}"
+_RECLAIM_STAGE = "entry_gate_reclaim_shadow"
+_RECLAIM_FORWARD_SESSIONS = (5, 10, 20)
+_RECLAIM_BOOK_MAX = 200          # records kept; the oldest block goes first
+_RECLAIM_LOCK_WAIT_S = 5         # the nightly check; the block path waits _RECLAIM_BLOCK_WAIT_S
+_RECLAIM_BLOCK_WAIT_S = 1.0      # the route / deferred retry: a short wait on the worker
+_RECLAIM_SUPERSEDED_MAX = 20     # replaced records waiting for their superseded row, per ticker
+
+
+def _reclaim_book_edit(fn, wait_s=_RECLAIM_LOCK_WAIT_S) -> bool:
+    """Apply fn(book) -> book (or None: nothing to write) to the reclaim
+    shadow's system_state record under a short Redis lock (waits up to
+    wait_s for it). The route (LLM worker), the deferred retry (orders
+    worker) and the nightly check all write it. A failed read writes nothing
+    (a non-strict read would replace the book with one record); a stored
+    value that isn't a JSON object is reset to {} (one warning) so the shadow
+    doesn't stay dead; a busy lock skips the edit (record only); without
+    Redis the edit runs unlocked. True when written. Never raises."""
+    lock = None
+    try:
+        import json
+        import db
+        import stop_lock
+        from config import TRADING_ENV
+        key = _ENTRY_GATE_RECLAIM_KEY.format(env=TRADING_ENV)
+        try:
+            lock = stop_lock._redis().lock(f"helios:{key}", timeout=30,
+                                           blocking_timeout=wait_s)
+            if not lock.acquire():
+                log.warning(f"{key}: lock busy; reclaim shadow edit skipped")
+                return False
+        except Exception as e:
+            lock = None
+            log.debug(f"{key}: lock unavailable ({type(e).__name__}); editing without it")
+        raw = db.get_state_strict(key, "")
+        try:
+            book = json.loads(raw or "{}")
+        except (TypeError, ValueError):
+            book = None
+        if not isinstance(book, dict):
+            log.warning(f"{key}: stored value is not a JSON object; reclaim shadow book reset to {{}}")
+            book = {}
+        new = fn(book)
+        if new is None:
+            return False
+        db.set_state(key, json.dumps(new, default=str))
+        return True
+    except Exception as e:
+        log.warning(f"entry gate reclaim book edit failed: {type(e).__name__}: {e}")
+        return False
+    finally:
+        if lock is not None:
+            try:
+                lock.release()
+            except Exception:
+                pass
+
+
+def _entry_gate_reclaim_record(ticker: str, result: dict, gate: dict, trend: dict | None,
+                               now=None) -> bool:
+    """Record only (config ENTRY_GATE_RECLAIM_SHADOW_ENABLED): called by
+    _entry_gate after it writes an ENTRY_GATE_BLOCKED row. Keeps one record
+    per ticker for _check_entry_gate_reclaims: the gate(s) that blocked
+    (entry_gate.<stopout|trend|add_loser>.blocked), the verdict's signal_id,
+    the block time (and the approval time on the deferred retry), and the
+    levels the gate tested: the name's SMA50 and SMA200 and its close vs
+    each, the market ticker's close vs its 200-day, and the stop-out exit
+    time with its window end. base_close is the verdict-time last completed
+    close (trend's last_close; None when the trend half did not run, and the
+    nightly check then takes the last cached close before the block's ET
+    date). One live record per ticker: a newer block replaces the record and
+    keeps first_blocked_at and the block count; the replaced record's
+    snapshot (blocked_at, gates, base, the rows it had logged) rides on the
+    new one in superseded_pending, and the nightly check writes its
+    superseded row (with the sessions it had run) from the same bars, so this
+    path does no DB read. Which blocks an evaluation counts (first, latest,
+    all) is a research choice (Luke); superseded rows keep every block
+    countable. Waits at most _RECLAIM_BLOCK_WAIT_S for the book's lock.
+    Nothing it writes is read by a gate, a prompt, routing or sizing.
+    Returns True when stored. Never raises."""
+    try:
+        try:
+            from config import ENTRY_GATE_RECLAIM_SHADOW_ENABLED as on
+        except ImportError:
+            on = False
+        if not on:
+            return False
+        from datetime import datetime, timedelta, timezone
+        from zoneinfo import ZoneInfo
+        now = now or datetime.now(timezone.utc)
+        gates = [g for g in ("stopout", "trend", "add_loser")
+                 if isinstance(gate.get(g), dict) and gate[g].get("blocked") is True]
+        if not gates:
+            return False
+        t = trend if isinstance(trend, dict) else {}
+        tg = gate.get("trend") if isinstance(gate.get("trend"), dict) else {}
+        market = tg.get("market") if isinstance(tg.get("market"), dict) else {}
+        so = gate.get("stopout") if isinstance(gate.get("stopout"), dict) else {}
+        window_end = None
+        try:
+            if so.get("exit_at") and so.get("days"):
+                ex = datetime.fromisoformat(str(so["exit_at"]).replace("Z", "+00:00"))
+                window_end = (ex + timedelta(days=float(so["days"]))).isoformat()
+        except (TypeError, ValueError):
+            window_end = None
+        prov = result.get("provenance") if isinstance(result.get("provenance"), dict) else {}
+        sid = prov.get("signal_id")
+        sid = sid if isinstance(sid, int) and not isinstance(sid, bool) else None
+        base = t.get("last_close")
+        rec = {"gates": gates, "action": result.get("action"), "signal_id": sid,
+               "path": gate.get("path"), "approval_id": gate.get("approval_id"),
+               "verdict_at": gate.get("approval_at") or now.isoformat(),
+               "blocked_at": now.isoformat(),
+               "et_date": now.astimezone(ZoneInfo("America/New_York")).date().isoformat(),
+               "levels": {"sma50": t.get("sma50"), "sma200": t.get("sma200"),
+                          "pct_vs_sma50": tg.get("pct_vs_sma50", t.get("pct_vs_sma50")),
+                          "pct_vs_sma200": tg.get("pct_vs_sma200", t.get("pct_vs_sma200")),
+                          "bar_age_days": tg.get("bar_age_days", t.get("bar_age_days")),
+                          "market_ticker": market.get("ticker"),
+                          "market_below_sma200": market.get("below_sma200"),
+                          "market_pct_vs_sma200": market.get("pct_vs_sma200"),
+                          "stopout_days": so.get("days"), "stopout_exit_at": so.get("exit_at"),
+                          "stopout_hours_since": so.get("hours_since"),
+                          "stopout_window_end": window_end},
+               "base_close": round(float(base), 4) if isinstance(base, (int, float)) else None,
+               "base_bar_date": t.get("last_bar_date") if base is not None else None,
+               "logged": {}}
+
+        def add(book):
+            old = book.get(ticker) if isinstance(book.get(ticker), dict) else {}
+            rec["first_blocked_at"] = old.get("first_blocked_at") or rec["blocked_at"]
+            try:
+                rec["blocks"] = int(old.get("blocks") or 0) + 1
+            except (TypeError, ValueError):
+                rec["blocks"] = 1
+            pending = [p for p in (old.get("superseded_pending") or []) if isinstance(p, dict)]
+            dropped = old.get("superseded_dropped") or 0
+            if old.get("blocked_at") and old.get("blocked_at") != rec["blocked_at"]:
+                pending.append({k: old.get(k) for k in (
+                    "blocked_at", "gates", "action", "signal_id", "path", "verdict_at",
+                    "et_date", "base_close", "base_bar_date", "base_source", "logged")}
+                    | {"superseded_at": rec["blocked_at"], "superseded_et_date": rec["et_date"]})
+            if len(pending) > _RECLAIM_SUPERSEDED_MAX:
+                dropped = (dropped if isinstance(dropped, int) else 0) + len(pending) - _RECLAIM_SUPERSEDED_MAX
+                pending = pending[-_RECLAIM_SUPERSEDED_MAX:]
+            if pending:
+                rec["superseded_pending"] = pending
+            if dropped:
+                rec["superseded_dropped"] = dropped
+            book[ticker] = rec
+            if len(book) > _RECLAIM_BOOK_MAX:
+                for k, _ in sorted(book.items(), key=lambda kv: str(kv[1].get("blocked_at")))[
+                        :len(book) - _RECLAIM_BOOK_MAX]:
+                    if k != ticker:
+                        book.pop(k, None)
+            return book
+        return _reclaim_book_edit(add, wait_s=_RECLAIM_BLOCK_WAIT_S)
+    except Exception as e:
+        log.warning(f"[{ticker}] entry gate reclaim record failed: {type(e).__name__}: {e}")
+        return False
+
+
+def _reclaim_gates_pass(ticker: str, gates: list) -> dict:
+    """Whether every gate in gates would pass now, by the gate's own rules
+    (_stopout_gate_hit, _trend_gate_eval) on fresh reads: the stop-out half
+    re-reads db.get_last_broker_exit, the trend half _entry_trend_check (the
+    cached completed bars). pass is True when each passes on a read the gate
+    could have blocked on, False when one would still block, None when one
+    can't be judged: a gate the config has since turned off (read "gate
+    off": a gate that no longer runs can't pass, so no reclaim is logged and
+    the record expires as usual), a failed, stale or split-suspect read
+    (where the gate would stand down rather than pass), a stop-out exit whose
+    hours_since is negative or not a number, or add_loser, which needs the
+    broker's average cost and a judged new fact, not bars. bar_date is the
+    trend read's last completed bar. Never raises."""
+    out = {"pass": None, "per_gate": {}, "bar_date": None}
+    try:
+        try:
+            from config import STOPOUT_REENTRY_GATE_DAYS as days
+        except ImportError:
+            days = 0
+        try:
+            from config import ENTRY_TREND_GATE_ENABLED as trend_on
+        except ImportError:
+            trend_on = False
+        try:
+            from config import ENTRY_TREND_GATE_MAX_BAR_AGE_DAYS as max_age
+        except ImportError:
+            max_age = 5
+        try:
+            from config import ENTRY_TREND_GATE_MARKET_TICKER as market_ticker
+        except ImportError:
+            market_ticker = ""
+        results = []
+        for g in gates:
+            res = None
+            if g == "stopout":
+                if not days or days <= 0:
+                    res = None   # gate off: recorded as such below
+                else:
+                    try:
+                        import db
+                        ex = db.get_last_broker_exit(ticker, _stopout_lookback_days(), strict=True)
+                        s = {"read": "ok", **(ex or {})}
+                        hrs = s.get("hours_since")
+                        if ex is None:
+                            res = True
+                        elif (not isinstance(hrs, (int, float)) or isinstance(hrs, bool)
+                              or hrs != hrs or hrs < 0):
+                            res = None   # an exit time ahead of the clock (or no age): not judged
+                        else:
+                            res = not _stopout_gate_hit(s, days)
+                        out["per_gate"][g] = {"pass": res, "read": "ok",
+                                              "hours_since": hrs, "days": days}
+                    except Exception as e:
+                        out["per_gate"][g] = {"pass": None, "read": f"error: {type(e).__name__}"}
+                        res = None
+            elif g == "trend":
+                if not trend_on:
+                    res = None   # gate off: recorded as such below
+                else:
+                    t = _entry_trend_check(ticker)
+                    hit, tg = _trend_gate_eval(t, max_age, market_ticker)
+                    age = tg.get("bar_age_days")
+                    fresh = isinstance(age, int) and not isinstance(age, bool) and 0 <= age <= max_age
+                    m = tg.get("market")
+                    m_age = (m or {}).get("bar_age_days")
+                    m_ok = m is None or (m.get("read") == "ok" and m.get("split_suspect") is not True
+                                         and isinstance(m_age, int) and not isinstance(m_age, bool)
+                                         and 0 <= m_age <= max_age)
+                    judged = t.get("read") == "ok" and fresh and t.get("split_suspect") is not True and m_ok
+                    res = (not hit) if judged else None
+                    out["bar_date"] = t.get("last_bar_date")
+                    out["per_gate"][g] = {"pass": res, "read": t.get("read"), "bar_age_days": age,
+                                          "last_bar_date": t.get("last_bar_date"),
+                                          "pct_vs_sma50": tg.get("pct_vs_sma50"),
+                                          "pct_vs_sma200": tg.get("pct_vs_sma200"),
+                                          "split_suspect": tg.get("split_suspect"),
+                                          "market_pct_vs_sma200": (m or {}).get("pct_vs_sma200"),
+                                          "market_read": (m or {}).get("read")}
+            else:
+                out["per_gate"][g] = {"pass": None, "read": "not judged on bars"}
+            if g not in out["per_gate"]:
+                out["per_gate"][g] = {"pass": res, "read": "gate off"}
+            results.append(res)
+        if results and all(r is True for r in results):
+            out["pass"] = True
+        elif any(r is False for r in results):
+            out["pass"] = False
+    except Exception as e:
+        out["error"] = type(e).__name__
+        out["pass"] = None
+    return out
+
+
+def _check_entry_gate_reclaims(today=None) -> int:
+    """Record only, nightly after refresh_price_history (beside
+    tasks._check_pending_entries, on the bars just stored). For each record
+    _entry_gate_reclaim_record kept, on the name's completed price_history
+    bars after its base bar (the verdict-time last close):
+    - reclaim, once: the first night _reclaim_gates_pass says every gate that
+      blocked it would pass, with that bar's date, sessions since the block
+      and the close's move since the block in percent;
+    - forward_<n>, once each for n in _RECLAIM_FORWARD_SESSIONS (up to the
+      record's life): the close n sessions after the base bar vs the base
+      close, in percent;
+    - expired, once, when ENTRY_GATE_RECLAIM_SHADOW_SESSIONS sessions have
+      passed (or the bars never got there within twice that many calendar
+      days plus 10: window_complete false); the record is then dropped;
+    - superseded, first, once for each record a newer block replaced
+      (superseded_pending): its blocked_at, gates, base close and source,
+      the rows it had logged, and sessions_elapsed (completed bars after its
+      base bar dated before the replacing block's ET date). Which blocks an
+      evaluation counts (first, latest, all) is a research choice (Luke);
+      superseded rows keep every block countable.
+    The forward rows are records; which horizon an evaluation uses is a
+    research choice (Luke).
+    Rows go to activity_feed stage entry_gate_reclaim_shadow with a
+    shadow_key (env:ticker:blocked_at:event), deduped against the rows
+    already written; percentages and counts only. A stored book that isn't a
+    JSON object is reset to {} (_reclaim_book_edit). Reads the DB cache, the
+    broker-exit table and system_state: no broker or network call. Returns
+    the rows written. Never raises."""
+    logged = 0
+    try:
+        try:
+            from config import ENTRY_GATE_RECLAIM_SHADOW_ENABLED as on, \
+                ENTRY_GATE_RECLAIM_SHADOW_SESSIONS as life
+        except ImportError:
+            return 0
+        if not on:
+            return 0
+        from datetime import date, datetime
+        from zoneinfo import ZoneInfo
+        import json
+        import db
+        from config import TRADING_ENV
+        key = _ENTRY_GATE_RECLAIM_KEY.format(env=TRADING_ENV)
+        raw = db.get_state_strict(key, "")
+        try:
+            book = json.loads(raw or "{}")
+        except (TypeError, ValueError):
+            book = None
+        if not isinstance(book, dict):
+            # Corrupt value: the book edit resets it to {} (its one warning),
+            # so later blocks are recorded again.
+            _reclaim_book_edit(lambda b: b)
+            return 0
+        if not book:
+            return 0
+        today = today or datetime.now(ZoneInfo("America/New_York")).date()
+        bars = db.get_price_history_bulk(sorted(book), days=260)
+        done = db.get_activity_shadow_keys(_RECLAIM_STAGE)
+        updates = {}   # ticker -> (blocked_at seen, record to keep or None)
+
+        def pct(a, b):
+            return round((a / b - 1) * 100, 2) if a and b else None
+        for ticker, rec in book.items():
+            try:
+                if not isinstance(rec, dict) or not rec.get("blocked_at"):
+                    continue
+                rec = json.loads(json.dumps(rec))          # a copy to change
+                logged_ev = rec.setdefault("logged", {})
+                tb = [b for b in bars.get(ticker, []) if b.get("date") and b.get("close")]
+                still = []
+                for p in rec.get("superseded_pending") or []:
+                    if not isinstance(p, dict) or not p.get("blocked_at"):
+                        continue
+                    p_base_d, p_base, p_src = p.get("base_bar_date"), p.get("base_close"), p.get("base_source")
+                    if not p_base_d:
+                        before = [b for b in tb if b["date"] < str(p.get("et_date"))]
+                        if before:
+                            p_base_d, p_base = before[-1]["date"], before[-1]["close"]
+                            p_src = "last cached close before the block's ET date"
+                    elif not p_src:
+                        p_src = "verdict-time last completed close"
+                    ran = [b for b in tb if p_base_d and str(p_base_d) < b["date"]
+                           < str(p.get("superseded_et_date"))]
+                    p_logged = p.get("logged") if isinstance(p.get("logged"), dict) else {}
+                    sk = f"{TRADING_ENV}:{ticker}:{p['blocked_at']}:superseded"
+                    if done is not None and sk in done:
+                        continue
+                    if db.log_activity(
+                            _RECLAIM_STAGE, ticker,
+                            f"entry gate block record superseded by a newer block after "
+                            f"{len(ran)} sessions (record only)", "neutral",
+                            {"event": "superseded", "gates": p.get("gates"),
+                             "action": p.get("action"), "signal_id": p.get("signal_id"),
+                             "path": p.get("path"), "verdict_at": p.get("verdict_at"),
+                             "blocked_at": p.get("blocked_at"), "block_et_date": p.get("et_date"),
+                             "base_close": p_base, "base_bar_date": p_base_d,
+                             "base_source": p_src,
+                             "forward_logged": sorted(k for k in p_logged if k.startswith("forward_")),
+                             "reclaimed": "reclaim" in p_logged, "logged": p_logged,
+                             "sessions_elapsed": len(ran),
+                             "superseded_at": p.get("superseded_at"),
+                             "superseded_et_date": p.get("superseded_et_date"),
+                             "first_blocked_at": rec.get("first_blocked_at"),
+                             "blocks": rec.get("blocks"), "life_sessions": life,
+                             "env": TRADING_ENV, "shadow_key": sk}):
+                        logged += 1
+                    else:
+                        still.append(p)
+                if still:
+                    rec["superseded_pending"] = still
+                else:
+                    rec.pop("superseded_pending", None)
+                if not rec.get("base_bar_date"):
+                    before = [b for b in tb if b["date"] < str(rec.get("et_date"))]
+                    if before:
+                        rec["base_bar_date"], rec["base_close"] = before[-1]["date"], before[-1]["close"]
+                        rec["base_source"] = "last cached close before the block's ET date"
+                base_d, base = rec.get("base_bar_date"), rec.get("base_close")
+                after = [b for b in tb if base_d and b["date"] > str(base_d)]
+                ident = f"{TRADING_ENV}:{ticker}:{rec['blocked_at']}"
+                common = {"gates": rec.get("gates"), "action": rec.get("action"),
+                          "signal_id": rec.get("signal_id"), "path": rec.get("path"),
+                          "verdict_at": rec.get("verdict_at"), "blocked_at": rec.get("blocked_at"),
+                          "first_blocked_at": rec.get("first_blocked_at"),
+                          "blocks": rec.get("blocks"), "block_et_date": rec.get("et_date"),
+                          "base_bar_date": base_d, "levels": rec.get("levels"),
+                          "superseded_dropped": rec.get("superseded_dropped"),
+                          "life_sessions": life, "env": TRADING_ENV}
+
+                def write(event, msg, fields):
+                    nonlocal logged
+                    sk = f"{ident}:{event}"
+                    if event in logged_ev or (done is not None and sk in done):
+                        logged_ev.setdefault(event, "already written")
+                        return
+                    if db.log_activity(_RECLAIM_STAGE, ticker, msg, "neutral",
+                                       {**common, "event": event, **fields, "shadow_key": sk}):
+                        logged_ev[event] = today.isoformat()
+                        logged += 1
+                for n in _RECLAIM_FORWARD_SESSIONS:
+                    if n <= life and len(after) >= n:
+                        b = after[n - 1]
+                        write(f"forward_{n}",
+                              f"{n} sessions after the entry gate block: {pct(b['close'], base)}% "
+                              f"({b['date']}; record only)",
+                              {"sessions": n, "bar_date": b["date"],
+                               "move_pct": pct(b["close"], base)})
+                if "reclaim" not in logged_ev and after:
+                    chk = _reclaim_gates_pass(ticker, rec.get("gates") or [])
+                    if chk.get("pass") is True:
+                        d = chk.get("bar_date") or after[-1]["date"]
+                        upto = [b for b in after if b["date"] <= str(d)] or after
+                        b = upto[-1]
+                        write("reclaim",
+                              f"every gate that blocked the {rec.get('action')} would pass on "
+                              f"{b['date']}: {pct(b['close'], base)}% since the block (record only)",
+                              {"reclaim_date": b["date"], "sessions": len(upto),
+                               "move_pct": pct(b["close"], base), "check": chk})
+                expired = len(after) >= life
+                stale = False
+                try:
+                    stale = (today - date.fromisoformat(str(rec.get("et_date")))).days > 2 * life + 10
+                except ValueError:
+                    stale = True
+                if expired or stale:
+                    write("expired",
+                          f"entry gate block record closed after {len(after)} sessions; "
+                          f"reclaimed {'reclaim' in logged_ev} (record only)",
+                          {"sessions": len(after), "window_complete": expired,
+                           "reclaimed": "reclaim" in logged_ev,
+                           "reclaim_logged": logged_ev.get("reclaim")})
+                    if "expired" in logged_ev and not rec.get("superseded_pending"):
+                        updates[ticker] = (rec["blocked_at"], None)
+                        continue
+                updates[ticker] = (rec["blocked_at"], rec)
+            except Exception as e:
+                log.warning(f"[{ticker}] entry gate reclaim check failed: {type(e).__name__}: {e}")
+
+        def apply(current):
+            for t_, (seen, keep) in updates.items():
+                cur = current.get(t_)
+                if not isinstance(cur, dict) or cur.get("blocked_at") != seen:
+                    continue    # replaced by a newer block meanwhile: the newer record stays
+                if keep is None:
+                    current.pop(t_, None)
+                else:
+                    current[t_] = keep
+            return current
+        if updates:
+            _reclaim_book_edit(apply)
+    except Exception as e:
+        log.warning(f"entry gate reclaim check failed: {type(e).__name__}: {e}")
+    return logged
 
 
 _BOOK_HEAT_SNAPSHOT_MAX_AGE_MIN = 15   # the same freshness the held checks use (tasks._broker_held)
@@ -3837,7 +4326,12 @@ def _route_to_approval(result: dict, regime: dict, trading_client) -> None:
         stop_rec = _stopout_reentry_shadow(ticker, result)
         trend = _entry_quality_shadow(ticker, result)
         add_loser = _add_loser_check(ticker, result, trading_client) if action == "ADD" else None
-        # "enforce": a gate half; "shadow": recorded on the approval only.
+        # "enforce": a gate half; "shadow": record only, never a gate input. In
+        # shadow the record rides on rx, so the route rows from here on (the
+        # ENTRY_GATE_BLOCKED row first) carry it as decision.add_loser_gate, the
+        # key the approval's risk_json uses; an approval still gets it there.
+        if (add_loser or {}).get("mode") == "shadow":
+            rx["add_loser_gate"] = add_loser
         if _entry_gate(ticker, result, stop_rec, trend,
                        add_loser=add_loser if (add_loser or {}).get("mode") == "enforce" else None,
                        row_extra=rx):

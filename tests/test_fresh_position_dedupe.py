@@ -20,7 +20,7 @@ NVDA_ROWS = [_pos("NVDA", 2.0, 193.1956, 4815747), _pos("MSFT", 1.0, 523.55, 272
 
 def _with_rows(rows):
     ib = NS(reqPositions=lambda: rows, positions=lambda: rows)
-    return patch("ibkr.get_ib", return_value=ib), patch("ibkr._bounded_req", side_effect=lambda ib, n, f: f())
+    return patch("ibkr.get_ib", return_value=ib), patch("ibkr._bounded_req", side_effect=lambda ib, n, f, **kw: f())
 
 
 def test_fresh_stock_position_counts_a_repeated_row_once():
@@ -53,7 +53,7 @@ def test_sell_guard_does_not_double_count_a_repeated_row():
     cache = [_pos("NVDA", 1.0, 190.0, 4815747)]
     fresh = [_pos("NVDA", 2.0, 190.0, 4815747), _pos("NVDA", 2.0, 191.0, 4815747)]
     ib = NS(positions=lambda: cache, reqPositions=lambda: fresh)
-    with patch("ibkr._bounded_req", side_effect=lambda ib, n, f: f()):
+    with patch("ibkr._bounded_req", side_effect=lambda ib, n, f, **kw: f()):
         ibkr._refuse_sell_on_short(ib, "NVDA", 2.0)          # 2 held: allowed
         with pytest.raises(ibkr.SellExceedsPosition):
             ibkr._refuse_sell_on_short(ib, "NVDA", 4.0)      # was allowed when 2+2=4

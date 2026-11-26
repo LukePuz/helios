@@ -1468,6 +1468,9 @@ def _whole_position_stop(ticker: str, new_stop: float, filled_qty: float,
     the filled shares get a stop at new_stop and the record is kept, the
     held texts about the whole-position stop are dropped, and
     status["recheck_after_place"] asks the caller for the coverage re-check.
+    An old stop whose cancel the broker confirmed after part of it filled
+    takes the same route (ibkr records it "Filled"): the new lot is stopped,
+    and the re-check covers the old shares that are left.
     """
     import db
     import ibkr
@@ -3970,9 +3973,11 @@ def execute_manual(
         # that level, not just the new shares (professor M115).
         stop_price = float(add_rec["stop_price"])
         placed = None
+        add_out: dict = {}
         try:
             placed = tasks._reprotect_after_late_sell(ticker, {}, None, from_queue=True,
-                                                      expect_at_least=held_before + filled_qty)
+                                                      expect_at_least=held_before + filled_qty,
+                                                      outcome_out=add_out)
         except Exception as e:
             log.error(f"[{ticker}] Re-protecting after a manual ADD failed: {e}")
         if placed is not True:
@@ -3982,11 +3987,25 @@ def execute_manual(
                 log.error(f"[{ticker}] Could not queue the stop retry: {e}")
             # The old stop may already be cancelled, or not cover the new
             # shares: treat the position as unprotected until a retry lands.
+            # A wait that cancelled nothing while the resting stops (not
+            # being cancelled) still cover the shares held before the ADD:
+            # only the added shares may be bare.
+            cover = add_out.get("cover")
+            whole = held_before + filled_qty
             try:
-                alert_module._send(
-                    f"🚨 UNPROTECTED POSITION — {ticker}\nManual ADD filled, but the stop for the "
-                    f"whole position (@ ${stop_price:.2f}) isn't confirmed. It is queued and retried "
-                    f"every reconcile cycle; place it manually if it isn't back within ~15 min.")
+                if cover is not None and held_before > 0 and cover >= held_before - 1e-6:
+                    alert_module._send(
+                        f"⚠️ STOP NOT YET RESIZED — {ticker}\nManual ADD filled; the old stop "
+                        f"still rests and covers {cover:g} of {whole:g} shares, but the stop for "
+                        f"the whole position (@ ${stop_price:.2f}) isn't confirmed, so the added "
+                        f"shares may be bare. It is queued and retried every reconcile cycle; "
+                        f"place it manually if it isn't back within ~15 min.")
+                else:
+                    alert_module._send(
+                        f"🚨 UNPROTECTED POSITION — {ticker}\nManual ADD filled, but the stop for "
+                        f"the whole position (@ ${stop_price:.2f}) isn't confirmed. It is queued "
+                        f"and retried every reconcile cycle; place it manually if it isn't back "
+                        f"within ~15 min.")
             except Exception:
                 pass
             tasks.open_manual_action(ticker, f"confirm the stop @ ${stop_price:.2f} covers the whole "

@@ -105,7 +105,8 @@ def test_screened_out_row_carries_the_flag():
     p = kw["provenance"]
     assert p["own_ticker_rejected"] is True and p["own_ticker_reason_match"] == "watchlist"
     assert p["own_ticker_patterns_sha"] == own_ticker.PATTERNS_SHA
-    assert {k: v for k, v in p.items() if not k.startswith("own_ticker_")} == prov
+    assert {k: v for k, v in p.items()
+            if not k.startswith(("own_ticker_", "material_event_"))} == prov
     assert "own_ticker_rejected" not in prov            # the screener's dict is not mutated
     json.dumps(p)
 
@@ -119,7 +120,8 @@ def test_a_failing_record_keeps_the_row():
     prov = {"model": "qwen2.5:7b", "title_names_ticker": True}
     with patch("agents.own_ticker.own_ticker_record", side_effect=RuntimeError("x")):
         log_signal = _screened_out({"relevant": False, "provenance": prov, "reason": "r"})
-    assert log_signal.call_args.kwargs["provenance"] == prov
+    assert {k: v for k, v in log_signal.call_args.kwargs["provenance"].items()
+            if not k.startswith("material_event_")} == prov
 
 
 def test_screened_in_rows_are_untouched():

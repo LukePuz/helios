@@ -226,6 +226,16 @@ def _no_reclaim_book_io(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_deal_state_io(monkeypatch):
+    """A screened deal item is folded into a record-only per-ticker deal
+    record (agents/material_event.deal_state_note) in system_state under a
+    Redis lock. Stubbed as "not stored" (no Redis or DB) unless a test
+    restores it; tests/test_material_event.py does."""
+    from agents import material_event
+    monkeypatch.setattr(material_event, "deal_state_note", lambda *a, **k: False)
+
+
+@pytest.fixture(autouse=True)
 def _no_vol_shadow_read(monkeypatch):
     """size_position's record-only volatility shadows read cached bars from
     price_history. Stubbed as "no cached bars" (no DB read) unless a test
@@ -338,6 +348,48 @@ def _no_more_stop_qty_from_broker(monkeypatch):
     import config
     _switch_off(monkeypatch, config, "PT_STOP_QTY_FROM_BROKER", False)
     _switch_off(monkeypatch, config, "LATE_FILL_EXPECT_MODE", "off")
+
+
+@pytest.fixture(autouse=True)
+def _fresh_positions_from_the_cache(monkeypatch):
+    """ibkr.get_fresh_stock_positions (a fresh reqPositions() read) reads
+    back the test's own portfolio cache (ibkr.get_client().get_all_positions),
+    so the re-protect's real helpers always run without each test mocking
+    the read. The real read runs instead when the test gave it the session
+    that read uses: ibkr._ib set (any read), or a patched ibkr.get_ib for a
+    reconnecting read (the default). A reconnect=False read (the
+    re-protect's) uses ibkr._ib only, so a patched get_ib alone would make
+    it raise ConnectionError where live has a session: that reads the cache.
+    A cache that raises raises here too, as a failed read; a test patches
+    the function itself to fake a disagreement or a missing session."""
+    import ibkr
+    real = ibkr.get_fresh_stock_positions
+
+    def from_cache(*args, **kw):
+        reconnect = kw.get("reconnect", args[1] if len(args) > 1 else True)
+        if getattr(ibkr, "_ib", None) is not None or (reconnect and ibkr.get_ib is not _blocked_get_ib):
+            return real(*args, **kw)
+        out: dict = {}
+        for p in ibkr.get_client().get_all_positions():
+            qty = float(p.qty)
+            if qty:
+                out[p.symbol] = out.get(p.symbol, 0.0) + qty
+        return out
+    monkeypatch.setattr(ibkr, "get_fresh_stock_positions", from_cache)
+
+
+@pytest.fixture(autouse=True)
+def _no_would_be_stop_read(monkeypatch):
+    """A gate-blocked buy's record-only would-be sizing reads cached bars for
+    its stop (agents/crew.py:_would_be_stop). Stubbed as "no stop" (no DB
+    read) unless a test patches it itself; tests/test_blocked_sizing_shadow.py
+    does. Its vol bars and book heat inputs are stubbed by the two fixtures
+    above."""
+    from agents import crew
+
+    def _no_stop(ticker, price, bucket):
+        raise RuntimeError("stubbed in tests")
+    monkeypatch.setattr(crew, "_would_be_stop", _no_stop)
 
 
 @pytest.fixture(autouse=True)
@@ -569,29 +621,51 @@ class _FakeLock:
 
 class _FakeRedis:
     store: dict = {}
+    # ex is honoured against this test clock (seconds), which only a test
+    # moves (_FakeRedis.clock += 51): a key set with ex is gone once the clock
+    # reaches its expiry. Reset per test.
+    clock: float = 0.0
+    expires: dict = {}
+
+    @classmethod
+    def _expire(cls):
+        for k, at in list(cls.expires.items()):
+            if at <= cls.clock:
+                cls.store.pop(k, None)
+                cls.expires.pop(k, None)
 
     def lock(self, name, **kw):
         return _FakeLock(name, **kw)
 
     def set(self, key, value, ex=None, nx=False):
+        _FakeRedis._expire()
         if nx and key in _FakeRedis.store:
             return None
         _FakeRedis.store[key] = value
+        if ex is not None:
+            _FakeRedis.expires[key] = _FakeRedis.clock + float(ex)
+        else:
+            _FakeRedis.expires.pop(key, None)
         return True
 
     def exists(self, key):
         # A held lock is an ordinary key in Redis.
+        _FakeRedis._expire()
         return int(key in _FakeRedis.store or key in _FakeLock.held)
 
     def get(self, key):
+        _FakeRedis._expire()
         v = _FakeRedis.store.get(key)
         return v.encode() if isinstance(v, str) else v
 
     def scan_iter(self, pattern, count=None):
         import fnmatch
+        _FakeRedis._expire()
         return [k for k in list(_FakeRedis.store) if fnmatch.fnmatch(k, pattern)]
 
     def delete(self, key):
+        _FakeRedis._expire()
+        _FakeRedis.expires.pop(key, None)
         return int(_FakeRedis.store.pop(key, None) is not None)
 
     def ping(self):
@@ -605,7 +679,11 @@ def _no_live_redis(monkeypatch):
     _FakeLock.renewed = []
     _FakeLock.owner = {}
     _FakeRedis.store = {}
+    _FakeRedis.clock = 0.0
+    _FakeRedis.expires = {}
     monkeypatch.setattr(stop_lock, "_redis", lambda: _FakeRedis())
+    # The stop coverage re-check's per-ticker dedupe key (tasks._RECHECK_KEY).
+    monkeypatch.setattr("tasks._recheck_redis", lambda: _FakeRedis())
 
 
 @pytest.fixture(autouse=True)
@@ -628,15 +706,17 @@ def _alert_policy_to_tmp(tmp_path, monkeypatch):
     monkeypatch.setattr(alert_policy, "STATE_PATH", tmp_path / ".alert_policy_state.json")
 
 
+def _blocked_get_ib(*a, **k):
+    raise RuntimeError("tests must not connect to IBKR; mock the ibkr.* call")
+
+
 @pytest.fixture(autouse=True)
 def _no_live_ibkr(monkeypatch):
     """Like the DB guard: an unmocked broker call fails fast instead of
     trying to reach a real gateway (one test spent 9 s retrying, 10-28)."""
     import ibkr
 
-    def _blocked(*a, **k):
-        raise RuntimeError("tests must not connect to IBKR; mock the ibkr.* call")
-    monkeypatch.setattr(ibkr, "get_ib", _blocked)
+    monkeypatch.setattr(ibkr, "get_ib", _blocked_get_ib)
 
 
 @pytest.fixture(autouse=True)

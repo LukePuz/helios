@@ -1,4 +1,5 @@
 """Resting stops for more shares than held get rebuilt (professor M54)."""
+from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -201,7 +202,8 @@ class TestBackstopSellReads:
              patch("ibkr.get_open_orders", return_value=_orders(4)), \
              patch("ibkr.place_market_order", return_value={"filled_qty": 6, "fill_price": 140.0}) as order, \
              patch("db.log_trade"), patch("db.delete_position_stop") as delete, \
-             patch("db.close_trade_outcome") as close, patch("alerts._send"):
+             patch("db.close_trade_outcome") as close, patch("alerts._send"), \
+             patch("tasks._reconcile_alert_due", return_value=True):
             assert tasks._execute_backstop_sell("AMD", self._alert) is True
         order.assert_called_once_with("AMD", "SELL", 6.0)
         delete.assert_not_called(); close.assert_not_called()
@@ -335,7 +337,8 @@ def test_backstop_does_not_sell_shares_a_working_sell_already_covers():
                    return_value={"order_id": 78, "filled_qty": 6, "fill_price": 140.0}) as order, \
              patch("db.log_trade"), patch("db.delete_position_stop") as delete, \
              patch("db.log_order", return_value=5), \
-             patch("db.update_order_fill"), patch("db.close_trade_outcome") as close, patch("alerts._send"):
+             patch("db.update_order_fill"), patch("db.close_trade_outcome") as close, patch("alerts._send"), \
+             patch("tasks._reconcile_alert_due", return_value=True):
             tasks._execute_backstop_sell("AMD", TestBackstopSellReads._alert)
         if sold is None:
             order.assert_not_called()
@@ -761,6 +764,40 @@ def test_retry_keeps_a_waiting_exit_without_counting_a_try():
     alert.assert_not_called()
 
 
+@pytest.mark.parametrize("entry,intent", [
+    ({"intent": "EXIT", "order_id": 5}, "EXIT"),
+    ({"intent": "BACKSTOP", "order_id": 5}, "BACKSTOP"),
+    ({"intent": "PROFIT_TARGET", "exit_intent": "EXIT", "exit_order_id": 5}, "EXIT"),
+])
+@pytest.mark.parametrize("due", [True, False])
+def test_a_queued_exit_dropped_after_its_waits_alerts_once_and_opens_a_manual_action(entry, intent, due):
+    """Professor m118: after _EXIT_WAIT_MAX waits the entry was dropped with
+    a log line only. Now one throttled alert (no prices or sizes) and a
+    manual action; nothing is placed."""
+    import json
+    state = {tasks._REPROTECT_STATE_KEY: json.dumps(
+        {"CRWD": {**entry, "nonce": "n", "waits": tasks._EXIT_WAIT_MAX - 1}})}
+    with patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
+         patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+         patch("stop_lock._redis", side_effect=RuntimeError("no redis")), \
+         patch("tasks._reprotect_after_late_sell", return_value="wait"), \
+         patch("tasks._reconcile_alert_due", return_value=due) as due_check, \
+         patch("tasks.open_manual_action") as manual, \
+         patch("tasks.manage_stop_place") as place, \
+         patch("alerts._send") as alert:
+        tasks._retry_pending_reprotects()
+    assert json.loads(state[tasks._REPROTECT_STATE_KEY]) == {}
+    due_check.assert_called_once_with("queued_exit_dropped_CRWD")
+    place.assert_not_called()
+    assert manual.call_args.args[0] == "CRWD" and intent in manual.call_args.args[1]
+    if due:
+        msg = alert.call_args.args[0]
+        assert f"QUEUED {intent} DROPPED" in msg and "<b>CRWD</b>" in msg
+        assert "Check TWS" in msg and "$" not in msg
+    else:
+        alert.assert_not_called()
+
+
 def test_a_queued_profit_target_keeps_a_later_exits_order_for_the_flat_close():
     """Professor m111: the PROFIT_TARGET entry keeps priority, and the EXIT's
     order row id rides along so its flat close still finds the order."""
@@ -837,6 +874,98 @@ def test_a_buy_merged_into_a_profit_target_gets_the_flat_buy_retry():
         tasks._retry_pending_reprotects()
     alert.assert_called_once()
     assert "STOP NOT PLACED" in alert.call_args.args[0]
+
+
+class _Retry(Exception):
+    pass
+
+
+def _reconcile_pass(state, retries, reprotect_result=None):
+    """One _reconcile_unconfirmed_orders_locked pass as Celery runs it: the
+    order list fails to load, so the pass ends in task.retry (120 s later).
+    retries is task.request.retries (0 for the scheduled run)."""
+    task = SimpleNamespace(request=SimpleNamespace(retries=retries),
+                           retry=lambda exc=None, countdown=None: _Retry())
+    with patch("db.get_state", side_effect=lambda k, d=None: state.get(k, d)), \
+         patch("db.set_state", side_effect=lambda k, v: state.__setitem__(k, v)), \
+         patch("stop_lock._redis", side_effect=RuntimeError("no redis")), \
+         patch("tasks._retry_untracked_orders"), patch("tasks._retry_pending_buy_outcomes"), \
+         patch("tasks._adopt_orphaned_submitted_orders"), patch("tasks._recover_trade_pending_orders"), \
+         patch("db.get_unconfirmed_orders", side_effect=RuntimeError("db down")), \
+         patch("tasks._reprotect_after_late_sell", return_value=reprotect_result) as reprotect, \
+         patch("alerts._send") as alert, patch("tasks.open_manual_action") as manual:
+        with pytest.raises(_Retry):
+            tasks._reconcile_unconfirmed_orders_locked(task)
+    return reprotect, alert, manual
+
+
+def test_a_celery_rerun_tries_the_queued_stop_but_never_spends_its_budget():
+    """Professor m121: the order-list load fails, task.retry reruns the pass
+    120 s later, and that rerun counted a second try, so "STOP NOT PLACED
+    (~10 min)" went out after ~2 min. The rerun still tries the stop (no
+    change to placement) but the count stays in 5-min reconcile cycles."""
+    import json
+    state = {tasks._REPROTECT_STATE_KEY: json.dumps({"CRWD": {"intent": "BUY", "nonce": "a"}})}
+    tries = lambda: json.loads(state[tasks._REPROTECT_STATE_KEY])["CRWD"]["tries"]
+    reprotect, alert, _ = _reconcile_pass(state, retries=0)      # scheduled run: try 1
+    assert reprotect.call_count == 1 and tries() == 1
+    alert.assert_not_called()
+    for n in (1, 2):                                              # its two Celery reruns
+        reprotect, alert, manual = _reconcile_pass(state, retries=n)
+        assert reprotect.call_count == 1 and tries() == 1         # tried, not counted
+        alert.assert_not_called(); manual.assert_not_called()
+    reprotect, alert, manual = _reconcile_pass(state, retries=0)  # next scheduled run: try 2
+    assert reprotect.call_count == 1
+    alert.assert_called_once()
+    assert "STOP NOT PLACED" in alert.call_args.args[0] and "~10 min" in alert.call_args.args[0]
+    manual.assert_called_once()
+    assert json.loads(state[tasks._REPROTECT_STATE_KEY]) == {}
+
+
+def test_a_celery_rerun_never_advances_a_waiting_exits_wait_count():
+    import json
+    state = {tasks._REPROTECT_STATE_KEY: json.dumps(
+        {"CRWD": {"intent": "EXIT", "order_id": 5, "nonce": "n", "waits": tasks._EXIT_WAIT_MAX - 1}})}
+    _reconcile_pass(state, retries=1, reprotect_result="wait")
+    assert json.loads(state[tasks._REPROTECT_STATE_KEY])["CRWD"]["waits"] == tasks._EXIT_WAIT_MAX - 1
+    _reconcile_pass(state, retries=0, reprotect_result="wait")
+    assert json.loads(state[tasks._REPROTECT_STATE_KEY]) == {}    # the scheduled run drops it
+
+
+@pytest.mark.parametrize("task,counted", [
+    (MagicMock(), True),                                          # no int retries: a first run
+    (SimpleNamespace(), True),                                    # no request at all
+    (SimpleNamespace(request=SimpleNamespace(retries=0)), True),
+    (SimpleNamespace(request=SimpleNamespace(retries=2)), False),
+])
+def test_only_a_celery_rerun_skips_the_budget(task, counted):
+    with patch("tasks._retry_untracked_orders"), \
+         patch("tasks._retry_pending_buy_outcomes") as outcomes, \
+         patch("tasks._adopt_orphaned_submitted_orders"), patch("tasks._recover_trade_pending_orders"), \
+         patch("tasks._retry_pending_reprotects") as reprotects, \
+         patch("db.get_unconfirmed_orders", return_value=[]), \
+         patch("tasks._backfill_perm_ids", side_effect=_Retry("stop the pass here")):
+        with pytest.raises(_Retry):
+            tasks._reconcile_unconfirmed_orders_locked(task)
+    reprotects.assert_called_once_with(count_budget=counted)
+    outcomes.assert_called_once_with(count_budget=counted)
+
+
+@pytest.mark.parametrize("retries,counted", [(0, True), (1, False)])
+def test_the_real_tasks_retry_count_reaches_the_queued_retries(retries, counted):
+    """Through the Celery task itself (apply, eager): self.request.retries is
+    what decides the budget, so a rerun Celery makes is the one seen here."""
+    with patch("tasks._run_singleton", side_effect=lambda name, fn, **k: fn()), \
+         patch("tasks._retry_untracked_orders"), \
+         patch("tasks._retry_pending_buy_outcomes") as outcomes, \
+         patch("tasks._adopt_orphaned_submitted_orders"), patch("tasks._recover_trade_pending_orders"), \
+         patch("tasks._retry_pending_reprotects") as reprotects, \
+         patch("db.get_unconfirmed_orders", return_value=[]), \
+         patch("tasks._backfill_perm_ids", side_effect=_Retry("stop the pass here")):
+        result = tasks.reconcile_unconfirmed_orders.apply(retries=retries)
+    assert isinstance(result.result, _Retry)          # stopped where the test stopped it
+    reprotects.assert_called_once_with(count_budget=counted)
+    outcomes.assert_called_once_with(count_budget=counted)
 
 
 def test_an_exit_after_a_merged_buy_clears_the_buy_flag():
@@ -934,7 +1063,7 @@ def test_the_newer_position_check_waits_when_a_read_fails():
 
 def _queued_restore(open_orders, before, after, intent="RESTORE", held=20):
     """from_queue path with coverage read before the cancel (before) and the
-    stops left after it (after)."""
+    stops left after it (after). Returns (ok, place, cancel, recheck)."""
     client = MagicMock()
     client.get_all_positions.return_value = [MagicMock(symbol="CRWD", qty=held)]
     kw = {"side_effect": open_orders} if isinstance(open_orders, Exception) else {"return_value": open_orders}
@@ -947,31 +1076,33 @@ def _queued_restore(open_orders, before, after, intent="RESTORE", held=20):
                **({"side_effect": after} if isinstance(after, Exception) else {"return_value": after})), \
          patch("tasks.manage_cancel_stop_orders_for") as cancel, \
          patch("tasks.manage_stop_place", return_value={"order_id": 3}) as place, \
-         patch("db.set_stop_broker_order_id"):
+         patch("db.set_stop_broker_order_id"), \
+         patch("tasks._queue_stop_coverage_recheck", return_value=True) as recheck:
         ok = tasks._reprotect_after_late_sell("CRWD", {"intent": intent, "stop_price": 160.0}, None,
                                               from_queue=True)
-    return ok, place, cancel
+    return ok, place, cancel, recheck
 
 
 def test_queued_restore_waits_when_open_orders_cannot_be_read():
     """m116: a queued retry does not stop blind; it counts a try."""
-    ok, place, cancel = _queued_restore(TimeoutError("no reply"), 0.0, [])
+    ok, place, cancel, _ = _queued_restore(TimeoutError("no reply"), 0.0, [])
     assert ok is False
     place.assert_not_called(); cancel.assert_not_called()
 
 
 def test_queued_restore_waits_when_resting_stops_cannot_be_read():
-    ok, place, cancel = _queued_restore([], None, [])
+    ok, place, cancel, recheck = _queued_restore([], None, [])
     assert ok is False
     place.assert_not_called(); cancel.assert_not_called()
+    recheck.assert_called_once_with("CRWD")               # the shares may be bare
 
 
 def test_queued_restore_covers_only_what_a_stop_it_cannot_cancel_leaves():
     """m116: another client's stop on 8 shares stays; ours goes on 12."""
     other = {"order_id": 5, "ticker": "CRWD", "qty": 8.0, "stop_price": 140.0}
-    ok, place, cancel = _queued_restore([], 8.0, [other])
+    ok, place, cancel, _ = _queued_restore([], 8.0, [other])
     assert ok is True
-    cancel.assert_called_once_with("CRWD")
+    cancel.assert_called_once_with("CRWD", stuck_out=[])
     place.assert_called_once_with("CRWD", 12.0, 150.0)
 
 
@@ -980,13 +1111,13 @@ def test_queued_restore_nets_a_working_market_sell():
     mkt = {"order_id": 9, "ticker": "CRWD", "action": "SELL", "order_type": "MKT", "qty": 5.0,
            "stop_price": None, "status": "Submitted", "remaining": 5.0}
     other = {"order_id": 5, "ticker": "CRWD", "qty": 8.0, "stop_price": 140.0}
-    ok, place, _ = _queued_restore([mkt], 8.0, [other])
+    ok, place, _, _ = _queued_restore([mkt], 8.0, [other])
     assert ok is True
     place.assert_called_once_with("CRWD", 7.0, 150.0)
 
 
 def test_queued_restore_with_no_cover_places_without_a_cancel_round_trip():
-    ok, place, cancel = _queued_restore([], 0.0, [])
+    ok, place, cancel, _ = _queued_restore([], 0.0, [])
     assert ok is True
     cancel.assert_not_called()
     place.assert_called_once_with("CRWD", 20.0, 150.0)
@@ -996,9 +1127,9 @@ def test_queued_profit_target_replaces_ours_and_sizes_to_what_is_left():
     """A profit target still re-places (it raises the stop), sized net of a
     stop the cancel could not remove."""
     other = {"order_id": 5, "ticker": "CRWD", "qty": 8.0, "stop_price": 140.0}
-    ok, place, cancel = _queued_restore([], 20.0, [other], intent="PROFIT_TARGET")
+    ok, place, cancel, _ = _queued_restore([], 20.0, [other], intent="PROFIT_TARGET")
     assert ok is True
-    cancel.assert_called_once_with("CRWD")
+    cancel.assert_called_once_with("CRWD", stuck_out=[])
     place.assert_called_once_with("CRWD", 12.0, 160.0)
 
 
@@ -1055,28 +1186,169 @@ def test_queued_restore_giving_up_on_a_sign_flip_says_check_long_or_short():
 def test_queued_restore_stops_everything_if_the_re_read_after_its_cancel_fails():
     """Review of 48581aa: ours is already cancelled, so a failed re-read must
     not leave the shares naked."""
-    ok, place, cancel = _queued_restore([], 8.0, TimeoutError("no reply"))
+    ok, place, cancel, recheck = _queued_restore([], 8.0, TimeoutError("no reply"))
     assert ok is True
-    cancel.assert_called_once_with("CRWD")
+    cancel.assert_called_once_with("CRWD", stuck_out=[])
     place.assert_called_once_with("CRWD", 20.0, 150.0)
+    recheck.assert_called_once_with("CRWD")   # stopped blind: an over-stop is trimmed
 
 
-def test_queued_restore_takes_a_second_look_at_a_pending_cancel():
-    ours = {"order_id": 4, "ticker": "CRWD", "qty": 20.0, "stop_price": 150.0, "status": "PendingCancel"}
+def _queued_restore_looks(first_look, second_look, rows=None, covered=5.0, recheck_ok=True,
+                          place_error=None, from_queue=True):
+    """A RESTORE for 20 CRWD (queued unless from_queue=False). covered is what
+    _stops_still_resting reports before the cancel; rows, when given, are its
+    rows (the floor then needs no read of its own). Without rows the floor
+    reads ours working first. Then the looks after the cancel (a list of
+    rows, or an exception for a read that raises). recheck_ok: what queueing
+    the coverage re-check returns; place_error: raised by the place.
+    Returns (result, place, sleep, recheck, warnings logged)."""
     client = MagicMock()
     client.get_all_positions.return_value = [MagicMock(symbol="CRWD", qty=20)]
+    looks = [first_look, second_look]
+    if rows is None:
+        looks = [[{**_OURS_CRWD, "status": "Submitted"}]] + looks
+
+    def still_resting(ticker, rows_out=None, **_):
+        if rows_out is not None and rows is not None:
+            rows_out[:] = rows
+        return covered
+    placed = {"side_effect": place_error} if place_error else {"return_value": {"order_id": 3}}
     with patch("ibkr.get_client", return_value=client), \
          patch("ibkr.get_open_orders", return_value=[]), \
          patch("db.get_position_stop", return_value={"stop_price": 150.0}), \
-         patch("execution._stops_still_resting", return_value=5.0), \
-         patch("tasks._resting_sell_stops",   # the floor read before the cancel, then two looks
-               side_effect=[[{**ours, "status": "Submitted"}], [ours], []]), \
+         patch("db.log_activity_direct"), \
+         patch("execution._stops_still_resting", side_effect=still_resting), \
+         patch("tasks._resting_sell_stops", side_effect=looks), \
          patch("tasks.manage_cancel_stop_orders_for"), patch("time.sleep") as sleep, \
-         patch("tasks.manage_stop_place", return_value={"order_id": 3}) as place, \
-         patch("db.set_stop_broker_order_id"):
-        assert tasks._reprotect_after_late_sell("CRWD", {"intent": "RESTORE"}, None, from_queue=True) is True
+         patch("tasks.manage_stop_place", **placed) as place, \
+         patch("db.set_stop_broker_order_id"), \
+         patch("tasks._queue_stop_coverage_recheck", return_value=recheck_ok) as recheck, \
+         patch.object(tasks.log, "warning") as warn:
+        result = tasks._reprotect_after_late_sell("CRWD", {"intent": "RESTORE"}, None,
+                                                  from_queue=from_queue)
+    return result, place, sleep, recheck, " ".join(str(c.args[0]) for c in warn.call_args_list)
+
+
+_OURS_CRWD = {"order_id": 4, "ticker": "CRWD", "qty": 20.0, "stop_price": 150.0}
+
+
+@pytest.mark.parametrize("cancelling", ["PendingCancel", "ApiPendingCancel"])
+def test_queued_restore_takes_a_second_look_at_a_pending_cancel(cancelling):
+    ok, place, sleep, recheck, _ = _queued_restore_looks([{**_OURS_CRWD, "status": cancelling}], [])
+    assert ok is True
     sleep.assert_called_once_with(5)                  # the second look ran
     place.assert_called_once_with("CRWD", 20.0, 150.0)
+    recheck.assert_not_called()                       # the cancel landed: nothing to trim
+
+
+@pytest.mark.parametrize("cancelling", ["PendingCancel", "ApiPendingCancel"])
+def test_queued_restore_never_counts_a_stop_still_cancelling_as_cover(cancelling):
+    """Review of 332ff4e (SF1): the second look still shows ours cancelling.
+    Counted as others it would size ours at 0 and leave the shares bare once
+    the cancel lands, so it isn't cover (as in _restore_cover/_fix_overstop):
+    the whole 20 is stopped and a coverage re-check trims it if the cancel is
+    rejected."""
+    still = [{**_OURS_CRWD, "status": cancelling}]
+    ok, place, sleep, recheck, logged = _queued_restore_looks(still, still)
+    assert ok is True
+    sleep.assert_called_once_with(5)
+    place.assert_called_once_with("CRWD", 20.0, 150.0)
+    recheck.assert_called_once_with("CRWD")
+    assert "stay covered by stop(s) the cancel did not remove" not in logged
+
+
+def test_queued_restore_still_counts_a_stop_the_cancel_did_not_remove():
+    """Another client's working stop stays cover next to ours still
+    cancelling: ours goes on the rest, and the re-check is queued."""
+    other = {"order_id": 9, "ticker": "CRWD", "qty": 8.0, "stop_price": 140.0, "status": "Submitted"}
+    still = [{**_OURS_CRWD, "status": "PendingCancel"}, other]
+    ok, place, _, recheck, logged = _queued_restore_looks(still, still)
+    assert ok is True
+    place.assert_called_once_with("CRWD", 12.0, 150.0)
+    recheck.assert_called_once_with("CRWD")
+    assert "8 shares stay covered" in logged and "$140.00" in logged and "$150.00 goes on 12" in logged
+
+
+@pytest.mark.parametrize("from_queue", [True, False])
+@pytest.mark.parametrize("cancelling", ["PendingCancel", "ApiPendingCancel"])
+def test_a_stop_still_cancelling_never_reads_as_already_covered(cancelling, from_queue):
+    """Review of 0934299 (F1): all 20 resting are one stop still being
+    cancelled. "Already covered" would drop the entry and leave the shares
+    bare once the cancel lands; the whole 20 is stopped instead and the
+    re-check is queued for a rejected cancel."""
+    ours = [{**_OURS_CRWD, "status": cancelling}]
+    ok, place, _, recheck, _ = _queued_restore_looks(ours, ours, rows=ours, covered=20.0,
+                                                    from_queue=from_queue)
+    assert ok is True
+    place.assert_called_once_with("CRWD", 20.0, 150.0)
+    recheck.assert_called_once_with("CRWD")
+
+
+@pytest.mark.parametrize("from_queue", [True, False])
+def test_working_stops_still_read_as_already_covered(from_queue):
+    rows = [{**_OURS_CRWD, "status": "Submitted"}]
+    ok, place, _, recheck, _ = _queued_restore_looks([], [], rows=rows, covered=20.0,
+                                                    from_queue=from_queue)
+    assert ok is True
+    place.assert_not_called()
+    recheck.assert_not_called()
+
+
+def test_others_covering_everything_still_queue_the_recheck_for_ours_cancelling():
+    """F3: another client's stop covers all 20 while ours is still being
+    cancelled. Nothing is placed, but a rejected cancel would bring ours back
+    on top, so the re-check is queued."""
+    other = {"order_id": 9, "ticker": "CRWD", "qty": 20.0, "stop_price": 140.0, "status": "Submitted"}
+    still = [{**_OURS_CRWD, "status": "PendingCancel"}, other]
+    ok, place, _, recheck, _ = _queued_restore_looks(still, still)
+    assert ok is True
+    place.assert_not_called()
+    recheck.assert_called_once_with("CRWD")
+
+
+def test_a_recheck_that_cannot_be_queued_leaves_the_placed_stop_standing():
+    still = [{**_OURS_CRWD, "status": "PendingCancel"}]
+    ok, place, _, recheck, logged = _queued_restore_looks(still, still, recheck_ok=False)
+    assert ok is True
+    place.assert_called_once_with("CRWD", 20.0, 150.0)
+    recheck.assert_called_once_with("CRWD")
+    assert "re-check queued" not in logged
+
+
+@pytest.mark.parametrize("from_queue", [True, False])
+@pytest.mark.parametrize("cancel_pending", [False, True])
+def test_a_failed_place_returns_false_and_always_rechecks(cancel_pending, from_queue):
+    """F2: a failed place counts a try (False). The place may still have
+    rested (an unknown outcome), and after the cancel the shares may be bare,
+    so the re-check is queued either way (reprotect-cancel-status: every
+    failed place queues it)."""
+    if cancel_pending:      # all 20 resting are ours, still being cancelled
+        rows = first = [{**_OURS_CRWD, "status": "PendingCancel"}]
+    else:                   # 8 resting, working; the cancel removes them
+        rows, first = [{**_OURS_CRWD, "qty": 8.0, "status": "Submitted"}], []
+    ok, place, _, recheck, _ = _queued_restore_looks(
+        first, first, rows=rows, covered=sum(o["qty"] for o in rows),
+        place_error=RuntimeError("orders worker: unknown outcome"), from_queue=from_queue)
+    assert ok is False
+    place.assert_called_once()
+    recheck.assert_called_once_with("CRWD")
+
+
+@pytest.mark.parametrize("second_read_error", [TimeoutError("no reply"), ConnectionError("dropped")])
+def test_queued_restore_stops_everything_when_the_second_look_after_a_pending_cancel_fails(
+        second_read_error):
+    """Professor m119: the first look sees our stop still PendingCancel and
+    the second read raises. The first look's rows must not be kept: counted
+    as others they would size the new stop at 0. Over-stopped beats
+    under-stopped, so the whole remainder is stopped and _fix_overstop trims."""
+    ok, place, sleep, recheck, logged = _queued_restore_looks(
+        [{**_OURS_CRWD, "status": "PendingCancel"}], second_read_error)
+    assert ok is True
+    sleep.assert_called_once_with(5)                  # the second look ran and failed
+    place.assert_called_once_with("CRWD", 20.0, 150.0)
+    recheck.assert_called_once_with("CRWD")           # a rejected cancel's over-stop is trimmed
+    assert "stopping all 20" in logged
+    assert "stay covered by stop(s) the cancel did not remove" not in logged
 
 
 def test_queued_flat_exit_passes_its_orders_fill_time():

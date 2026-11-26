@@ -170,7 +170,7 @@ def test_record_never_raises(shadow_on):
     with patch("agents.story_dedup.classify", side_effect=ValueError("boom")), \
          patch("db.recent_event_verdicts", return_value=[]):
         rec = sd.story_dedup_record("NVDA", _trig("A"))
-    assert rec == {"version": sd.STORY_DEDUP_VERSION, "read": "error: ValueError"}
+    assert rec == {"version": sd.STORY_DEDUP_VERSION_NO_CLUSTER, "read": "error: ValueError"}
 
 
 def test_db_strict_raises_and_default_returns_empty():

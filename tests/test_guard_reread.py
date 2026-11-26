@@ -322,6 +322,7 @@ def _late(order, from_queue, mode="enforce"):
          patch("db.mark_profit_target_taken"), \
          patch("db.log_activity_queued") as queued, \
          patch("market_data.is_market_hours", return_value=True), \
+         patch("tasks._queue_stop_coverage_recheck", return_value=True), \
          patch("alerts._send"), patch("time.sleep"):
         tasks._reprotect_after_late_sell("NVDA", order, None, from_queue=from_queue)
     rows = [c.args[4] for c in queued.call_args_list if c.args[0] == "stop_above_market_guard"]

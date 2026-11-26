@@ -596,16 +596,30 @@ def get_broker_stock_qty(symbol: str, settle: bool = False) -> float:
     return round(_long_qty(ib.positions(), symbol), 4)
 
 
-def get_fresh_stock_positions() -> dict[str, float]:
+def get_fresh_stock_positions(timeout: float | None = None,
+                              reconnect: bool = True) -> dict[str, float]:
     """{symbol: qty} for every non-zero stock position from a fresh
     reqPositions() request, not the ib.portfolio() cache that
     IBKRClient.get_all_positions reads. Used to confirm a position looks
     gone before reconcile cancels its stop or deletes its record: the
     portfolio cache can read empty or short after a reconnect (audit
-    2026-11-02 #6). Raises on any read failure."""
-    ib = get_ib()
+    2026-11-02 #6). Raises on any read failure.
+
+    timeout / reconnect: as get_open_orders. timeout is a shorter bound than
+    _REQ_TIMEOUT_S (_bounded_req; a timeout still drops the session).
+    reconnect=False uses this process's session as it is (no connect, no
+    heartbeat) and raises ConnectionError when there is none, so a caller
+    holding a ticker lock stays within timeout. The defaults are the usual
+    read."""
+    if reconnect:
+        ib = get_ib()
+    else:
+        ib = _ib
+        if ib is None or not ib.isConnected():
+            raise ConnectionError("IBKR not connected")
     out: dict[str, float] = {}
-    for p in _latest_positions(_bounded_req(ib, "reqPositions", ib.reqPositions)):
+    for p in _latest_positions(_bounded_req(ib, "reqPositions", ib.reqPositions,
+                                            timeout=timeout)):
         if getattr(p.contract, "secType", "STK") != "STK" or float(p.position) == 0:
             continue
         out[p.contract.symbol] = out.get(p.contract.symbol, 0.0) + float(p.position)
@@ -1225,6 +1239,19 @@ def _status_after_raise(trade) -> str:
     return "SentUnknown"
 
 
+def _cancel_part_filled(trade) -> bool:
+    """True when a stop whose cancel the broker confirmed had sold shares
+    first (trade.orderStatus.filled > 0): the rest is cancelled, but a
+    stop sized from the count read before the cancel would be too big.
+    Only a real number counts (a test double without one reads False).
+    Never raises."""
+    try:
+        got = trade.orderStatus.filled
+        return isinstance(got, (int, float)) and not isinstance(got, bool) and got > 0
+    except Exception:
+        return False
+
+
 def cancel_order(order_id: int, _poll_seconds: int = 5, symbol: str | None = None,
                  perm_id: int | None = None) -> bool:
     """Cancel an open order by orderId. Returns True only if the broker
@@ -1287,6 +1314,14 @@ def cancel_order(order_id: int, _poll_seconds: int = 5, symbol: str | None = Non
                 # stuck list, then the same exception goes on.
                 _record_cancel_status(order_id, _status_after_raise(trade))
                 raise
+            if status in _CANCEL_CONFIRMED_STATUSES and _cancel_part_filled(trade):
+                # Confirmed, but part of it filled first: kept as "Filled" so
+                # a caller sizing a stop over it takes its fill route
+                # (cancel_stop_orders_for lists it in stuck_out). Still True:
+                # nothing of it rests.
+                _record_cancel_status(order_id, "Filled")
+                log.error(_cancel_part_filled_line(order_id, trade, status))
+                return True
             _record_cancel_status(order_id, status)
             if status in _CANCEL_CONFIRMED_STATUSES:
                 log.info(f"Cancel confirmed for orderId={order_id} "
@@ -1298,6 +1333,20 @@ def cancel_order(order_id: int, _poll_seconds: int = 5, symbol: str | None = Non
     _record_cancel_status(order_id, "NotFound")
     log.warning(f"cancel_order: orderId={order_id} not found among open orders")
     return False
+
+
+def _cancel_part_filled_line(order_id, trade, status) -> str:
+    """The error for a confirmed cancel of an order that had part-filled
+    (a stop, or a stale market order cancel_order also cancels)."""
+    try:
+        got = f"{float(trade.orderStatus.filled):g}"
+    except Exception:
+        got = "some"
+    action = str(getattr(trade.order, "action", "") or "")
+    done = {"SELL": "sold", "BUY": "bought"}.get(action.upper(), "traded")
+    return (f"Cancel confirmed for orderId={order_id} ({action} "
+            f"{trade.order.totalQuantity} {trade.contract.symbol}) status={status}, but {got} "
+            f"shares FILLED before it — shares were {done}; check the position in TWS")
 
 
 def _cancel_not_confirmed_line(order_id, trade, status, poll_seconds) -> str:
@@ -1433,8 +1482,10 @@ def _cancel_stops_parallel(ib, ticker: str, matches: list, _poll_seconds: int = 
     yet settled is kept as Filled if it reads Filled, else SentUnknown (its
     cancel was sent), and that exception (or an earlier send's) is returned
     the same way. A trade already sent a cancel is never matched or polled
-    twice. Returns (confirmed
-    count, the orderIds not confirmed in match order, the exception or None)."""
+    twice. A confirmed cancel of a stop that had part-filled
+    (_cancel_part_filled) is counted and also listed, with status "Filled".
+    Returns (confirmed count, the orderIds not confirmed (or part-filled) in
+    match order, the exception or None)."""
     confirmed = 0
     not_ok: set[int] = set()            # indexes into matches
     first_exc = None
@@ -1475,6 +1526,16 @@ def _cancel_stops_parallel(ib, ticker: str, matches: list, _poll_seconds: int = 
                     # Ended without a cancel: not confirmed, stop polling it.
                     _record_cancel_status(oid, status[i])
                     log.warning(_cancel_not_confirmed_line(oid, trade, status[i], _poll_seconds))
+                    not_ok.add(i)
+                    done.add(i)
+                elif (status[i] in _CANCEL_CONFIRMED_STATUSES
+                      and _cancel_confirmed_by_log(trade, status[i])
+                      and _cancel_part_filled(trade)):
+                    # As cancel_order: confirmed, but part of it filled
+                    # first. Counted, and listed with "Filled".
+                    _record_cancel_status(oid, "Filled")
+                    log.error(_cancel_part_filled_line(oid, trade, status[i]))
+                    confirmed += 1
                     not_ok.add(i)
                     done.add(i)
                 elif (status[i] in _CANCEL_CONFIRMED_STATUSES
@@ -1551,7 +1612,9 @@ def cancel_stop_orders_for(ticker: str, stuck_out: list | None = None) -> int:
     is re-raised after stuck_out is filled.
 
     stuck_out (optional list): filled with (orderId, status) for each stop
-    that did not cancel, before any raise, so a caller placing over them
+    that did not cancel, and each one whose confirmed cancel came after a
+    part fill (status "Filled"; also in the count), before any raise, so a
+    caller placing over them
     knows. status is the one cancel_order or the parallel poll ended on
     (_LAST_CANCEL_STATUS: "Filled", "Inactive", "PendingCancel", "NotFound",
     "NotSent", "SentUnknown", ...), or None when none was kept.
@@ -1595,6 +1658,8 @@ def cancel_stop_orders_for(ticker: str, stuck_out: list | None = None) -> int:
                 break
             if ok:
                 confirmed += 1
+                if _LAST_CANCEL_STATUS.get(order.orderId) == "Filled":
+                    stuck.append(order.orderId)   # cancelled after a part fill
             else:
                 stuck.append(order.orderId)
     if stuck:

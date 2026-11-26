@@ -261,7 +261,7 @@ def test_a_failed_read_is_shown_not_counted():
 
 def test_every_batch_card_is_listed_once():
     names = [st["stage"] for st in src.STAGES]
-    assert len(names) == len(set(names)) == 39
+    assert len(names) == len(set(names)) == 42
     assert {st["card"] for st in src.STAGES} >= {"held-exit candidates", "book heat",
                                                  "above-market stop guard",
                                                  "self-consistency vote on routed entries",
@@ -314,8 +314,8 @@ def test_text_marks_silent_and_not_recording():
     text = src.render_text(lines, _meta())
     assert "VERDICT_VOTE_SHADOW_ENABLED=False (not recording)" in text
     always = [st["stage"] for st in src.STAGES if st["expect_rows"] == "always"]
-    assert len(always) == 9
-    assert f"{len(always)} silent, 0 alarm of 39 stages." in text
+    assert len(always) == 10
+    assert f"{len(always)} silent, 0 alarm of 42 stages." in text
     assert "no trigger yet" in text
     assert "no switch" in text
     assert "$" not in text
@@ -334,7 +334,7 @@ def test_text_marks_alarm_and_a_triggered_silent_stage():
     assert by["book_heat"]["silent"] is True
     assert by["hwm_guard"]["alarm"] is True
     assert by["risk_subcheck_fail"]["alarm"] is True
-    assert "1 silent, 2 alarm of 39 stages." in text
+    assert "1 silent, 2 alarm of 42 stages." in text
 
 
 def test_json_is_serialisable():

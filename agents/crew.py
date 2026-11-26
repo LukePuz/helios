@@ -78,6 +78,7 @@ def screen_event_only(event: dict) -> dict:
     if not screening.get("relevant", False):
         reason = screening.get("reason", "Not relevant")
         log.info(f"[{ticker}] Screened out: {reason}")
+        prov = None
         try:
             import db
             prov = screening.get("provenance") or {}
@@ -92,6 +93,16 @@ def screen_event_only(event: dict) -> dict:
                                                         screening.get("reason"))}
             except Exception as e:
                 log.debug(f"[{ticker}] own_ticker record failed: {e}")
+            # Record only: deal / offering / guidance-withdrawal terms in the
+            # title, whatever the reason says (agents/material_event.py).
+            # Read by nothing; the screen above is unchanged.
+            try:
+                from agents.material_event import material_event_record
+                if prov:
+                    prov = {**prov, **material_event_record(event.get("title"),
+                                                            event.get("actual_form"))}
+            except Exception as e:
+                log.debug(f"[{ticker}] material_event record failed: {e}")
             # The item's identifiers, as on SCREENED_IN, so a rejected item
             # can be found again (audit 2026-11-07 15:07 #1: only a 70-char
             # feed title survived). Never its text.
@@ -102,6 +113,7 @@ def screen_event_only(event: dict) -> dict:
                                     "new_fact": screening.get("new_fact")})
         except Exception as e:
             log.warning(f"[{ticker}] SCREENED_OUT signal log failed: {e}")
+        _deal_state_note(ticker, event, "SCREENED_OUT", screening, prov)
     else:
         log.info(f"[{ticker}] Relevant (urgency={screening.get('urgency')}) — queued for deep analysis")
         # Log-only: a pass whose analysis later expires or fails still has a
@@ -116,8 +128,24 @@ def screen_event_only(event: dict) -> dict:
                                     "new_fact": screening.get("new_fact")})
         except Exception as e:
             log.warning(f"[{ticker}] SCREENED_IN signal log failed: {e}")
+        _deal_state_note(ticker, event, "SCREENED_IN", screening, None)
 
     return screening
+
+
+def _deal_state_note(ticker: str, event: dict, signal: str, screening: dict,
+                     prov: dict | None) -> None:
+    """Record only: fold a screened item into the ticker's deal record
+    (agents/material_event.deal_state_note, system_state deal_state_<env>).
+    prov: the SCREENED_OUT row's provenance (with the material_event keys);
+    None uses the screener's own. Read by nothing that decides. Never
+    raises."""
+    try:
+        from agents.material_event import deal_state_note
+        deal_state_note(ticker, event, signal,
+                        prov if isinstance(prov, dict) else (screening or {}).get("provenance"))
+    except Exception as e:
+        log.debug(f"[{ticker}] deal record not noted: {e}")
 
 
 def event_item_fields(event) -> dict:
@@ -3533,6 +3561,289 @@ def _trend_gate_eval(t: dict, max_age, market_ticker) -> tuple[bool, dict]:
     return hit, gate_trend
 
 
+class _NoBrokerRead(AttributeError):
+    """Raised by _NoBrokerClient for any attribute: an AttributeError, so
+    hasattr() and getattr() with a default see "no such attribute"."""
+
+
+class _NoBrokerClient:
+    """The client of _would_be_stop's RiskManager: any broker read raises,
+    so a record-only path can never reach the broker through it."""
+    def __getattr__(self, name):
+        raise _NoBrokerRead(f"no broker read on a record-only path ({name})")
+
+
+class _BarsReadFailed(RuntimeError):
+    """_would_be_stop's cached-bar read failed (or hit its timeout): the
+    stop would be a flat fallback for the wrong reason, so none is given."""
+
+
+_WOULD_BE_READ_TIMEOUT_MS = 3000   # each price_history read on the block path
+# The would-be record's time budget on the route worker. Checked before each
+# part that reads (stop, vol, book heat): once spent, the remaining parts are
+# skipped and say so. A part already running is not interrupted (no thread:
+# a daemon-thread read crashed a worker before, roadmap 04d/04e), so the worst
+# case is the budget plus one part's own bound.
+_WOULD_BE_BUDGET_S = 4.0
+
+
+class _StopNotEvaluated(RuntimeError):
+    """The would-be stop is not computed on this path (setup gates are on:
+    the stop would come from classify_setup's unbounded ladder read)."""
+
+
+class _quiet_atr_fallback_warning:
+    """with _quiet_atr_fallback_warning(): risk_manager's "ATR unavailable —
+    using flat … fallback stop" warning is dropped for this thread only, so a
+    would-be stop doesn't read like a real sizing fallback in the worker log
+    (and doesn't log its price). Other threads, and the real sizing path, keep
+    the warning."""
+
+    def __init__(self):
+        import threading
+        self._ident = threading.get_ident()
+
+    def filter(self, record) -> bool:
+        try:
+            return not (record.thread == self._ident and "ATR unavailable" in record.getMessage())
+        except Exception:
+            return True
+
+    def __enter__(self):
+        import risk_manager
+        risk_manager.log.addFilter(self)
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        import risk_manager
+        risk_manager.log.removeFilter(self)
+        return False
+
+
+def _would_be_stop(ticker: str, price: float, bucket: str) -> tuple:
+    """(stop, method, atr, atr_multiple) from RiskManager.calculate_stop, the
+    stop function size_position uses, on a simulation RiskManager: ATR from
+    the price_history cache (one read, at most _WOULD_BE_READ_TIMEOUT_MS), no
+    alert, no stop_atr_fallback row, and no fallback warning in the log.
+    Built without __init__ (which reads the broker account) and given a
+    client that raises on use. With SETUP_GATES_ENABLED on, raises
+    _StopNotEvaluated before any read (calculate_stop would call
+    classify_setup, whose trade-ladder read has no bound). Raises
+    _BarsReadFailed when the bar read failed, and anything else on failure
+    (_would_be_sizing_record catches)."""
+    import db
+    import risk_manager
+    from risk_manager import RiskManager
+    if getattr(risk_manager, "SETUP_GATES_ENABLED", False):
+        raise _StopNotEvaluated("setup gates on: the stop would come from classify_setup")
+    rm = RiskManager.__new__(RiskManager)
+    rm.simulation, rm._client = True, _NoBrokerClient()
+    rm.halt_unknown = rm.monitor_read_failed = False
+    rm.last_stop_atr = rm.last_stop_mult = None
+    with db.price_history_bound(_WOULD_BE_READ_TIMEOUT_MS) as bound, _quiet_atr_fallback_warning():
+        stop, method = rm.calculate_stop(ticker, price, bucket, log_fallback=False,
+                                         log_caller="other")
+    if bound["errors"]:
+        raise _BarsReadFailed(bound["errors"][0])
+    return stop, method, rm.last_stop_atr, rm.last_stop_mult
+
+
+def _stop_kind(method) -> str | None:
+    """calculate_stop's method text as a label without its dollar figures."""
+    m = str(method or "")
+    if not m:
+        return None
+    for prefix, kind in (("Setup-gate structural stop", "setup_gate"),
+                         ("Moonshot hard stop", "moonshot_hard"),
+                         ("Fallback stop", "atr_fallback")):
+        if m.startswith(prefix):
+            return kind
+    return "atr_multiple" if "× ATR" in m else "other"
+
+
+# _rr_vs_stop fields kept as they are (ratios, ATR units, labels). Its percent
+# fields (x 100) are converted to fractions under a _frac name; its prices
+# (price, stop, target, atr, model_floor, stop_method) and its stop_pct (the
+# stop block already has stop_frac) are left out.
+_WOULD_BE_RR_KEYS = ("r_to_target", "r_to_plan_t1", "r_to_plan_t2", "target_source",
+                     "stop_atr", "target_atr", "atr_source", "model_udr",
+                     "stop_above_model_floor", "thresholds", "would_block", "reason", "error")
+# _book_heat_record fields kept: its read state, counts and the summed open
+# risk (renamed sum_open_risk_frac); not the per-holding list.
+_WOULD_BE_HEAT_KEYS = ("read", "source", "snapshot_age_min", "n_positions", "n_with_stop",
+                       "n_no_stop", "n_short", "n_unpriced", "n_stop_at_or_above_price",
+                       "reason")
+
+
+def _would_be_sizing_record(ticker: str, result: dict, trend: dict | None) -> dict | None:
+    """Record only (config BLOCKED_SIZING_SHADOW_ENABLED): what sizing's
+    record-only shadows would have shown for a buy the entry gate blocked,
+    marked hypothetical. Those shadows (rr_vs_stop, vol_target_shadow,
+    stop_vol, book_heat) run after size_position, so a blocked buy has none.
+    Nothing was sized or ordered, and nothing reads this record.
+
+    Units: every share of price or of the book is a fraction (0.1 = 10%), and
+    such fields are named *_frac; R values are ratios, *_atr fields are ATR
+    units. No price, dollar value or share count is recorded.
+
+    price is the trend read's last completed close (the gate's own read, no
+    new one; on a gap day it is the prior close). From it:
+    - stop: _would_be_stop (RiskManager.calculate_stop on cached bars; live
+      sizing reads IBKR daily bars): kind, stop_frac (distance below price),
+      atr_multiple;
+    - rr: _rr_vs_stop against that stop (_WOULD_BE_RR_KEYS, plus target_frac
+      and floor_vs_stop_frac from its percent fields);
+    - vol_target / stop_vol (VOL_TARGET_SIZING_SHADOW_ENABLED): risk_manager.
+      _vol_shadow_record with no share count, held value or portfolio value,
+      so only rvol20, vol_weight (of the book) and the stop's sigma distance
+      are filled;
+    - book_heat (BOOK_HEAT_SHADOW_ENABLED): _book_heat_record with no order,
+      its counts and sum_open_risk_frac only;
+    - order_risk_at_vol_weight_frac = vol_weight x stop_frac, and
+      sum_open_risk_after_at_vol_weight_frac.
+    A switch that is off gives that part read "switch off" and no read.
+    Parts that read run only while _WOULD_BE_BUDGET_S is left (checked before
+    the vol and book heat parts; the stop runs first); a skipped part reads
+    "skipped: time budget spent". With SETUP_GATES_ENABLED on the stop is not
+    evaluated (stop.reason says so), so no unbounded ladder read runs. The
+    allocation-table size, share counts and add_lot_r need the broker account
+    or position read and are not computed (not_computed says why). Reads only
+    what those functions read: price_history twice (each bounded by
+    _WOULD_BE_READ_TIMEOUT_MS) and the newest portfolio snapshot and
+    position_stops (book heat's own 3 s bound); no broker or vendor call.
+    None when the switch is off. Never raises."""
+    try:
+        try:
+            from config import BLOCKED_SIZING_SHADOW_ENABLED as on
+        except ImportError:
+            on = False
+        if not on:
+            return None
+        import math
+        import time as _time
+        t0 = _time.monotonic()
+        t = trend if isinstance(trend, dict) else {}
+        result = result if isinstance(result, dict) else {}
+        rec = {"hypothetical": True, "version": 1, "units": "fractions (*_frac), ratios, ATR units",
+               "price_basis": None, "price_bar_date": t.get("last_bar_date"), "stop": None,
+               "rr": None, "vol_target": None, "stop_vol": None, "book_heat": None,
+               "order_risk_at_vol_weight_frac": None,
+               "sum_open_risk_after_at_vol_weight_frac": None, "reason": None,
+               "not_computed": {
+                   "allocation_size": "needs the broker account read size_position makes "
+                                      "(portfolio value, cash, positions)",
+                   "shares": "share counts are not recorded",
+                   "add_lot_r": "needs the broker position and its fills"}}
+
+        def frac_of_pct(v):
+            return round(v / 100.0, 4) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+        try:
+            price = float(t.get("last_close"))
+            if not math.isfinite(price) or price <= 0:
+                price = None
+        except (TypeError, ValueError):
+            price = None
+        if price is None:
+            rec["reason"] = "no price in hand (the trend read has no last completed close)"
+            rec["elapsed_ms"] = round((_time.monotonic() - t0) * 1000)
+            return rec
+        rec["price_basis"] = "last_completed_close"
+        bucket = result.get("thesis_bucket") or "Accelerator"
+        stop = atr = mult = None
+
+        def budget_spent() -> bool:
+            return _time.monotonic() - t0 >= _WOULD_BE_BUDGET_S
+        skipped = {"read": "skipped: time budget spent"}
+        s = {"function": "RiskManager.calculate_stop", "bars": "price_history",
+             "kind": None, "stop_frac": None, "atr_multiple": None, "reason": None}
+        try:
+            stop, method, atr, mult = _would_be_stop(ticker, price, bucket)
+            s["kind"] = _stop_kind(method)
+            if isinstance(mult, (int, float)) and not isinstance(mult, bool):
+                s["atr_multiple"] = round(float(mult), 2)
+            if isinstance(stop, (int, float)) and 0 < stop < price:
+                s["stop_frac"] = round((price - stop) / price, 4)
+            else:
+                s["reason"], stop = "no stop below price", None
+        except _BarsReadFailed as e:
+            s["reason"], stop = f"bars read failed: {e}", None
+        except _StopNotEvaluated as e:
+            s["reason"], stop = f"not evaluated: {e}", None
+        except Exception as e:
+            s["reason"], stop = f"error: {type(e).__name__}", None
+        rec["stop"] = s
+        sizing = {"stop_loss_price": stop,
+                  "atr_stop": atr if isinstance(atr, (int, float)) and atr and atr > 0 else None}
+        try:
+            rr = _rr_vs_stop(result, sizing, price)
+            rec["rr"] = {k: rr.get(k) for k in _WOULD_BE_RR_KEYS if k in rr}
+            rec["rr"]["target_frac"] = frac_of_pct(rr.get("target_pct"))
+            rec["rr"]["floor_vs_stop_frac"] = frac_of_pct(rr.get("floor_vs_stop_pct"))
+        except Exception as e:
+            rec["rr"] = {"error": type(e).__name__}
+        try:
+            from config import VOL_TARGET_SIZING_SHADOW_ENABLED as vol_on
+        except ImportError:
+            vol_on = False
+        if not vol_on:
+            rec["vol_target"] = rec["stop_vol"] = {"read": "switch off"}
+        elif budget_spent():
+            rec["vol_target"] = rec["stop_vol"] = dict(skipped)
+        else:
+            try:
+                import db
+                from risk_manager import _vol_shadow_record
+                with db.price_history_bound(_WOULD_BE_READ_TIMEOUT_MS):
+                    vs = _vol_shadow_record(ticker, price, 0, 0.0, stop, atr, mult, None)
+                vt, sv = vs.get("vol_target_shadow") or {}, vs.get("stop_vol") or {}
+                rec["vol_target"] = {k: vt.get(k) for k in ("read", "source", "window", "bars",
+                                                            "last_bar_date", "stale_sessions",
+                                                            "rvol20", "target_contribution",
+                                                            "vol_weight", "reason")}
+                if rec["vol_target"]["read"] == "ok" and rec["vol_target"]["reason"] == \
+                        "no price or portfolio value":
+                    rec["vol_target"]["reason"] = None   # no portfolio value is passed, by design
+                rec["stop_vol"] = {"stop_frac": sv.get("stop_pct"),
+                                   "stop_distance_atr": sv.get("stop_distance_atr"),
+                                   "atr_multiple": sv.get("atr_multiple"),
+                                   "sigma20_frac": sv.get("sigma20_pct"),
+                                   "stop_sigma20": sv.get("stop_sigma20"), "reason": sv.get("reason")}
+            except Exception as e:
+                rec["vol_target"] = {"read": f"error: {type(e).__name__}"}
+        try:
+            from config import BOOK_HEAT_SHADOW_ENABLED as heat_on
+        except ImportError:
+            heat_on = False
+        if not heat_on:
+            rec["book_heat"] = {"read": "switch off"}
+        elif budget_spent():
+            rec["book_heat"] = dict(skipped)
+        else:
+            try:
+                bh = _book_heat_record(ticker, {})
+                rec["book_heat"] = {k: bh.get(k) for k in _WOULD_BE_HEAT_KEYS}
+                rec["book_heat"]["sum_open_risk_frac"] = bh.get("sum_open_risk_pct")
+                if rec["book_heat"]["reason"] == "order risk unknown (no shares, price or stop)":
+                    rec["book_heat"]["reason"] = None   # no order is passed, by design
+            except Exception as e:
+                rec["book_heat"] = {"read": f"error: {type(e).__name__}"}
+        vw = (rec.get("vol_target") or {}).get("vol_weight")
+        if isinstance(vw, (int, float)) and s["stop_frac"] is not None:
+            rec["order_risk_at_vol_weight_frac"] = round(vw * s["stop_frac"], 4)
+            heat = (rec.get("book_heat") or {}).get("sum_open_risk_frac")
+            if isinstance(heat, (int, float)):
+                rec["sum_open_risk_after_at_vol_weight_frac"] = round(
+                    heat + rec["order_risk_at_vol_weight_frac"], 4)
+        rec["elapsed_ms"] = round((_time.monotonic() - t0) * 1000)
+        rec["budget_s"] = _WOULD_BE_BUDGET_S
+        return rec
+    except Exception as e:
+        try:
+            return {"hypothetical": True, "version": 1, "error": type(e).__name__}
+        except Exception:
+            return None
+
+
 def _entry_gate(ticker: str, result: dict, stop_rec: dict | None, trend: dict | None,
                 path: str | None = None, extra: dict | None = None,
                 add_loser: dict | None = None,
@@ -3573,7 +3884,9 @@ def _entry_gate(ticker: str, result: dict, stop_rec: dict | None, trend: dict | 
 
     row_extra's keys go into the ENTRY_GATE_BLOCKED row's decision beside
     entry_gate (the recheck-contradiction and same-day-consensus records, and
-    add_loser_gate for a shadow-mode ADD); they never decide."""
+    add_loser_gate for a shadow-mode ADD); they never decide. On the route's
+    block (no path) the row also gets would_be_sizing (_would_be_sizing_record,
+    record only, after the block is decided)."""
     try:
         try:
             from config import STOPOUT_REENTRY_GATE_DAYS as days
@@ -3635,8 +3948,18 @@ def _entry_gate(ticker: str, result: dict, stop_rec: dict | None, trend: dict | 
             return False
         reason = f"{result.get('action')} skipped by the entry gate: " + "; ".join(blocks)
         log.info(f"[{ticker}] {reason}")
-        _log_route_exit(ticker, "ENTRY_GATE_BLOCKED", result, reason,
-                        {"entry_gate": gate, **(row_extra or {})})
+        row = {"entry_gate": gate, **(row_extra or {})}
+        if path is None:
+            # Record only, on the route's block (a deferred retry's approval
+            # already carries its real sizing). Its own try: a raise here must
+            # never reach the except below, which would let the buy through.
+            try:
+                would_be = _would_be_sizing_record(ticker, result, trend)
+                if would_be is not None:
+                    row["would_be_sizing"] = would_be
+            except Exception as e:
+                log.warning(f"[{ticker}] would-be sizing record failed: {type(e).__name__}: {e}")
+        _log_route_exit(ticker, "ENTRY_GATE_BLOCKED", result, reason, row)
         try:
             # Record only, after the block row. Its own try: a raise here must
             # never reach the except below, which would let the buy through.

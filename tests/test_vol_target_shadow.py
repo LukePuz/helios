@@ -257,11 +257,14 @@ def test_nothing_outside_risk_manager_reads_the_shadow_keys():
                 text = fh.read()
             if rel == os.path.join("agents", "crew.py"):
                 # crew's only uses: restating the record at the final share count,
-                # and the record-only book heat (_book_heat_record) reading it
-                a = text.find("def _book_heat_record(")
-                b = text.find("\ndef ", a + 1) if a >= 0 else -1   # that one function only
-                if 0 <= a < b:
-                    text = text[:a] + text[b:]
+                # and two record-only functions reading it: the book heat
+                # (_book_heat_record) and a blocked buy's would-be sizing
+                # (_would_be_sizing_record)
+                for fn in ("def _book_heat_record(", "def _would_be_sizing_record("):
+                    a = text.find(fn)
+                    b = text.find("\ndef ", a + 1) if a >= 0 else -1   # that one function only
+                    if 0 <= a < b:
+                        text = text[:a] + text[b:]
                 text = text.replace('sizing.get("vol_target_shadow")', "").replace(
                     'sizing["vol_target_shadow"] = _vol_shadow_reweigh(sizing["vol_target_shadow"],', "")
             if pat.search(text):

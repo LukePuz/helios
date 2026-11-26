@@ -14,6 +14,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from typing import NamedTuple
 
 from celery import Celery
 from celery.schedules import crontab
@@ -382,12 +383,15 @@ def _orders_call(task, args, kwargs=None, timeout: int = 30):
 _NOT_WORKING = {"Cancelled", "ApiCancelled", "Inactive", "Filled"}
 
 
-def _resting_sell_stops(ticker: str, types=("STP", "STP LMT", "TRAIL")) -> list[dict]:
+def _resting_sell_stops(ticker: str, types=("STP", "STP LMT", "TRAIL"),
+                        **read_kw) -> list[dict]:
     """Working SELL stops for ticker, with qty = the unfilled remainder
     (professor M64: totalQuantity counted part-filled, cancelling and
-    inactive stops as coverage)."""
+    inactive stops as coverage). read_kw (timeout, reconnect) go to
+    ibkr.get_open_orders; none: the usual read."""
     import ibkr
-    return [o for o in _working_sell_stops(ibkr.get_open_orders(), types) if o["ticker"] == ticker]
+    orders = ibkr.get_open_orders(**read_kw) if read_kw else ibkr.get_open_orders()
+    return [o for o in _working_sell_stops(orders, types) if o["ticker"] == ticker]
 
 
 def _working_mkt_sell_qty(open_orders: list[dict], ticker: str) -> float:
@@ -449,7 +453,8 @@ def manage_cancel_stop_orders_for(ticker: str, timeout: int = 30,
                                   stuck_out: list | None = None) -> int:
     """Cancel all resting stop orders for a ticker — see manage_stop_place.
     stuck_out (optional list): filled with (orderId, status) for each stop
-    that did not cancel (ibkr.cancel_stop_orders_for); through the orders
+    that did not cancel, or cancelled after a part fill ("Filled")
+    (ibkr.cancel_stop_orders_for); through the orders
     worker each pair arrives as a list, and a worker from before the
     statuses sends bare orderIds (execution._stuck_pairs reads all three).
     A cancel that raised on the worker raises OrdersCallFailed here, after
@@ -2338,10 +2343,15 @@ def _reconcile_unconfirmed_orders_locked(task):
     from datetime import timedelta
 
     # Queued retries first: they don't need the order list, and a failed
-    # load must not hold back a stop (review of 1492b13).
+    # load must not hold back a stop (review of 1492b13). A task.retry rerun
+    # (below, 120 s later) still tries each queued stop but doesn't count it:
+    # the try and wait budgets are in 5-min reconcile cycles, so a rerun
+    # counting would send "STOP NOT PLACED (~10 min)" after ~2 min (m121).
+    retries = getattr(getattr(task, "request", None), "retries", 0)
+    count_budget = not (isinstance(retries, int) and retries > 0)
     _retry_untracked_orders()
-    _retry_pending_reprotects()
-    _retry_pending_buy_outcomes()
+    _retry_pending_reprotects(count_budget=count_budget)
+    _retry_pending_buy_outcomes(count_budget=count_budget)
     _adopt_orphaned_submitted_orders()
     _recover_trade_pending_orders()
 
@@ -2755,6 +2765,9 @@ def _book_late_fill(order: dict, fill_qty: float, fill_price: float, total_avg: 
         )
 
     stop_placed: bool | None = False
+    # The re-protect's outcome_out (a late SELL): "by" says why nothing was
+    # placed on a True return (_ReprotectStep.by).
+    reprotect_out: dict = {}
     deferred_until = None   # a BUY stop deferred until the cache shows this count
     expect = None
     shadow = None           # (path, cache count before the place): the shadow row, written last
@@ -2905,7 +2918,8 @@ def _book_late_fill(order: dict, fill_qty: float, fill_price: float, total_avg: 
         # the recorded stop (professor C12, 2026-10-28).
         stop_placed = _reprotect_after_late_sell(ticker, order, fill_price, exit_avg=total_avg,
                                                  exit_fill_at=fill.get("fill_time"),
-                                                 exit_fill_at_source=fill.get("fill_time_source"))
+                                                 exit_fill_at_source=fill.get("fill_time_source"),
+                                                 outcome_out=reprotect_out)
         if stop_placed is False:
             # Busy ticker or a failed placement: the order is already
             # marked filled, so remember to retry (professor M50).
@@ -2920,6 +2934,15 @@ def _book_late_fill(order: dict, fill_qty: float, fill_price: float, total_avg: 
         # Deliberately not placed yet (the cache lags the fill), not a failure.
         alert_lines.append(f"⏳ late BUY fill: stop deferred until the position cache shows "
                            f"{float(deferred_until):g}; retry queued.")
+    elif stop_placed and reprotect_out.get("by") == "stops":
+        alert_lines.append("No new stop placed: resting stops already cover the remaining "
+                           "shares.")
+    elif stop_placed and reprotect_out.get("by") == "sell":
+        alert_lines.append("No new stop placed: a working SELL covers the remaining shares.")
+    elif stop_placed and reprotect_out.get("by") == "lag":
+        alert_lines.append(f"No new stop placed: stops cover the broker's count, "
+                           f"{float(reprotect_out.get('broker_qty') or 0):g}; the cached count is "
+                           f"higher: re-checking.")
     elif order["side"] == "BUY" or stop_placed is not None:
         alert_lines.append(
             "Protective stop placed." if stop_placed else
@@ -3248,8 +3271,9 @@ def _queue_reprotect(ticker: str, order: dict, fill_price: float | None) -> None
         if old.get("intent") == "PROFIT_TARGET" and entry["intent"] != "PROFIT_TARGET":
             # Keep the target sale's breakeven-or-higher stop and its
             # target-taken step; a later RESTORE/BUY must not replace them
-            # with the lower stop on record (professor M80).
-            pending[ticker] = {**{k: v for k, v in old.items() if k != "tries"},
+            # with the lower stop on record (professor M80). The merged entry
+            # starts its own try and wait budgets (professor m122).
+            pending[ticker] = {**{k: v for k, v in old.items() if k not in ("tries", "waits")},
                                "nonce": entry["nonce"]}
             if entry.get("floor"):
                 # The later sell's floor still applies to the target's stop.
@@ -3658,7 +3682,11 @@ def _apply_buy_outcome(approval_id: int, rec: dict, approval: dict | None = None
         log.error(f"[{rec['ticker']}] could not queue the outcome retry: {e}")
 
 
-def _retry_pending_buy_outcomes() -> None:
+def _retry_pending_buy_outcomes(count_budget: bool = True) -> None:
+    """Retry queued trade_outcomes writes for filled BUYs. count_budget=False
+    (a Celery task.retry rerun of the reconcile pass): each entry is still
+    written if it can be, but its tries don't advance, so the ~2 h budget
+    stays in reconcile cycles (professor m121)."""
     import db
     try:
         pending = json.loads(db.get_state(_OUTCOME_STATE_KEY) or "{}")
@@ -3672,7 +3700,7 @@ def _retry_pending_buy_outcomes() -> None:
             log.info(f"[{rec['ticker']}] reconcile: queued outcome {rec['kind']} for approval {aid} done")
             outcome[aid] = (rec, None)
             continue
-        tries = int(rec.get("tries", 0)) + 1
+        tries = int(rec.get("tries", 0)) + (1 if count_budget else 0)
         if tries < _OUTCOME_MAX_TRIES:
             outcome[aid] = (rec, {**rec, "tries": tries})
             continue
@@ -3702,12 +3730,16 @@ def _retry_pending_buy_outcomes() -> None:
         log.error(f"reconcile: could not save the outcome retry queue: {e}")
 
 
-def _retry_pending_reprotects() -> None:
+def _retry_pending_reprotects(count_budget: bool = True) -> None:
     """Re-protect after late SELL fills whose first attempt failed or found
     the ticker busy (professor M50). Runs every reconcile cycle until each
     one places a stop or finds nothing held. Works from a snapshot, then
     updates only the tickers it processed, and only if their entry wasn't
-    replaced meanwhile (A0653-2)."""
+    replaced meanwhile (A0653-2).
+
+    count_budget=False (a Celery task.retry rerun of the reconcile pass):
+    each entry is still tried, but its tries and waits don't advance, so the
+    budgets and their alerts stay in reconcile cycles (professor m121)."""
     import db
     try:
         pending = json.loads(db.get_state(_REPROTECT_STATE_KEY) or "{}")
@@ -3739,14 +3771,27 @@ def _retry_pending_reprotects() -> None:
             if result == "wait":
                 # The EXIT's remainder is still working: keep the entry, untried,
                 # for up to ~4 h (professor M124).
-                waits = int(rec.get("waits", 0)) + 1
+                waits = int(rec.get("waits", 0)) + (1 if count_budget else 0)
                 if waits < _EXIT_WAIT_MAX:
                     outcome[ticker] = (rec, {**rec, "waits": waits})
                 else:
                     log.warning(f"[{ticker}] reconcile: queued flat EXIT still waiting after {waits} cycles; dropped")
+                    # Not silently (professor m118): nothing retries this exit's
+                    # close now, and reads that kept failing count as waits too.
+                    intent = rec.get("exit_intent") or rec.get("intent") or "sell"
+                    held_alerts.append((
+                        f"queued_exit_dropped_{ticker}",
+                        f"⚠️ QUEUED {intent} DROPPED — <b>{ticker}</b>\nThe {intent} sale's close "
+                        f"waited {waits} reconcile cycles (~4 h): its remainder was still working, "
+                        f"or the order or position reads kept failing. It is no longer retried, so "
+                        f"its outcome and stop record are not closed by it. Check TWS: if shares "
+                        f"remain, make sure a stop covers them; if flat, make sure no SELL of ours "
+                        f"is still working."))
+                    open_manual_action(ticker, f"a queued {intent} close was dropped after ~4 h; "
+                                               f"check the remainder and the stop in TWS")
                     outcome[ticker] = (rec, None)
                 continue
-            tries = int(rec.get("tries", 0)) + 1
+            tries = int(rec.get("tries", 0)) + (1 if count_budget else 0)
             # A BUY that still reads flat is retried for 2 runs (~10 min; they
             # are 5 min apart, professor m55/m112), then handed to Luke like a
             # failed retry (professor M60).
@@ -4154,6 +4199,300 @@ def _late_fill_expect(ticker: str, fill_qty: float, path: str,
     return rec["expect_at_least"] if mode == "enforce" else None
 
 
+# A cancel status that may mean the stop filled: it left openTrades before
+# its cancel (NotFound), the send's outcome is unknown (SentUnknown), or no
+# status was kept (None, an old worker or a bare orderId). The re-protect
+# sizes from a fresh read after the cancel for these, as after a fill.
+_CANCEL_MAYBE_FILLED = frozenset({"NotFound", "SentUnknown", None})
+
+
+def _reprotect_cancel(ticker: str, ambiguous_out: list | None = None
+                      ) -> tuple[list, list, Exception | None]:
+    """The re-protect paths' "cancel ours", with each stop's cancel status
+    (manage_cancel_stop_orders_for's stuck_out, read as
+    execution._stuck_pairs reads it). Returns (orderIds that FILLED during
+    the cancel, orderIds that did not cancel and may still rest: any status
+    but execution._STUCK_NOT_RESTING, the cancel's exception or None).
+    ambiguous_out (optional list): filled with the ones of those whose status
+    may mean filled (_CANCEL_MAYBE_FILLED). Never raises."""
+    import execution
+    stuck: list = []
+    exc = None
+    try:
+        manage_cancel_stop_orders_for(ticker, stuck_out=stuck)
+    except Exception as e:
+        exc = e
+    pairs = execution._stuck_pairs(stuck)
+    filled = [oid for oid, st in pairs if st == "Filled"]
+    resting = [oid for oid, st in pairs
+               if st != "Filled" and st not in execution._STUCK_NOT_RESTING]
+    if ambiguous_out is not None:
+        ambiguous_out[:] = [oid for oid, st in pairs if st in _CANCEL_MAYBE_FILLED]
+    return filled, resting, exc
+
+
+def _reprotect_left_after_cancel(ticker: str, bounded: bool = False) -> list | None:
+    """The sell stops still resting after a re-protect's cancel (any
+    client's: ours that didn't cancel, another client's, one placed in TWS),
+    as _resting_sell_stops rows. Read at most twice: a timed-out read drops
+    the session and the second reconnects, and a PendingCancel on the first
+    look (execution._CANCELLING_STATUSES) gets one second look 5 s later (as
+    _fix_overstop). None when no
+    read succeeded. bounded (the late-sell path, shares bare until its
+    place): one read of _REPROTECT_FRESH_TIMEOUT_S on this process's session,
+    no second look."""
+    import execution
+    if bounded:
+        try:
+            return _resting_sell_stops(ticker, timeout=_REPROTECT_FRESH_TIMEOUT_S, reconnect=False)
+        except Exception as e:
+            log.warning(f"[{ticker}] reconcile: re-read after the cancel failed: {e}")
+            return None
+    left = None
+    for attempt in (1, 2):
+        try:
+            left = _resting_sell_stops(ticker)
+            if attempt == 1 and any(o.get("status") in execution._CANCELLING_STATUSES
+                                    for o in left):
+                import time
+                time.sleep(5)   # a slow cancel; same second look as _fix_overstop
+                continue
+            break
+        except Exception as e:
+            # Not the first look's rows: a stop of ours still cancelling
+            # there would count as others and undersize the new stop
+            # (professor m119).
+            left = None
+            log.warning(f"[{ticker}] reconcile: re-read after the cancel failed (try {attempt}/2): {e}")
+    return left
+
+
+# The re-protect's fresh position read runs under the ticker lock: bounded,
+# on this process's session (ibkr.get_fresh_stock_positions).
+_REPROTECT_FRESH_TIMEOUT_S = 5
+
+
+def _reprotect_fresh_held(ticker: str) -> float | None:
+    """The re-protect's fresh count for ticker, read after the cover read and
+    before any cancel (again after the cancel when a stop of ours filled or
+    may have filled during it): a
+    reqPositions() read (ibkr.get_fresh_stock_positions), which the caller
+    takes the smaller of with the portfolio cache's count, as
+    _recheck_position_reads sizes the re-check. The cache can lag a stop that
+    filled minutes ago (a retry after a fill) or during the cancel, and a
+    stop sized from it can sell more than is held. None when the read fails
+    or is empty (a reconnect gap): no cross-check, so the caller places
+    nothing and waits. 0.0 when the read shows other positions but not this
+    one (flat?). Signed: a short reads negative. Bounded
+    (_REPROTECT_FRESH_TIMEOUT_S, this process's session, no reconnect): it
+    runs under the ticker lock. Never raises."""
+    import ibkr
+    try:
+        fresh_all = ibkr.get_fresh_stock_positions(timeout=_REPROTECT_FRESH_TIMEOUT_S,
+                                                   reconnect=False)
+    except Exception as e:
+        log.warning(f"[{ticker}] reconcile: fresh position read failed ({e}); no stop sized")
+        return None
+    if not fresh_all:
+        log.warning(f"[{ticker}] reconcile: the fresh position read is empty (a reconnect "
+                    f"gap?); no stop sized")
+        return None
+    return round(float(fresh_all.get(ticker) or 0.0), 4)
+
+
+def _record_placed_reprotect(ticker: str, result: dict, stop_price, unfloored, stop_rec: dict,
+                             guard: dict, order: dict, qty: float) -> None:
+    """After a re-protect's stop went on: its broker order id on the stop
+    record, then the floor, guard and seed records. The stop is placed, so a
+    failed write is logged, not raised: the caller still reports it placed
+    (reconcile links the order id later)."""
+    import db
+    try:
+        db.set_stop_broker_order_id(ticker, result["order_id"])
+    except Exception as e:
+        log.error(f"[{ticker}] reconcile: stop placed for {qty:g} shares, but its broker order id "
+                  f"was not recorded: {e}")
+    try:
+        _record_floored_stop(ticker, stop_price, unfloored, stop_rec)
+        _record_guarded_stop(ticker, stop_price, stop_rec, guard)
+        _record_seeded_stop(ticker, stop_rec, order, stop_price, qty, result)
+    except Exception as e:
+        log.error(f"[{ticker}] reconcile: stop placed for {qty:g} shares; recording it failed: {e}")
+    log.info(f"[{ticker}] reconcile: stop @ ${float(stop_price):.2f} placed for {qty} shares")
+
+
+class _ReprotectStep(NamedTuple):
+    """One _reprotect_plan answer. action: "done" (return True, nothing to
+    place), "wait" (return False, nothing placed: the retry), "cancel"
+    (cancel ours, then ask the plan again with what the cancel found) or
+    "place" (a stop for qty). recheck: queue recheck_stop_coverage. alert:
+    "sign_flip" (the fresh read shows a short) or "filled" (a stop of ours
+    filled during the cancel). by (a "done" only): why nothing is placed,
+    "stops" (resting stops cover the cache's count, or after the cancel the
+    count held), "sell" (a working SELL covers the count held) or "lag"
+    (stops cover the fresh count, qty, and the cache's count is higher)."""
+    action: str
+    qty: float = 0.0
+    recheck: bool = False
+    alert: str | None = None
+    reason: str = ""
+    by: str | None = None
+
+
+def _reprotect_plan(remaining: float, covered: float | None, fresh: float | None,
+                    selling: float = 0.0, *, path: str, pt: bool = False,
+                    cancelling: float = 0.0, cancelled: bool = False, filled=(), still=(),
+                    ambiguous=(), cancel_exc=None, fresh_after: float | None = None,
+                    left: list | None = None) -> _ReprotectStep:
+    """The re-protect's decision (_reprotect_after_late_sell, both paths), no
+    I/O. remaining: the cache's count less a working SELL (> 0). covered: the
+    resting stops' shares before the cancel, None when unread (a late
+    profit-target re-place doesn't read it); cancelling: how many of those
+    are stops still being cancelled (execution._CANCELLING_STATUSES), which
+    are not cover. fresh: the fresh count read after the cover read
+    (_reprotect_fresh_held: None unread or empty, 0.0 not shown, negative
+    short). path: "queued" or "late"; pt: a profit-target re-place (it
+    raises the stop, so it cancels even when covered). basis: min(remaining,
+    fresh - selling) for a usable fresh read; a basis below remaining is a
+    "lag" (one read is behind the other, e.g. after an ADD).
+
+    Before the cancel (cancelled False), in order:
+    1. fresh < 0: wait, the sign-flip alert (a SELL stop would add to a short).
+    2. covered - cancelling >= remaining (not pt): done ("stops"), nothing
+       cancelled; re-check if the resting stops are more than the basis (the
+       cache's count when the fresh read is unread), if cancelling stops
+       rest, or on a lag.
+    3. queued and covered unread: wait, re-check.
+    4. fresh unread: nothing resting (covered 0): place remaining (the cache,
+       as before) and re-check (the cache may lag); else wait, nothing
+       cancelled (those stops stay), re-check.
+    5. fresh 0 (flat by the fresh read): wait, re-check.
+    6. basis <= 0 (a working SELL covers it): done ("sell"), re-check.
+    7. covered - cancelling >= basis (not pt): done ("lag": only reached
+       below the cache's count, qty = basis), re-check.
+    8. nothing resting: place basis. Else: cancel, sized from basis.
+    After the cancel (cancelled True; only planned with fresh > 0):
+    9. the cancel raised: wait, re-check (ours may be gone or still resting).
+    10. a stop of ours filled, or ended with a status that may mean filled
+        (ambiguous: NotFound, SentUnknown, none kept): fresh_after (read
+        after the cancel) unread or <= 0: wait, re-check; else held =
+        min(basis, fresh_after - selling).
+    11. others = the stops left (left), not counting ones still being
+        cancelled; left unread: none, so all of held goes on. need = held -
+        others. need <= 0: done; else place need. Re-check when a stop of
+        ours may still rest (still), one filled or is ambiguous, left was
+        unread, a cancelling stop rested (before or after), the others are
+        more than held, or (done) on a lag. A done is "sell" when held <= 0
+        (a working SELL covers what the read after a fill shows), "lag" when
+        held is below the cache's count (qty = held), else "stops".
+    alert "filled" on every step after a real fill (not an ambiguous one)."""
+    import execution
+    eps = 1e-6
+    net = None if covered is None else round(covered - cancelling, 4)
+    basis = None if fresh is None else (round(min(remaining, fresh - selling), 4)
+                                        if fresh > 0 else 0.0)
+    lag = basis is not None and basis < remaining - eps
+    if not cancelled:
+        if fresh is not None and fresh < 0:
+            return _ReprotectStep("wait", alert="sign_flip",
+                                  reason=f"the fresh position read shows a short ({fresh:g}); "
+                                         f"no stop placed, nothing cancelled")
+        if not pt and net is not None and net >= remaining - eps:
+            over = covered > (remaining if basis is None else max(basis, 0.0)) + eps
+            return _ReprotectStep("done", recheck=over or cancelling > eps or lag, by="stops",
+                                  reason=f"{remaining:g} shares already covered by resting stops "
+                                         f"({net:g}); nothing cancelled")
+        if path == "queued" and covered is None:
+            return _ReprotectStep("wait", recheck=True,
+                                  reason="resting stops could not be read; queued stop waits")
+        if fresh is None:
+            if covered is not None and covered <= eps:
+                return _ReprotectStep("place", qty=remaining, recheck=True,
+                                      reason="fresh position read unread and nothing resting: "
+                                             "sized from the cache")
+            return _ReprotectStep("wait", recheck=True,
+                                  reason="fresh position read unread; nothing cancelled, the "
+                                         "resting stops (if any) stay")
+        if fresh <= eps:
+            return _ReprotectStep("wait", recheck=True,
+                                  reason="the fresh position read doesn't show the position "
+                                         "(flat?); no stop placed")
+        if basis <= eps:
+            return _ReprotectStep("done", recheck=True, by="sell",
+                                  reason=f"a working SELL covers the fresh count ({fresh:g}); "
+                                         f"no stop placed")
+        if not pt and net is not None and net >= basis - eps:
+            # Reached only below the cache's count (rule 2 took the rest).
+            return _ReprotectStep("done", qty=basis, recheck=True, by="lag",
+                                  reason=f"the fresh count ({basis:g}) is already covered by "
+                                         f"resting stops ({net:g}); nothing cancelled")
+        if covered is not None and covered <= eps:
+            return _ReprotectStep("place", qty=basis, reason="nothing resting")
+        return _ReprotectStep("cancel", qty=basis, reason="cancel ours, then size the stop")
+    held = basis
+    alert = "filled" if filled else None
+    if cancel_exc is not None:
+        return _ReprotectStep("wait", recheck=True, alert=alert,
+                              reason=f"the cancel failed ({cancel_exc}); no stop placed")
+    if filled or ambiguous:
+        if fresh_after is None or fresh_after <= eps:
+            return _ReprotectStep("wait", recheck=True, alert=alert,
+                                  reason=("a stop filled" if filled else
+                                          f"stop(s) {list(ambiguous)} may have filled")
+                                         + " during the cancel and the fresh read after it is "
+                                         + ("unread" if fresh_after is None else f"{fresh_after:g}")
+                                         + "; no stop placed")
+        held = round(min(held, fresh_after - selling), 4)
+    left_cancelling = bool(left) and any(o.get("status") in execution._CANCELLING_STATUSES
+                                         for o in left)
+    kept = left if not left_cancelling else [o for o in left if o.get("status")
+                                             not in execution._CANCELLING_STATUSES]
+    others = 0.0 if kept is None else round(sum(float(o["qty"]) for o in kept), 4)
+    need = round(held - others, 4)
+    recheck = (bool(still) or bool(filled) or bool(ambiguous) or left is None
+               or left_cancelling or cancelling > eps)
+    if need <= eps:
+        by = "sell" if held <= eps else ("lag" if held < remaining - eps else "stops")
+        return _ReprotectStep("done", qty=held if by == "lag" else 0.0,
+                              recheck=recheck or others > max(held, 0.0) + eps or by != "stops",
+                              alert=alert, by=by,
+                              reason=f"stops the cancel did not remove ({others:g}) cover the "
+                                     f"{max(held, 0.0):g} shares; nothing placed")
+    return _ReprotectStep("place", qty=need, recheck=recheck, alert=alert,
+                          reason=f"after the cancel, {others:g} shares stay covered; ours goes "
+                                 f"on {need:g}")
+
+
+def _reprotect_filled_text(ticker: str, filled: list, remaining: float,
+                           placed: float | None = None) -> str:
+    """The CHECK POSITION alert when a stop of ours FILLED (or part-filled)
+    while a re-protect was cancelling it: the shares it was sized for may be
+    sold. remaining: the count read before the cancel. placed: the shares the
+    stop went on (sized from the fresh read), 0 when other stops cover the
+    fresh count, None when no stop was placed."""
+    head = (f"🚨 CHECK POSITION — <b>{ticker}</b>\nRe-protect: {len(filled)} old stop(s) "
+            f"FILLED during the cancel (orderIds {filled}), so some of the {remaining:g} "
+            f"shares it would have stopped may be sold. ")
+    if placed is None:
+        tail = ("No stop was placed now: the stop coverage re-check (about 1 min) adds one "
+                "from fresh position reads, and the re-protect retries.")
+    elif placed > 0:
+        tail = (f"A stop went on {placed:g} shares, sized from a fresh position read; the "
+                f"stop coverage re-check (about 1 min) looks again.")
+    else:
+        tail = ("No new stop was needed: by a fresh position read, other stops cover what is "
+                "held. The stop coverage re-check (about 1 min) looks again.")
+    return head + tail + " Check the position in TWS."
+
+
+def _reprotect_cancelling_qty(rows: list) -> float:
+    """Shares in _resting_sell_stops rows that are stops still being
+    cancelled (execution._CANCELLING_STATUSES): not cover."""
+    import execution
+    return round(sum(float(o["qty"]) for o in rows or ()
+                     if o.get("status") in execution._CANCELLING_STATUSES), 4)
+
+
 @locked_by_ticker(lambda ticker, *a, **k: ticker, on_busy=False)
 def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
                                fill_price: float | None = None,
@@ -4162,7 +4501,8 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
                                exit_avg: float | None = None,
                                exit_fill_at=None,
                                exit_fill_at_source: str | None = None,
-                               pass_alerts: list | None = None) -> bool | None | str:
+                               pass_alerts: list | None = None,
+                               outcome_out: dict | None = None) -> bool | None | str:
     """After a late SELL fill, finish what the selling path would have done
     (professor M-3, 2026-10-28):
     - nothing left: delete the stop record and close the outcome at the fill
@@ -4172,7 +4512,14 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
     - otherwise: cancel resting stops and protect the rest at the stop on record.
     Returns True if a stop was placed, False if it should have been but failed,
     None if nothing is held, and (queued retries only) "wait" while a flat
-    EXIT's remainder is still working."""
+    EXIT's remainder is still working.
+    outcome_out (optional dict), set when the re-protect reached its plan
+    (or a working SELL covers everything): "placed" the shares a stop went
+    on, 0.0 on a "done" with "by" saying why (_ReprotectStep.by) and, for
+    "lag", "broker_qty" the fresh count the stops cover; "cover" on a wait
+    that cancelled nothing after reading the stops: the shares the resting
+    stops not being cancelled cover (an old stop sized before a manual ADD
+    still rests)."""
     import db
     import ibkr
     order = order or {}
@@ -4204,11 +4551,21 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
         except Exception:
             pass
         return None
-    if from_queue and pos is not None and _fresh_read_short(ticker, float(pos.qty)):
-        # A queued restore after a sign-flip refusal (execution
-        # _restore_sized_stop): keep retrying until the reads agree.
-        _REPROTECT_SIGN_FLIP.add(ticker)
-        return False
+    if from_queue and pos is not None and float(pos.qty) > 0:
+        # _reprotect_plan's rule 1 (a short by the fresh read waits), applied
+        # here first so a queued restore after a sign-flip refusal (execution
+        # _restore_sized_stop) waits before any other read; the plan applies
+        # it again to the read it sizes from, taken after the cover read.
+        # So the queued path makes two fresh reads under the ticker lock,
+        # each bounded (_REPROTECT_FRESH_TIMEOUT_S): this one is not reused,
+        # since a stop can fill before the cover read. Worst case before the
+        # place: these two, the cover read, a 5 s second look when a stop is
+        # still being cancelled, and after a fill a third fresh read.
+        early = _reprotect_fresh_held(ticker)
+        if early is not None and early < 0:
+            _sign_flip_alert(ticker, float(pos.qty), early)
+            _REPROTECT_SIGN_FLIP.add(ticker)   # keep retrying until the reads agree
+            return False
     if expect_at_least and 0 < remaining < float(expect_at_least) - 1e-6:
         # The read lags a fill it should include (a manual ADD): resting stops
         # sized for the old position would look like full cover (review of
@@ -4380,105 +4737,147 @@ def _reprotect_after_late_sell(ticker: str, order: dict | None = None,
         remaining = round(remaining - selling, 4)
         if remaining <= 0:
             log.info(f"[{ticker}] reconcile: a working SELL covers the remaining shares; no stop placed")
+            if outcome_out is not None:
+                outcome_out.update(placed=0.0, by="sell")
             return True
-    if from_queue:
-        # Sized from the all-clients view (m116): a stop the cancel can't
-        # remove (another client's, or one placed in TWS) stays as cover, and
-        # ours goes on only the shares it leaves. position_stops.stop_price
-        # stays ours.
-        import execution
-        resting_rows: list = []
-        covered = execution._stops_still_resting(ticker, rows_out=resting_rows)
-        if covered is None:
-            log.warning(f"[{ticker}] reconcile: resting stops could not be read; queued stop waits")
-            return False
-        if order.get("intent") != "PROFIT_TARGET" and covered >= remaining:
-            log.info(f"[{ticker}] reconcile: {remaining} shares already covered by resting stops "
-                     f"({covered:g}); nothing cancelled")
-            return True
-        try:
-            # Nothing resting: no floor to read. Covered with no rows back
-            # (never expected): the floor's own single read.
-            stop_price = floor_and_guard(stop_price, "queued_reprotect",
-                                         resting=(resting_rows or None) if covered > 0 else [])
-            if covered > 0:
-                # Cancel ours, then see what the cancel could not remove.
-                try:
-                    manage_cancel_stop_orders_for(ticker)
-                except Exception as e:
-                    log.warning(f"[{ticker}] reconcile: queued stop could not cancel stops ({e}); waits")
-                    return False
-                left = None
-                for attempt in (1, 2):   # a timed-out read drops the session; the second reconnects
-                    try:
-                        left = _resting_sell_stops(ticker)
-                        if attempt == 1 and any(o.get("status") == "PendingCancel" for o in left):
-                            import time
-                            time.sleep(5)   # a slow cancel; same second look as _fix_overstop
-                            continue
-                        break
-                    except Exception as e:
-                        log.warning(f"[{ticker}] reconcile: re-read after the cancel failed (try {attempt}/2): {e}")
-                if left is None:
-                    # Ours is gone and only cover went down: unprotected is worse
-                    # than over-stopped, so stop all of it; _fix_overstop trims.
-                    log.warning(f"[{ticker}] reconcile: stops unreadable after the cancel; stopping all {remaining}")
-                    left = []
-            else:
-                left = []
-            others = round(sum(o["qty"] for o in left), 4)
-            need = round(remaining - others, 4)
-            if others > 0:
-                prices = ", ".join(f"${float(o['stop_price']):.2f}" if o.get("stop_price") else "?" for o in left)
-                log.warning(f"[{ticker}] reconcile: {others:g} shares stay covered by stop(s) the cancel did not "
-                            f"remove ({prices}); ours @ ${float(stop_price):.2f} goes on {max(need, 0):g}")
-            if need <= 0:
-                return True
-            try:
-                result = manage_stop_place(ticker, need, float(stop_price), **place_kw())
-                db.set_stop_broker_order_id(ticker, result["order_id"])
-                _record_floored_stop(ticker, stop_price, unfloored, stop_rec)
-                _record_guarded_stop(ticker, stop_price, stop_rec, guard)
-                _record_seeded_stop(ticker, stop_rec, order, stop_price, need, result)
-                log.info(f"[{ticker}] reconcile: stop @ ${float(stop_price):.2f} placed for {need} shares")
-                return True
-            except Exception as e:
-                log.error(f"[{ticker}] reconcile: stop placement after a late sell failed: {e}")
-                return False
-        finally:
-            _send_alert_texts(held_alerts)   # after the place; once each
-    if order.get("intent") != "PROFIT_TARGET":
+    # One decision for both paths (_reprotect_plan, no I/O): the reads, then
+    # the plan says what to do; after a cancel it is asked again with what
+    # the cancel found. Sized from the all-clients view (m116): a stop the
+    # cancel can't remove (another client's, or one placed in TWS) stays as
+    # cover, and ours goes on only the shares it leaves.
+    # position_stops.stop_price stays ours.
+    import execution
+    pt = order.get("intent") == "PROFIT_TARGET"
+    path = "queued" if from_queue else "late"
+    rows: list = []
+    covered = None
+    cancelling = 0.0
+    if from_queue or not pt:
         # Already covered (e.g. a stop Luke placed after a "place manually"
         # alert, or an earlier try that did land): cancelling it to re-place
-        # ours would leave a gap each cycle (professor M79). A profit-target
-        # entry still re-places, since it raises the stop.
-        import execution
-        late_rows: list = []
-        covered = execution._stops_still_resting(ticker, rows_out=late_rows)
-        if covered is not None and covered >= remaining:
-            log.info(f"[{ticker}] reconcile: {remaining} shares already covered by resting stops "
-                     f"({covered:g}); nothing cancelled")
-            return True
-        # The coverage read is reused by the floor and the guard; an unread
-        # one (None) leaves the floor its single read.
-        late_resting = None if covered is None else ((late_rows or None) if covered > 0 else [])
-    else:
-        late_resting = None      # a profit-target re-place: the floor reads once
+        # ours would leave a gap each cycle (professor M79). A late
+        # profit-target re-place reads no cover: it raises the stop.
+        covered = execution._stops_still_resting(ticker, rows_out=rows)
+        cancelling = _reprotect_cancelling_qty(rows) if covered is not None else 0.0
+        if cancelling > 0:
+            # A stop still being cancelled is not cover: one second look
+            # after ~5 s, as execution._restore_cover (a slow cancel usually
+            # lands by then). A failed second look keeps the first.
+            import time
+            time.sleep(5)
+            again: list = []
+            covered2 = execution._stops_still_resting(ticker, rows_out=again)
+            if covered2 is not None:
+                covered, rows = covered2, again
+                cancelling = _reprotect_cancelling_qty(rows)
+    # After the cover read, so a fill before it is counted; the sign check
+    # reads it too.
+    fresh = _reprotect_fresh_held(ticker)
+    step = _reprotect_plan(remaining, covered, fresh, selling, path=path, pt=pt,
+                           cancelling=cancelling)
+    if step.alert == "sign_flip":
+        _sign_flip_alert(ticker, abs(float(pos.qty)), fresh)
+        if from_queue:
+            # A queued restore after a sign-flip refusal (execution
+            # _restore_sized_stop): keep retrying until the reads agree.
+            _REPROTECT_SIGN_FLIP.add(ticker)
+    if step.action in ("done", "wait"):
+        (log.info if step.action == "done" else log.warning)(
+            f"[{ticker}] reconcile: {path} re-protect: {step.reason}")
+        if outcome_out is not None:
+            if step.action == "done":
+                outcome_out.update(placed=0.0, by=step.by, broker_qty=step.qty)
+            elif covered is not None and step.alert is None:
+                # A wait that cancelled nothing: the resting stops (not
+                # being cancelled) still cover this many shares.
+                outcome_out["cover"] = round(covered - cancelling, 4)
+        if step.recheck:
+            _queue_stop_coverage_recheck(ticker)
+        return step.action == "done"
+    # filled: stops of ours that FILLED (or part-filled) during the cancel;
+    # their CHECK POSITION text goes out from the finally, saying what was
+    # placed (placed_qty, None: nothing).
+    filled: list = []
+    placed_qty = None
+    pre_qty = step.qty
     try:
-        stop_price = floor_and_guard(stop_price, "late_sell_reprotect", resting=late_resting)
+        # The cover read is reused by the floor and the guard: nothing
+        # resting, no floor to read; unread (or no rows back), the floor's
+        # own single read.
+        stop_price = floor_and_guard(
+            stop_price, "queued_reprotect" if from_queue else "late_sell_reprotect",
+            resting=None if covered is None else ((rows or None) if covered > 0 else []))
+        if step.action == "cancel":
+            ambiguous: list = []
+            filled, still, exc = _reprotect_cancel(ticker, ambiguous_out=ambiguous)
+            if filled:
+                log.error(f"[{ticker}] reconcile: {path} re-protect: stop(s) {filled} FILLED "
+                          f"during the cancel")
+            if ambiguous:
+                log.warning(f"[{ticker}] reconcile: {path} re-protect: stop(s) {ambiguous} may "
+                            f"have filled during the cancel (status unknown); sizing from a "
+                            f"fresh read")
+            # A fresh read again only after a fill or a status that may mean
+            # one. The stops left: not after a raised cancel.
+            fresh_after = (_reprotect_fresh_held(ticker) if (filled or ambiguous) and exc is None
+                           else None)
+            left = (None if exc is not None
+                    else _reprotect_left_after_cancel(ticker, bounded=not from_queue))
+            step = _reprotect_plan(remaining, covered, fresh, selling, path=path, pt=pt,
+                                   cancelling=cancelling, cancelled=True, filled=filled,
+                                   still=still, ambiguous=ambiguous, cancel_exc=exc,
+                                   fresh_after=fresh_after, left=left)
+            if exc is None and left is None and step.action == "place":
+                log.warning(f"[{ticker}] reconcile: stops unreadable after the cancel; stopping all "
+                            f"{step.qty:g}")
+            elif left:
+                goes_on = step.qty if step.action == "place" else 0
+                for still_cancelling in (False, True):
+                    group = [o for o in left if (o.get("status") in execution._CANCELLING_STATUSES)
+                             == still_cancelling]
+                    if not group:
+                        continue
+                    prices = ", ".join(f"${float(o['stop_price']):.2f}" if o.get("stop_price")
+                                       else "?" for o in group)
+                    what = ("are still being cancelled, so not counted as cover" if still_cancelling
+                            else "stay covered by stop(s) the cancel did not remove")
+                    log.warning(f"[{ticker}] reconcile: {sum(float(o['qty']) for o in group):g} "
+                                f"shares {what} ({prices}); ours @ ${float(stop_price):.2f} goes "
+                                f"on {goes_on:g}")
+            if step.action != "place":
+                (log.info if step.action == "done" else log.warning)(
+                    f"[{ticker}] reconcile: {path} re-protect: {step.reason}")
+                if step.action == "done":
+                    placed_qty = 0.0
+                    if outcome_out is not None:
+                        outcome_out.update(placed=0.0, by=step.by, broker_qty=step.qty)
+                if step.recheck:
+                    _queue_stop_coverage_recheck(ticker)
+                return step.action == "done"
         try:
-            manage_cancel_stop_orders_for(ticker)
-            result = manage_stop_place(ticker, remaining, float(stop_price), **place_kw())
-            db.set_stop_broker_order_id(ticker, result["order_id"])
-            _record_floored_stop(ticker, stop_price, unfloored, stop_rec)
-            _record_guarded_stop(ticker, stop_price, stop_rec, guard)
-            _record_seeded_stop(ticker, stop_rec, order, stop_price, remaining, result)
-            log.info(f"[{ticker}] reconcile: stop @ ${float(stop_price):.2f} placed for {remaining} shares")
-            return True
+            result = manage_stop_place(ticker, step.qty, float(stop_price), **place_kw())
+            placed_qty = step.qty
+            if outcome_out is not None:
+                outcome_out["placed"] = step.qty
         except Exception as e:
             log.error(f"[{ticker}] reconcile: stop placement after a late sell failed: {e}")
+            # Ours may be cancelled (shares bare), or the failed place may
+            # have rested: the re-check looks in ~60 s.
+            _queue_stop_coverage_recheck(ticker)
             return False
+        _record_placed_reprotect(ticker, result, stop_price, unfloored, stop_rec, guard,
+                                 order, step.qty)
+        if step.recheck and _queue_stop_coverage_recheck(ticker):
+            # A stop of ours may still rest (an unconfirmed cancel), one
+            # filled or may have during it, the stops left were unread or
+            # still cancelling, or the place was sized from the cache: ~60 s.
+            log.warning(f"[{ticker}] reconcile: {path} re-protect: stop placed while a cancel was "
+                        f"pending, unconfirmed or unread, after a fill, or from the cache; stop "
+                        f"coverage re-check queued in 60 s")
+        return True
     finally:
+        if filled:
+            held_alerts.append(_reprotect_filled_text(ticker, filled, pre_qty, placed_qty))
         _send_alert_texts(held_alerts)   # after the place; once each
 
 
@@ -6471,14 +6870,46 @@ def _send_alert_texts(texts: list) -> None:
     """Send alert texts a caller held back while a position had no stop (a
     Telegram send can take tens of seconds), then empty the list, so a later
     call (a finally) doesn't send them twice. Never raises. The same job as
-    risk_manager._send_guard_alerts, for the guard's alerts_out texts."""
+    risk_manager._send_guard_alerts, for the guard's alerts_out texts.
+
+    An entry may also be an (issue_key, text) pair: sent only when
+    _reconcile_alert_due(issue_key), so a standing condition doesn't re-alert
+    every cycle (professor m118/m124). The check runs here, at send time, so
+    a caller holding the texts across a sale adds no DB read before it; a
+    failed check sends. The check claims the issue before the send (so two
+    senders can't both send it); when the send then fails (alerts._send
+    returns no message id, or raises), _reconcile_alert_retry_soon makes the
+    issue due again in _HELD_ALERT_RETRY_S instead of after the whole
+    throttle window. alerts._send also returns None when Telegram isn't
+    configured or alert_policy holds a LOW text for the digest, so such a
+    keyed alert re-arms every _HELD_ALERT_RETRY_S too; that is harmless (the
+    digest dedupes it, and these held texts classify as critical)."""
     while texts:
         text = texts.pop(0)
+        issue_key = None
+        if isinstance(text, tuple):
+            issue_key, text = text
+            try:
+                due = _reconcile_alert_due(issue_key)
+            except Exception as e:
+                log.warning(f"alert throttle check failed ({issue_key}): {e}; sending")
+                due = True
+            if not due:
+                log.info(f"held alert throttled ({issue_key})")
+                continue
+        sent = False
         try:
             import alerts
-            alerts._send(text)
+            sent = alerts._send(text) is not None
         except Exception as e:
             log.warning(f"held alert failed: {e}")
+        if issue_key is not None and not sent:
+            try:
+                _reconcile_alert_retry_soon(issue_key)
+                log.warning(f"held alert not sent ({issue_key}); due again in "
+                            f"{_HELD_ALERT_RETRY_S // 60} min")
+            except Exception as e:
+                log.warning(f"held alert retry stamp failed ({issue_key}): {e}")
 
 
 def _position_left_after_sale(ticker: str, pre: float | None) -> str | None:
@@ -6627,9 +7058,10 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
         if resting > 0:
             log.error(f"[{ticker}] Backstop: stops for {resting:g} of {owned:g} shares still "
                       f"resting after the cancel; selling only the rest")
-            held_alerts.append(f"⚠️ BACKSTOP — <b>{ticker}</b>\nA stop for {resting:g} of "
-                               f"{owned:g} shares would not cancel; only the uncovered shares "
-                               f"are sold. Check TWS.")
+            held_alerts.append((f"backstop_stop_not_cancelled_{ticker}",   # throttled (m124)
+                                f"⚠️ BACKSTOP — <b>{ticker}</b>\nA stop for {resting:g} of "
+                                f"{owned:g} shares would not cancel; only the uncovered shares "
+                                f"are sold. Check TWS."))
             owned = round(owned - resting, 4)
             if owned <= 0:
                 return False
@@ -6642,9 +7074,10 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
         if working > 0:
             log.warning(f"[{ticker}] Backstop: a SELL for {working:g} shares is still working; "
                         f"selling only what it doesn't cover")
-            held_alerts.append(f"⚠️ BACKSTOP — <b>{ticker}</b>\nA market SELL for {working:g} of "
-                               f"{owned:g} shares is still working, so only the rest is sold. "
-                               f"Check TWS if it doesn't fill.")
+            held_alerts.append((f"backstop_sell_working_{ticker}",   # throttled (m124)
+                                f"⚠️ BACKSTOP — <b>{ticker}</b>\nA market SELL for {working:g} of "
+                                f"{owned:g} shares is still working, so only the rest is sold. "
+                                f"Check TWS if it doesn't fill."))
             owned = round(owned - working, 4)
             if owned <= 0:
                 return False
@@ -10170,22 +10603,115 @@ def _recheck_position_reads(ticker: str) -> dict | None:
 _COVERAGE_RECHECK_TRIES = 6   # last look ~360 s: past a ~180 s cross-client revert
 # 5 s looks _fix_overstop gives its own cancel before sizing the stop.
 _CANCEL_SETTLE_LOOKS = 3
+_RECHECK_COUNTDOWN_S = 60
+# The per-ticker "a re-check is queued and hasn't run" key lives this long,
+# less than the countdown, so it is gone before that run starts: a request
+# it skips always has a run after it (none can fall between a chain's last
+# look and the key's removal).
+_RECHECK_DEDUPE_S = 50
+_RECHECK_KEY = "stop_recheck_pending:{}"
+# Left by a request the dedupe skipped, for the queued run it relies on: that
+# run counts as its first look and its follow-ups restart at attempt 2, so a
+# skip next to a chain's last look still gets _COVERAGE_RECHECK_TRIES looks.
+# It outlives the dedupe key and the countdown, so the run finds it.
+_RECHECK_RESTART_KEY = "stop_recheck_restart:{}"
+_RECHECK_RESTART_S = 600
+# Rare windows where a request is still lost: a crash between the SET NX and
+# apply_async, a follow-up's apply_async failing, an ETA task redelivered
+# after a restart (the key long gone). Reconcile's coverage check backs them up.
+_RECHECK_REDIS_TIMEOUT_S = 1.0
+_RECHECK_REDIS_CLIENT = None
+
+
+def _recheck_redis():
+    """The Redis client for the re-check dedupe keys: one per process, kept
+    as stop_lock._redis keeps its own, with 1 s socket timeouts, so a hung
+    Redis holds the caller's ticker lock about a second per call, not a
+    connect plus a read each time (patched in tests)."""
+    global _RECHECK_REDIS_CLIENT
+    if _RECHECK_REDIS_CLIENT is None:
+        import redis
+        _RECHECK_REDIS_CLIENT = redis.Redis.from_url(
+            os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+            socket_timeout=_RECHECK_REDIS_TIMEOUT_S,
+            socket_connect_timeout=_RECHECK_REDIS_TIMEOUT_S)
+    return _RECHECK_REDIS_CLIENT
+
+
+def _recheck_take_restart(ticker: str) -> bool:
+    """Whether a request the dedupe skipped left its restart marker
+    (_RECHECK_RESTART_KEY) for this run; the marker is taken (deleted).
+    False when Redis is unreadable: the chain counts on as before. Never
+    raises."""
+    try:
+        if _recheck_redis().delete(_RECHECK_RESTART_KEY.format(ticker)):
+            log.info(f"[{ticker}] stop coverage re-check: a request was skipped for this run; "
+                     f"its follow-up looks restart the count")
+            return True
+    except Exception as e:
+        log.warning(f"[{ticker}] stop coverage re-check: restart marker unreadable "
+                    f"({type(e).__name__}: {e})")
+    return False
+
+
+def _recheck_put_restart(ticker: str) -> None:
+    """Write the restart marker back: a run that took it (_recheck_take_restart)
+    and then stops without a look leaves it for the next run. Never raises."""
+    try:
+        _recheck_redis().set(_RECHECK_RESTART_KEY.format(ticker), "1", ex=_RECHECK_RESTART_S)
+    except Exception as e:
+        log.warning(f"[{ticker}] stop coverage re-check: restart marker not written back "
+                    f"({type(e).__name__}: {e})")
 
 
 def _queue_stop_coverage_recheck(ticker: str, attempt: int = 1) -> bool:
     """Queue recheck_stop_coverage in 60 s, unless attempt is past
     _COVERAGE_RECHECK_TRIES. Never raises: on a failure the position is left
-    to reconcile. True when queued."""
+    to reconcile. True when a re-check is queued: this call's, or (attempt 1)
+    one already queued for ticker that hasn't run yet, so a second caller
+    within the minute (an ADD's whole-position stop and a re-protect) doesn't
+    start a second chain. A skipped request leaves a restart marker
+    (_recheck_take_restart), so the run it relies on restarts the count and
+    it keeps its full _COVERAGE_RECHECK_TRIES; if the marker can't be
+    written, it is queued instead. The chain's own next looks (attempt > 1)
+    always queue. The key is in Redis (_RECHECK_KEY, _RECHECK_DEDUPE_S); an
+    unreadable Redis queues as before: a missing re-check is worse than a
+    duplicate."""
     if attempt > _COVERAGE_RECHECK_TRIES:
         log.warning(f"[{ticker}] stop coverage re-check: {attempt - 1} tries done; "
                     f"reconcile checks the coverage")
         return False
+    key = _RECHECK_KEY.format(ticker)
+    rcli = None
     try:
-        recheck_stop_coverage.apply_async(args=[ticker], kwargs={"attempt": attempt}, countdown=60)
+        rcli = _recheck_redis()
+        if attempt == 1:
+            if not rcli.set(key, "1", nx=True, ex=_RECHECK_DEDUPE_S):
+                # The queued run counts as this request's first look; the
+                # marker restarts that run's follow-up count. A failed write
+                # raises to the queue-anyway path below.
+                rcli.set(_RECHECK_RESTART_KEY.format(ticker), "1", ex=_RECHECK_RESTART_S)
+                log.info(f"[{ticker}] stop coverage re-check already queued (runs within a "
+                         f"minute); not queued again, its follow-ups restart the count")
+                return True
+        else:
+            rcli.set(key, "1", ex=_RECHECK_DEDUPE_S)
+    except Exception as e:
+        log.warning(f"[{ticker}] stop coverage re-check dedupe unreadable "
+                    f"({type(e).__name__}: {e}); queued anyway")
+        rcli = None
+    try:
+        recheck_stop_coverage.apply_async(args=[ticker], kwargs={"attempt": attempt},
+                                          countdown=_RECHECK_COUNTDOWN_S)
         return True
     except Exception as e:
         log.error(f"[{ticker}] could not queue the stop coverage re-check ({e}); "
                   f"reconcile checks the coverage")
+        if rcli is not None:
+            try:
+                rcli.delete(key)   # nothing queued: don't skip the next request
+            except Exception:
+                pass
         return False
 
 
@@ -10201,8 +10727,14 @@ def recheck_stop_coverage(ticker: str, attempt: int = 1):
 
     The pending check and the fix run under one ticker lock, so no other
     stop change gets in between (the lock is re-entrant: _fix_overstop's
-    own nests inside it)."""
+    own nests inside it).
+
+    A request the dedupe skipped for this run (_recheck_take_restart): this
+    run is its first look, so the follow-up is attempt 2, and attempt 1 when
+    the ticker is busy (no look yet)."""
     import execution
+    restart = _recheck_take_restart(ticker)
+    nxt = 2 if restart else attempt + 1
     try:
         with ticker_lock(ticker):
             try:
@@ -10211,9 +10743,11 @@ def recheck_stop_coverage(ticker: str, attempt: int = 1):
             except Exception as e:
                 log.warning(f"[{ticker}] stop coverage re-check: stops unreadable ({e}); "
                             f"reconcile checks it")
+                if restart:
+                    _recheck_put_restart(ticker)   # no look: the skipped request's stays
                 return
             if pending:
-                if _queue_stop_coverage_recheck(ticker, attempt + 1):
+                if _queue_stop_coverage_recheck(ticker, nxt):
                     log.info(f"[{ticker}] stop coverage re-check: a cancel is still pending; "
                              f"again in 60 s")
                 return
@@ -10221,19 +10755,19 @@ def recheck_stop_coverage(ticker: str, attempt: int = 1):
             if reads is None:
                 # Maybe flat, maybe a reconnect gap that clears within a
                 # minute: look again (the chain stays capped).
-                _queue_stop_coverage_recheck(ticker, attempt + 1)
+                _queue_stop_coverage_recheck(ticker, nxt)
                 return
             fix_out: dict = {}
-            msg = _fix_overstop_safe(ticker, recheck_try=attempt + 1, outcome_out=fix_out, **reads)
+            msg = _fix_overstop_safe(ticker, recheck_try=nxt, outcome_out=fix_out, **reads)
             over = fix_out.get("disagree_over_cover")
-            if over and _queue_stop_coverage_recheck(ticker, attempt + 1):
+            if over and _queue_stop_coverage_recheck(ticker, nxt):
                 # The cache can still show an ADD's pre-fill count after a
                 # minute: look again while the chain lasts (capped), not
                 # leave the over-stop to a reconcile with agreeing reads.
                 # The last try keeps the 🚨.
                 msg = f"⚠️ {over} yet; re-checking in 60 s"
     except stop_lock.TickerBusy:
-        if _queue_stop_coverage_recheck(ticker, attempt + 1):
+        if _queue_stop_coverage_recheck(ticker, 1 if restart else attempt + 1):
             log.info(f"[{ticker}] stop coverage re-check: ticker busy; again in 60 s")
         return
     log.info(f"[{ticker}] stop coverage re-check after a restore: {msg}")
@@ -10372,6 +10906,27 @@ def _reconcile_alert_due(issue_key: str) -> bool:
             pass
     db.set_state(state_key, now.isoformat())
     return True
+
+
+# After a held alert's send fails, its issue comes due again this long later
+# (not after the full RECONCILE_ALERT_THROTTLE_HOURS, and not on every pass).
+_HELD_ALERT_RETRY_S = 1800
+
+
+def _reconcile_alert_retry_soon(issue_key: str) -> None:
+    """After _reconcile_alert_due(issue_key) claimed the issue and the send
+    then failed: re-stamp it so the issue is due again _HELD_ALERT_RETRY_S
+    from now. A failed send then neither spends the whole throttle window
+    (a later sighting within it would be silenced, though nothing went out)
+    nor turns into a send every reconcile pass while Telegram is down (or
+    when a send that reached the chat still reports a failure). Raises on a
+    failed write; the caller logs it."""
+    import db
+    from datetime import datetime, timedelta, timezone
+    from config import RECONCILE_ALERT_THROTTLE_HOURS
+    window_s = float(RECONCILE_ALERT_THROTTLE_HOURS) * 3600
+    stamp = datetime.now(timezone.utc) - timedelta(seconds=max(0.0, window_s - _HELD_ALERT_RETRY_S))
+    db.set_state(f"reconcile_alert_{issue_key}", stamp.isoformat())
 
 
 # Reconcile's multi-cycle confirmations (the orphan and stale-record markers,

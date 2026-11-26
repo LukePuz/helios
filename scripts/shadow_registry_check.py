@@ -251,6 +251,14 @@ STAGES = (
      "expect_rows": "conditional",
      "trigger": (_SIG, "signal = 'SCREENED_OUT' AND provenance IS NOT NULL"),
      "sources": ((_SIG, "provenance ? 'own_ticker_rejected'"),)},
+    # On the provenance of every SCREENED_OUT row that has one (crew.py, from
+    # agents/material_event.py); the trigger is those rows. The deal record
+    # it feeds is a system_state key (deal_state_<env>), not counted here.
+    {"stage": "material_event_terms", "card": "deal / offering / guidance terms in a screened-out title",
+     "switch": None, "writer": ("agents/material_event.py", '"material_event_terms"'),
+     "expect_rows": "conditional",
+     "trigger": (_SIG, "signal = 'SCREENED_OUT' AND provenance IS NOT NULL"),
+     "sources": ((_SIG, "provenance ? 'material_event_terms'"),)},
     # Only events whose ticker has a held related symbol write a row, so no
     # trigger is named: 0 rows reads "no trigger yet".
     {"stage": "target_anchor", "card": "bull target vs the brief's targets",
@@ -266,6 +274,16 @@ STAGES = (
     {"stage": "entry_gate_reclaim_shadow", "card": "reclaim of gate-blocked buys",
      "switch": "ENTRY_GATE_RECLAIM_SHADOW_ENABLED", "expect_rows": "conditional",
      "sources": (_stage("entry_gate_reclaim_shadow"),)},
+    # On the route's ENTRY_GATE_BLOCKED row (a deferred retry's block, which
+    # carries entry_gate.path, gets none: its approval has the real sizing).
+    {"stage": "would_be_sizing", "card": "would-be sizing of gate-blocked buys",
+     "switch": "BLOCKED_SIZING_SHADOW_ENABLED", "expect_rows": "conditional",
+     "trigger": (_SIG, "signal = 'ENTRY_GATE_BLOCKED' AND NOT (decision->'entry_gate' ? 'path')"),
+     "sources": ((_SIG, "signal = 'ENTRY_GATE_BLOCKED' AND decision ? 'would_be_sizing'"),)},
+    # Inside story_dedup on every event verdict (version 2 of that record).
+    {"stage": "story_dedup_event_cluster", "card": "event cluster of event verdicts",
+     "switch": "STORY_DEDUP_SHADOW_ENABLED", "expect_rows": "always",
+     "sources": ((_SIG, "provenance->'trigger'->'story_dedup' ? 'event_cluster'"),)},
     # One row per daily scan pass (09:35 ET, Mon-Fri), after its enqueue.
     {"stage": "scan_tier_funnel", "card": "daily scan funnel by watchlist tier",
      "switch": "SCAN_TIER_FUNNEL_RECORD_ENABLED", "expect_rows": "always",

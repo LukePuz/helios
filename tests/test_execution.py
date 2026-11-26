@@ -2140,6 +2140,48 @@ def test_manual_add_keeps_the_stop_and_protects_the_whole_position():
     assert not upsert.called and not place.called and reprotect.called
 
 
+def _manual_add_unconfirmed(outcome):
+    def reprotect(*a, outcome_out=None, **k):
+        outcome_out.update(outcome)
+        return False
+    with patch("ibkr.get_client") as client, patch("risk_manager.RiskManager") as rm_cls, \
+         patch("market_data.get_priced_quote", return_value={"price": 100.0}), \
+         patch("ibkr.place_market_order", return_value={"order_id": 1, "fill_price": 100.0, "filled_qty": 2}), \
+         patch("db.log_trade"), patch("db.log_order", return_value=5), patch("db.update_order_fill"), \
+         patch("db.get_position_stop", return_value={"stop_price": 95.0}), \
+         patch("db.upsert_position_stop"), patch("tasks.manage_stop_place"), \
+         patch("tasks._reprotect_after_late_sell", side_effect=reprotect), \
+         patch("tasks._queue_reprotect") as queued, patch("tasks.open_manual_action") as action, \
+         patch("alerts._send") as send:
+        client.return_value.get_open_position.return_value = MagicMock(qty=5)
+        rm_cls.return_value.is_halted.return_value = False
+        execution.execute_manual("ZZZ", "BUY", 2, "test")
+    assert queued.called and action.called
+    return [c.args[0] for c in send.call_args_list]
+
+
+def test_manual_add_while_the_old_stop_rests_says_not_yet_resized():
+    """5 held before the ADD of 2, the old stop covers all 5."""
+    texts = _manual_add_unconfirmed({"cover": 5.0})
+    assert any(t.startswith("⚠️ STOP NOT YET RESIZED — ZZZ") and "the old stop still rests" in t
+               and "covers 5 of 7 shares" in t for t in texts)
+    assert not any("UNPROTECTED" in t for t in texts)
+
+
+@pytest.mark.parametrize("cover", [0.0, 1.0, 4.0])
+def test_manual_add_with_an_old_stop_short_of_the_old_position_is_unprotected(cover):
+    """A resting stop that doesn't cover the shares held before the ADD (5)
+    leaves more than the added shares bare: the 🚨 text."""
+    texts = _manual_add_unconfirmed({"cover": cover})
+    assert any(t.startswith("🚨 UNPROTECTED POSITION — ZZZ") for t in texts)
+    assert not any("NOT YET RESIZED" in t for t in texts)
+
+
+def test_manual_add_with_the_stop_unconfirmed_is_unprotected():
+    texts = _manual_add_unconfirmed({})
+    assert any(t.startswith("🚨 UNPROTECTED POSITION — ZZZ") for t in texts)
+
+
 def test_manual_fill_without_a_price_still_marks_the_order_filled():
     """Professor run 17: a fill confirmed without a price left the orders row
     'submitted'."""

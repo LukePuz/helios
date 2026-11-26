@@ -2552,7 +2552,10 @@ def trigger_record(path: str, event: dict | None = None) -> dict:
     e = event or {}
     rec = {"path": path, "source": e.get("source"), "type": e.get("type"),
            "title": (e.get("title") or "")[:200] or None, "url": e.get("url"),
-           "published_at": str(e.get("timestamp") or e.get("published_at") or "") or None}
+           "published_at": str(e.get("timestamp") or e.get("published_at") or "") or None,
+           # EDGAR only: the filing's own form (a 425 arrives with source
+           # sec_form4 and type "Form 4"); None off EDGAR. Log-only.
+           "actual_form": e.get("actual_form")}
     # The trigger headline's tone from the screener's keyword lists (not a
     # model), so a buy on a negative headline can be counted (audit 11-05
     # 17:32 #3). Tag only; the gate ignores it.

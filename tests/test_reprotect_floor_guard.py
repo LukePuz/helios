@@ -74,7 +74,7 @@ def test_171_failed_add_stop_queued_restop_keeps_lot_197_at_its_stop():
     out, cancel, place, record, rows, alerts = _run(
         {"intent": "BUY"}, L198, held=2, covered=1.0, before_cancel=[_stp(L197)], price=ADD_FILL)
     assert out is True
-    cancel.assert_called_once_with("NVDA")
+    cancel.assert_called_once_with("NVDA", stuck_out=[])
     assert place.call_args_list == [call("NVDA", 2.0, L197, market_price=ADD_FILL)]
     assert L197 < ADD_FILL                                 # nothing at or above the price
     record.assert_called_once_with("NVDA", L197, None, native_trail=False, strict=True)
@@ -112,7 +112,7 @@ def test_late_add_fill_with_a_kept_record_above_the_price_goes_below_it():
     out, cancel, place, record, rows, alerts = _run(
         {}, L197, held=2, covered=1.0, before_cancel=[_stp(L198)], price=FILL_1113)
     assert out is True
-    cancel.assert_called_once_with("NVDA")
+    cancel.assert_called_once_with("NVDA", stuck_out=[])
     assert place.call_args_list == [call("NVDA", 2.0, L198, market_price=FILL_1113)]
     assert L198 < FILL_1113
     record.assert_not_called()                 # a minute-bar price: the record stays higher
@@ -138,7 +138,7 @@ def test_late_partial_sell_after_a_lagging_add_keeps_lot_197_at_its_stop():
         {"intent": "TRIM", "side": "SELL"}, L198, held=2, covered=1.0,
         before_cancel=[_stp(L197)], price=ADD_FILL, from_queue=False)
     assert out is True
-    cancel.assert_called_once_with("NVDA")
+    cancel.assert_called_once_with("NVDA", stuck_out=[])
     assert place.call_args_list == [call("NVDA", 2.0, L197, market_price=ADD_FILL)]
     record.assert_called_once()
     assert rows == []
@@ -250,6 +250,18 @@ def test_queued_buy_over_a_profit_target_entry_keeps_the_own_stop():
     merged = _queue({"intent": "BUY", "own_stop": L199}, pending=pt)
     assert merged["intent"] == "PROFIT_TARGET" and merged["stop_price"] == 120.0
     assert merged["own_stop"] == L199 and merged["had_buy"] is True
+
+
+@pytest.mark.parametrize("intent", ["EXIT", "BACKSTOP", "RESTORE", "BUY"])
+def test_a_merge_into_a_profit_target_entry_starts_fresh_try_and_wait_budgets(intent):
+    """Professor m122: the merge dropped tries but kept waits, so an exit
+    merged into a target entry that had waited started with less of its
+    ~4 h budget."""
+    pt = {"NVDA": {"intent": "PROFIT_TARGET", "stop_price": 120.0, "nonce": "x",
+                   "tries": 2, "waits": 30}}
+    merged = _queue({"intent": intent, "order_id": 9}, pending=pt)
+    assert merged["intent"] == "PROFIT_TARGET" and merged["stop_price"] == 120.0
+    assert "tries" not in merged and "waits" not in merged
 
 
 def test_queue_stop_for_retry_passes_the_own_stop_only_when_given():

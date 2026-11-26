@@ -582,6 +582,13 @@ ENTRY_QUALITY_SHADOW_ENABLED = True
 STORY_DEDUP_SHADOW_ENABLED = True
 STORY_DEDUP_WINDOW_HOURS = 24
 STORY_STALE_CUTOFF_HOURS = 24
+# Event-cluster label on the same record (story_dedup.event_cluster): the
+# title-token Jaccard of this item against each earlier event verdict on the
+# ticker in the same window, the best score and which verdict it came from,
+# and would_cluster at this threshold. The score is stored, so any other
+# threshold can be applied later. Record only; nothing is skipped and the
+# screener is unchanged. Not read from .env.
+STORY_EVENT_CLUSTER_JACCARD = 0.5
 # Read-through record (record only; agents/crew.py:_read_through_record). When
 # an event is analysed, one activity row (stage read_through) lists the
 # related symbols the brief names for the event's ticker
@@ -644,6 +651,14 @@ ENTRY_TREND_GATE_MARKET_TICKER = "SPY"
 # routing or sizing.
 ENTRY_GATE_RECLAIM_SHADOW_ENABLED = True
 ENTRY_GATE_RECLAIM_SHADOW_SESSIONS = 20
+# Would-be sizing on gate-blocked buys (agents/crew.py:_would_be_sizing_record).
+# Record only: the route's ENTRY_GATE_BLOCKED row gets decision.would_be_sizing,
+# marked hypothetical: the stop sizing's calculate_stop would set (on cached
+# bars), R to the model's target against it, the volatility-target weight and
+# the book's open risk, from the gate's last completed close. Percentages and
+# ratios only. Nothing reads it, and the gate's outcome is unchanged. Not read
+# from .env.
+BLOCKED_SIZING_SHADOW_ENABLED = True
 # Add-to-loser gate (agents/crew.py:_add_loser_check, read by _entry_gate;
 # also on a deferred ADD's retry, tasks._deferred_entry_gate), for the written
 # rule "never add to a losing position without a new catalyst"

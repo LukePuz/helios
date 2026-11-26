@@ -82,6 +82,8 @@ def _reprotect(intent, resting_seq, from_queue, place_raises=None, order_extra=N
          patch("db.set_stop_broker_order_id"), patch("db.log_activity_queued"), \
          patch("tasks._record_floored_stop"), patch("tasks._record_guarded_stop"), \
          patch("tasks._record_seeded_stop"), \
+         patch.object(tasks.recheck_stop_coverage, "apply_async",
+                      side_effect=lambda *a, **k: events.append("recheck")), \
          patch("market_data.is_market_hours", return_value=True), \
          patch("time.sleep"), \
          patch("alerts._send", side_effect=lambda t, *a, **k: events.append(("alert", t.splitlines()[0]))):
@@ -142,11 +144,13 @@ def test_queued_already_covered_sends_nothing_and_places_nothing():
 # ---- S1: late-SELL re-place ----
 
 def test_late_trim_reuses_the_cover_read_and_alerts_after_the_place():
-    out, events = _reprotect("TRIM", [[_stp(145.0, 5.0)]], from_queue=False)
+    out, events = _reprotect("TRIM", [[_stp(145.0, 5.0)], []], from_queue=False)
     assert out is True
     i = events.index("read:resting")
-    assert events[i + 1:i + 3] == ["cancel", "place"]     # nothing slow between
-    assert events.count("read:resting") == 1
+    # the cancel, then the look after it (other clients' stops netted, as on
+    # the queued path), then the place: nothing else between
+    assert events[i + 1:i + 4] == ["cancel", "read:resting", "place"]
+    assert events.count("read:resting") == 2
     al = _alerts(events)
     assert len(al) == 1 and events.index(al[0]) > events.index("place")
 
@@ -155,11 +159,13 @@ def test_late_profit_target_floor_read_failure_is_alerted_after_the_place():
     """A profit-target re-place doesn't read cover, so the floor reads once;
     that read fails: the guard doesn't read again, and both the floor's
     STOP FLOOR UNREAD and the guard's alert go out after the place."""
-    out, events = _reprotect("PROFIT_TARGET", [TimeoutError("read")], from_queue=False,
+    out, events = _reprotect("PROFIT_TARGET", [TimeoutError("read"), []], from_queue=False,
                              order_extra={"stop_price": 150.0})
     assert out is True
-    assert events.count("read:resting") == 1
-    j = _nothing_slow_between(events, events.index("read:resting"))
+    assert events.count("read:resting") == 2              # the floor's, the look after the cancel
+    after = len(events) - 1 - events[::-1].index("read:resting")
+    assert events[after - 1] == "cancel"
+    j = _nothing_slow_between(events, after)
     al = _alerts(events)
     assert [a for a in al if "STOP FLOOR UNREAD" in a[1]] and len(al) == 2
     assert all(events.index(a) > j for a in al)

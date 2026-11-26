@@ -335,8 +335,13 @@ def _late_buy(cache, broker, order=None, approval=None):
          patch("tasks._retry_pending_reprotects"), \
          patch("tasks._queue_reprotect") as queue, \
          patch("db.log_activity_queued") as queued, \
-         patch("alerts._send") as send:
+         patch("alerts._send") as send, \
+         patch.object(tasks.recheck_stop_coverage, "apply_async") as recheck:
+        # The re-protect's fresh read is empty here (the fake session shows
+        # no positions), so a place is sized from the cache and queues the
+        # coverage re-check (_late_buy.recheck).
         tasks.reconcile_unconfirmed_orders.run()
+    _late_buy.recheck = recheck
     rows = [c.args[4] for c in queued.call_args_list if c.args[0] == "late_fill_expect"]
     _late_buy.sent = [c.args[0] for c in send.call_args_list]
     return place, queue, rows
@@ -379,6 +384,7 @@ def test_manual_late_buy_with_the_cache_caught_up_places(on):
     assert len(place.call_args_list) == 1 and place.call_args.args[:2] == ("CRWD", 144.0)
     queue.assert_not_called()
     assert rows[0]["path"] == "reconcile_late_manual_buy"
+    _late_buy.recheck.assert_called_once()              # sized from the cache (I6)
 
 
 # ── queued BUY retry keeps expect_at_least for 2 tries ──────────────────────
@@ -417,6 +423,7 @@ def test_late_buy_with_the_cache_caught_up_places_as_before(on):
     place, queue, _ = _late_buy(cache=144, broker=144.0)
     assert place.call_args_list == [call("CRWD", 144.0, 153.61)]
     queue.assert_not_called()
+    _late_buy.recheck.assert_called_once()              # sized from the cache (I6)
 
 
 @pytest.mark.switches(LATE_FILL_EXPECT_MODE="off")
@@ -424,6 +431,7 @@ def test_late_buy_switch_off_places_to_the_cache():
     place, _, rows = _late_buy(cache=100, broker=144.0)
     assert place.call_args_list == [call("CRWD", 100.0, 153.61)]        # today
     assert rows == []
+    _late_buy.recheck.assert_called_once()              # sized from the cache (I6)
 
 
 # ── LATE_FILL_EXPECT_MODE = "shadow": reads and a row, today's stop ─────────

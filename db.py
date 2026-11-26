@@ -1,3 +1,4 @@
+import contextvars
 import json
 import logging
 import math
@@ -4855,13 +4856,45 @@ def rescale_and_upsert_price_bars(ticker: str, k: float, bars: list[dict], volum
         _put_conn(conn)
 
 
+# A bound on get_price_history for one block of code (price_history_bound):
+# {"timeout_ms": int, "errors": [exception class names]} or None. Context-local,
+# so callers outside the block, and other threads, are unchanged.
+_PRICE_HISTORY_BOUND: contextvars.ContextVar = contextvars.ContextVar(
+    "price_history_bound", default=None)
+
+
+class price_history_bound:
+    """with price_history_bound(3000) as bound: every get_price_history in
+    the block runs under SET LOCAL statement_timeout (its own transaction,
+    rolled back after), and each failed read's exception class is appended
+    to bound["errors"] whether or not that caller is strict (a non-strict
+    caller still gets []). Used by record-only paths that call functions
+    which read price_history without a bound of their own."""
+
+    def __init__(self, timeout_ms: int):
+        self.state = {"timeout_ms": int(timeout_ms), "errors": []}
+        self._token = None
+
+    def __enter__(self) -> dict:
+        self._token = _PRICE_HISTORY_BOUND.set(self.state)
+        return self.state
+
+    def __exit__(self, *exc) -> bool:
+        _PRICE_HISTORY_BOUND.reset(self._token)
+        return False
+
+
 def get_price_history(ticker: str, days: int = 260, strict: bool = False) -> list[dict]:
     """Returns up to `days` most recent daily bars for ticker, oldest first.
     strict: raise on a failed read instead of returning [] (which reads as
-    "no history")."""
+    "no history"). Inside a price_history_bound block the read has that
+    statement timeout and a failure is noted on the bound."""
+    bound = _PRICE_HISTORY_BOUND.get()
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
+            if bound is not None:
+                cur.execute("SET LOCAL statement_timeout = %s", (bound["timeout_ms"],))
             cur.execute(
                 "SELECT date, open, high, low, close, volume FROM price_history "
                 "WHERE ticker=%s ORDER BY date DESC LIMIT %s",
@@ -4876,10 +4909,17 @@ def get_price_history(ticker: str, days: int = 260, strict: bool = False) -> lis
         ]
     except Exception as e:
         logging.error(f"get_price_history({ticker}) failed: {e}")
+        if bound is not None:
+            bound["errors"].append(type(e).__name__)
         if strict:
             raise
         return []
     finally:
+        if bound is not None:
+            try:
+                conn.rollback()   # ends the transaction, and the SET LOCAL with it
+            except Exception:
+                pass
         _put_conn(conn)
 
 

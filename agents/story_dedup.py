@@ -33,6 +33,14 @@ stores the result on the verdict's provenance.trigger.story_dedup:
   True only when even that lower bound is past the cut-off, else None.
 - would_skip_duplicate / would_skip_stale: labels at the cut-offs in
   config.py. None means "could not say" (read failed, no title, no time).
+- event_cluster (a record that carries it is version 2; one without it, from
+  the backfill or the error fallback, is version 1): the same event under a different
+  title or publisher, which duplicate_of can't see. The title's words
+  (title_tokens: function words, one-letter words and the ticker dropped)
+  against each earlier event verdict's in the window, by Jaccard:
+  best_score and its verdict, n_at_or_above STORY_EVENT_CLUSTER_JACCARD,
+  the earliest such verdict (first_*), and would_cluster. The score is
+  stored, so another threshold can be applied later.
 
 A re-analysis the system queues on purpose (source stale_entry_recheck) is
 marked exempt and labelled False. Nothing here is read by the prompt, the
@@ -48,7 +56,11 @@ from zoneinfo import ZoneInfo
 
 log = logging.getLogger(__name__)
 
-STORY_DEDUP_VERSION = 1
+# The record's version describes its keys: 2 when it carries event_cluster,
+# 1 when it doesn't (classify without cluster_threshold, as the backfill calls
+# it, and the error fallback of story_dedup_record).
+STORY_DEDUP_VERSION = 2
+STORY_DEDUP_VERSION_NO_CLUSTER = 1
 
 # Event sources that are deliberate re-analyses, never duplicates.
 _EXEMPT_SOURCES = ("stale_entry_recheck",)
@@ -162,8 +174,100 @@ def time_precision(value) -> str | None:
     return "datetime"
 
 
+# Event-cluster label (record only): title-token Jaccard against the earlier
+# event verdicts already read for duplicate_of. Function words carry no event.
+EVENT_CLUSTER_VERSION = 1
+_CLUSTER_STOPWORDS = frozenset(
+    "a an the and or of to in on for at by with from as is are was were be been its it "
+    "this that these those after before over amid into about says said vs".split())
+
+
+def title_tokens(title: str | None, url: str | None = None,
+                 ticker: str | None = None) -> frozenset:
+    """The normalised title's words (normalise_title, the Google News
+    publisher suffix removed) without function words, one-letter words or
+    the ticker itself. Empty when there is no title. Pure."""
+    norm = normalise_title(title, strip_publisher=is_google_news(url))
+    if not norm:
+        return frozenset()
+    drop = _CLUSTER_STOPWORDS | ({str(ticker).lower()} if ticker else frozenset())
+    return frozenset(w for w in norm.split() if len(w) > 1 and w not in drop)
+
+
+def token_jaccard(a: frozenset, b: frozenset) -> float | None:
+    """|a & b| / |a | b|, or None when either set is empty. Pure."""
+    if not a or not b:
+        return None
+    return len(a & b) / len(a | b)
+
+
+def token_overlap(a: frozenset, b: frozenset) -> float | None:
+    """|a & b| / min(|a|, |b|) (the overlap coefficient: a short title whose
+    words all appear in a longer one scores 1), or None when either set is
+    empty. Pure."""
+    if not a or not b:
+        return None
+    return len(a & b) / min(len(a), len(b))
+
+
+def event_cluster(trigger: dict, prior: list[dict], decided_at: datetime,
+                  window_hours: float, threshold: float, ticker: str | None = None) -> dict:
+    """The event-cluster label for one analysis: its title tokens against
+    each earlier event verdict in the window (the rows classify reads).
+    best_*: the highest score and its verdict; n_at_or_above: how many
+    scored at or above threshold; first_*: the earliest of those (the
+    cluster's first verdict in the window); would_cluster: best >= threshold,
+    None when this title has no tokens. best_overlap / best_overlap_signal_id:
+    the highest overlap coefficient (token_overlap) and its verdict, recorded
+    beside it; the label does not use it. Pure."""
+    t = trigger or {}
+    toks = title_tokens(t.get("title"), t.get("url"), ticker)
+    out = {"version": EVENT_CLUSTER_VERSION, "method": "title_token_jaccard",
+           "threshold": threshold, "tokens": len(toks), "compared": 0,
+           "best_score": None, "best_signal_id": None, "best_hours_before": None,
+           "n_at_or_above": 0, "first_signal_id": None, "first_hours_before": None,
+           "best_overlap": None, "best_overlap_signal_id": None, "would_cluster": None}
+    if not toks:
+        return out
+    best, first, best_ov = None, None, None
+    for p in prior or []:
+        ts = parse_time(p.get("timestamp"))
+        if ts is None or ts >= decided_at:
+            continue
+        hours_before = (decided_at - ts).total_seconds() / 3600.0
+        if hours_before > window_hours:
+            continue
+        other = title_tokens(p.get("title"), p.get("url"), ticker)
+        score = token_jaccard(toks, other)
+        if score is None:
+            continue
+        out["compared"] += 1
+        ov = token_overlap(toks, other)
+        if best_ov is None or ov > best_ov[0] or (ov == best_ov[0] and hours_before < best_ov[1]):
+            best_ov = (ov, hours_before, p.get("signal_id"))
+        if best is None or score > best[0] or (score == best[0] and hours_before < best[1]):
+            best = (score, hours_before, p.get("signal_id"))
+        if score >= threshold:
+            out["n_at_or_above"] += 1
+            if first is None or hours_before > first[0]:
+                first = (hours_before, p.get("signal_id"))
+    if best is not None:
+        out["best_score"] = round(best[0], 3)
+        out["best_hours_before"] = round(best[1], 2)
+        out["best_signal_id"] = best[2]
+    if best_ov is not None:
+        out["best_overlap"] = round(best_ov[0], 3)
+        out["best_overlap_signal_id"] = best_ov[2]
+    if first is not None:
+        out["first_hours_before"] = round(first[0], 2)
+        out["first_signal_id"] = first[1]
+    out["would_cluster"] = best is not None and best[0] >= threshold
+    return out
+
+
 def classify(trigger: dict, prior: list[dict], decided_at: datetime,
-             window_hours: float, stale_cutoff_hours: float) -> dict:
+             window_hours: float, stale_cutoff_hours: float,
+             cluster_threshold: float | None = None, ticker: str | None = None) -> dict:
     """The record for one analysis from its trigger and the earlier event
     verdicts on the ticker (each {signal_id, timestamp, title, url, source}).
     Pure; the backfill calls it on stored rows. prior rows outside the window
@@ -221,7 +325,8 @@ def classify(trigger: dict, prior: list[dict], decided_at: datetime,
             would_stale = True
         else:
             would_stale = None
-    return {"version": STORY_DEDUP_VERSION, "story_key": key, "url_key": ukey,
+    out = {"version": STORY_DEDUP_VERSION if cluster_threshold is not None
+           else STORY_DEDUP_VERSION_NO_CLUSTER, "story_key": key, "url_key": ukey,
             "window_hours": window_hours, "prior_event_verdicts": len(prior or []),
             "duplicate_of": dup, "duplicate_count": len(matches),
             "published_age_hours": age, "published_age_hours_min": age_min,
@@ -230,6 +335,12 @@ def classify(trigger: dict, prior: list[dict], decided_at: datetime,
             "stale_cutoff_hours": stale_cutoff_hours,
             "would_skip_duplicate": would_dup, "would_skip_stale": would_stale,
             "exempt": exempt, "decided_at": decided_at.isoformat(timespec="seconds")}
+    if cluster_threshold is not None:
+        ec = event_cluster(t, prior, decided_at, window_hours, float(cluster_threshold), ticker)
+        if exempt:
+            ec["would_cluster"] = False
+        out["event_cluster"] = ec
+    return out
 
 
 def story_dedup_record(ticker: str, trigger: dict | None) -> dict | None:
@@ -243,6 +354,7 @@ def story_dedup_record(ticker: str, trigger: dict | None) -> dict | None:
             return None
         window = float(config.STORY_DEDUP_WINDOW_HOURS)
         cutoff = float(config.STORY_STALE_CUTOFF_HOURS)
+        cluster = float(getattr(config, "STORY_EVENT_CLUSTER_JACCARD", 0.5))
         decided_at = datetime.now(timezone.utc)
         read = "ok"
         try:
@@ -250,17 +362,23 @@ def story_dedup_record(ticker: str, trigger: dict | None) -> dict | None:
             prior = db.recent_event_verdicts(ticker, int(window * 60), strict=True)
         except Exception as e:
             prior, read = [], f"error: {type(e).__name__}"
-        rec = classify(trigger or {}, prior, decided_at, window, cutoff)
+        rec = classify(trigger or {}, prior, decided_at, window, cutoff,
+                       cluster_threshold=cluster, ticker=ticker)
         rec["read"] = read
         if read != "ok":
             rec["duplicate_of"], rec["duplicate_count"] = None, None
             rec["prior_event_verdicts"] = None
             if not rec["exempt"]:
                 rec["would_skip_duplicate"] = None
+            ec = rec.get("event_cluster")
+            if isinstance(ec, dict):
+                ec["compared"] = ec["n_at_or_above"] = None
+                if not rec["exempt"]:
+                    ec["would_cluster"] = None
         return rec
     except Exception as e:
         log.debug(f"[{ticker}] story dedup shadow failed: {e}")
         try:
-            return {"version": STORY_DEDUP_VERSION, "read": f"error: {type(e).__name__}"}
+            return {"version": STORY_DEDUP_VERSION_NO_CLUSTER, "read": f"error: {type(e).__name__}"}
         except Exception:
             return None

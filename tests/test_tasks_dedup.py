@@ -840,8 +840,9 @@ class TestReconcileUnconfirmedOrders:
         _, place, _ = self._run_sell([MagicMock(symbol="CRWD", qty=20)],
                                      intent="PROFIT_TARGET", stop_price=181.0)
         self.extra["taken"].assert_called_once_with("CRWD", 181.0)
-        # working-sell read (no cover check), then the no-loosen floor read before the cancel
-        assert self.extra["open_orders"].call_count == 2
+        # working-sell read (no cover check), then the no-loosen floor read before the cancel,
+        # and the look after it (other clients' stops are netted, as on the queued path)
+        assert self.extra["open_orders"].call_count == 3
         place.assert_called_once_with("CRWD", 20.0, 181.0)
 
     def test_late_trim_keeps_recorded_stop_and_target_open(self):
@@ -849,7 +850,8 @@ class TestReconcileUnconfirmedOrders:
         _, place, _ = self._run_sell([MagicMock(symbol="CRWD", qty=20)], intent="TRIM")
         self.extra["taken"].assert_not_called()
         # working sells and resting cover; the floor and the guard reuse the
-        # cover read (no third read before the cancel, review S1)
+        # cover read (no third read before the cancel, review S1); nothing
+        # resting, so no cancel and no look after it
         assert self.extra["open_orders"].call_count == 2
         place.assert_called_once_with("CRWD", 20.0, 150.0)
 
@@ -858,12 +860,48 @@ class TestReconcileUnconfirmedOrders:
         sale, so a late fill used to leave the rest with no stop."""
         from unittest.mock import MagicMock
         cancel, place, send = self._run_sell([MagicMock(symbol=self._order()["ticker"], qty=20)])
-        # working sells and resting cover (nothing found, so no floor to read:
-        # review S1)
+        # working sells and resting cover (nothing found, so no floor to read
+        # (review S1), no cancel and no look after it)
         assert self.extra["open_orders"].call_count == 2
-        cancel.assert_called_once()
+        cancel.assert_not_called()             # nothing resting to cancel
         place.assert_called_once_with(self._order()["ticker"], 20.0, 150.0)
         assert "Protective stop placed." in send.call_args.args[0]
+
+    def test_late_partial_sell_already_covered_says_nothing_was_placed(self):
+        """Resting stops already cover the rest: the alert does not say a
+        stop was placed."""
+        from unittest.mock import MagicMock
+        with patch("execution._stops_still_resting", return_value=20.0):
+            cancel, place, send = self._run_sell([MagicMock(symbol=self._order()["ticker"],
+                                                            qty=20)])
+        place.assert_not_called()
+        cancel.assert_not_called()
+        text = send.call_args.args[0]
+        assert "Protective stop placed." not in text
+        assert "No new stop placed: resting stops already cover the remaining shares." in text
+
+    def test_late_partial_sell_with_a_working_sell_covering_it_says_so(self):
+        from unittest.mock import MagicMock
+        with patch("tasks._working_mkt_sell_qty", return_value=20.0):
+            _, place, send = self._run_sell([MagicMock(symbol=self._order()["ticker"], qty=20)])
+        place.assert_not_called()
+        text = send.call_args.args[0]
+        assert "Protective stop placed." not in text and "resting stops" not in text
+        assert "No new stop placed: a working SELL covers the remaining shares." in text
+
+    def test_late_partial_sell_with_stops_covering_only_the_broker_count_says_so(self):
+        """Stops cover the fresh count (12); the cache still shows 20."""
+        from unittest.mock import MagicMock
+        with patch("execution._stops_still_resting", return_value=12.0), \
+             patch("tasks._reprotect_fresh_held", return_value=12.0), \
+             patch.object(tasks.recheck_stop_coverage, "apply_async") as recheck:
+            _, place, send = self._run_sell([MagicMock(symbol=self._order()["ticker"], qty=20)])
+        place.assert_not_called()
+        recheck.assert_called_once()
+        text = send.call_args.args[0]
+        assert "resting stops already cover" not in text
+        assert ("No new stop placed: stops cover the broker's count, 12; the cached count is "
+                "higher: re-checking.") in text
 
     def test_late_partial_sell_without_a_stop_record_warns(self):
         from unittest.mock import MagicMock
@@ -1589,8 +1627,14 @@ def test_queue_retry_keeps_the_entry_on_each_broker_failure():
     import tasks
     for err in (tasks.OrdersCallUnknown("x"), tasks.OrdersCallExpired("x"),
                 stop_lock.LockLost("AMD"), RuntimeError("boom")):
-        pending, placed = _queue_harness(err)
+        # a failed place queues the stop coverage re-check (it may have rested);
+        # each case a minute apart, past the re-check dedupe key
+        from conftest import _FakeRedis
+        _FakeRedis.clock += tasks._RECHECK_COUNTDOWN_S
+        with patch.object(tasks.recheck_stop_coverage, "apply_async") as recheck:
+            pending, placed = _queue_harness(err)
         assert placed == [] and pending["AMD"]["tries"] == 1, err
+        recheck.assert_called_once()
 
 
 def test_edgar_dispatches_each_filing_as_found_and_skips_overlap():
@@ -1987,6 +2031,26 @@ class TestBuyOutcomeRetry:
              patch("alerts._send") as alert:
             tasks._retry_pending_buy_outcomes()
         alert.assert_called_once()
+        assert json.loads(state[tasks._OUTCOME_STATE_KEY]) == {}
+
+    def test_a_celery_rerun_retries_the_write_without_spending_a_try(self):
+        """Professor m121 (review of 64537d7): a task.retry rerun of the
+        reconcile pass advanced tries too, so the ~2 h budget could end in
+        ~40 min. The rerun still tries the write; only the count stays."""
+        import json
+        state, gs, ss = self._state()
+        state[tasks._OUTCOME_STATE_KEY] = json.dumps(
+            {"59": {**self.REC, "tries": tasks._OUTCOME_MAX_TRIES - 1}})
+        with gs, ss, patch("db.get_approval_by_id", side_effect=RuntimeError("db down")) as read, \
+             patch("alerts._send") as alert:
+            tasks._retry_pending_buy_outcomes(count_budget=False)
+            read.assert_called_once()                                  # the write was tried
+            alert.assert_not_called()
+            assert json.loads(state[tasks._OUTCOME_STATE_KEY])["59"]["tries"] == \
+                tasks._OUTCOME_MAX_TRIES - 1
+            tasks._retry_pending_buy_outcomes()                        # the next scheduled run
+        alert.assert_called_once()
+        assert "OUTCOME NOT RECORDED" in alert.call_args.args[0]
         assert json.loads(state[tasks._OUTCOME_STATE_KEY]) == {}
 
     def test_reaverage_with_no_open_row_writes_the_row_instead(self):

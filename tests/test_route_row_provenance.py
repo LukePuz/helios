@@ -261,6 +261,7 @@ def test_trigger_record_and_every_analyze_call_passes_one():
                                            "timestamp": "2026-10-29T11:02"})
     assert rec == {"path": "event", "source": "analyst_ratings", "type": "pt_raise",
                    "title": "Stifel raises MSFT", "url": "u", "published_at": "2026-10-29T11:02",
+                   "actual_form": None,
                    "event_time": "2026-10-29T11:02", "event_time_source": "timestamp", "title_tone": "pos",
                    "title_tone_sha": __import__("agents.screener", fromlist=["TONE_SHA"]).TONE_SHA}
     assert "trigger" not in inspect.getsource(analyst._build_prompt)

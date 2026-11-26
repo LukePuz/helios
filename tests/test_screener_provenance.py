@@ -23,8 +23,10 @@ def test_screened_out_signal_logs_model_and_provenance():
         crew.screen_event_only({"ticker": "NVDA", "source": "news", "title": "t", "text": "x"})
     kw = log_signal.call_args.kwargs
     assert kw["model"] == "qwen2.5:7b"
-    # The screener's provenance, plus the record-only own_ticker keys (agents/own_ticker.py).
-    assert {k: v for k, v in kw["provenance"].items() if not k.startswith("own_ticker_")} == prov
+    # The screener's provenance, plus the record-only own_ticker and
+    # material_event keys (agents/own_ticker.py, agents/material_event.py).
+    assert {k: v for k, v in kw["provenance"].items()
+            if not k.startswith(("own_ticker_", "material_event_"))} == prov
     assert kw["provenance"]["own_ticker_rejected"] is False
     assert kw["decision"]["title"] == "t" and kw["decision"]["source"] == "news"
     assert "text" not in kw["decision"]

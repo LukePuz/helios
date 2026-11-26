@@ -98,7 +98,7 @@ def test_sell_stuck_alert_still_sent_when_the_restore_raises():
 _BACKSTOP_ALERT = {"current_price": 140.0, "stop_price": 150.0}
 
 
-def _backstop(place_effect, open_orders, retry=False):
+def _backstop(place_effect, open_orders, retry=False, due=True):
     events = []
     client = MagicMock()
     client.get_all_positions.return_value = [MagicMock(symbol="AMD", qty=10)]
@@ -122,9 +122,11 @@ def _backstop(place_effect, open_orders, retry=False):
          patch("db.close_trade_outcome", side_effect=_recorder(events, "close_outcome")), \
          patch("tasks._schedule_backstop_retry", side_effect=_recorder(events, "schedule_retry")), \
          patch("tasks._claim_backstop_retry_send", return_value=True), \
+         patch("tasks._reconcile_alert_due", return_value=due) as due_check, \
          patch("alerts._send", side_effect=_alert_recorder(events)):
         out = (tasks.retry_backstop_sell.run("AMD", _BACKSTOP_ALERT) if retry
                else tasks._execute_backstop_sell("AMD", _BACKSTOP_ALERT))
+    _backstop.due_keys = [c.args[0] for c in due_check.call_args_list]
     return out, events
 
 
@@ -179,6 +181,125 @@ def test_backstop_alert_still_sent_when_nothing_is_left_to_sell():
     assert out is False
     assert "sell" not in events
     assert len(events) == 2 and events[1][0] == "alert" and "BACKSTOP" in events[1][1]
+
+
+def test_send_alert_texts_throttles_keyed_entries_at_send_time():
+    """Professor m118/m124: an (issue_key, text) entry is sent only when
+    _reconcile_alert_due(issue_key); a plain text is never checked."""
+    texts = ["plain", ("key_due", "due text"), ("key_not_due", "throttled text")]
+    with patch("tasks._reconcile_alert_due", side_effect=lambda k: k == "key_due") as due, \
+         patch("alerts._send") as send:
+        tasks._send_alert_texts(texts)
+    assert [c.args[0] for c in send.call_args_list] == ["plain", "due text"]
+    assert [c.args[0] for c in due.call_args_list] == ["key_due", "key_not_due"]
+    assert texts == []
+
+
+def test_send_alert_texts_sends_when_the_throttle_check_fails():
+    texts = [("key", "text")]
+    with patch("tasks._reconcile_alert_due", side_effect=RuntimeError("db down")), \
+         patch("alerts._send") as send:
+        tasks._send_alert_texts(texts)
+    send.assert_called_once_with("text")
+    assert texts == []
+
+
+def _throttle_state():
+    """In-memory system_state for the real _reconcile_alert_due."""
+    st = {}
+    return st, patch("db.get_state", side_effect=lambda k, d=None: st.get(k, d)), \
+        patch("db.set_state", side_effect=lambda k, v: st.__setitem__(k, v))
+
+
+def _age_s(st, key):
+    from datetime import datetime, timezone
+    return (datetime.now(timezone.utc) - datetime.fromisoformat(st[f"reconcile_alert_{key}"])).total_seconds()
+
+
+def test_a_sent_keyed_alert_spends_the_throttle_window():
+    st, gs, ss = _throttle_state()
+    with gs, ss, patch("alerts._send", return_value=41) as send:
+        tasks._send_alert_texts([("queued_exit_dropped_AMD", "dropped")])
+        tasks._send_alert_texts([("queued_exit_dropped_AMD", "dropped")])   # the next pass
+    assert send.call_count == 1
+    assert _age_s(st, "queued_exit_dropped_AMD") < 60
+
+
+@pytest.mark.parametrize("failure", [{"return_value": None}, {"side_effect": RuntimeError("telegram")}])
+def test_a_failed_keyed_send_is_due_again_after_the_retry_wait_not_every_pass(failure):
+    """Review of 33fe560: the issue key was recorded before the send, so a
+    failed 'QUEUED … DROPPED' send spent the whole window, and a later drop
+    within it was silenced although nothing went out. Now the issue is due
+    again after _HELD_ALERT_RETRY_S: not at once (no send every pass while
+    Telegram is down), not after the full window."""
+    import config
+    key = "queued_exit_dropped_AMD"
+    st, gs, ss = _throttle_state()
+    with gs, ss, patch("alerts._send", **failure) as send:
+        tasks._send_alert_texts([(key, "dropped")])
+        window = config.RECONCILE_ALERT_THROTTLE_HOURS * 3600
+        assert abs(_age_s(st, key) - (window - tasks._HELD_ALERT_RETRY_S)) < 60
+        for _ in range(3):                                   # the next passes, minutes later
+            tasks._send_alert_texts([(key, "dropped")])
+        assert send.call_count == 1
+    # the retry wait passes: due again, and this time it goes out
+    from datetime import datetime, timedelta
+    st[f"reconcile_alert_{key}"] = (datetime.fromisoformat(st[f"reconcile_alert_{key}"])
+                                    - timedelta(seconds=tasks._HELD_ALERT_RETRY_S + 60)).isoformat()
+    with gs, ss, patch("alerts._send", return_value=42) as send:
+        tasks._send_alert_texts([(key, "dropped again")])
+        tasks._send_alert_texts([(key, "dropped again")])
+    assert [c.args[0] for c in send.call_args_list] == ["dropped again"]
+    assert _age_s(st, key) < 60                              # sent: the full window from now
+
+
+def test_a_failed_plain_send_writes_no_throttle_state():
+    st, gs, ss = _throttle_state()
+    with gs, ss, patch("alerts._send", return_value=None):
+        tasks._send_alert_texts(["plain"])
+    assert st == {}
+
+
+def test_a_failed_retry_stamp_never_raises():
+    texts = [("k", "t"), "after"]
+    with patch("tasks._reconcile_alert_due", return_value=True), \
+         patch("tasks._reconcile_alert_retry_soon", side_effect=RuntimeError("db down")) as soon, \
+         patch("alerts._send", side_effect=[None, 7]) as send:
+        tasks._send_alert_texts(texts)
+    soon.assert_called_once_with("k")
+    assert send.call_count == 2 and texts == []
+
+
+def test_a_throttled_or_unkeyed_entry_never_restamps():
+    with patch("tasks._reconcile_alert_due", return_value=False), \
+         patch("tasks._reconcile_alert_retry_soon") as soon, patch("alerts._send") as send:
+        tasks._send_alert_texts([("k", "t")])
+    send.assert_not_called(); soon.assert_not_called()
+    with patch("tasks._reconcile_alert_retry_soon") as soon, patch("alerts._send", return_value=None):
+        tasks._send_alert_texts(["plain"])
+    soon.assert_not_called()
+
+
+@pytest.mark.parametrize("due", [True, False])
+def test_backstop_stuck_stop_alert_is_throttled_and_the_sale_is_not(due):
+    """Professor m124: the 'would not cancel' alert repeated every trigger
+    cycle. Throttled at send time; the sale of the uncovered rest stands."""
+    out, events = _backstop({"order_id": 78, "filled_qty": 6, "fill_price": 140.0}, [_stop(4.0)], due=due)
+    assert "sell" in events
+    assert _backstop.due_keys == ["backstop_stop_not_cancelled_AMD"]
+    sent = [e[1] for e in events if isinstance(e, tuple)]   # first lines only
+    assert sum("BACKSTOP" in s for s in sent) == (1 if due else 0)
+
+
+@pytest.mark.parametrize("due", [True, False])
+def test_backstop_working_sell_alert_is_throttled_and_the_sale_is_not(due):
+    working = {"order_id": 77, "ticker": "AMD", "action": "SELL", "order_type": "MKT", "qty": 10.0,
+               "stop_price": None, "status": "Submitted", "remaining": 4.0}
+    out, events = _backstop({"order_id": 78, "filled_qty": 6, "fill_price": 140.0}, [working], due=due)
+    assert "sell" in events
+    assert _backstop.due_keys == ["backstop_sell_working_AMD"]
+    sent = [e[1] for e in events if isinstance(e, tuple)]   # first lines only
+    assert sum("BACKSTOP" in s for s in sent) == (1 if due else 0)
 
 
 def test_send_alert_texts_empties_the_list_and_never_raises():

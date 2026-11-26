@@ -391,6 +391,13 @@ _VERDICT = {"kind": "verdict", "ticker": "MSFT", "env": "paper", "signal_id": 41
 
 def _outcomes(verdict, bars, done=frozenset(), today=None, actions=(), raw_close=None):
     import tasks
+    if today is None:
+        # The fixture's bars are dated November 2026; the tracker reads the real
+        # date when none is given, so from 2026-12-30 the verdict passed its 40
+        # sessions and an extra outcome_status row appeared. Pinned to the day
+        # these tests were written against.
+        from datetime import date
+        today = date(2026, 11, 26)
     acts = ({"side_effect": actions} if isinstance(actions, Exception) else
             {"return_value": {"events": list(actions), "raw_close": dict(raw_close or {}),
                               "fetched_at": "2026-12-31T00:00:00+00:00"}})

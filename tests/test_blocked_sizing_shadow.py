@@ -58,7 +58,13 @@ def _vol_bars(n=21, step=0.01):
     for i in range(n):
         closes.append(c)
         c = c * math.exp(step if i % 2 == 0 else -step)
-    return [{"date": f"2026-10-{i + 1:02d}", "close": x} for i, x in enumerate(closes)]
+    # Dated back from yesterday (the real date): the record's stale_sessions
+    # counts sessions since the last bar, so fixed dates made it grow with the
+    # real clock, and on 2027-02-25 it read 90, the banned stop value.
+    from datetime import date, timedelta
+    end = date.today() - timedelta(days=1)
+    return [{"date": (end - timedelta(days=n - 1 - i)).isoformat(), "close": x}
+            for i, x in enumerate(closes)]
 
 
 def _heat_inputs():

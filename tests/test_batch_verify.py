@@ -877,3 +877,26 @@ def test_book_gap_risk_requires_the_corporate_action_guard_keys():
         if key not in ("session_date", "window_gaps", "definitions", "close_dates",
                        "close_is_today", "shadow_key"):
             assert key in rec, key
+
+
+def test_watcher_skips_thanksgiving_and_still_checks_the_early_close_friday():
+    since = datetime(2026, 11, 25, 16, 30, tzinfo=NY)        # Wed after its last hour
+    now = datetime(2026, 11, 27, 13, 30, tzinfo=NY)          # Fri 11-27, after the 13:00 close
+    fri = [_line(f"2026-11-27 {h:02d}:{m:02d}:00") for h in range(9, 13) for m in (31, 45)]
+    c = bv.check_watcher(bv.watcher_runs(fri, since), since, now)
+    # No run on Thu 11-26 (an NYSE holiday) is not a gap.
+    assert c["status"] == "OK", c.get("why")
+    assert not any("11-26" in f for f in c["extra_fail"])
+    # Friday's elapsed hours are still checked: drop the 11:00 hour and it fails.
+    gap = [l for l in fri if " 11:" not in l]
+    c = bv.check_watcher(bv.watcher_runs(gap, since), since, now)
+    assert c["status"] == "FAIL" and "11-27 11:00-12:00" in c["why"]
+
+
+def test_watcher_thanksgiving_hours_were_gaps_before_the_holiday_skip(monkeypatch):
+    import market_calendar
+    monkeypatch.setattr(market_calendar, "NYSE_HOLIDAYS", set())
+    since = datetime(2026, 11, 26, 5, 0, tzinfo=NY)
+    now = datetime(2026, 11, 26, 18, 0, tzinfo=NY)
+    c = bv.check_watcher({}, since, now)
+    assert c["status"] == "FAIL" and "11-26 09:30-10:00" in c["why"]

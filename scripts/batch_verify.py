@@ -233,8 +233,9 @@ Records:
                       transaction.
   watch_broker_sells  Celery log lines (logs/*.log) for the task, per hour.
                       FAIL: more than 20% of finished runs raised, or a fully
-                      elapsed weekday market hour (09:30-16:00 ET) with no
-                      succeeded run. WARN: no finished run yet.
+                      elapsed weekday market hour (09:30-16:00 ET; NYSE
+                      holidays skipped) with no succeeded run. WARN: no
+                      finished run yet.
 
 activity_feed has no env column: rows are filtered on extra_json.env only
 where the row carries one (broker_sell_seen). Counts and percentages only:
@@ -1645,7 +1646,7 @@ def watcher_runs(lines, since: datetime) -> dict:
 
 def check_watcher(hours: dict, since: datetime, now: datetime) -> dict:
     chk = _new("watch_broker_sells", "Celery logs logs/*.log, per ET hour",
-               ">=1 succeeded run in each elapsed weekday market hour; raised within 20%")
+               ">=1 succeeded run in each elapsed weekday (non-holiday) market hour; raised within 20%")
     total = Counter()
     for c in hours.values():
         total.update(c)
@@ -1654,9 +1655,10 @@ def check_watcher(hours: dict, since: datetime, now: datetime) -> dict:
     chk["reads"]["outcome"] = Counter({("error: raised" if k == "raised" else k): v
                                        for k, v in total.items() if v})
     elapsed = 0
+    from market_calendar import NYSE_HOLIDAYS
     d = since.astimezone(NY).date()
     while d <= now.astimezone(NY).date():
-        if d.weekday() < 5:
+        if d.weekday() < 5 and d not in NYSE_HOLIDAYS:
             for h in range(MARKET_OPEN.hour, MARKET_CLOSE.hour):
                 start = max(datetime.combine(d, time(h), tzinfo=NY),
                             datetime.combine(d, MARKET_OPEN, tzinfo=NY))

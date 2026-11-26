@@ -127,11 +127,18 @@ def _watch(plan, held_prices, enabled):
     return n, log_signal.call_args_list, act.call_args_list, queued
 
 
+def _watcher_plan():
+    """The plan for the watch_plan_levels tests, with its horizon 30 days past
+    the real date: the watcher reads the real date, and once the fixture's
+    2026-12-10 horizon has passed its time stop would cross too."""
+    return _plan(horizon_end=date.today() + timedelta(days=30))
+
+
 def test_watcher_plan_level_hit_rows_identical_with_the_switch_on_or_off():
     """A price under both the model's invalidation and the structural stop."""
-    off = _watch(_plan(), {"NVDA": 470.0}, False)
+    off = _watch(_watcher_plan(), {"NVDA": 470.0}, False)
     stop_lock._redis().store.clear()
-    on = _watch(_plan(), {"NVDA": 470.0}, True)
+    on = _watch(_watcher_plan(), {"NVDA": 470.0}, True)
     assert off[0] == on[0] == 1
     assert [c.args for c in off[1]] == [c.args for c in on[1]]
     strip = lambda calls: [{k: v for k, v in c.kwargs["provenance"].items()} for c in calls]
@@ -142,7 +149,7 @@ def test_watcher_plan_level_hit_rows_identical_with_the_switch_on_or_off():
 
 
 def test_a_compiled_crossing_alone_writes_no_plan_level_hit():
-    n, signals, acts, queued = _watch(_plan(), {"NVDA": 580.0}, True)     # t1 crossed, no model level
+    n, signals, acts, queued = _watch(_watcher_plan(), {"NVDA": 580.0}, True)   # t1 crossed, no model level
     assert n == 0 and signals == [] and len(acts) == 1 and not queued.called
 
 

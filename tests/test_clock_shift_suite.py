@@ -185,3 +185,69 @@ def test_time_time_is_shifted_only_on_request():
         out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                              env={**env, "HELIOS_TEST_CLOCK_SHIFT_TIME": flag}, timeout=120)
         assert out.stdout.split()[0] == want_days, out.stderr
+
+
+_XML_TB = """<?xml version="1.0" encoding="utf-8"?><testsuites><testsuite name="pytest">
+<testcase classname="tests.test_c" name="test_diff" time="0.1"><failure message="AssertionError: assert {...} == {...}&#10;  Differing items:">def test_diff():
+&gt;       assert a == b
+E       Differing items:
+E       {'k17': 17} != {'k17': 99}</failure></testcase>
+</testsuite></testsuites>"""
+
+
+def test_parse_junit_keeps_the_full_failure_text():
+    p = suite.parse_junit(_XML_TB)
+    tid = "tests/test_c.py::test_diff"
+    assert p[tid] == "failure: AssertionError: assert {...} == {...}"
+    assert p["_text"][tid].startswith("def test_diff():")
+    assert "{'k17': 17} != {'k17': 99}" in p["_text"][tid]
+    assert suite.parse_junit(_XML)["_text"]["tests/test_a.py::test_bad"] == "tb"
+    no_tb = _XML.replace('more">tb</failure>', 'more"/>')
+    assert suite.parse_junit(no_tb)["_text"]["tests/test_a.py::test_bad"] == "assert 2 == 1\nmore"
+
+
+def test_the_report_ends_with_the_full_text_of_new_failures_only():
+    c = {"tests": 2, "failures": 1, "errors": 0, "skipped": 0}
+    base = {"a": "failure: x", "_counts": c, "_text": {"a": "old\ntraceback"}}
+    shifted = {"a": "failure: x", "b": "failure: y", "_counts": c,
+               "_text": {"a": "old\ntraceback", "b": "y\nE  {'k': 1} != {'k': 2}"}}
+    text = suite.report("t", date(2026, 11, 27), date(2026, 11, 26),
+                        {"shipped": {"baseline": base, 30: shifted}})
+    assert "## Full failure text (new failures)" in text
+    assert "### shipped, load + 30: `b`" in text and "    E  {'k': 1} != {'k': 2}" in text
+    assert "traceback" not in text                       # a baseline failure is not repeated
+    assert text.rstrip().endswith("NEW FAILURES (date bombs to fix with relative dates)")
+    assert suite.new_failures(base, shifted) == {"b": "failure: y"}
+    # no new failure: no details section
+    same = suite.report("t", date(2026, 11, 27), date(2026, 11, 26),
+                        {"shipped": {"baseline": base, 30: base}})
+    assert "Full failure text" not in same and same.rstrip().endswith("no new failures")
+    # a parse without "_text" (an older report shape) falls back to the first line
+    old = suite.report("t", date(2026, 11, 27), date(2026, 11, 26),
+                       {"default": {"baseline": {"_counts": c}, 7: {"b": "failure: y", "_counts": c}}})
+    assert "### default, load + 7: `b`" in old and "    failure: y" in old
+
+
+def test_each_run_asks_for_long_tracebacks_and_full_diffs(monkeypatch, tmp_path):
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+    monkeypatch.setattr(suite.subprocess, "run", fake_run)
+    suite.run_once(str(tmp_path), ["tests"], 0, False, sys.executable)
+    cmd = seen["cmd"]
+    assert "--tb=long" in cmd and "--tb=no" not in cmd
+    assert cmd[cmd.index("-o") + 1] == "verbosity_assertions=2"
+
+
+def test_a_real_run_keeps_the_whole_assertion_diff(tmp_path):
+    """run_once on a throwaway tree: the failing test's full dict diff is in
+    "_text" (pytest truncates it without verbosity_assertions=2)."""
+    (tmp_path / "test_big.py").write_text(
+        "def test_d():\n"
+        "    a = {f'k{i}': i for i in range(40)}\n"
+        "    assert {'approval': a} == {'approval': dict(a, k31=99)}\n")
+    p = suite.run_once(str(tmp_path), ["test_big.py"], 0, False, sys.executable)
+    assert p["_counts"]["failures"] == 1
+    text = p["_text"]["test_big.py::test_d"]
+    assert "'k31': 31" in text and "'k31': 99" in text

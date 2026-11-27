@@ -306,3 +306,40 @@ def test_main_refuses_without_the_pooler_port(monkeypatch, capsys):
 def test_default_windows_are_the_audits():
     assert ccr.CLAIM_WINDOW == ("2026-11-24", "2026-11-30")
     assert ccr.MIGRATION_WINDOW == ("2026-12-01", "2026-12-04")
+
+
+# ---- named cases ------------------------------------------------------------
+
+def test_msft_plan_3_is_a_named_case():
+    (case,) = [c for c in ccr.NAMED_CASES if c["name"] == "MSFT plan 3"]
+    assert case["ticker"] == "MSFT" and case["plan_id"] == 3 and case["date"] == "2026-11-30"
+    assert "MSFT plan 3" in ccr.__doc__
+
+
+def test_the_named_case_counts_its_tickers_verdicts_in_the_window():
+    """A 12-02 MSFT verdict still dating Q1 FY27 earnings to 11-30 is past_date;
+    one that moved to 12-03 lands in the XLK cluster window (11-30..12-06)."""
+    rows = [_row(ticker="MSFT", date="2026-11-30", event="Q1 FY27 earnings", id_=11),
+            _row(ticker="MSFT", date="2026-12-03", event="Q1 FY27 earnings", id_=12),
+            _row(ticker="MSFT", date="Q1 2027", event="Azure growth", id_=13),
+            _row(ticker="NVDA", date="2026-11-30", id_=14)]
+    m = ccr.migration(rows, CAL)
+    (c,) = m["named_cases"]
+    assert c["verdicts"] == 3 and c["naming_the_date"] == 1 and c["ids"] == [11, 12, 13]
+    assert c["category"] == {"no_day_date": 1, "past_date": 1, "sector_window": 1}
+    assert c["catalyst_dates"] == {"2026-11-30": 1, "2026-12-03": 1, "Q1 2027": 1}
+    assert sum(v["verdicts"] for v in m["by_category"].values()) == 4    # tallies unchanged
+
+
+def test_a_named_case_with_no_verdicts_still_shows():
+    m = ccr.migration([_row()], CAL)
+    assert m["named_cases"][0]["verdicts"] == 0 and m["named_cases"][0]["category"] == {}
+    assert ccr.migration([_row()], CAL, cases=())["named_cases"] == []
+
+
+def test_render_lists_the_named_cases():
+    res = {"env": "live", "migration_window": ["2026-12-01", "2026-12-04"],
+           "migration": ccr.migration([_row(ticker="MSFT", date="2026-11-30", id_=11)], CAL)}
+    text = ccr.render(res)
+    assert "Named cases:" in text
+    assert "| MSFT plan 3 (MSFT) | 2026-11-30 | 1 | 1 | past_date 1 | 2026-11-30 1 |" in text

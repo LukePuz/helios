@@ -28,6 +28,7 @@ factor). Prints ratios and counts only.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import statistics
 import sys
@@ -82,7 +83,9 @@ def _rows(cur, ticker):
     return [{"date": d, "close": c, "volume": v} for d, c, v in cur.fetchall()]
 
 
-def dry_run(conn, tickers: list[str] | None) -> list[tuple[str, dict]]:
+def dry_run(conn, tickers: list[str] | None, seen: dict | None = None) -> list[tuple[str, dict]]:
+    """Candidate steps per ticker; seen, when given, gets each ticker's rows
+    as read (for the non-finite bar flag)."""
     found = []
     with conn.cursor() as cur:
         cur.execute("SET TRANSACTION READ ONLY")
@@ -90,7 +93,10 @@ def dry_run(conn, tickers: list[str] | None) -> list[tuple[str, dict]]:
             cur.execute("SELECT DISTINCT ticker FROM price_history ORDER BY ticker")
             tickers = [r[0] for r in cur.fetchall()]
         for t in tickers:
-            for c in candidates(_rows(cur, t)):
+            rows = _rows(cur, t)
+            if seen is not None:
+                seen[t] = rows
+            for c in candidates(rows):
                 found.append((t, c))
     conn.rollback()
     return found
@@ -122,6 +128,15 @@ def apply(conn, ticker: str, factor: float, before: str | None) -> dict:
             "step_ratio_was": step["ratio"]}
 
 
+def _bar_qa():
+    """scripts/_bar_qa.py (the non-finite bar flag) as a module."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_bar_qa.py")
+    spec = importlib.util.spec_from_file_location("_bar_qa", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ticker", action="append", help="limit to these tickers (repeatable)")
@@ -144,13 +159,15 @@ def main(argv=None) -> int:
             print(f"applied: {res['ticker']} rows before {res['before']} x {res['factor']:g} "
                   f"({res['rows']} rows; stored step was x{res['step_ratio_was']})")
             return 0
-        found = dry_run(conn, [t.upper() for t in args.ticker] if args.ticker else None)
+        seen: dict = {}
+        found = dry_run(conn, [t.upper() for t in args.ticker] if args.ticker else None, seen)
         print("DRY RUN (read-only). ticker | step date | ratio | nearest | volume after/before "
               "| first-3 max / after-median | rows that would change")
         for t, c in found:
             print(f"{t} | {c['step_date']} | x{c['ratio']} | {c['nearest']} | {c['volume_ratio']} | "
                   f"{c['spike_ratio']} | {c['rows_before']}")
         print(f"{len(found)} candidate step(s).")
+        print(_bar_qa().flag_line(seen))   # flag only (scripts/_bar_qa.py)
         return 0
     finally:
         try:

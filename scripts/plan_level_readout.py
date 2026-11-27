@@ -325,6 +325,15 @@ def build(plans, outcomes, bars, since: date, env: str, head: str, now: datetime
     return readout(recs, summary, fwd, since, env, head, len(plans) - len(compiled))
 
 
+def _bar_qa():
+    """scripts/_bar_qa.py (the non-finite bar flag) as a module."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_bar_qa.py")
+    spec = importlib.util.spec_from_file_location("_bar_qa", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--since", default="2026-10-28", help="YYYY-MM-DD, New York date")
@@ -339,6 +348,7 @@ def main() -> None:
     except Exception:
         head = "unknown"
     text = build(plans, outcomes, bars, since, TRADING_ENV, head, datetime.now(timezone.utc))
+    text += "\n" + _bar_qa().flag_line(bars) + "\n"   # flag only (scripts/_bar_qa.py)
     if args.out:
         with open(args.out, "w") as f:
             f.write(text)

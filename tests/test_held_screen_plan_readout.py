@@ -111,6 +111,16 @@ def test_build_rows_keeps_the_raw_fields():
     assert b["adverse_groups"] == ["export_regulatory"]
 
 
+def test_screen_path():
+    assert src.screen_path("SCREENED_OUT", None, None) == "SCREENED_OUT"
+    assert src.screen_path("SCREENED_IN", 10, "HOLD") == "SCREENED_IN HOLD"
+    assert src.screen_path("SCREENED_IN", None, None) == "SCREENED_IN no verdict"
+    assert src.screen_path("SCREENED_IN", 10, None) == "SCREENED_IN none"
+    rows = _rows()
+    assert [r["screen_path"] for r in rows] == ["SCREENED_IN HOLD", "SCREENED_IN HOLD",
+                                                "SCREENED_OUT", "SCREENED_OUT"]
+
+
 def test_build_rows_tolerates_odd_values():
     r = src.build_rows([_raw(nf="maybe", wph={"would_pass": "yes"}, prisk=None, title=None)], {})[0]
     assert r["new_fact"] is None and r["would_pass_held_negative"] is None
@@ -144,6 +154,11 @@ def test_render_counts_only_and_no_titles():
         assert r["title"] not in text
     assert "$" not in text
     assert "%" not in text                               # no rate is printed
+    # adverse rows (sid 1 credit, 2 export halt, 3 allegation; 4 has none)
+    assert "Rows with any adverse-term group: 3 (SCREENED_OUT 1, SCREENED_IN 2)." in text
+    assert "| | SCREENED_IN HOLD | SCREENED_OUT | all |" in text
+    assert "| NVDA | 2 | 1 | 3 |" in text                 # ticker by screen path
+    assert "| neg | 1 | 0 | 1 |" in text and "| neutral | 1 | 1 | 2 |" in text
 
 
 def test_export_masks_and_drops_the_url():
@@ -166,6 +181,22 @@ def test_sql_shape():
 
 # ── main ────────────────────────────────────────────────────────────────────
 
+def test_db_root(tmp_path):
+    assert src.db_root(str(tmp_path)) == src.ROOT
+    (tmp_path / "db.py").write_text("")
+    assert src.db_root(str(tmp_path)) == str(tmp_path)
+
+
+def test_main_stops_without_a_host(capsys):
+    fake_db = types.SimpleNamespace(__file__="/x/db.py", _get_conn=MagicMock())
+    env = {k: v for k, v in os.environ.items() if k != "SUPABASE_HOST"}
+    env["SUPABASE_PORT"] = "6543"
+    with patch.dict(os.environ, env, clear=True), patch.dict("sys.modules", {"db": fake_db}):
+        assert src.main([]) == 2
+    fake_db._get_conn.assert_not_called()
+    assert "/x/db.py" in capsys.readouterr().err
+
+
 def test_main_refuses_other_ports(capsys):
     with patch.dict(os.environ, {"SUPABASE_PORT": "5432"}):
         assert src.main([]) == 2
@@ -179,7 +210,7 @@ def test_main_reads_once_read_only_and_rolls_back(tmp_path):
     conn.cursor.return_value.__enter__.return_value = cur
     fake_db = types.SimpleNamespace(_get_conn=lambda: conn, _put_conn=MagicMock())
     out, ex = tmp_path / "r.md", tmp_path / "r.json"
-    with patch.dict(os.environ, {"SUPABASE_PORT": "6543"}), \
+    with patch.dict(os.environ, {"SUPABASE_PORT": "6543", "SUPABASE_HOST": "h"}), \
          patch.dict("sys.modules", {"db": fake_db}):
         assert src.main(["--out", str(out), "--export", str(ex),
                          "--watchlist", str(tmp_path / "none.md")]) == 0
@@ -193,3 +224,4 @@ def test_main_reads_once_read_only_and_rolls_back(tmp_path):
     assert data["adverse_terms_sha"] == src.ADVERSE_TERMS_SHA and len(data["rows"]) == 2
     assert data["label_status"] == src.OPEN_LABEL
     assert Counter(r["outcome"] for r in data["rows"]) == {"SCREENED_IN": 1, "SCREENED_OUT": 1}
+    assert {r["screen_path"] for r in data["rows"]} == {"SCREENED_IN HOLD", "SCREENED_OUT"}

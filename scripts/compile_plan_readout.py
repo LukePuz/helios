@@ -46,6 +46,7 @@ Read-only: one transaction opened READ ONLY, then rolled back.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import statistics
 import subprocess
@@ -400,6 +401,15 @@ def _fetch(since: date, env: str):
     return lots, open_lots, approvals, plans, bars
 
 
+def _bar_qa():
+    """scripts/_bar_qa.py (the non-finite bar flag) as a module."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_bar_qa.py")
+    spec = importlib.util.spec_from_file_location("_bar_qa", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--since", default="2026-08-17", help="YYYY-MM-DD, New York date")
@@ -415,6 +425,7 @@ def main() -> None:
         head = "unknown"
     text = build(lots, open_lots, approvals, plans, bars, since, TRADING_ENV, head,
                  datetime.now(timezone.utc))
+    text += "\n" + _bar_qa().flag_line(bars) + "\n"   # flag only (scripts/_bar_qa.py)
     if args.out:
         with open(args.out, "w") as f:
             f.write(text)

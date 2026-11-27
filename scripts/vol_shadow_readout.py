@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import importlib.util
 import os
 import statistics
 import subprocess
@@ -234,6 +235,15 @@ def _fetch(env: str):
     return fills, bars, snapshots, approvals
 
 
+def _bar_qa():
+    """scripts/_bar_qa.py (the non-finite bar flag) as a module."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_bar_qa.py")
+    spec = importlib.util.spec_from_file_location("_bar_qa", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--env", default=None, help="live, paper or all (default: config TRADING_ENV)")
@@ -248,6 +258,7 @@ def main() -> None:
     except Exception:
         head = "unknown"
     text = readout(fill_rows(fills, bars, snapshots, approvals), env, head or "unknown")
+    text += "\n" + _bar_qa().flag_line(bars) + "\n"   # flag only (scripts/_bar_qa.py)
     if args.out:
         with open(args.out, "w") as f:
             f.write(text)

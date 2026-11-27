@@ -13,6 +13,10 @@ REDIS_URL=redis://127.0.0.1:1/0, and go one at a time; the script refuses to
 start while another `python -m pytest` runs unless --force. Test-only: no DB,
 broker or network access of its own, and no runtime module imports it.
 
+Each run uses --tb=long with full assertion diffs (verbosity_assertions=2),
+and the report ends with the full failure text of every new failure, so a
+one-off can be read without a rerun (1130 clock-shift, 2026-11-26).
+
 Exit status: 0 when no shifted run has a new failure, 1 when one does, 2 on a
 usage or busy refusal."""
 from __future__ import annotations
@@ -48,9 +52,11 @@ def _ps_lines() -> list[str]:
 
 def parse_junit(text: str) -> dict:
     """{test id: first line of its failure or error message} from a junit
-    XML report, plus the pass/fail/error/skip counts under "_counts"."""
+    XML report, plus the pass/fail/error/skip counts under "_counts" and
+    {test id: its full traceback text (the message when there is none)}
+    under "_text"."""
     root = ET.fromstring(text)
-    out, counts = {}, {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+    out, counts, full = {}, {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}, {}
     for case in root.iter("testcase"):
         counts["tests"] += 1
         cls, name = case.get("classname", ""), case.get("name", "")
@@ -68,15 +74,19 @@ def parse_junit(text: str) -> dict:
                 counts["failures" if kind == "failure" else "errors"] += 1
                 msg = (el.get("message") or el.text or "").strip().splitlines()
                 out[tid] = f"{kind}: {msg[0][:200] if msg else ''}"
+                # the traceback holds the message's E lines; the message alone
+                # only when there is none
+                full[tid] = (el.text or "").strip() or (el.get("message") or "").strip()
                 break
         if case.find("skipped") is not None:
             counts["skipped"] += 1
     out["_counts"] = counts
+    out["_text"] = full
     return out
 
 
 def new_failures(base: dict, shifted: dict) -> dict:
-    return {k: v for k, v in shifted.items() if k != "_counts" and k not in base}
+    return {k: v for k, v in shifted.items() if not k.startswith("_") and k not in base}
 
 
 def run_once(tree: str, files: list[str], days: int, shipped: bool, python: str,
@@ -97,7 +107,7 @@ def run_once(tree: str, files: list[str], days: int, shipped: bool, python: str,
     with tempfile.TemporaryDirectory() as td:
         xml = os.path.join(td, "junit.xml")
         cmd = [python, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "clock_shift_plugin",
-               "--tb=no", f"--junitxml={xml}", *files]
+               "--tb=long", "-o", "verbosity_assertions=2", f"--junitxml={xml}", *files]
         subprocess.run(cmd, cwd=tree, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                        preexec_fn=lambda: os.nice(19))
         if not os.path.exists(xml):
@@ -126,7 +136,7 @@ def report(tree_label: str, load: date, today: date, results: dict, tree: str | 
     lines = [f"# Clock-shift check: {tree_label}", "",
              f"Real date {today.isoformat()}; load date {load.isoformat()}. Baseline = the plugin "
              "installed with a 0-day shift. Listed: failures new against the baseline.", ""]
-    any_new = False
+    any_new, details = False, []
     for mode, runs in results.items():
         base = runs["baseline"]
         bc = base.get("_counts")
@@ -143,7 +153,12 @@ def report(tree_label: str, load: date, today: date, results: dict, tree: str | 
             for tid in sorted(new):
                 note = unshifted_clock_note(tree, tid) if tree else ""
                 lines.append(f"  - `{tid}`: {new[tid]}{note}")
+                body = (parsed.get("_text") or {}).get(tid) or new[tid]
+                details += [f"### {mode}, load + {plus}: `{tid}`", ""]
+                details += ["    " + ln for ln in body.splitlines()] + [""]
         lines.append("")
+    if details:
+        lines += ["## Full failure text (new failures)", ""] + details
     lines.append("Result: " + ("NEW FAILURES (date bombs to fix with relative dates)" if any_new
                                else "no new failures"))
     return "\n".join(lines) + "\n"

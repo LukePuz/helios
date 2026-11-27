@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import importlib.util
 import os
 import statistics
 import subprocess
@@ -370,6 +371,15 @@ def _fetch(kinds: list[str], since: date, env: str, by_conviction: bool = False)
     return rows, bars
 
 
+def _bar_qa():
+    """scripts/_bar_qa.py (the non-finite bar flag) as a module."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_bar_qa.py")
+    spec = importlib.util.spec_from_file_location("_bar_qa", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--since", default=None, help="YYYY-MM-DD, New York date (default 30 days ago)")
@@ -394,6 +404,7 @@ def main() -> None:
         head = "unknown"
     text = (conviction_readout(rows, bars, since, TRADING_ENV, head or "unknown") if by_conv
             else readout(collect(rows, bars), since, TRADING_ENV, head or "unknown"))
+    text += "\n" + _bar_qa().flag_line(bars) + "\n"   # flag only (scripts/_bar_qa.py)
     if args.out:
         with open(args.out, "w") as f:
             f.write(text)

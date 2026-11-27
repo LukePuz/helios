@@ -33,6 +33,12 @@ Two labels sit beside the raw text, both open (a labelling choice, Luke's):
 Neither is a measure; any other list or rule can be applied to the exported
 rows. The report is counts only: no rate is chosen, and no threshold.
 
+screen_path per row: SCREENED_OUT, or SCREENED_IN with the matched
+verdict's final action ("SCREENED_IN HOLD", ...; "SCREENED_IN no verdict"
+when none matched). The adverse-term rows are counted by it per ticker and
+per title_tone, so the items that never reached the analyst sit beside the
+verdicts of the ones that did (audit 2026-11-26 20:53 #3).
+
 --export writes the rows (JSON) with titles and primary_risk text masked:
 every dollar figure becomes $X. The markdown never prints a title. No
 prices or account data are read.
@@ -40,6 +46,13 @@ prices or account data are read.
 SUPABASE_PORT must be 6543 (the transaction pooler); one read-only
 transaction with a statement timeout, rolled back. Imports: db and the
 standard library only. Not loaded by weekly_readouts.
+
+db.py reads the .env beside itself, so db is imported from the working
+directory when it holds a db.py (env -C ~/Desktop/trading_bot: the live
+clone's db and .env), else from beside this script. With no SUPABASE_HOST
+after the import the readout stops before connecting and names the db.py
+it loaded (audit 2026-11-26 20:53: run from a checkout without a .env, it
+failed to connect).
 """
 from __future__ import annotations
 
@@ -55,7 +68,6 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
 
 REQUIRED_PORT = "6543"
 STATEMENT_TIMEOUT_MS = 60000
@@ -202,6 +214,23 @@ def _bool(v):
     return v if isinstance(v, bool) else None
 
 
+def db_root(cwd: str | None = None) -> str:
+    """The directory db is imported from: cwd when it holds a db.py, else
+    this script's checkout."""
+    cwd = os.getcwd() if cwd is None else cwd
+    return cwd if os.path.isfile(os.path.join(cwd, "db.py")) else ROOT
+
+
+def screen_path(outcome: str | None, verdict_id, verdict_action) -> str:
+    """SCREENED_OUT, or SCREENED_IN with the matched verdict's final action
+    ("no verdict" when none matched). Pure."""
+    if outcome != "SCREENED_IN":
+        return str(outcome)
+    if verdict_id is None:
+        return "SCREENED_IN no verdict"
+    return f"SCREENED_IN {_k(verdict_action)}"
+
+
 def build_rows(raw, names: dict[str, frozenset]) -> list[dict]:
     """One record per fetched row (the _SQL column order). Pure."""
     out = []
@@ -222,6 +251,7 @@ def build_rows(raw, names: dict[str, frozenset]) -> list[dict]:
             "verdict_id": vid,
             "verdict_et": vts.astimezone(ET).strftime("%Y-%m-%d %H:%M") if vts else None,
             "verdict_action": vfinal, "verdict_model_action": vmodel,
+            "screen_path": screen_path(sig, vid, vfinal),
             "adverse_groups": adverse_groups(title),
             "risk_words": risk_words(title, prisk, sym, company),
         })
@@ -285,6 +315,17 @@ def render(rows: list[dict], env: str, days: int, since: datetime, head: str) ->
     lines += _table("adverse-term group by outcome (a row can hit several)", g,
                     sorted({k[1] for k in g}), [x for x, _ in ADVERSE_TERMS if any(
                         k[0] == x for k in g)])
+    adv = [r for r in rows if r["adverse_groups"]]
+    path = lambda r: r["screen_path"]
+    lines.append(f"Rows with any adverse-term group: {len(adv)} (SCREENED_OUT "
+                 f"{sum(r['outcome'] == 'SCREENED_OUT' for r in adv)}, SCREENED_IN "
+                 f"{sum(r['outcome'] == 'SCREENED_IN' for r in adv)}).")
+    lines.append("")
+    c, rr, cc = _cross(adv, lambda r: str(r["symbol"]), path)
+    lines += _table("adverse-term rows: ticker by screen path (SCREENED_OUT, or SCREENED_IN "
+                    "with the verdict's final action)", c, cc, rr)
+    c, rr, cc = _cross(adv, tones, path)
+    lines += _table("adverse-term rows: title_tone by screen path", c, cc, rr)
     with_risk = [r for r in rows if r["risk_words"] is not None]
     c, rr, cc = _cross(with_risk, tones,
                        lambda r: r["outcome"] + (" shared" if r["risk_words"] else " none"))
@@ -316,7 +357,12 @@ def main(argv=None) -> int:
         return 2
     since = datetime.now(timezone.utc) - timedelta(days=args.days)
 
+    sys.path.insert(0, db_root())
     import db
+    if not os.getenv("SUPABASE_HOST"):
+        print(f"No SUPABASE_HOST after importing {getattr(db, '__file__', 'db')} (no .env beside "
+              "it?); run with env -C ~/Desktop/trading_bot. Not connecting.", file=sys.stderr)
+        return 2
     conn = db._get_conn()
     try:
         with conn.cursor() as cur:

@@ -399,6 +399,15 @@ def _fetch_reclaims(since: date) -> list[dict]:
         db._put_conn(conn)
 
 
+def _bar_qa():
+    """scripts/_bar_qa.py (the non-finite bar flag) as a module."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_bar_qa.py")
+    spec = importlib.util.spec_from_file_location("_bar_qa", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--since", default=GATES_LIVE_FROM.isoformat(),
@@ -429,6 +438,7 @@ def main(argv=None) -> int:
         reclaim_read = type(e).__name__
     text = readout(sessions, tally(sessions, rows, funnel), forward_groups(rows, bars),
                    ef._git_head(), datetime.now(timezone.utc), cached, reclaims, reclaim_read)
+    text += "\n" + _bar_qa().flag_line(bars) + "\n"   # flag only (scripts/_bar_qa.py)
     if a.out:
         with open(a.out, "w") as fh:
             fh.write(text)

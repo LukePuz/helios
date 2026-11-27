@@ -420,6 +420,15 @@ def _git_head() -> str:
         return "unknown"
 
 
+def _bar_qa():
+    """scripts/_bar_qa.py (the non-finite bar flag) as a module."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_bar_qa.py")
+    spec = importlib.util.spec_from_file_location("_bar_qa", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--since", help="YYYY-MM-DD, New York date (default 8 weeks ago)")
@@ -428,7 +437,9 @@ def main(argv=None) -> int:
     since = (date.fromisoformat(a.since) if a.since
              else datetime.now(NY).date() - timedelta(weeks=8))
     from config import TRADING_ENV
-    text = run(since, TRADING_ENV, _git_head())
+    data = _fetch(since, TRADING_ENV)
+    text = build(data, since, TRADING_ENV, _git_head())
+    text += "\n" + _bar_qa().flag_line(data.get("bars") or {}) + "\n"   # flag only (scripts/_bar_qa.py)
     if a.out:
         with open(a.out, "w") as f:
             f.write(text)

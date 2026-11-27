@@ -41,6 +41,13 @@ db._NON_ANALYST_SIGNALS row) of one trading env:
               count (the brief may have printed them when the verdict ran);
               own_earnings_rows gives how many un-superseded own earnings
               rows the ticker had then.
+              Named cases (NAMED_CASES) are listed after the tallies: each
+              case's ticker's verdicts in the window, by category and
+              catalyst date, and how many still name the case's own date.
+                MSFT plan 3 (audit 2026-11-26-2053 #6): an analyst plan
+                created 11-03, still active after the 11-20 stop-out, that
+                dates "Q1 FY27 earnings" to 2026-11-30, the XLK
+                sector-cluster date (MSFT reported 10-28).
 
     env -C ~/Desktop/trading_bot SUPABASE_PORT=6543 venv/bin/python \\
         scripts/catalyst_claim_readout.py [--env live] [--section claims|migration|both] \\
@@ -73,6 +80,14 @@ CLAIM_WINDOW = ("2026-11-24", "2026-11-30")
 MIGRATION_WINDOW = ("2026-12-01", "2026-12-04")
 NOT_RECORDED = "not recorded"
 FLAGS = ("earnings_claim_unmatched", "matches_sector_cluster_date")
+# Named cases for the migration section (descriptive; nothing is decided
+# from them): a ticker, the plan or claim they come from, and its date.
+NAMED_CASES = (
+    {"name": "MSFT plan 3", "ticker": "MSFT", "plan_id": 3, "date": "2026-11-30",
+     "event": "Q1 FY27 earnings",
+     "note": "analyst plan created 11-03, active after the 11-20 stop-out; 11-30 is the XLK "
+             "sector-cluster date, MSFT reported 10-28 (audit 2026-11-26-2053 #6)"},
+)
 CATEGORIES = ("no_day_date", "past_date", "own_earnings_line", "sector_window", "macro_line",
               "own_other_line", "invented_earnings", "unmatched_date")
 
@@ -249,7 +264,24 @@ def classify(r: dict, calendar: list[dict], tol: int = 0) -> dict:
     return rec
 
 
-def migration(rows: list[dict], calendar: list[dict], tol: int = 0) -> dict:
+def named_case(case: dict, recs: list[dict]) -> dict:
+    """One named case over the migration records: its ticker's verdicts in
+    the window, by category and by catalyst date, and how many still name
+    the case's own date (the stored text, first 10 characters)."""
+    t = str(case.get("ticker") or "").upper()
+    mine = [x for x in recs if x["ticker"] == t]
+    cats, dates = Counter(x["category"] for x in mine), Counter(x["catalyst_date"] or "none" for x in mine)
+    return {"name": case.get("name"), "ticker": t, "plan_id": case.get("plan_id"),
+            "date": case.get("date"), "event": case.get("event"), "note": case.get("note"),
+            "verdicts": len(mine),
+            "naming_the_date": sum(1 for x in mine if (x["catalyst_date"] or "")[:10] == case.get("date")),
+            "category": dict(sorted(cats.items(), key=lambda kv: (-kv[1], kv[0]))),
+            "catalyst_dates": dict(sorted(dates.items(), key=lambda kv: (-kv[1], kv[0]))),
+            "ids": [x["id"] for x in mine]}
+
+
+def migration(rows: list[dict], calendar: list[dict], tol: int = 0,
+              cases=NAMED_CASES) -> dict:
     recs = [classify(r, calendar, tol) for r in rows]
     by_date = defaultdict(lambda: {"verdicts": 0, "category": Counter(), "tickers": Counter(),
                                    "line_kinds": set()})
@@ -273,6 +305,7 @@ def migration(rows: list[dict], calendar: list[dict], tol: int = 0) -> dict:
                                      "tickers": counts(v["tickers"]),
                                      "line_kinds": sorted(v["line_kinds"])}
                                  for k, v in sorted(by_date.items())},
+            "named_cases": [named_case(c, recs) for c in cases or ()],
             "rows": recs}
 
 
@@ -307,6 +340,13 @@ def render(res: dict) -> str:
         for k, v in m["by_catalyst_date"].items():
             L.append(f"| {k} | {v['verdicts']} | {_v(v['category'])} | {_v(v['line_kinds'])} | "
                      f"{_v(v['tickers'])} |")
+        if m.get("named_cases"):
+            L += ["", "Named cases:", "",
+                  "| case | date | verdicts | naming the date | category | catalyst dates |",
+                  "|---|---|---|---|---|---|"]
+            for c in m["named_cases"]:
+                L.append(f"| {c['name']} ({c['ticker']}) | {c['date']} | {c['verdicts']} | "
+                         f"{c['naming_the_date']} | {_v(c['category'])} | {_v(c['catalyst_dates'])} |")
         L.append("")
     return "\n".join(L)
 

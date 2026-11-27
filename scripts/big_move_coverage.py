@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import importlib.util
 import json
 import os
 import sys
@@ -251,6 +252,15 @@ def render(res: dict, start: date, end: date, n_tickers: int) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _bar_qa():
+    """scripts/_bar_qa.py (the non-finite bar flag) as a module."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_bar_qa.py")
+    spec = importlib.util.spec_from_file_location("_bar_qa", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--start", required=True, help="first session, YYYY-MM-DD")
@@ -277,7 +287,12 @@ def main(argv=None) -> int:
     res = coverage(day_moves(bars, start, end), sigs, args.k)
     res.update(start=start.isoformat(), end=end.isoformat(), n_watchlist=len(tickers),
                n_watchlist_with_bars=sum(1 for t in tickers if bars.get(t)))
-    text = json.dumps(res, indent=1, default=str) + "\n" if args.json else render(res, start, end, len(tickers))
+    qa = _bar_qa()   # flag only (scripts/_bar_qa.py): no bar is dropped or changed
+    if args.json:
+        res["nonfinite_bars"] = qa.flag_record(bars)
+        text = json.dumps(res, indent=1, default=str) + "\n"
+    else:
+        text = render(res, start, end, len(tickers)) + "\n" + qa.flag_line(bars) + "\n"
     if args.out:
         with open(args.out, "w") as f:
             f.write(text)

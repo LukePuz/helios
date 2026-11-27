@@ -236,6 +236,16 @@ Records:
                       elapsed weekday market hour (09:30-16:00 ET; NYSE
                       holidays skipped) with no succeeded run. WARN: no
                       finished run yet.
+  nonfinite_bars      price_history bars with a non-finite open, high, low or
+                      close (NaN or +/-Infinity) within each ticker's last
+                      NONFINITE_BAR_ROWS (260) rows, the window the 260-row
+                      readers take (brief price history, trend template,
+                      regime, scanner). Not by --since: the nightly refresh
+                      rewrites the trailing year, so a bad bar persists.
+                      WARN-only: OK with none, WARN naming each ticker with
+                      its count and dates (or the read error); never FAIL.
+                      Only the non-finite values leave the DB, never a price.
+                      Its own READ ONLY transaction (30 s statement timeout).
 
 activity_feed has no env column: rows are filtered on extra_json.env only
 where the row carries one (broker_sell_seen). Counts and percentages only:
@@ -373,6 +383,10 @@ WATCH_TASK = "tasks.watch_broker_sells"
 _LOG_RE = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)[,.]\d+: [^\]]*\] "
                      r"(?:Task " + re.escape(WATCH_TASK) + r"\[[^\]]+\] (succeeded|raised|retry)"
                      r"|Discarding revoked task: " + re.escape(WATCH_TASK) + r"\[)")
+# Non-finite OHLC bars (check_nonfinite_bars): rows per ticker, newest first.
+NONFINITE_BAR_ROWS = 260
+NONFINITE_BAR_COLUMNS = ("open", "high", "low", "close")
+NONFINITE_TIMEOUT_MS = 30000
 
 
 # ---------------------------------------------------------------- helpers
@@ -1594,6 +1608,84 @@ def check_entry_funnel(result) -> dict:
     return _finish(chk)
 
 
+def _nonfinite_sql(col: str) -> str:
+    """True when the DECIMAL column is NaN or +/-Infinity (NULL is not). Any
+    comparison with NaN is false, so NaN fails the open interval too."""
+    return (f"({col} IS NOT NULL AND NOT ({col}::float8 > '-Infinity'::float8 "
+            f"AND {col}::float8 < 'Infinity'::float8))")
+
+
+def nonfinite_bars_sql(rows: int = NONFINITE_BAR_ROWS) -> str:
+    """One row per bar with any non-finite OHLC value within its ticker's
+    last `rows` rows: ticker, date, then per column the value as text when
+    non-finite, else NULL (so no finite price is selected)."""
+    kinds = ", ".join(f"CASE WHEN {_nonfinite_sql(c)} THEN {c}::text END"
+                      for c in NONFINITE_BAR_COLUMNS)
+    anyc = " OR ".join(_nonfinite_sql(c) for c in NONFINITE_BAR_COLUMNS)
+    cols = ", ".join(NONFINITE_BAR_COLUMNS)
+    return (f"WITH r AS (SELECT ticker, date, {cols}, row_number() OVER "
+            f"(PARTITION BY ticker ORDER BY date DESC) AS rn FROM price_history) "
+            f"SELECT ticker, date::text, {kinds} FROM r "
+            f"WHERE rn <= {int(rows)} AND ({anyc}) ORDER BY ticker, date")
+
+
+def fetch_nonfinite_bars(rows: int = NONFINITE_BAR_ROWS):
+    """[{"ticker", "date", "values": {column: 'NaN' / 'Infinity' / ...}}] for
+    check_nonfinite_bars, or the exception when the read raised. Its own READ
+    ONLY transaction, rolled back."""
+    try:
+        import db
+        conn = db._get_conn()
+    except Exception as e:
+        return e
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET TRANSACTION READ ONLY")   # this transaction only, not the pooled conn
+            cur.execute(f"SET LOCAL statement_timeout = {int(NONFINITE_TIMEOUT_MS)}")
+            cur.execute(nonfinite_bars_sql(rows))
+            out = []
+            for r in cur.fetchall():
+                vals = {c: v for c, v in zip(NONFINITE_BAR_COLUMNS, r[2:]) if v is not None}
+                out.append({"ticker": r[0], "date": str(r[1]), "values": vals})
+            return out
+    except Exception as e:
+        return e
+    finally:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        db._put_conn(conn)
+
+
+def check_nonfinite_bars(result, rows: int = NONFINITE_BAR_ROWS) -> dict:
+    """result: fetch_nonfinite_bars()'s list, or an exception. WARN-only."""
+    chk = _new("nonfinite_bars", f"price_history, each ticker's last {rows} rows",
+               "none expected; any bar with a NaN or infinite open/high/low/close is WARN "
+               "(naming ticker and dates); never FAIL")
+    if isinstance(result, Exception):
+        chk["status"], chk["why"] = "WARN", f"price_history read failed ({type(result).__name__})"
+        return chk
+    chk["rows"] = chk["triggered"] = len(result)
+    if not result:
+        chk["status"], chk["why"] = "OK", f"no non-finite OHLC bar in any ticker's last {rows} rows"
+        return chk
+    by_ticker: dict[str, list[str]] = {}
+    for bar in result:
+        by_ticker.setdefault(bar["ticker"], []).append(bar["date"])
+        vals = bar.get("values") or {}
+        _read(chk, "columns", ",".join(c for c in NONFINITE_BAR_COLUMNS if c in vals) or "none")
+        _read(chk, "value", "/".join(sorted({str(v) for v in vals.values()})) or "none")
+    # Newest bad bar first, so a fresh defect leads the line.
+    order = sorted(by_ticker, key=lambda t: (max(by_ticker[t]), t), reverse=True)
+    chk["status"] = "WARN"
+    chk["why"] = (f"{len(result)} non-finite OHLC bar(s) in {len(by_ticker)} ticker(s) within "
+                  f"each ticker's last {rows} rows: "
+                  + ", ".join(f"{t} {len(by_ticker[t])} ({', '.join(sorted(by_ticker[t]))})"
+                              for t in order))
+    return chk
+
+
 def unmatched_broker_exits(exit_rows, seen_rows) -> list[dict]:
     """exit_rows: (ticker, exit_fill_at). seen_rows: activity dicts of stage
     broker_sell_seen. Exits with no seen row whose first_exec_at is within
@@ -1854,7 +1946,7 @@ def run_checks(gate_rows, trim_rows, event_rows, approvals, activity, exits, hou
                feed_health_on: bool = True, verdict_rows=(), target_anchor_on: bool = True,
                news_timeline=(True, ("event", "daily_scan")), plan_reseed_on: bool = True,
                screened_out_rows=(), own_ticker_sha: str | None = None,
-               scan_funnel_on: bool = True):
+               scan_funnel_on: bool = True, nonfinite_bars=None):
     checks = [check_entry_gate(gate_rows), check_story_dedup(event_rows),
               check_source_mix(event_rows),
               *check_approvals(approvals),
@@ -1877,6 +1969,8 @@ def run_checks(gate_rows, trim_rows, event_rows, approvals, activity, exits, hou
               check_entry_funnel(funnel), check_watcher(hours, since, now)]
     if watchlist is not None:
         checks.append(check_watchlist_parse(watchlist))
+    if nonfinite_bars is not None:
+        checks.append(check_nonfinite_bars(nonfinite_bars))
     _note_entry_basis(checks, approvals)
     seen = [r for r in activity if r.get("stage") == "broker_sell_seen"
             and (_as_dict(r.get("extra")) or {}).get("env") in (None, env)]
@@ -1907,7 +2001,8 @@ def main() -> None:
                                    plan_reseed_on=plan_reseed_enabled(),
                                    screened_out_rows=_fetch_screened_out(since, TRADING_ENV),
                                    own_ticker_sha=own_ticker_patterns_sha(),
-                                   scan_funnel_on=scan_tier_funnel_enabled())
+                                   scan_funnel_on=scan_tier_funnel_enabled(),
+                                   nonfinite_bars=fetch_nonfinite_bars())
     text = readout(checks, since, TRADING_ENV, _git_head(ROOT), now, unmatched)
     if args.out:
         with open(args.out, "w") as f:

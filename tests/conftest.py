@@ -379,6 +379,16 @@ def _fresh_positions_from_the_cache(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_fill_record_wait(monkeypatch):
+    """ibkr.place_market_order's fill-record wait (config.FILL_TIME_WAIT_S,
+    m141) is off unless a test sets the cap itself: many fake trades are
+    Filled with no fills, and their ib.sleep returns at once, so the wait
+    would spin to the cap. tests/test_fill_time_complete.py sets it."""
+    import config
+    monkeypatch.setattr(config, "FILL_TIME_WAIT_S", 0)
+
+
+@pytest.fixture(autouse=True)
 def _no_would_be_stop_read(monkeypatch):
     """A gate-blocked buy's record-only would-be sizing reads cached bars for
     its stop (agents/crew.py:_would_be_stop). Stubbed as "no stop" (no DB

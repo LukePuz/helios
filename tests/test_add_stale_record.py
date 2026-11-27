@@ -1,7 +1,10 @@
 """add_stale_record activity row (execution._record_add_stale): an ADD that
 takes _whole_position_stop's stale-record branch (reads show no more than
-the fill, as on 11-10 NVDA). Record only: the return value, the cancels and
-the placed stop are unchanged."""
+the fill, as on 11-10 NVDA). The row itself is record only: a failing write
+changes nothing. An ADD with no count above 0 held before the order keeps the
+record and the old stop there while an old stop is still working
+(tests/test_add_stale_guard.py), and the row says so (record
+"kept_unconfirmed", old_stop_state)."""
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -21,6 +24,7 @@ def _run(action="ADD", cache_qty=1, fresh=(1.0, 90.0), held_before=None, prior=N
          patch("ibkr.get_fresh_stock_position", return_value=fresh), \
          patch("db.log_activity_direct"), patch("db.get_all_position_stops", return_value=[]), \
          patch("db.log_activity_queued", side_effect=queued_effect) as queued, \
+         patch("tasks._resting_sell_stops", return_value=[{"ticker": "NVDA"}]), \
          patch("tasks.manage_cancel_stop_orders_for") as cancel:
         out = execution._whole_position_stop("NVDA", 79.74, 1, status=status, action=action,
                                              held_before=held_before, market_price=90.9)
@@ -28,14 +32,16 @@ def _run(action="ADD", cache_qty=1, fresh=(1.0, 90.0), held_before=None, prior=N
     return out, status, rows, cancel
 
 
-def test_lagging_add_writes_the_row_and_changes_nothing():
+def test_lagging_add_writes_the_row_and_keeps_the_record():
     out, status, rows, cancel = _run()
-    assert out == (79.74, None) and status.get("stale_record") is True
+    assert out == (79.74, None) and "stale_record" not in status
+    assert status["prior_unreadable"] is True and "recheck_after_place" not in status
     cancel.assert_not_called()
     assert len(rows) == 1
     stage, ticker, message, sentiment, extra = rows[0].args
     assert (stage, ticker, sentiment) == ("add_stale_record", "NVDA", "neutral")
-    assert extra["record"] == "rewritten_at_new_stop"
+    assert extra["record"] == "kept_unconfirmed" and extra["old_stop_state"] == "working"
+    assert "the record and the old stop are kept" in message
     assert extra["new_stop_vs_prior_stop_pct"] == pytest.approx((79.74 / 89.3 - 1) * 100, abs=1e-3)
     assert extra["filled_qty"] == 1 and extra["cache_qty"] == 1 and extra["fresh_qty"] == 1.0
     assert extra["held_before"] is None and extra["reclassified_open"] is False
@@ -78,5 +84,5 @@ def test_a_failing_row_write_changes_nothing():
 
 def test_an_unusable_prior_stop_still_returns_the_new_stop():
     out, status, rows, _ = _run(prior={"stop_price": "x", "opened_at": None})
-    assert out == (79.74, None) and status.get("stale_record") is True
+    assert out == (79.74, None) and status["prior_unreadable"] is True
     assert rows == []                                       # the row failed inside, logged

@@ -3742,7 +3742,8 @@ class RiskManager:
                     if not db.update_order_fill(local_id, order_result["fill_price"], filled,
                                                 "filled" if filled >= float(sell_qty) - 1e-6 else "partial",
                                                 filled_at=order_result.get("fill_time"),
-                                                filled_at_source=order_result.get("fill_time_source")):
+                                                filled_at_source=order_result.get("fill_time_source"),
+                                                fill_time_complete=order_result.get("fill_time_complete")):
                         db.set_order_reconcile_note(local_id, "fill_write_failed")
                 elif local_id and local_id > 0:
                     # Filled with no price from the broker: the row stays

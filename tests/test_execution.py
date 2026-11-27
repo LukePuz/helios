@@ -1159,9 +1159,11 @@ class TestAddStopsWholePosition:
     the add's fill and stop only the added shares."""
 
     def _run(self, prior, pos_qty=15, avg=105.0, new_stop=95.0, filled=5, fresh=None, action=None,
-             status=None, cache_error=None, held_before=None):
+             status=None, cache_error=None, held_before=None, stops=()):
         """fresh: what the fresh reqPositions() read returns, (qty, avg_cost)
-        or an exception; default the same as the portfolio cache."""
+        or an exception; default the same as the portfolio cache. stops: the
+        working SELL stops an ADD's stale-record branch reads
+        (_old_stop_state); default none, the fresh-entry route."""
         client = MagicMock()
         if cache_error is not None:
             client.get_open_position.side_effect = cache_error
@@ -1176,6 +1178,7 @@ class TestAddStopsWholePosition:
              patch("ibkr.get_client", return_value=client), \
              patch("ibkr.get_fresh_stock_position", **fresh_kw) as fresh_read, \
              patch("db.log_activity_queued"), \
+             patch("tasks._resting_sell_stops", return_value=list(stops)), \
              patch("tasks.manage_cancel_stop_orders_for") as cancel:
             result = execution._whole_position_stop("NVDA", new_stop, filled, status=status,
                                                     action=action, held_before=held_before)
@@ -1378,7 +1381,15 @@ class TestAddStopsWholePosition:
         assert (stop, add) == (95.0, None)
         cancel.assert_not_called()
         assert not status.get("prior_unreadable")
-        assert act.call_args.args[0] == "stale_record_at_entry"
+        # With a status dict the caller writes the row after its stop work
+        # (with the broker reads); the prior order id is read now, before
+        # the caller's record write replaces it.
+        act.assert_not_called()
+        pending = status["stale_entry"]
+        assert pending["over_leftover"] is True and pending["held_before"] == 5.0
+        assert pending["post_fill_qty"] == 3.0 and pending["broker_qty"] == 3
+        assert pending["prior_order_ref"] == (None, "ok")
+        assert pending["decision_basis"] == "post_fill_read"
 
     def test_open_on_a_held_ticker_with_reads_at_the_pre_fill_count_equal_to_the_fill_stays_unknown(self):
         """5 held, OPEN of 5, both reads still 5: the old shares may be the
@@ -2064,7 +2075,8 @@ def test_manual_orders_get_an_orders_row():
     assert kw.get("decision_price") is None and not fill.called
     r, log_order, fill = run({"order_id": 78, "fill_price": 100.0, "filled_qty": 2})
     assert r["success"] and log_order.call_args.kwargs["status"] == "submitted"
-    fill.assert_called_once_with(5, 100.0, 2.0, "partial", filled_at=None, filled_at_source=None)
+    fill.assert_called_once_with(5, 100.0, 2.0, "partial", filled_at=None, filled_at_source=None,
+                                 fill_time_complete=None)
 
 
 def test_manual_buy_intent_says_open_when_nothing_held():
@@ -2197,7 +2209,8 @@ def test_manual_fill_without_a_price_still_marks_the_order_filled():
         rm_cls.return_value.is_halted.return_value = False
         rm_cls.return_value.calculate_stop.return_value = (92.0, "ATR")
         execution.execute_manual("ZZZ", "BUY", 2, "test")
-    fill.assert_called_once_with(5, None, 2.0, "filled", filled_at=None, filled_at_source=None)
+    fill.assert_called_once_with(5, None, 2.0, "filled", filled_at=None, filled_at_source=None,
+                                 fill_time_complete=None)
 
 
 def test_portfolio_updates_are_dropped_from_the_ib_async_log_but_order_status_is_kept():
@@ -2376,20 +2389,23 @@ class TestNoteStaleRecord:
     def test_leftover_record_on_an_open_is_recorded(self):
         rec = {"stop_price": 98.0}
         stale = self._run(rec, "OPEN", path="bracket")
-        stale.assert_called_once_with("NVDA", rec, 5, None, path="bracket", decision_basis="approval_action")
+        stale.assert_called_once_with("NVDA", rec, 5, None, path="bracket", decision_basis="approval_action",
+                                      held_before=None, read_broker=False)
 
     def test_add_writes_no_row(self):
         assert not self._run({"stop_price": 98.0}, "ADD", path="bracket").called
 
     def test_manual_open_names_the_pre_order_read(self):
         stale = self._run({"stop_price": 98.0}, "OPEN", path="manual", decision_basis="pre_order_read")
-        assert stale.call_args.kwargs == {"path": "manual", "decision_basis": "pre_order_read"}
+        assert stale.call_args.kwargs == {"path": "manual", "decision_basis": "pre_order_read",
+                                          "held_before": None, "read_broker": False}
 
     def test_no_action_falls_back_to_the_position_read(self):
         stale = self._run({"stop_price": 98.0}, None, positions=[MagicMock(symbol="NVDA", qty=5)],
                           path="manual")
         assert stale.call_args.args[3] == 5.0
-        assert stale.call_args.kwargs == {"path": "manual", "decision_basis": "position_read"}
+        assert stale.call_args.kwargs == {"path": "manual", "decision_basis": "position_read",
+                                          "held_before": None, "read_broker": False}
 
     def test_no_action_with_more_held_than_the_fill_writes_no_row(self):
         assert not self._run({"stop_price": 98.0}, None, positions=[MagicMock(symbol="NVDA", qty=12)],

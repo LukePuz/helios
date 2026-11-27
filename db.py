@@ -934,6 +934,16 @@ _MIGRATIONS: list[tuple[int, str]] = [
     # already-held ticker from a fresh entry (roadmap 04ah). NULL for orders
     # before this migration, SELLs, manual orders and an unreadable count.
     (92, "ALTER TABLE orders ADD COLUMN IF NOT EXISTS held_before_qty DECIMAL;"),
+    # Whether an immediate market order's fill time saw every execution
+    # (ibkr.place_market_order, config.FILL_TIME_WAIT_S; m141): TRUE when the
+    # fills' shares reached the filled count, FALSE when the wait's cap ran
+    # out first (the time is then from the fills seen, or NULL). NULL for
+    # rows before these migrations, on paths that don't stamp (reconcile late
+    # fills, broker_exit, bracket fills) and with the wait off. A later fill
+    # write that brings its own time from another path resets the orders
+    # stamp to NULL. ADD COLUMN with no default: catalog-only.
+    (93, "ALTER TABLE orders ADD COLUMN IF NOT EXISTS fill_time_complete BOOLEAN;"),
+    (94, "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS exit_fill_complete BOOLEAN;"),
 ]
 
 _SCHEMA_VERSION_TABLE = """
@@ -5722,22 +5732,26 @@ def get_order_held_before(order_row_id: int) -> float | None:
 
 def update_order_fill(order_id: int, fill_price: float, filled_qty: float, status: str,
                       expect_filled_qty: float | None = None, filled_at=None,
-                      filled_at_source: str | None = None) -> bool:
+                      filled_at_source: str | None = None,
+                      fill_time_complete: bool | None = None) -> bool:
     """Records the fill and computes slippage_pct vs decision_price if one was logged.
     Returns False if the write failed (reconcile relies on it, professor M51).
     With expect_filled_qty, the update applies only while the row is still
     unconfirmed/partial with that filled_qty, and returns False if another
-    run got there first (audit 22:53, A2253-5)."""
+    run got there first (audit 22:53, A2253-5). fill_time_complete: see
+    _stamp_order_fill_complete."""
     n = _write_order_fill(order_id, fill_price, filled_qty, status,
                           expect_filled_qty=expect_filled_qty, filled_at=filled_at,
-                          filled_at_source=filled_at_source)
+                          filled_at_source=filled_at_source,
+                          fill_time_complete=fill_time_complete)
     if n is None:
         return False
     return expect_filled_qty is None or n > 0
 
 
 def mark_submitted_order_fill(order_id: int, fill_price: float, filled_qty: float, status: str,
-                              filled_at=None, filled_at_source: str | None = None) -> int | None:
+                              filled_at=None, filled_at_source: str | None = None,
+                              fill_time_complete: bool | None = None) -> int | None:
     """update_order_fill for a row written before the fill wait, applied only
     while it is still 'submitted'. Returns the rows updated: 0 means the row
     has moved on (reconcile adopted it from its fill wait and may have booked
@@ -5745,15 +5759,19 @@ def mark_submitted_order_fill(order_id: int, fill_price: float, filled_qty: floa
     return _write_order_fill(order_id, fill_price, filled_qty, status,
                              filled_at=filled_at, filled_at_source=filled_at_source,
                              only_if_submitted=True,
-                             note=TRADE_PENDING_NOTE)
+                             note=TRADE_PENDING_NOTE,
+                             fill_time_complete=fill_time_complete)
 
 
 def _write_order_fill(order_id: int, fill_price: float, filled_qty: float, status: str,
                       expect_filled_qty: float | None = None, filled_at=None,
                       only_if_submitted: bool = False, note: str | None = None,
-                      filled_at_source: str | None = None) -> int | None:
+                      filled_at_source: str | None = None,
+                      fill_time_complete: bool | None = None) -> int | None:
     """The fill UPDATE behind update_order_fill and mark_submitted_order_fill.
-    Rows updated, or None on error. Never raises."""
+    Rows updated, or None on error. Never raises. After a write that updated
+    the row, _stamp_order_fill_complete sets the completeness stamp in its
+    own transaction, so it can't touch the fill."""
     conn = None
     try:
         conn = _get_conn()   # inside the try: a pool error is a False, never a raise
@@ -5799,6 +5817,14 @@ def _write_order_fill(order_id: int, fill_price: float, filled_qty: float, statu
                 cur.execute(*statement(False))
             updated = cur.rowcount
         conn.commit()
+        if updated:
+            # Only a write with expect_filled_qty (reconcile, on an unconfirmed
+            # or partial row) can land on a row that already carries a stamp:
+            # the immediate paths' first write finds it 'submitted'. So the
+            # reset (complete None) runs only there, and a first fill write
+            # with no stamp adds no statement before the stop.
+            _stamp_order_fill_complete(conn, order_id, fill_time_complete, filled_at,
+                                       reset=expect_filled_qty is not None)
         return updated
     except Exception as e:
         if conn is not None:
@@ -5808,6 +5834,36 @@ def _write_order_fill(order_id: int, fill_price: float, filled_qty: float, statu
     finally:
         if conn is not None:
             _put_conn(conn)
+
+
+def _stamp_order_fill_complete(conn, order_id: int, complete: bool | None, filled_at,
+                               reset: bool = True) -> None:
+    """orders.fill_time_complete (migration 93, m141) after a fill write that
+    updated the row. complete True/False (from ibkr.place_market_order's
+    result) is stored as given. With complete None and reset, the write came
+    from a path that doesn't stamp (reconcile), and it may have added shares
+    or a time the stamp didn't see, so a stamp left by an earlier write is
+    reset to NULL (a no-op on a row without one); without reset nothing is
+    written. Its own short transaction after the fill's commit; a missing
+    column (migration pending) is skipped with one warning per process.
+    filled_at is unused (kept for the callers' signature). Log-only; never
+    raises."""
+    if complete is None and not reset:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = 3000")
+            if complete is not None:
+                cur.execute("UPDATE orders SET fill_time_complete = %s WHERE id = %s",
+                            (bool(complete), order_id))
+            else:
+                cur.execute("UPDATE orders SET fill_time_complete = NULL "
+                            "WHERE id = %s AND fill_time_complete IS NOT NULL", (order_id,))
+        conn.commit()
+    except Exception as e:
+        _rollback_quietly(conn)
+        if not _is_missing_column(e, "fill_time_complete"):
+            logging.warning(f"fill_time_complete stamp for order row {order_id} failed: {e}")
 
 
 def recorded_sell_order_ids(ticker: str, max_age_hours: int = 24) -> tuple[set[int], set[int]] | None:
@@ -5895,33 +5951,63 @@ def get_unconfirmed_orders(max_age_hours: int = 24) -> list[dict]:
 
 
 def get_order_fill_state(order_id: int) -> dict | None:
-    """status, fill_price, filled_qty, broker_order_id, created_at, filled_at and
-    filled_at_source of one orders row (professor M124), or None if there is no
-    such row. Raises on error."""
+    """status, fill_price, filled_qty, broker_order_id, created_at, filled_at,
+    filled_at_source and perm_id of one orders row (professor M124; perm_id
+    for m117), or None if there is no such row. Raises on error."""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             sql = ("SELECT status, fill_price, filled_qty, broker_order_id, created_at, filled_at, "
-                   "filled_at_source FROM orders WHERE id=%s AND trading_env=%s")
+                   "filled_at_source, perm_id FROM orders WHERE id=%s AND trading_env=%s")
             try:
                 cur.execute(sql, (order_id, TRADING_ENV))
             except Exception as e:
                 if not _is_missing_column(e, "filled_at_source"):
                     raise
                 conn.rollback()
-                cur.execute(sql.replace(", filled_at_source", ""), (order_id, TRADING_ENV))
+                # NULL keeps perm_id in the same column.
+                cur.execute(sql.replace(", filled_at_source", ", NULL"), (order_id, TRADING_ENV))
             r = cur.fetchone()
         if not r:
             return None
         return {"status": r[0], "fill_price": float(r[1]) if r[1] is not None else None,
                 "filled_qty": float(r[2]) if r[2] is not None else 0.0, "broker_order_id": r[3],
                 "created_at": r[4], "filled_at": r[5],
-                "filled_at_source": r[6] if len(r) > 6 else None}
+                "filled_at_source": r[6] if len(r) > 6 else None,
+                "perm_id": r[7] if len(r) > 7 else None}
     except Exception as e:
         logging.error(f"get_order_fill_state failed: {e}")
         raise
     finally:
         _put_conn(conn)
+
+
+def get_order_fill_complete(order_id: int) -> bool | None:
+    """orders.fill_time_complete of one orders row (migration 93, m141), so a
+    close booked later from that row (tasks._close_queued_flat_exit) carries
+    the same stamp to trade_outcomes.exit_fill_complete. None when NULL, no
+    row, the column is missing (one warning per process) or the read fails.
+    A separate read, not a column of get_order_fill_state, so that query's
+    column positions stay as they are. 3 s bound; never raises."""
+    conn = None
+    try:
+        conn = _get_conn()
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = 3000")
+            cur.execute("SELECT fill_time_complete FROM orders WHERE id=%s AND trading_env=%s",
+                        (order_id, TRADING_ENV))
+            r = cur.fetchone()
+        conn.rollback()
+        return bool(r[0]) if r and r[0] is not None else None
+    except Exception as e:
+        if conn is not None:
+            _rollback_quietly(conn)
+        if not _is_missing_column(e, "fill_time_complete"):
+            logging.warning(f"get_order_fill_complete({order_id}) failed: {e}")
+        return None
+    finally:
+        if conn is not None:
+            _put_conn(conn)
 
 
 def order_row_exists(ticker: str, side: str, broker_order_id: int | None,
@@ -6366,6 +6452,27 @@ def compute_outcome_metrics(
     }
 
 
+def _stamp_exit_fill_complete(conn, ids: list, complete: bool | None) -> None:
+    """trade_outcomes.exit_fill_complete (migration 94, m141) on the rows a
+    close just committed, when the close passed one (the immediate market
+    closes: model_exit, model_trim_last, manual_sell, backstop_sell). None
+    leaves the rows NULL. Its own transaction, so it can't touch the close;
+    a missing column is skipped with one warning per process. Log-only;
+    never raises."""
+    if not ids or complete is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = 3000")
+            cur.execute("UPDATE trade_outcomes SET exit_fill_complete = %s WHERE id = ANY(%s)",
+                        (bool(complete), list(ids)))
+        conn.commit()
+    except Exception as e:
+        _rollback_quietly(conn)
+        if not _is_missing_column(e, "exit_fill_complete"):
+            logging.warning(f"exit_fill_complete stamp failed: {e}")
+
+
 def _stamp_exit_benchmark_at(conn, ids: list, at, status: str | None = None) -> None:
     """After the close commits: when the exit SPY price was fetched, and the
     fetch's status (migration 88), on the rows just closed. Its own
@@ -6385,12 +6492,14 @@ def _stamp_exit_benchmark_at(conn, ids: list, at, status: str | None = None) -> 
 
 def close_trade_outcome(ticker: str, exit_price: float, exit_date=None,
                         exit_source: str | None = None, exit_price_source: str | None = None,
-                        exit_fill_at=None, exit_fill_at_source: str | None = None) -> bool:
+                        exit_fill_at=None, exit_fill_at_source: str | None = None,
+                        exit_fill_complete: bool | None = None) -> bool:
     """
     Closes every still-open (exit_date IS NULL) trade_outcomes row for this
     ticker: computes outcome_pct, was_correct, and alpha vs. SPY over each
     row's holding window. Called after a confirmed full exit.
-    Returns True if any row was closed.
+    Returns True if any row was closed. exit_fill_complete: see
+    _stamp_exit_fill_complete.
     """
     import math
     from datetime import datetime, timezone as _tz
@@ -6519,6 +6628,7 @@ def close_trade_outcome(ticker: str, exit_price: float, exit_date=None,
                 return False
         conn.commit()
         _stamp_exit_benchmark_at(conn, closed_ids, exit_benchmark_at, exit_benchmark_status)
+        _stamp_exit_fill_complete(conn, closed_ids, exit_fill_complete)
         logging.info(
             f"[{ticker}] Outcome closed: {outcome_pct:+.1%} "
             f"(alpha vs SPY: {alpha_pct:+.1%})" if outcome_pct is not None and alpha_pct is not None

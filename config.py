@@ -1234,6 +1234,20 @@ BROKER_SELL_WATCH_ENABLED = True
 # (3 s): up to ~11 s more before that stop. Shadow does them after the run.
 LATE_FILL_HELD_BEFORE_MODE = "shadow"
 
+# ib_async marks a market order done on orderStatus Filled, but adds each
+# execution to trade.fills only when its execDetails arrives, which can be
+# later. ibkr.place_market_order then waits up to this many seconds while
+# the fills' shares are below the filled count, so the fill time it returns
+# is the last execution's (m141). It polls in 0.1 s steps and adds no time
+# when the fills are already complete (the usual case). The order's price,
+# quantity and status are read before the wait and aren't changed by it.
+# The result carries fill_time_complete: True when the fills reached the
+# filled count, False when the cap ran out (the time is then from the fills
+# seen), None when off or nothing filled. It is stored as
+# orders.fill_time_complete and trade_outcomes.exit_fill_complete
+# (migrations 93, 94). 0 turns the wait off (no stamp; today's behaviour).
+FILL_TIME_WAIT_S = 2.0
+
 # ---------------------------------------------------------------------------
 # Ollama model config
 # ---------------------------------------------------------------------------

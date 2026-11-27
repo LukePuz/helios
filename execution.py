@@ -371,7 +371,8 @@ def _mark_early_row_filled(ticker: str, early: dict, order_result: dict,
         n = db.mark_submitted_order_fill(order_row_id, order_result.get("fill_price"), filled_qty,
                                          "partial" if filled_qty < float(qty) - 1e-6 else "filled",
                                          filled_at=order_result.get("fill_time"),
-                                         filled_at_source=order_result.get("fill_time_source"))
+                                         filled_at_source=order_result.get("fill_time_source"),
+                                         fill_time_complete=order_result.get("fill_time_complete"))
     except Exception as e:
         log.error(f"[{ticker}] fill write for order row {order_row_id} raised: {e}")
         n = None
@@ -712,14 +713,18 @@ def _alert_stop_unknown(ticker: str, qty: float, stop_price: float) -> None:
 
 def _alert_stop_refused(ticker: str, qty: float, err: Exception) -> None:
     """The broker layer refused the stop: it shows fewer shares long than the
-    stop is for, so it would open or add to a short (professor run 11)."""
+    stop is for, so it would open or add to a short (professor run 11). When
+    its positions re-read failed, the count is the cached one (m120), and the
+    alert says so instead of blaming position lag."""
     import alerts as alert_module
     log.error(f"[{ticker}] Stop for {qty:g} refused: {err}")
+    why = ("The positions re-read failed, so that count is the cached one, not a fresh "
+           "broker read" if "positions read failed" in str(err)
+           else "Usually the broker's position hasn't caught up with the fill yet")
     try:
         alert_module._send(
-            f"⚠️ STOP REFUSED — {ticker}\n{err}. Usually the broker's position hasn't caught "
-            f"up with the fill yet; the stop is queued and retried each reconcile cycle. If "
-            f"this repeats, check the position and stops in TWS."
+            f"⚠️ STOP REFUSED — {ticker}\n{err}. {why}; the stop is queued and retried each "
+            f"reconcile cycle. If this repeats, check the position and stops in TWS."
         )
     except Exception:
         pass
@@ -1011,7 +1016,7 @@ def _alert_stop_record_missing(ticker: str, qty: float, stop_price: float, outco
 
 def _alert_prior_stop_unread(ticker: str, qty: float, stop_price: float, outcome: str,
                              prior, reason: str | None = None,
-                             old_stop_filled: bool = False) -> None:
+                             old_stop_filled: bool = False, exit_possible: bool = False) -> None:
     """A BUY that may have added to a position whose prior stop record could
     not be read. The record write was skipped (an overwrite would hand the
     trail and ladder code the new shares' level for the whole position), the
@@ -1024,7 +1029,12 @@ def _alert_prior_stop_unread(ticker: str, qty: float, stop_price: float, outcome
 
     old_stop_filled: the old stop FILLED while an ADD was cancelling it
     (_whole_position_stop): the alert says the old shares may be sold, not
-    that their stop was left in place."""
+    that their stop was left in place.
+
+    exit_possible: an ADD whose reads showed no more than the fill with
+    nothing held before the order and whose open orders couldn't be read
+    (_whole_position_stop): the old shares may have been sold already, so the
+    kept record is not called right for them."""
     import alerts as alert_module
     import tasks
     how, todo = _stop_outcome_text(outcome)
@@ -1055,6 +1065,11 @@ def _alert_prior_stop_unread(ticker: str, qty: float, stop_price: float, outcome
         lines.append(f"The old shares may already be sold by that stop: check the position "
                      f"and any other old stop in TWS, and fix the record by hand if the position "
                      f"changed. {_MANUAL_ACTION_CLEARS}")
+    elif isinstance(prior, dict) and exit_possible:
+        lines.append(f"If the old shares are still held, the record is right for them: check in "
+                     f"TWS that both stops rest (old shares and new shares). If they were sold, "
+                     f"the record still carries the old position's entry, trail state and stop "
+                     f"order: fix it by hand. {_MANUAL_ACTION_CLEARS}")
     elif isinstance(prior, dict):
         lines.append(f"The record is right for the old shares. Check in TWS that both stops rest "
                      f"(old shares and new shares). {_MANUAL_ACTION_CLEARS}")
@@ -1180,16 +1195,176 @@ def _restore_stop_after_failed_sell(ticker: str, floor: float | None = None) -> 
         tasks.open_manual_action(ticker, f"restore the stop @ ${float(stop_rec['stop_price']):.2f}")
 
 
+# entry_record_basis values (stale_record_at_entry rows). Record only: the
+# record is never reset here; would_reset says whether a fresh record would
+# be started if that were ever enforced.
+_BASIS_FRESH = "fresh_after_confirmed_exit"
+_BASIS_LAGGED = "inherited_lagged_read"
+_BASIS_UNKNOWN = "inherited_unknown"
+# The broker reads behind prior_order_status: a short bound, this process's
+# session only (no reconnect). They run after the new shares' stop is placed.
+_STALE_EVIDENCE_TIMEOUT_S = 5.0
+# prior_order_status values that show the old stop's shares were sold or its
+# order ended with them: no longer open, filled, or cancelled.
+_EXIT_STATUSES = frozenset({"not_open", "Filled", "Cancelled", "ApiCancelled"})
+
+
+def _entry_record_basis(filled_qty: float, held_before: float | None,
+                        post_fill_qty: float | None, over_leftover: bool = False,
+                        prior_order_status: str | None = None,
+                        prior_sell_fill_seen: bool | None = None,
+                        old_stop_state: str | None = None) -> str:
+    """Which case a BUY filled over an existing stop record is (pure; no I/O):
+    _BASIS_LAGGED when the old position looks still held (the old stop is
+    still working at the broker, or a count above 0 was read before the order
+    and it isn't a reclassified OPEN over a leftover record), _BASIS_FRESH
+    when its exit looks confirmed (nothing held before the order, or an OPEN
+    over a leftover record; the post-fill count is exactly the fill; and the
+    old stop is no longer open at the broker, or listed filled or cancelled,
+    or a SELL execution for an order the bot didn't log was seen today), else
+    _BASIS_UNKNOWN: a read is missing or failed, the old stop is listed with
+    no status, or a count held before the order meets exit evidence. An
+    Inactive (rejected) stop is no evidence either way.
+
+    old_stop_state: what the stop-path check before the new stop saw for
+    ANY working SELL stop of the ticker (execution._old_stop_state: working /
+    absent / unread; None when it didn't run). The record's own order id can
+    be stale or missing, so "working" there is lagged whatever that id's
+    status, and "unread" never gives _BASIS_FRESH."""
+    if old_stop_state == "working" or _stop_status_working(prior_order_status):
+        return _BASIS_LAGGED
+    exit_seen = prior_order_status in _EXIT_STATUSES or prior_sell_fill_seen is True
+    if held_before is not None and held_before > 1e-6 and not over_leftover:
+        # A count held before the order says the old position was there; exit
+        # evidence against it leaves the case unknown, not lagged.
+        return _BASIS_UNKNOWN if exit_seen else _BASIS_LAGGED
+    nothing_before = (held_before is not None and held_before <= 1e-6) or over_leftover
+    exact = post_fill_qty is not None and abs(float(post_fill_qty) - float(filled_qty)) <= 1e-6
+    if nothing_before and exact and exit_seen and old_stop_state != "unread":
+        return _BASIS_FRESH
+    return _BASIS_UNKNOWN
+
+
+def _stop_status_working(status: str | None) -> bool:
+    """A prior_order_status that names a working stop: a broker status other
+    than a dead one (tasks._NOT_WORKING), "not_open", "read_error" or
+    "unknown" (listed with no status)."""
+    import tasks
+    return (status is not None and status not in ("not_open", "read_error", "unknown")
+            and status not in tasks._NOT_WORKING)
+
+
+def _stale_entry_evidence(ticker: str, prior_order) -> dict:
+    """prior_order_status and prior_sell_fill_seen for a stale_record_at_entry
+    row. prior_order_status (only when the record has a broker order id): its
+    status in the broker's open orders, "not_open" when it isn't among them
+    (filled or cancelled), "read_error" when the read failed.
+    prior_sell_fill_seen (only when that status isn't a working stop): True
+    or False for a SELL execution of ticker today for an order the bot
+    didn't log as its own (db.recorded_sell_order_ids: every SELL order row
+    of the last 24 h, as reconcile's exit lookup, so a same-day TRIM is no
+    exit; a logged EXIT whose fill was never booked is left out too, which
+    errs toward unknown, never toward would_reset), None when it couldn't be
+    read or the session is down. Today only: an older exit isn't visible. One bounded
+    read each on this process's session as it is: no connect, no heartbeat,
+    and a timeout doesn't drop the session for the executions read. Never
+    raises."""
+    import db
+    import ibkr
+    out: dict = {}
+    if prior_order is not None:
+        try:
+            orders = ibkr.get_open_orders(timeout=_STALE_EVIDENCE_TIMEOUT_S, reconnect=False)
+            match = next((o for o in orders if o.get("ticker") == ticker
+                          and str(o.get("order_id")) == str(prior_order)), None)
+            out["prior_order_status"] = ((str(match.get("status") or "") or "unknown")
+                                         if match is not None else "not_open")
+        except Exception as e:
+            log.info(f"[{ticker}] stale-record evidence: open orders unreadable: {e}")
+            out["prior_order_status"] = "read_error"
+    if not _stop_status_working(out.get("prior_order_status")):
+        try:
+            ib = getattr(ibkr, "_ib", None)
+            if ib is None or not ib.isConnected():
+                raise ConnectionError("IBKR not connected")
+            recorded = db.recorded_sell_order_ids(ticker)
+            if recorded is None:
+                raise RuntimeError("recorded sells unreadable")
+            order_ids, perm_ids = recorded
+            execs = ibkr._bounded_req(ib, "reqExecutions", ib.reqExecutions, drop_session=False,
+                                      timeout=_STALE_EVIDENCE_TIMEOUT_S)
+            out["prior_sell_fill_seen"] = any(
+                e.contract.symbol == ticker and e.execution.side == "SLD"
+                and (getattr(e.execution, "permId", 0) or None) not in perm_ids
+                and e.execution.orderId not in order_ids
+                for e in execs or [])
+        except Exception as e:
+            log.info(f"[{ticker}] stale-record evidence: executions unreadable: {e}")
+            out["prior_sell_fill_seen"] = None
+    return out
+
+
+def _prior_stop_order_id(ticker: str) -> tuple:
+    """(broker_order_id, "ok") of the ticker's stop record, (None, "error")
+    when the read failed. The old stop's order id goes in each
+    stale_record_at_entry row so it can be checked later: an old order filled
+    or cancelled means a real exit, one still working means a lagged position
+    read (professor m586). get_position_stop doesn't select the order id;
+    this read is rare. Strict, so a null id from a failed read is told apart
+    from a record with no order id (professor run 58); its own guard, so a
+    pool error leaves the id null instead of losing the row (SEF 133c).
+    Never raises."""
+    try:
+        import db
+        return (next((r.get("broker_order_id") for r in db.get_all_position_stops(strict=True)
+                      if r.get("ticker") == ticker), None), "ok")
+    except Exception:
+        return None, "error"
+
+
+_STALE_ENTRY_TEXT = {
+    _BASIS_FRESH: "BUY filled over a stop record whose position looks closed, its exit not booked",
+    _BASIS_LAGGED: "BUY filled while a stop record exists and the position reads may lag the fill "
+                   "(no exit confirmed)",
+    _BASIS_UNKNOWN: "BUY filled while a stop record exists; whether its position closed is unknown",
+}
+
+
 def _record_stale_entry(ticker: str, prior: dict, filled_qty: float, broker_qty: float | None,
-                        path: str = "execution", decision_basis: str | None = None) -> None:
+                        path: str = "execution", decision_basis: str | None = None,
+                        held_before: float | None = None, post_fill_qty: float | None = None,
+                        over_leftover: bool = False, read_broker: bool = False,
+                        prior_order_ref: tuple | None = None,
+                        old_stop_state: str | None = None) -> None:
     """Activity row (stage stale_record_at_entry) for a BUY filled while a stop
-    record from a position the broker no longer holds still exists. path
+    record exists that the BUY's own reads don't place under a held
+    position. path
     names the caller: "execution" (broker_qty from the position read),
     "reconcile" or "reconcile_manual" (a late fill; broker_qty None, the
     approval's action or a position read decided), "bracket" or "manual".
     decision_basis says what called the position fresh: "post_fill_read",
-    "approval_action", "position_read" or "pre_order_read". Record only;
-    never raises."""
+    "approval_action", "position_read" or "pre_order_read".
+
+    entry_record_basis (always) says which case it is (_entry_record_basis):
+    a confirmed exit, a possibly lagging read, or unknown; would_reset
+    (always) is True only for a confirmed exit. Record only: the record keeps
+    its opened_at and entry thesis either way. held_before: the count read
+    before the order (None: not read or unreadable); post_fill_qty: the
+    freshest post-fill count (default broker_qty); over_leftover: a
+    reclassified OPEN over a leftover record (_whole_position_stop).
+    read_broker: also read prior_order_status / prior_sell_fill_seen
+    (_stale_entry_evidence); only callers whose new stop is already placed
+    pass it (execute_approved after its stop work, the bracket path), so the
+    reads never delay a stop (on a raise before the place, execute_approved
+    still writes its row, with the reads, from its finally). Without it those
+    two keys are absent.
+    prior_order_ref: (broker order id, "ok"/"error") read before the record
+    was rewritten (_prior_stop_order_id); a row written after the caller's
+    record write must pass it, or the new stop's id would be read.
+    old_stop_state: the stop path's own read of the ticker's working SELL
+    stops, when one ran (status["old_stop_state"] from _whole_position_stop);
+    stamped on the row (null when none ran) and used by _entry_record_basis.
+    Never raises."""
     try:
         import db
         versions = {}
@@ -1199,25 +1374,18 @@ def _record_stale_entry(ticker: str, prior: dict, filled_qty: float, broker_qty:
         except Exception:
             pass
         opened = prior.get("opened_at")
-        # The old stop's broker order id and entry, so each row can be
-        # checked later: an old order filled or cancelled means a real exit,
-        # one still working means a lagged position read (professor m586).
-        # get_position_stop doesn't select the order id; this read is rare.
-        # Strict, so a null id from a failed read is told apart from a
-        # record with no order id (professor run 58).
-        try:
-            # Its own guard: a pool error here (raised before the read's own
-            # try) leaves the id null instead of losing the row (SEF 133c).
-            prior_order = next((r.get("broker_order_id") for r in db.get_all_position_stops(strict=True)
-                                if r.get("ticker") == ticker), None)
-            order_read = "ok"
-        except Exception:
-            prior_order, order_read = None, "error"
-        log.warning(f"[{ticker}] BUY filled with a stale stop record (opened {opened}): "
+        prior_order, order_read = (prior_order_ref if prior_order_ref is not None
+                                   else _prior_stop_order_id(ticker))
+        evidence = _stale_entry_evidence(ticker, prior_order) if read_broker else {}
+        basis = _entry_record_basis(filled_qty, held_before,
+                                    broker_qty if post_fill_qty is None else post_fill_qty,
+                                    over_leftover, evidence.get("prior_order_status"),
+                                    evidence.get("prior_sell_fill_seen"), old_stop_state)
+        log.warning(f"[{ticker}] BUY filled while a stop record exists (opened {opened}; {basis}): "
                     f"the new position keeps that record's opened_at and entry thesis")
         db.log_activity_direct(
             "stale_record_at_entry", ticker,
-            f"BUY filled while a stop record from an unbooked exit still exists (opened {opened})",
+            f"{_STALE_ENTRY_TEXT[basis]} (opened {opened})",
             "neutral",
             {"prior_opened_at": opened.isoformat() if hasattr(opened, "isoformat") else opened,
              "prior_stop_method": prior.get("stop_method"),
@@ -1225,18 +1393,25 @@ def _record_stale_entry(ticker: str, prior: dict, filled_qty: float, broker_qty:
              "prior_entry_price": prior.get("entry_price"), "prior_broker_order_id": prior_order,
              "prior_order_read": order_read, "decision_basis": decision_basis,
              "filled_qty": filled_qty, "broker_qty": broker_qty, "path": path, "env": db.TRADING_ENV,
-             "code_sha": versions.get("code_sha"), "env_sha": versions.get("env_sha")})
+             "code_sha": versions.get("code_sha"), "env_sha": versions.get("env_sha"),
+             "entry_record_basis": basis, "would_reset": basis == _BASIS_FRESH,
+             "held_before": held_before, "old_stop_state": old_stop_state, **evidence})
     except Exception as e:
         log.warning(f"[{ticker}] stale-record entry row not written: {e}")
 
 
 def _note_stale_record(ticker: str, filled_qty: float, action: str | None, path: str,
-                       decision_basis: str | None = None) -> None:
+                       decision_basis: str | None = None, held_before: float | None = None,
+                       read_broker: bool = False, defer_out: dict | None = None) -> None:
     """The stale_record_at_entry check for the BUY paths that write the stop
     record without _whole_position_stop: bracket and manual (professor m586).
     Call before the record is written over. Fresh vs added is decided as on
     the late-fill path (tasks._held_before_fill: the action when it is ADD
-    or OPEN, else a position read). Record only; never raises."""
+    or OPEN, else a position read). held_before / read_broker: passed to
+    _record_stale_entry. defer_out (a dict): instead of writing the row, put
+    its arguments there, with the old order id read now (prior_order_ref),
+    for the caller to write after its record write (the bracket path, so
+    its broker reads never hold up the record). Record only; never raises."""
     try:
         import db
         import tasks
@@ -1251,8 +1426,13 @@ def _note_stale_record(ticker: str, filled_qty: float, action: str | None, path:
         if tasks._held_before_fill(ticker, filled_qty, action, seen=seen):
             return
         basis = decision_basis or ("approval_action" if action in ("ADD", "OPEN") else "position_read")
-        _record_stale_entry(ticker, prior, filled_qty, seen.get("broker_qty"), path=path,
-                            decision_basis=basis)
+        kw = {"path": path, "decision_basis": basis, "held_before": held_before,
+              "read_broker": read_broker}
+        if defer_out is not None:
+            defer_out.update(prior=prior, filled_qty=filled_qty, broker_qty=seen.get("broker_qty"),
+                             prior_order_ref=_prior_stop_order_id(ticker), **kw)
+            return
+        _record_stale_entry(ticker, prior, filled_qty, seen.get("broker_qty"), **kw)
     except Exception as e:
         log.warning(f"[{ticker}] stale-record check failed: {e}")
 
@@ -1274,17 +1454,43 @@ def _held_before_order(ticker: str) -> float | None:
         return None
 
 
+def _old_stop_state(ticker: str) -> str:
+    """For _whole_position_stop's stale-record branch on an ADD with nothing
+    held before the order: "working" when any SELL stop for ticker is still
+    working at the broker (all clients' open orders; a cancelling stop counts:
+    it may still fill), "absent" when a successful read shows none, "unread"
+    when the read failed. One bounded read on this process's session, no
+    reconnect (the reprotect path's bound). Never raises."""
+    import tasks
+    try:
+        stops = tasks._resting_sell_stops(ticker, timeout=tasks._REPROTECT_FRESH_TIMEOUT_S,
+                                          reconnect=False)
+    except Exception as e:
+        log.warning(f"[{ticker}] ADD check: open orders unreadable ({type(e).__name__}: {e})")
+        return "unread"
+    return "working" if stops else "absent"
+
+
 def _record_add_stale(ticker: str, prior: dict, new_stop: float, filled_qty: float,
                       cache_qty: float | None, fresh_qty: float | None,
-                      held_before: float | None, reclassified_open: bool) -> None:
+                      held_before: float | None, reclassified_open: bool,
+                      record: str, old_stop_state: str | None = None) -> None:
     """Activity row (stage add_stale_record) when an ADD takes
     _whole_position_stop's stale-record branch (not an OPEN over a leftover
     record): the position reads show no more than the fill, so the old stop
-    is not cancelled, the new shares get their own stop at new_stop, and the
-    caller rewrites the record at that level. A lagging read (11-10 NVDA) leaves
-    the old shares' stop resting below or above it. Levels are given as
-    percent from the old record's stop. No broker read; queued write, so the
-    stop placement never waits on it. Record only; never raises."""
+    is not cancelled and the new shares get their own stop at new_stop.
+    record says what happens to the stop record: "kept_unconfirmed" (the
+    record and the old stop are kept and the caller alerts) or
+    "rewritten_at_new_stop" (the caller rewrites the record at that level).
+    old_stop_state (_old_stop_state; an ADD by the approval with no count
+    above 0 held before the order, else None) decided which: "working" or
+    "unread" keeps the record, "absent" (no SELL stop working: usually the
+    old position exited, but an old position resting with no stop reads the
+    same) rewrites it. Before that check every such ADD rewrote it (the 11-10 NVDA case,
+    whose lagging read left the old shares' stop resting outside the
+    record). Levels are given
+    as percent from the old record's stop. No broker read; queued write, so
+    the stop placement never waits on it. Record only; never raises."""
     try:
         import db
         opened = prior.get("opened_at")
@@ -1293,10 +1499,15 @@ def _record_add_stale(ticker: str, prior: dict, new_stop: float, filled_qty: flo
         db.log_activity_queued(
             "add_stale_record", ticker,
             f"ADD on the stale-record branch: reads show {cache_qty} after a {filled_qty:g}-share "
-            f"fill; the record is rewritten at the new shares' stop ({pct}% vs the old record), "
-            f"the old stop is not cancelled",
+            + (f"fill; the record and the old stop are kept, the new shares get their own stop "
+               f"({pct}% vs the old record)" if record == "kept_unconfirmed" else
+               f"fill; no SELL stop is working, so the record is rewritten at the new shares' "
+               f"stop ({pct}% vs the old record)" if old_stop_state == "absent" else
+               f"fill; the record is rewritten at the new shares' stop ({pct}% vs the old record), "
+               f"the old stop is not cancelled"),
             "neutral",
-            {"record": "rewritten_at_new_stop", "new_stop_vs_prior_stop_pct": pct,
+            {"record": record, "old_stop_state": old_stop_state,
+             "new_stop_vs_prior_stop_pct": pct,
              "filled_qty": filled_qty, "cache_qty": cache_qty, "fresh_qty": fresh_qty,
              "held_before": held_before, "reclassified_open": reclassified_open,
              "prior_opened_at": opened.isoformat() if hasattr(opened, "isoformat") else opened,
@@ -1471,6 +1682,14 @@ def _whole_position_stop(ticker: str, new_stop: float, filled_qty: float,
     An old stop whose cancel the broker confirmed after part of it filled
     takes the same route (ibkr records it "Filled"): the new lot is stopped,
     and the re-check covers the old shares that are left.
+
+    An ADD (by the approval) whose post-fill reads show no more than the
+    fill, with no count above 0 held before the order, reads the ticker's
+    working SELL stops (_old_stop_state). One still working, or a failed
+    read, takes the kept-record route (prior_unreadable, no re-check; on a
+    failed read status["exit_possible"]: the old shares may have been
+    sold). None working takes the fresh-entry route, as before. Either way
+    status["old_stop_state"] says what the read saw (record only).
     """
     import db
     import ibkr
@@ -1600,16 +1819,72 @@ def _whole_position_stop(ticker: str, new_stop: float, filled_qty: float,
                                         f"held before the order")
         return new_stop, None
     if total_qty <= filled_qty:
-        # Nothing was held before this fill, yet a stop record exists: the
-        # old position's exit isn't booked yet, so this entry keeps its
-        # opened_at and entry thesis (audit 11-06 03:34 #5). Log-only.
-        _record_stale_entry(ticker, prior, filled_qty, total_qty, decision_basis="post_fill_read")
+        # The reads show nothing held before this fill, yet a stop record
+        # exists: either the old position's exit isn't booked yet or the
+        # reads lag the fill (11-10 NVDA). Either way this entry keeps its
+        # opened_at and entry thesis (audit 11-06 03:34 #5); the row's
+        # entry_record_basis says which case it looks like. Log-only.
+        stale_kw = {"decision_basis": "post_fill_read", "held_before": held_before,
+                    "post_fill_qty": fresh_qty if fresh_qty is not None else total_qty,
+                    "over_leftover": open_over_leftover}
+        if status is not None:
+            # The caller writes the row after its stop work, with the broker
+            # reads (prior_order_status), so they never delay the new stop. A
+            # caller that passes status must write status["stale_entry"]
+            # (execute_approved does, in its finally), or the row is lost.
+            status["stale_entry"] = {"prior": prior, "filled_qty": filled_qty,
+                                     "broker_qty": total_qty,
+                                     # Now: the caller's write replaces the order id.
+                                     "prior_order_ref": _prior_stop_order_id(ticker), **stale_kw}
+        else:
+            _record_stale_entry(ticker, prior, filled_qty, total_qty, **stale_kw)
+        # An ADD by the approval (the analyst saw the ticker held) with no
+        # held count above 0 read before the order: the position reads alone
+        # don't tell a lagging read (11-10 NVDA: the old shares' stop still
+        # rested, outside the rewritten record) from a real exit not yet
+        # booked. The old stop's state decides (_old_stop_state): still
+        # working, or unreadable, takes the kept-record route (the record and
+        # the old stop are kept, the new shares get their own stop, the
+        # caller alerts; reconcile checks the two stops, as after the guard
+        # above); none working keeps the fresh-entry path below, as before
+        # (usually an exit not yet booked, so no old stop is left behind; an
+        # old position resting with no stop at all reads the same, and is
+        # stopped and recorded at the new shares' level). An OPEN with no
+        # count held before keeps the fresh-entry path as before.
+        add_unconfirmed = (action == "ADD" and not reclassified_open
+                           and (held_before is None or held_before <= 1e-6))
+        old_stop = _old_stop_state(ticker) if add_unconfirmed else None
+        keep = old_stop in ("working", "unread")
+        if status is not None and old_stop is not None:
+            # Record only: what this check saw, for the caller's
+            # stale_record_at_entry row (its case must agree with the route).
+            status["old_stop_state"] = old_stop
         if action == "ADD" and not open_over_leftover:
-            # An ADD whose reads lag the fill (11-10 NVDA): the old shares'
-            # stop still rests. Not a reclassified OPEN over a leftover
-            # record, whose earlier shares are gone.
+            # Not a reclassified OPEN over a leftover record, whose earlier
+            # shares are gone.
             _record_add_stale(ticker, prior, new_stop, filled_qty, total_qty, fresh_qty,
-                              held_before, reclassified_open)
+                              held_before, reclassified_open,
+                              record="kept_unconfirmed" if keep else "rewritten_at_new_stop",
+                              old_stop_state=old_stop)
+        if keep:
+            before = "unreadable" if held_before is None else f"{held_before:g}"
+            log.warning(f"[{ticker}] ADD check: reads show {total_qty:g} after a {filled_qty:g}-share "
+                        f"fill, the count held before the order was {before} and the old stop is "
+                        f"{old_stop}; keeping the old stop and record and stopping only the "
+                        f"filled shares")
+            if status is not None:
+                status["prior_unreadable"] = True
+                if old_stop == "unread":
+                    status["exit_possible"] = True
+                status["unknown_reason"] = (
+                    f"the broker's position reads ({total_qty:g}) showed no more than the "
+                    f"{filled_qty:g} new shares with no count above 0 held before the order "
+                    f"({'unreadable' if held_before is None else 'none'}), and "
+                    + ("a SELL stop for it is still working (a lagging read)"
+                       if old_stop == "working" else
+                       "its open orders couldn't be read to tell a lagging read from an exit "
+                       "not yet booked"))
+            return new_stop, None
         if status is not None:
             # Record only (execution._record_add_lot_r): the record is about
             # to be rewritten at the new shares' stop over an existing one.
@@ -1991,7 +2266,10 @@ def _record_add_lot_r(ticker: str, approval: dict, placed_stop, new_lot_entry, n
     add_lot_r) when a BUY's stop is placed over an existing stop record.
     path is "whole_position" (an ADD's one stop for all shares) or
     "stale_record" (the record rewritten at the new shares' stop while the
-    old record's order may still rest at the broker). The lots are the open
+    old record's order may still rest at the broker: an OPEN over an existing
+    record, or an ADD with no SELL stop working; an ADD whose old stop still
+    works, or whose open orders can't be read, keeps the record and writes
+    no row). The lots are the open
     trade_outcomes lots (db.get_open_lots_initial_stops, strict) plus this
     fill's own lot (its row is written after the stop). A lot's own initial
     stop is entry - fill_risk_per_share (the stop placed for its shares at
@@ -3215,7 +3493,8 @@ def execute_approved(
                 if not db.update_order_fill(local_order_id, order_result.get("fill_price"),
                                             filled_qty, "partial" if partial else "filled",
                                             filled_at=order_result.get("fill_time"),
-                                            filled_at_source=order_result.get("fill_time_source")):
+                                            filled_at_source=order_result.get("fill_time_source"),
+                                            fill_time_complete=order_result.get("fill_time_complete")):
                     # The row stays 'submitted'; say why (a note, not a status).
                     log.warning(f"[{ticker}] fill write failed for order row {local_order_id}")
                     db.set_order_reconcile_note(local_order_id, "fill_write_failed")
@@ -3292,7 +3571,8 @@ def execute_approved(
                         db.close_trade_outcome(ticker, exit_price=current_price, exit_source="model_exit",
                                               exit_price_source=price_source,
                                               exit_fill_at=order_result.get("fill_time"),
-                                              exit_fill_at_source=order_result.get("fill_time_source"))
+                                              exit_fill_at_source=order_result.get("fill_time_source"),
+                                              exit_fill_complete=order_result.get("fill_time_complete"))
                     except Exception as e:
                         log.warning(f"[{ticker}] close_trade_outcome failed: {e}")
             else:  # TRIM — re-place stop at same price for remaining quantity
@@ -3397,7 +3677,8 @@ def execute_approved(
                         db.close_trade_outcome(ticker, exit_price=current_price, exit_source="model_trim_last",
                                               exit_price_source=price_source,
                                               exit_fill_at=order_result.get("fill_time"),
-                                              exit_fill_at_source=order_result.get("fill_time_source"))
+                                              exit_fill_at_source=order_result.get("fill_time_source"),
+                                              exit_fill_complete=order_result.get("fill_time_complete"))
                     except Exception as e:
                         log.warning(f"[{ticker}] close_trade_outcome failed: {e}")
 
@@ -3406,20 +3687,31 @@ def execute_approved(
         # re-placing it here would create a second, redundant stop.
         stop_price = approval.get("stop_loss_price") or risk_json.get("stop_loss_price")
         if stop_price and side == "BUY" and bracket_used:
-            _note_stale_record(ticker, filled_qty, action, path="bracket")
-            db.upsert_position_stop(
-                ticker=ticker,
-                entry_price=current_price,
-                stop_price=float(stop_price),
-                stop_method=risk_json.get("stop_method", ""),
-                bucket=approval.get("thesis_bucket", "Accelerator"),
-                conviction=approval.get("conviction", 5),
-                trail_distance_pct=risk_json.get("trailing_stop_distance_pct"),
-                entry_price_source=price_source,
-            )
-            db.set_stop_broker_order_id(ticker, bracket_result["stop_order_id"])
-            _capture_original_thesis_if_new(ticker, approval)
-            log.info(f"[{ticker}] Bracket stop recorded (orderId={bracket_result['stop_order_id']})")
+            # The check runs before the record is written over; its row (with
+            # the broker reads) is written after the record and its order id.
+            bracket_stale: dict = {}
+            _note_stale_record(ticker, filled_qty, action, path="bracket",
+                               held_before=held_before_order, read_broker=True,
+                               defer_out=bracket_stale)
+            try:
+                db.upsert_position_stop(
+                    ticker=ticker,
+                    entry_price=current_price,
+                    stop_price=float(stop_price),
+                    stop_method=risk_json.get("stop_method", ""),
+                    bucket=approval.get("thesis_bucket", "Accelerator"),
+                    conviction=approval.get("conviction", 5),
+                    trail_distance_pct=risk_json.get("trailing_stop_distance_pct"),
+                    entry_price_source=price_source,
+                )
+                db.set_stop_broker_order_id(ticker, bracket_result["stop_order_id"])
+                _capture_original_thesis_if_new(ticker, approval)
+                log.info(f"[{ticker}] Bracket stop recorded (orderId={bracket_result['stop_order_id']})")
+            finally:
+                if bracket_stale:   # record only, after the record write (or its raise); never raises
+                    _record_stale_entry(ticker, bracket_stale.pop("prior"),
+                                        bracket_stale.pop("filled_qty"),
+                                        bracket_stale.pop("broker_qty"), **bracket_stale)
         elif stop_price and side == "BUY":
             stop_price = _stop_anchored_to_fill(ticker, float(stop_price), price_at_sizing, current_price)
             new_lot_stop = float(stop_price)      # this fill's own stop, before any merge
@@ -3542,6 +3834,7 @@ def execute_approved(
                     else:
                         _alert_prior_stop_unread(ticker, stop_qty, float(stop_price), stop_outcome,
                                                  prior_now, reason=prior_info.get("unknown_reason"),
+                                                 exit_possible=bool(prior_info.get("exit_possible")),
                                                  old_stop_filled=bool(prior_info.get("old_stop_filled")))
                 elif not record_ok:
                     _alert_stop_record_missing(
@@ -3586,6 +3879,19 @@ def execute_approved(
                 # any raise in between: the texts _whole_position_stop held
                 # back. Once each; never raises.
                 tasks._send_alert_texts(prior_info.get("alerts_out") or [])
+                stale = prior_info.get("stale_entry")
+                if stale:
+                    # Record only, last: the stale_record_at_entry row
+                    # _whole_position_stop left for after the stop work, with
+                    # its broker reads. Never raises.
+                    _record_stale_entry(ticker, stale["prior"], stale["filled_qty"],
+                                        stale["broker_qty"], decision_basis=stale["decision_basis"],
+                                        held_before=stale["held_before"],
+                                        post_fill_qty=stale["post_fill_qty"],
+                                        over_leftover=stale["over_leftover"], read_broker=True,
+                                        prior_order_ref=stale["prior_order_ref"],
+                                        # Set by the stale branch's old-stop check where it runs.
+                                        old_stop_state=prior_info.get("old_stop_state"))
             _capture_original_thesis_if_new(ticker, approval)
             if add_to_existing or prior_info.get("stale_record"):
                 # Record only: per-lot R at the stop just placed. Last in the
@@ -3865,7 +4171,8 @@ def execute_manual(
             if not db.update_order_fill(local_order_id, order_result.get("fill_price"), filled_qty,
                                         "partial" if filled_qty < float(qty) - 1e-6 else "filled",
                                         filled_at=order_result.get("fill_time"),
-                                        filled_at_source=order_result.get("fill_time_source")):
+                                        filled_at_source=order_result.get("fill_time_source"),
+                                        fill_time_complete=order_result.get("fill_time_complete")):
                 log.warning(f"[{ticker}] fill write failed for order row {local_order_id}")
                 db.set_order_reconcile_note(local_order_id, "fill_write_failed")
     except Exception as e:
@@ -3885,7 +4192,8 @@ def execute_manual(
                 db.close_trade_outcome(ticker, exit_price=fill_price, exit_source="manual_sell",
                                        exit_price_source="fill" if order_result.get("fill_price") else "quote",
                                        exit_fill_at=order_result.get("fill_time"),
-                                       exit_fill_at_source=order_result.get("fill_time_source"))
+                                       exit_fill_at_source=order_result.get("fill_time_source"),
+                                       exit_fill_complete=order_result.get("fill_time_complete"))
             except Exception:
                 pass  # no open outcome row is expected for positions not opened via approval
         else:
@@ -4015,8 +4323,10 @@ def execute_manual(
         # lag. MANUAL_ADD lands here when the ADD branch found no record.
         # MANUAL_BUY: the read before the order failed (professor 58j).
         pre_order = {"MANUAL_OPEN": "OPEN", "MANUAL_ADD": "ADD"}.get(order_intent)
+        # MANUAL_OPEN: the read before the order showed nothing held.
         _note_stale_record(ticker, filled_qty, pre_order, path="manual",
-                           decision_basis="pre_order_read" if pre_order else None)
+                           decision_basis="pre_order_read" if pre_order else None,
+                           held_before=0.0 if pre_order == "OPEN" else None)
         try:
             stop_price, stop_method = rm.calculate_stop(ticker, fill_price, bucket,
                                                         log_caller="post_fill")

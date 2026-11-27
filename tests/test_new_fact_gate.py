@@ -7,6 +7,7 @@ import copy
 import logging
 import re
 from contextlib import ExitStack
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -268,19 +269,37 @@ def test_sells_are_not_gated(action):
     assert not [c for c in ls.call_args_list if c.args[1] == "ROUTE_NO_NEW_FACT"]
 
 
+class _StoryClock(datetime):
+    """agents.story_dedup's clock, one second later on each now(): the two
+    runs below always straddle a second, as a slow suite run sometimes did."""
+    n = 0
+
+    @classmethod
+    def now(cls, tz=None):
+        _StoryClock.n += 1
+        return datetime(2026, 11, 24, 6, 0, 0, tzinfo=timezone.utc) + timedelta(seconds=_StoryClock.n)
+
+
 def test_verdict_inputs_identical_gate_on_and_off():
     """The gate sits in routing only: what the analyst gets (candidate,
-    trigger) and what it returns are the same with the gate on or off."""
+    trigger) and what it returns are the same with the gate on or off. The
+    story de-dup shadow is on (as shipped) in both modes, on a stepping clock."""
     seen = []
 
     def fake_analyze(candidate, situation_brief="", regime_packet=None, trigger=None):
         trigger = copy.deepcopy(trigger)
-        trigger.pop("brief_built_at", None)   # a clock reading
+        # Clock readings: brief_built_at, and the story de-dup record's
+        # decided_at (to the second; present when STORY_DEDUP_SHADOW_ENABLED,
+        # as shipped), which differed whenever the two runs straddled a second.
+        trigger.pop("brief_built_at", None)
+        (trigger.get("story_dedup") or {}).pop("decided_at", None)
         seen.append((copy.deepcopy(candidate), trigger))
         return {"action": "WATCH", "ticker": "NVDA", "conviction": 5, "pass_to_risk": False}
     out = []
     for on in (True, False):
         with patch("config.BUY_REQUIRES_NEW_FACT", on), \
+             patch("config.STORY_DEDUP_SHADOW_ENABLED", True), \
+             patch("agents.story_dedup.datetime", _StoryClock), \
              patch("ibkr.IBKRClient", side_effect=RuntimeError("no broker")), \
              patch("agents.analyst.analyze", fake_analyze), \
              patch("agents.market_regime.get_cached_regime", return_value={"regime": "Neutral"}), \
@@ -288,6 +307,7 @@ def test_verdict_inputs_identical_gate_on_and_off():
              patch("agents.crew._c6_bar_unrouted"):
             out.append(crew.deep_analyze({"ticker": "NVDA", "source": "news", "title": "t",
                                           "text": "x"}, {"relevant": True, "new_fact": False}))
+    assert seen[0][1]["story_dedup"]["read"].startswith("error")   # the record ran (DB blocked)
     assert seen[0] == seen[1] and out[0] == out[1]
 
 

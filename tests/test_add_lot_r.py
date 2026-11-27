@@ -155,18 +155,34 @@ def test_db_read_shape_and_strict():
 
 # ── stale-record flag in _whole_position_stop ────────────────────────────────
 
-def test_stale_branch_sets_the_flag():
+def _stale_branch(action):
     client = MagicMock()
     client.get_open_position.return_value = MagicMock(qty=1, avg_entry_price=100.0)
     status = {}
     with patch("db.get_position_stop", return_value={"stop_price": 98.0}), \
          patch("ibkr.get_client", return_value=client), \
          patch("ibkr.get_fresh_stock_position", return_value=(1.0, 100.0)), \
-         patch("db.log_activity_direct"), patch("db.get_all_position_stops", return_value=[]), \
+         patch("db.log_activity_direct"), patch("db.log_activity_queued"), \
+         patch("db.get_all_position_stops", return_value=[]), \
+         patch("tasks._resting_sell_stops", return_value=[{"ticker": "NVDA"}]), \
          patch("tasks.manage_cancel_stop_orders_for") as cancel:
-        out = execution._whole_position_stop("NVDA", 95.0, 1, status=status, action="ADD")
-    assert out == (95.0, None) and status.get("stale_record") is True
+        out = execution._whole_position_stop("NVDA", 95.0, 1, status=status, action=action)
     cancel.assert_not_called()
+    return out, status
+
+
+def test_stale_branch_sets_the_flag():
+    # An OPEN over an existing record: the record is rewritten at the new stop.
+    out, status = _stale_branch("OPEN")
+    assert out == (95.0, None) and status.get("stale_record") is True
+
+
+def test_an_add_on_the_stale_branch_keeps_the_record_and_sets_no_flag():
+    # Nothing held before the order (None), the old stop still working: the
+    # kept-record route, no lot-R row.
+    out, status = _stale_branch("ADD")
+    assert out == (95.0, None) and "stale_record" not in status
+    assert status["prior_unreadable"] is True
 
 
 # ── execute_approved: the recorder runs on a re-stop, and the stop is unchanged ─

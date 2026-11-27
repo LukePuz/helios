@@ -1,0 +1,1714 @@
+{
+ "meta": {
+  "what": "Trigger engagement fixture for scripts/trigger_engagement_readout.py (audit 2026-11-26 14:53 #1).",
+  "labels": "AI-labelled by Claude (trading-bot-26) on 2026-11-26 from the masked title and verdict text below; not Luke's labels.",
+  "label_rules": {
+   "engaged": "the verdict text refers to the item's main fact or claim, by name or paraphrase",
+   "not_engaged": "the item carries a ticker-specific fact or claim and the verdict text does not refer to it",
+   "no_new_fact": "the item carries no ticker-specific new fact (recap, listicle, preview, explainer, opinion without a claim); judged on the item, whatever the verdict says"
+  },
+  "sample": "random.Random(20261126).sample of the 754 event-path verdicts with model_output, env live or NULL, 2026-11-12 20:07 to 2026-11-26 20:07 UTC (read-only SELECT on port 6543, 2026-11-26 15:08 EST)",
+  "masking": "dollar figures written $X and every other standalone number #; checked at build time that no per-word flag moved",
+  "df": "each title word's share of that ticker's verdict texts in the same 14-day window (all paths), frozen at read time"
+ },
+ "rows": [
+  {
+   "id": 89311,
+   "ticker": "TSLA",
+   "action": "WATCH",
+   "source": "news",
+   "new_fact": "false",
+   "company": [
+    "tesla"
+   ],
+   "title": "Tesla (TSLA) Stock Trends After Hours As SpaceX Merger Talks Heat Up, Elon Musk Extends Cybertruck Production - Benzinga",
+   "fields": {
+    "reasoning": [
+     "Tesla's current Price/Sales multiple of #x is above peer median, but a successful SpaceX merger and progress with the Optimus robot could justify this valuation (per FUNDAMENTALS section)."
+    ],
+    "thesis_summary": [
+     "Tesla is a key player in the robotics and physical AI space, with potential for significant growth through the Optimus robot and potential synergies from a SpaceX merger."
+    ],
+    "key_risks": [
+     "The SpaceX merger fails to materialize",
+     "Technical delays in the Optimus robot development"
+    ],
+    "expectation_gap": [
+     "A successful SpaceX merger and accelerated production of the Optimus robot could drive significant upside.",
+     "The SpaceX merger fails to materialize or the Optimus robot faces technical delays.",
+     "The SpaceX merger is confirmed and Tesla makes significant progress with the Optimus robot.",
+     "The market is pricing in moderate growth and potential synergies from the SpaceX merger, but not a major breakthrough in humanoid robotics."
+    ]
+   },
+   "df": {
+    "trends": 0.0135,
+    "hours": 0.0,
+    "spacex": 0.2297,
+    "merger": 0.2162,
+    "talks": 0.1216,
+    "heat": 0.0,
+    "elon": 0.0135,
+    "musk": 0.0676,
+    "extends": 0.0,
+    "cybertruck": 0.0405,
+    "production": 0.2162
+   },
+   "loose_at_read": true,
+   "strict_at_read": true,
+   "label": "engaged",
+   "label_note": "SpaceX merger and Cybertruck/Optimus in all fields"
+  },
+  {
+   "id": 89956,
+   "ticker": "NVDA",
+   "action": "HOLD",
+   "source": "news",
+   "new_fact": "false",
+   "company": [
+    "nvidia"
+   ],
+   "title": "Cathie Wood on Nvidia's strengths in a post-Jensen Huang era",
+   "fields": {
+    "reasoning": [
+     "Nvidia's strong fundamentals, including +#% YoY revenue growth and a gross margin of +#%, support the bull case (per FUNDAMENTALS section). The upcoming earnings report on #-11-17 is a key catalyst that could confirm or break the thesis."
+    ],
+    "thesis_summary": [
+     "Nvidia is a core holding in AI infrastructure with strong fundamentals and long-term growth potential, despite current market concerns."
+    ],
+    "key_risks": [
+     "Management transition risk",
+     "Economic slowdown impacting AI infrastructure demand"
+    ],
+    "expectation_gap": [
+     "Nvidia maintains strong market position in AI infrastructure, driven by continued demand for GPUs and high-performance computing solutions.",
+     "Management transition fails to stabilize investor confidence, leading to further share price declines.",
+     "Nvidia demonstrates strong earnings growth and maintains its competitive edge in AI infrastructure, particularly if the new management team executes effectively.",
+     "The current price suggests the market is pricing in a significant leadership risk following Jensen Huang's resignation and broader economic concerns."
+    ]
+   },
+   "df": {
+    "cathie": 0.0,
+    "wood": 0.0,
+    "strengths": 0.0021,
+    "post-jensen": 0.0043,
+    "huang": 0.4103,
+    "era": 0.2885
+   },
+   "loose_at_read": true,
+   "strict_at_read": false,
+   "label": "no_new_fact",
+   "label_note": "an investor's general view of strengths; no new ticker fact"
+  },
+  {
+   "id": 90135,
+   "ticker": "MSFT",
+   "action": "HOLD",
+   "source": "news",
+   "new_fact": "false",
+   "company": [
+    "microsoft"
+   ],
+   "title": "Microsoft outage is ‘one of the most economically damaging in history’, expert warns",
+   "fields": {
+    "reasoning": [
+     "MSFT is a core holding with strong financials and leadership in the AI infrastructure thesis, but the current forward P/E of #x (per FUNDAMENTALS) suggests some market skepticism. The upcoming Q2 earnings report on #-11-30 could provide clarity on growth and margins."
+    ],
+    "thesis_summary": [
+     "MSFT is a core holding in the AI infrastructure thesis, with strong financials and leadership in cloud services."
+    ],
+    "key_risks": [
+     "Hyperscaler capex slowdown",
+     "Increased competition in cloud and AI services"
+    ],
+    "expectation_gap": [
+     "Continued strong growth in cloud and AI services, with MSFT maintaining its leadership position and benefiting from the AI infrastructure boom.",
+     "A significant slowdown in hyperscaler capex could reduce demand for MSFT's cloud and AI services.",
+     "MSFT can maintain its leadership in cloud and AI services, expand margins, and benefit from the ongoing AI infrastructure boom.",
+     "The market expects moderate to strong revenue growth, but is pricing in a forward P/E of #x, which suggests some skepticism about future margins or growth sustainability."
+    ]
+   },
+   "df": {
+    "outage": 0.1341,
+    "one": 0.0366,
+    "economically": 0.0,
+    "damaging": 0.0,
+    "history": 0.0,
+    "expert": 0.0,
+    "warns": 0.0
+   },
+   "loose_at_read": false,
+   "strict_at_read": false,
+   "label": "not_engaged",
+   "label_note": "the outage is not mentioned"
+  },
+  {
+   "id": 90731,
+   "ticker": "AMD",
+   "action": "WATCH",
+   "source": "news",
+   "new_fact": "false",
+   "company": [
+    "advanced",
+    "devices",
+    "micro"
+   ],
+   "title": "Why Analysts Think AMD Could Emerge as the Biggest Winner From Nvidia’s Turmoil - Barchart.com",
+   "fields": {
+    "reasoning": [
+     "AMD's strong revenue growth and gross margin (#% YoY, #%) position it well to capitalize on Nvidia’s turmoil. The current price of $X implies moderate optimism but not full pricing in of the potential upside from Nvidia’s issues (per Q3 fundamentals)."
+    ],
+    "thesis_summary": [
+     "AMD is a core AI infrastructure play with strong growth and competitive positioning, poised to benefit from Nvidia's operational challenges."
+    ],
+    "key_risks": [
+     "Nvidia stabilizes operations more quickly than expected",
+     "Macro environment deteriorates, affecting overall tech sector performance"
+    ],
+    "expectation_gap": [
+     "AMD could gain significant market share in AI accelerators and data center business as Nvidia faces turmoil.",
+     "Nvidia could stabilize its operations more quickly than expected, reducing the impact on AMD.",
+     "Nvidia's leadership changes and operational challenges lead to significant business losses that benefit AMD.",
+     "The current price of $X implies a moderate premium, reflecting some optimism about AMD's growth prospects but not fully pricing in the potential upside from Nvidia’s issues."
+    ]
+   },
+   "df": {
+    "analysts": 0.0,
+    "think": 0.0,
+    "emerge": 0.0,
+    "biggest": 0.0,
+    "winner": 0.0,
+    "turmoil": 0.0714,
+    "barchart": 0.0,
+    "com": 0.9286
+   },
+   "loose_at_read": true,
+   "strict_at_read": true,
+   "label": "engaged",
+   "label_note": "AMD gaining from Nvidia's turmoil is the reasoning's core"
+  },
+  {
+   "id": 90878,
+   "ticker": "MSFT",
+   "action": "HOLD",
+   "source": "news",
+   "new_fact": "false",
+   "company": [
+    "microsoft"
+   ],
+   "title": "Market Chatter: Nvidia, Amazon, Microsoft, OpenAI and Anthropic To Be Named AI National Champs By White House",
+   "fields": {
+    "reasoning": [
+     "MSFT is a core holding with strong financials and leadership in AI cloud services, trading at #x NTM earnings (per FUNDAMENTALS section). The White House naming MSFT as an AI National Champ could provide a near-term catalyst for the stock."
+    ],
+    "thesis_summary": [
+     "MSFT is a core holding in the AI infrastructure thesis with strong financials and leadership in cloud services."
+    ],
+    "key_risks": [
+     "Hyperscaler capex slowdown",
+     "Increased competition in AI cloud services"
+    ],
+    "expectation_gap": [
+     "MSFT continues to lead in AI cloud services, driving revenue and market share gains",
+     "Hyperscaler capex slowdown could reduce demand for MSFT's AI infrastructure solutions",
+     "AI cloud services continue to grow faster than expected, and MSFT maintains or expands its market leadership",
+     "Market expects moderate growth in AI-related revenues and stable margins"
+    ]
+   },
+   "df": {
+    "chatter": 0.0,
+    "openai": 0.0244,
+    "anthropic": 0.061,
+    "named": 0.0,
+    "national": 0.0244,
+    "champs": 0.0,
+    "white": 0.0122,
+    "house": 0.0122
+   },
+   "loose_at_read": true,
+   "strict_at_read": true,
+   "label": "engaged",
+   "label_note": "White House AI National Champ named in the reasoning"
+  },
+  {
+   "id": 91184,
+   "ticker": "NVDA",
+   "action": "HOLD",
+   "source": "news",
+   "new_fact": "true",
+   "company": [
+    "nvidia"
+   ],
+   "title": "Tech shares slide ahead of Nvidia results, Anthropic IPO",
+   "fields": {
+    "reasoning": [
+     "Nvidia's upcoming earnings report on #-11-17 is a key catalyst that could either confirm the company's strong fundamentals and growth potential (bull_case_target $X) or further erode investor confidence (downside_scenario $X). The current price of $X implies significant risk, but the stock is oversold with a forward P/E of #x, trading below peer multiples (#x to #x NTM earnings)."
+    ],
+    "thesis_summary": [
+     "Nvidia remains a core holding in AI infrastructure with strong fundamentals and long-term growth potential."
+    ],
+    "key_risks": [
+     "Negative earnings or guidance",
+     "Further management instability",
+     "Broad tech sector weakness"
+    ],
+    "expectation_gap": [
+     "Nvidia reports strong earnings and guidance, reaffirming its leadership in AI infrastructure despite recent management changes.",
+     "Negative earnings or guidance could further erode investor confidence and lead to additional selling pressure.",
+     "Earnings and guidance exceed expectations, and management provides a clear path forward for growth and stability.",
+     "The market is pricing in a significant risk of negative earnings or guidance due to the CEO resignation and broader tech sector concerns."
+    ]
+   },
+   "df": {
+    "tech": 0.2436,
+    "slide": 0.0,
+    "ahead": 0.0021,
+    "results": 0.0513,
+    "anthropic": 0.0085,
+    "ipo": 0.0043
+   },
+   "loose_at_read": true,
+   "strict_at_read": true,
+   "label": "no_new_fact",
+   "label_note": "sector recap ahead of results; no new ticker fact"
+  },
+  {
+   "id": 92461,
+   "ticker": "NVDA",
+   "action": "HOLD",
+   "source": "news",
+   "new_fact": "true",
+   "company": [
+    "nvidia"
+   ],
+   "title": "Nvidia establishes committee to oversee national security after abrupt departure of CEO Jensen Huang",
+   "fields": {
+    "reasoning": [
+     "NVIDIA's strong fundamentals and long-term growth potential in AI infrastructure (revenue growth +#%, gross margin +#%) suggest a recovery is possible if the new leadership can stabilize the company. The stock is currently oversold (RSI #) and the upcoming earnings report on #-11-17 could provide clarity."
+    ],
+    "thesis_summary": [
+     "NVIDIA is a core holding in AI infrastructure with strong fundamentals and long-term growth potential, despite current market concerns."
+    ],
+    "key_risks": [
+     "Further negative news related to the CEO departure",
+     "National security concerns leading to regulatory issues"
+    ],
+    "expectation_gap": [
+     "NVIDIA's strong fundamentals and long-term growth potential in AI infrastructure could drive a recovery despite near-term headwinds.",
+     "Further negative news related to the CEO departure or national security could further erode investor confidence.",
+     "The new leadership can stabilize the company, and upcoming earnings show continued strong performance in AI infrastructure.",
+     "The market is pricing in significant uncertainty due to the CEO departure and national security concerns, leading to an oversold condition."
+    ]
+   },
+   "df": {
+    "establishes": 0.0,
+    "committee": 0.0021,
+    "oversee": 0.0,
+    "national": 0.0085,
+    "security": 0.0064,
+    "abrupt": 0.0,
+    "departure": 0.0491,
+    "ceo": 0.4573,
+    "jensen": 0.3846,
+    "huang": 0.4103
+   },
+   "loose_at_read": true,
+   "strict_at_read": true,
+   "label": "engaged",
+   "label_note": "national security concerns in risks and gap"
+  },
+  {
+   "id": 92914,
+   "ticker": "NVDA",
+   "action": "HOLD",
+   "source": "news",
+   "new_fact": "true",
+   "company": [
+    "nvidia"
+   ],
+   "title": "Nvidia Stock Dips Ahead Of Earnings: Will Results Calm Investors Amid Turmoil? (Live Coverage)",
+   "fields": {
+    "reasoning": [
+     "NVIDIA is trading at a forward P/E of #x, below the peer range of #x to #x (per Q2 fundamentals). The upcoming earnings report on Nov. # could provide a catalyst for a rebound if it beats expectations and management provides positive guidance."
+    ],
+    "thesis_summary": [
+     "NVIDIA is a core holding in AI infrastructure with strong fundamentals and long-term growth potential, despite current market concerns."
+    ],
+    "key_risks": [
+     "Negative earnings report or weak guidance",
+     "Continued market concerns over Jensen Huang's resignation"
+    ],
+    "expectation_gap": [
+     "NVIDIA reports strong earnings, reaffirms AI demand and growth outlook",
+     "Negative earnings report or weak guidance, further impacting investor confidence",
+     "Earnings beat expectations and management provides positive guidance on future AI chip demand",
+     "Market expects a mixed or negative report due to recent turmoil and Jensen Huang's resignation"
+    ]
+   },
+   "df": {
+    "dips": 0.0,
+    "ahead": 0.0021,
+    "earnings": 0.7201,
+    "results": 0.0513,
+    "calm": 0.0,
+    "investors": 0.047,
+    "turmoil": 0.0192,
+    "coverage": 0.0
+   },
+   "loose_at_read": true,
+   "strict_at_read": true,
+   "label": "no_new_fact",
+   "label_note": "earnings preview / live coverage; no new fact"
+  },
+  {
+   "id": 93288,
+   "ticker": "NVDA",
+   "action": "HOLD",
+   "source": "news",
+   "new_fact": "false",
+   "company": [
+    "nvidia"
+   ],
+   "title": "Could Nvidia’s leadership change fuel a new wave of chip rivals?",
+   "fields": {
+    "reasoning": [
+     "NVIDIA's current price of $X implies significant uncertainty due to leadership changes, but the company's strong fundamentals (revenue growth +#%, gross margin +#%) and upcoming earnings report provide a clear catalyst for potential upside. The bull case target of $X represents a #% upside from current levels, with a downside scenario to the stop level at $X (-5.#%)."
+    ],
+    "thesis_summary": [
+     "NVIDIA is a core holding in AI infrastructure with strong fundamentals and long-term growth potential, despite current market concerns."
+    ],
+    "key_risks": [
+     "Leadership transition fails to address market concerns",
+     "Increased competition from AMD and other chip rivals"
+    ],
+    "expectation_gap": [
+     "NVIDIA returns to strong revenue growth and maintains its leadership in AI infrastructure with a new CEO or strategic changes that address current concerns.",
+     "The new leadership fails to address market concerns, leading to further declines in investor confidence and stock price.",
+     "NVIDIA's earnings report shows strong financials and provides clarity on the leadership transition, reassuring investors and driving a positive sentiment.",
+     "The market is pricing in continued uncertainty and potential negative impacts from the leadership change, including slower growth and increased competition."
+    ]
+   },
+   "df": {
+    "leadership": 0.7265,
+    "change": 0.3291,
+    "fuel": 0.0,
+    "wave": 0.0,
+    "chip": 0.0513,
+    "rivals": 0.0021
+   },
+   "loose_at_read": true,
+   "strict_at_read": true,
+   "label": "engaged",
+   "label_note": "competition from chip rivals in risks and gap"
+  },
+  {
+   "id": 93404,
+   "ticker": "NVDA",
+   "action": "HOLD",
+   "source": "news",
+   "new_fact": "true",
+   "company": [
+    "nvidia"
+   ],
+   "title": "Huang open to Nvidia return as scandal-hit chipmaker heads into results",
+   "fields": {
+    "reasoning": [
+     "NVDA is trading at a forward P/E of #x, below its peer range of #-20x (per fundamentals data). The stock is oversold with a RSI(#) of # and in a downtrend (per price action). A positive earnings report or resolution to the CEO scandal could lead to a significant rebound."
+    ],
+    "thesis_summary": [
+     "NVDA is a core holding in AI infrastructure with strong fundamentals and long-term growth potential, despite current market concerns."
+    ],
+    "key_risks": [
+     "Continued escalation of the CEO scandal",
+     "Negative earnings report"
+    ],
+    "expectation_gap": [
+     "Huang's potential return could stabilize the company and restore investor confidence, leading to a rebound in share price.",
+     "The scandal continues to escalate, leading to further management changes and damaging the company's reputation.",
+     "Huang returns as CEO or the board announces a positive resolution to the scandal, restoring investor confidence.",
+     "The market expects continued uncertainty and negative sentiment due to the CEO scandal, with the stock trading at an oversold level."
+    ]
+   },
+   "df": {
+    "huang": 0.4103,
+    "open": 0.0,
+    "return": 0.3397,
+    "scandal-hit": 0.0,
+    "chipmaker": 0.0,
+    "heads": 0.0,
+    "results": 0.0513
+   },
+   "loose_at_read": true,
+   "strict_at_read": false,
+   "label": "engaged",
+   "label_note": "Huang's potential return in the gap"
+  },
+  {
+   "id": 93504,
+   "ticker": "NVDA",
+   "action": "HOLD",
+   "source": "news",
+   "new_fact": "true",
+   "company": [
+    "nvidia"
+   ],
+   "title": "Nvidia Lost Jensen Huang. Trump Is Adding to AI Stocks’ Risks. - Barron's",
+   "fields": {
+    "reasoning": [
+     "NVIDIA's strong fundamentals (revenue growth +#%, gross margin +#%) and long-term growth potential in AI infrastructure suggest a recovery is possible if the earnings report on #-11-17 is positive, despite current market concerns over leadership changes."
+    ],
+    "thesis_summary": [
+     "NVIDIA remains a core holding in AI infrastructure with strong fundamentals and long-term growth potential, despite near-term headwinds."
+    ],
+    "key_risks": [
+     "Market skepticism about new leadership",
+     "Potential slowdown in AI capex by hyperscalers"
+    ],
+    "expectation_gap": [
+     "NVIDIA's strong fundamentals and long-term growth potential in AI infrastructure could lead to a recovery once the market digests the leadership change.",
+     "The market may continue to be skeptical of NVIDIA's ability to maintain its competitive edge without Jensen Huang, leading to further price declines.",
+     "NVIDIA's earnings report on #-11-17 shows strong financials and positive guidance, reassuring investors about the company's future under new leadership.",
+     "The current price of $X implies significant concerns about the loss of Jensen Huang and broader macro risks, pricing in a continued downtrend."
+    ]
+   },
+   "df": {
+    "lost": 0.0,
+    "jensen": 0.3846,
+    "huang": 0.4103,
+    "trump": 0.0043,
+    "adding": 0.0,
+    "risks": 0.2329
+   },
+   "loose_at_read": true,
+   "strict_at_read": true,
+   "label": "not_engaged",
+   "label_note": "Huang's departure is discussed, but not the headline's new claim (Trump adding to risk)"
+  },
+  {
+   "id": 94193,
+   "ticker": "NVDA",
+   "action": "HOLD",
+   "source": "news",
+   "new_fact": "true",
+   "company": [
+    "nvidia"
+   ],
+   "title": "Dow Jones Futures Fall, Techs Rise After Nvidia, Target Earnings; Anthropic IPO Ahead",
+   "fields": {
+    "reasoning": [
+     "NVDA's strong revenue growth (#% YoY per FUNDAMENTALS) and data center demand support the bull case, despite technical indicators suggesting an oversold condition. The upcoming earnings report on #-11-30 is a key catalyst that could confirm or break the thesis."
+    ],
+    "thesis_summary": [
+     "NVDA is a core holding in AI infrastructure with strong fundamentals and long-term growth potential, despite current market concerns."
+    ],
+    "key_risks": [
+     "Hyperscaler capex slowdown",
+     "Macro deterioration leading to reduced demand"
+    ],
+    "expectation_gap": [
+     "Continued strong revenue growth and data center demand, driven by AI infrastructure expansion",
+     "Hyperscaler capex slowdown or macroeconomic deterioration leading to reduced demand",
+     "Earnings beat expectations and management provides strong guidance for future quarters",
+     "The market is pricing in a continued downtrend based on technical indicators (RSI oversold, MACD bearish) and recent price action"
+    ]
+   },
+   "df": {
+    "dow": 0.7073,
+    "jones": 0.0,
+    "futures": 0.0,
+    "fall": 0.0064,
+    "techs": 0.0,
+    "rise": 0.0406,
+    "target": 0.141,
+    "earnings": 0.7201,
+    "anthropic": 0.0085,
+    "ipo": 0.0043,
+    "ahead": 0.0021
+   },
+   "loose_at_read": true,
+   "strict_at_read": false,
+   "label": "not_engaged",
+   "label_note": "results were out; the verdict still calls the earnings report upcoming"
+  },
+  {
+   "id": 94239,
+   "ticker": "NVDA",
+   "action": "HOLD",
+   "source": "news",
+   "new_fact": "true",
+   "company": [
+    "nvidia"
+   ],
+   "title": "Dow Jones Futures Fall, Techs Rise After Nvidia Earnings, Waller's 'Shock' Warning; Anthropic IPO Ahead",
+   "fields": {
+    "reasoning": [
+     "NVDA's Q3 results showed strong revenue growth of +#% YoY, particularly in the Data Center segment (+#% YoY), per FUNDAMENTALS and FILINGS sections. The stock is currently trading at a forward P/E of #x, below the peer range of #x to #x, suggesting potential upside if Q4 earnings confirm continued growth."
+    ],
+    "thesis_summary": [
+     "NVDA is a core holding in AI infrastructure with strong fundamentals and long-term growth potential."
+    ],
+    "key_risks": [
+     "Hyperscaler capex slowdown",
+     "Competitive pressures in AI infrastructure"
+    ],
+    "expectation_gap": [
+     "Continued strong growth in AI infrastructure and data center revenue",
+     "Hyperscaler capex slowdown or competitive pressures in AI infrastructure",
+     "Q4 earnings show continued strength in AI and data center segments, validating the long-term thesis",
+     "Market is pricing in some recovery but remains skeptical of sustained growth given recent sell-off and CEO transition"
+    ]
+   },
+   "df": {
+    "dow": 0.7073,
+    "jones": 0.0,
+    "futures": 0.0,
+    "fall": 0.0064,
+    "techs": 0.0,
+    "rise": 0.0406,
+    "earnings": 0.7201,
+    "waller": 0.0,
+    "shock": 0.0,
+    "warning": 0.0,
+    "anthropic": 0.0085,
+    "ipo": 0.0043,
+    "ahead": 0.0021
+   },
+   "loose_at_read": true,
+   "strict_at_read": false,
+   "label": "engaged",
+   "label_note": "Q3 results discussed"
+  },
+  {
+   "id": 94939,
+   "ticker": "MSFT",
+   "action": "HOLD",
+   "source": "news",
+   "new_fact": "false",
+   "company": [
+    "microsoft"
+   ],
+   "title": "Microsoft Stocks Fall #% on Day Ignite Unveils Maia # and Copilot Workspaces",
+   "fields": {
+    "reasoning": [
+     "MSFT's current price of $X (per SITUATION BRIEF) implies a forward P/E of #x, which is within the peer range of #x to #x NTM earnings (per FUNDAMENTALS). The upcoming earnings report on #-11-30 (per UPCOMING CATALYST CALENDAR) could provide a catalyst for upside if MSFT reports strong growth in AI and cloud services."
+    ],
+    "thesis_summary": [
+     "MSFT is a core holding in the AI infrastructure thesis with strong financials and leadership in cloud services."
+    ],
+    "key_risks": [
+     "Hyperscaler capex slowdown",
+     "Intense competition in AI and cloud services"
+    ],
+    "expectation_gap": [
+     "MSFT continues to lead in AI and cloud services with strong financials and new product launches like Maia #.",
+     "Hyperscaler capex slowdown could reduce demand for MSFT's cloud services and AI infrastructure.",
+     "MSFT's new AI products gain significant traction, leading to accelerated revenue growth and margin expansion.",
+     "The market expects moderate growth in revenue and earnings, with the current price reflecting a forward P/E of #x."
+    ]
+   },
+   "df": {
+    "fall": 0.0,
+    "day": 0.0,
+    "ignite": 0.0244,
+    "unveils": 0.0,
+    "maia": 0.0122,
+    "copilot": 0.0976,
+    "workspaces": 0.0
+   },
+   "loose_at_read": true,
+   "strict_at_read": true,
+   "label": "engaged",
+   "label_note": "Maia launch named in the gap"
+  },
+  {
+   "id": 95284,
+   "ticker": "MSFT",
+   "action": "HOLD",
+   "source": "news",
+   "new_fact": "false",
+   "company": [
+    "microsoft"
+   ],
+   "title": "Satya Nadella predicts AI agents will reshuffle the economics of the web",
+   "fields": {
+    "reasoning": [
+     "MSFT trades at a forward P/E of #x, within the peer range of #x to #x (per FUNDAMENTALS). The stock has a strong AI and cloud thesis, but the current price implies moderate growth. Earnings on #-11-30 could provide a catalyst for higher-than-expected revenue and margin improvements."
+    ],
+    "thesis_summary": [
+     "MSFT is a core holding in the AI infrastructure thesis with strong financials and leadership in cloud services."
+    ],
+    "key_risks": [
+     "Hyperscaler capex slowdown",
+     "Competitive pressures in the cloud market"
+    ],
+    "expectation_gap": [
+     "AI agents driving significant revenue growth and margin expansion in cloud services",
+     "Hyperscaler capex slowdown or competitive pressures in the cloud market",
+     "AI adoption accelerates, leading to higher-than-expected revenue and margin improvements",
+     "Moderate AI-driven growth with current multiples already reflecting some optimism"
+    ]
+   },
+   "df": {
+    "satya": 0.0,
+    "nadella": 0.0,
+    "predicts": 0.0,
+    "agents": 0.0366,
+    "reshuffle": 0.0,
+    "economics": 0.0,
+    "web": 0.0
+   },
+   "loose_at_read": true,
+   "strict_at_read": true,
+   "label": "engaged",
+   "label_note": "AI agents driving cloud revenue in the gap"
+  },
+  {
+   "id": 95437,
+   "ticker": "NVDA",
+   "action": "HOLD",
+   "source": "news",
+   "new_fact": "false",
+   "company": [
+    "nvidia"
+   ],
+   "title": "Anthropic's record IPO lands as Nvidia suffers its worst run since #",
+   "fields": {
+    "reasoning": [
+     "NVIDIA's strong revenue growth (+#% YoY) and leadership in AI infrastructure suggest a recovery is likely, especially if the upcoming earnings report provides positive guidance (per FUNDAMENTALS section)."
+    ],
+    "thesis_summary": [
+     "NVIDIA is a core holding in AI infrastructure with strong fundamentals and long-term growth potential."
+    ],
+    "key_risks": [
+     "Hyperscaler capex slowdown",
+     "Increased competition in AI infrastructure"
+    ],
+    "expectation_gap": [
+     "NVIDIA's strong revenue growth and leadership in AI infrastructure continue, driving a recovery in the stock price.",
+     "Hyperscaler capex slowdown, which would reduce demand for NVIDIA's products.",
+     "NVIDIA reports strong earnings or provides positive guidance that reassures investors about its long-term growth potential.",
+     "The market is pricing in continued weakness due to recent underperformance and macroeconomic concerns."
+    ]
+   },
+   "df": {
+    "anthropic": 0.0085,
+    "record": 0.0021,
+    "ipo": 0.0043,
+    "lands": 0.0021,
+    "suffers": 0.0,
+    "worst": 0.0,
+    "run": 0.0,
+    "since": 0.0
+   },
+   "loose_at_read": false,
+   "strict_at_read": false,
+   "label": "no_new_fact",
+   "label_note": "market recap (another firm's IPO, a losing run); no new ticker fact"
+  },
+  {
+   "id": 95830,
+   "ticker": "NVDA",
+   "action": "HOLD",
+   "source": "news",
+   "new_fact": "false",
+   "company": [
+    "nvidia"
+   ],
+   "title": "Anthropic IPO Should Spark ‘Relief Rally’ In AI Stocks, Analyst Expects ‘Modest Hop’ On Day One",
+   "fields": {
+    "reasoning": [
+     "NVIDIA's strong fundamentals (revenue growth +#%, gross margin +#%) and leadership in AI infrastructure suggest significant upside potential if the market sentiment improves, as implied by the upcoming Anthropic IPO. The current price of $X is oversold, with a bull case target of $X (per FUNDAMENTALS)."
+    ],
+    "thesis_summary": [
+     "NVIDIA is a core holding in AI infrastructure with strong fundamentals and long-term growth potential."
+    ],
+    "key_risks": [
+     "Continued negative market sentiment",
+     "Hyperscaler capex slowdown",
+     "Valuation already assuming the bull case"
+    ],
+    "expectation_gap": [
+     "NVIDIA's strong fundamentals and leadership in AI infrastructure could drive a significant recovery as the market sentiment improves.",
+     "The primary risk is that the market sentiment remains negative, leading to continued selling pressure despite strong fundamentals.",
+     "If the AI sector sees a relief rally following Anthropic's IPO and NVIDIA's strong fundamentals are recognized, the stock could recover significantly.",
+     "The current price of $X implies that the market is pricing in continued near-term weakness, with little expectation for a rapid recovery or further downside."
+    ]
+   },
+   "df": {
+    "anthropic": 0.0085,
+    "ipo": 0.0043,
+    "spark": 0.0,
+    "relief": 0.0021,
+    "rally": 0.0085,
+    "analyst": 0.0064,
+    "expects": 0.1261,
+    "modest": 0.0,
+    "hop": 0.0021,
+    "day": 0.0064,
+    "one": 0.0085
+   },
+   "loose_at_read": true,
+   "strict_at_read": true,
+   "label": "engaged",
+   "label_note": "Anthropic IPO relief rally in reasoning and gap"
+  },
+  {
+   "id": 95940,
+   "ticker": "NVDA",
+   "action": "ADD",
+   "source": "news",
+   "new_fact": "false",
+   "company": [
+    "nvidia"
+   ],
+   "title": "Nvidia, AMD, Micron stocks lead chip sector higher amid Anthropic IPO optimism",
+   "fields": {
+    "reasoning": [
+     "NVIDIA's strong fundamentals and leadership in AI infrastructure (revenue growth +#%, gross margin +#%) support a revaluation, especially as the market is currently pricing in continued weakness (RSI(#): # — OVERSOLD). The upcoming XLK sector earnings cluster on #-11-30 could provide a positive catalyst."
+    ],
+    "thesis_summary": [
+     "NVIDIA is a core holding in AI infrastructure with strong fundamentals and long-term growth potential."
+    ],
+    "key_risks": [
+     "Hyperscaler capex slowdown",
+     "Valuation already assuming bull case"
+    ],
+    "expectation_gap": [
+     "NVIDIA's strong fundamentals and leadership in AI infrastructure could drive a recovery as the market recognizes its long-term growth potential.",
+     "Hyperscaler capex slowdown or weakening demand for AI infrastructure could continue to pressure the stock.",
+     "NVIDIA's strong revenue growth and leadership in AI infrastructure are recognized by the market, leading to a revaluation of its stock.",
+     "The current price of $X implies that the market is pricing in continued near-term weakness, with concerns about macroeconomic conditions and valuation."
+    ]
+   },
+   "df": {
+    "micron": 0.0,
+    "lead": 0.8718,
+    "chip": 0.0513,
+    "sector": 0.0491,
+    "higher": 0.109,
+    "anthropic": 0.0085,
+    "ipo": 0.0043,
+    "optimism": 0.0064
+   },
+   "loose_at_read": true,
+   "strict_at_read": true,
+   "label": "no_new_fact",
+   "label_note": "sector price move on another firm's IPO; no new ticker fact"
+  },
+  {
+   "id": 96633,
+   "ticker": "TSLA",
+   "action": "WATCH",
+   "source": "news",
+   "new_fact": "false",
+   "company": [
+    "tesla"
+   ],
+   "title": "Tesla Stock Rises as Musk Doubles Down on China",
+   "fields": {
+    "reasoning": [
+     "Tesla's aggressive expansion in China could drive significant revenue growth, but the stock is trading at a premium to peers (#x NTM revenue vs. #-14x range per FUNDAMENTALS). The bull case target of $X implies a #% upside, while the downside scenario is $X (-10.#%)."
+    ],
+    "thesis_summary": [
+     "Tesla's China expansion could drive significant revenue growth and market share gains."
+    ],
+    "key_risks": [
+     "Intense competition in the Chinese market",
+     "Regulatory and geopolitical risks in China"
+    ],
+    "expectation_gap": [
+     "Tesla's aggressive expansion in China could lead to significant revenue growth and market share gains.",
+     "The primary risk is that the China market may be more competitive than expected, leading to lower-than-expected sales and margins.",
+     "If the China expansion leads to strong sales and positive earnings surprises, the stock could see significant upside.",
+     "The current price of $X implies a moderate level of optimism about Tesla's future, but not a major breakthrough or rapid growth."
+    ]
+   },
+   "df": {
+    "rises": 0.027,
+    "musk": 0.0676,
+    "doubles": 0.0,
+    "china": 0.0676
+   },
+   "loose_at_read": true,
+   "strict_at_read": true,
+   "label": "engaged",
+   "label_note": "China expansion is the thesis"
+  },
+  {
+   "id": 96807,
+   "ticker": "NVDA",
+   "action": "HOLD",
+   "source": "news",
+   "new_fact": "true",
+   "company": [
+    "nvidia"
+   ],
+   "title": "Nvidia will not be the leader # years from now: Tiernan Ray",
+   "fields": {
+    "reasoning": [
+     "Nvidia's strong revenue growth (+#% YoY) and competitive position in AI infrastructure suggest significant upside if it maintains its edge, despite current market skepticism (per FUNDAMENTALS section)."
+    ],
+    "thesis_summary": [
+     "Nvidia is a core holding in the AI infrastructure thesis with strong fundamentals and long-term growth potential."
+    ],
+    "key_risks": [
+     "Potential loss of leadership to competitors",
+     "Economic slowdown impacting AI infrastructure spending"
+    ],
+    "expectation_gap": [
+     "Nvidia continues to lead in AI infrastructure, with strong revenue and margin expansion",
+     "Potential loss of leadership position to competitors like AMD or new entrants",
+     "Nvidia maintains its competitive edge and executes on upcoming product launches and market opportunities",
+     "Market is pricing in significant near-term headwinds and potential leadership challenges"
+    ]
+   },
+   "df": {
+    "leader": 0.735,
+    "years": 0.0021,
+    "tiernan": 0.0,
+    "ray": 0.0
+   },
+   "loose_at_read": true,
+   "strict_at_read": false,
+   "label": "engaged",
+   "label_note": "loss of leadership to competitors in risks and gap"
+  },
+  {
+   "id": 97307,
+   "ticker": "MSFT",
+   "action": "HOLD",
+   "source": "news",
+   "new_fact": "true",
+   "company": [
+    "microsoft"
+   ],
+   "title": "Microsoft CEO Nadella faces uncomfortable reality after outage",
+   "fields": {
+    "reasoning": [
+     "MSFT's current multiple of #x NTM earnings is within the peer range of #x to #x, suggesting fair valuation. The bull case target of $X (per street consensus) represents a #% upside from the current price of $X, while the downside scenario of $X implies a -26.#% downside risk."
+    ],
+    "thesis_summary": [
+     "MSFT is a core holding in the AI infrastructure thesis with strong financials and leadership in cloud services."
+    ],
+    "key_risks": [
+     "Persistent service outages",
+     "Slowing hyperscaler capex"
+    ],
+    "expectation_gap": [
+     "MSFT continues to grow its cloud and AI services, maintaining leadership in the hyperscaler market.",
+     "Persistent issues with service reliability could erode customer trust and impact MSFT's competitive position.",
+     "MSFT can demonstrate that the recent outages are isolated incidents and do not affect long-term growth prospects.",
+     "The current price implies moderate growth in cloud and AI services, with some concerns about recent outages affecting investor sentiment."
+    ]
+   },
+   "df": {
+    "ceo": 0.0,
+    "nadella": 0.0,
+    "faces": 0.0,
+    "uncomfortable": 0.0,
+    "reality": 0.0,
+    "outage": 0.1341
+   },
+   "loose_at_read": true,
+   "strict_at_read": true,
+   "label": "engaged",
+   "label_note": "outages in risks and gap"
+  },
+  {
+   "id": 97329,
+   "ticker": "NVDA",
+   "action": "OPEN",
+   "source": "news",
+   "new_fact": "false",
+   "company": [
+    "nvidia"
+   ],
+   "title": "Why Did Nvidia Stock Fall #%? - Trefis",
+   "fields": {
+    "reasoning": [
+     "NVIDIA's Q3 revenue grew by #% YoY, driven by strong data center demand (per filing). The stock is currently trading at a forward P/E of #x, which is within the peer range of #x to #x NTM earnings (per fundamentals)."
+    ],
+    "thesis_summary": [
+     "NVIDIA is a category leader in AI compute with strong revenue growth and a long-term structural tailwind."
+    ],
+    "key_risks": [
+     "Revenue growth slows more than expected",
+     "CEO transition causes operational disruptions"
+    ],
+    "expectation_gap": [
+     "Revenue growth and strong data center demand continue to drive the stock higher",
+     "Revenue growth slows more than expected, or the CEO transition causes operational disruptions",
+     "NVIDIA maintains its revenue growth trajectory and successfully navigates the CEO transition without disruption",
+     "The market is pricing in a significant slowdown in revenue growth and potential leadership changes impacting investor sentiment"
+    ]
+   },
+   "df": {
+    "did": 0.0,
+    "fall": 0.0064,
+    "trefis": 0.0
+   },
+   "loose_at_read": false,
+   "strict_at_read": false,
+   "label": "no_new_fact",
+   "label_note": "explainer of a past price move; no new fact"
+  },
+  {
+   "id": 98651,
+   "ticker": "NVDA",
+   "action": "HOLD",
+   "source": "news",
+   "new_fact": "true",
+   "company": [
+    "nvidia"
+   ],
+   "title": "Nvidia Stock Plunges #% After Reuters Reports an SEC Probe of Its Accounting. It’s Nvidia’s Worst Day Since DeepSeek and It Has Lost $X Trillion Since October - Yahoo Finance",
+   "fields": {
+    "reasoning": [
+     "Nvidia's strong fundamentals and leadership in AI infrastructure suggest long-term growth potential, despite the current regulatory scrutiny (per Q3 earnings report). The stock is oversold and trades at a discount to its historical multiples (per FUNDAMENTALS section)."
+    ],
+    "thesis_summary": [
+     "Nvidia is a core AI infrastructure play with strong fundamentals but faces regulatory scrutiny."
+    ],
+    "key_risks": [
+     "SEC probe uncovers significant issues",
+     "Hyperscaler capex slowdown"
+    ],
+    "expectation_gap": [
+     "Nvidia's strong fundamentals and leadership in AI infrastructure continue to drive long-term growth despite short-term regulatory scrutiny.",
+     "The SEC probe uncovers significant accounting irregularities that lead to material financial restatements and regulatory penalties.",
+     "Nvidia successfully navigates the SEC probe without major financial or operational impacts, maintaining its leadership in AI infrastructure.",
+     "The market expects significant regulatory risks and potential earnings downgrades due to the SEC probe, pricing Nvidia at a discount to its historical multiples."
+    ]
+   },
+   "df": {
+    "plunges": 0.0,
+    "sec": 0.3226,
+    "probe": 0.0192,
+    "accounting": 0.0064,
+    "worst": 0.0,
+    "day": 0.0064,
+    "since": 0.0,
+    "deepseek": 0.0,
+    "lost": 0.0,
+    "trillion": 0.0021,
+    "october": 0.0
+   },
+   "loose_at_read": true,
+   "strict_at_read": true,
+   "label": "engaged",
+   "label_note": "SEC probe in all fields"
+  },
+  {
+   "id": 99310,
+   "ticker": "NVDA",
+   "action": "HOLD",
+   "source": "news",
+   "new_fact": "true",
+   "company": [
+    "nvidia"
+   ],
+   "title": "Nvidia (NVDA) Stock Looks Below Fair Value After Recent Turmoil - Yahoo Finance",
+   "fields": {
+    "reasoning": [
+     "NVIDIA's strong fundamentals and leadership in AI infrastructure are underappreciated at the current price of $X (per Q2 fundamentals). The stock is oversold with a forward P/E of #x, below peer averages (per FUNDAMENTALS section)."
+    ],
+    "thesis_summary": [
+     "NVIDIA is a core AI infrastructure play with strong fundamentals and leadership in GPU technology."
+    ],
+    "key_risks": [
+     "Regulatory scrutiny in China",
+     "Potential slowdown in AI infrastructure spending by hyperscalers"
+    ],
+    "expectation_gap": [
+     "NVIDIA's strong fundamentals and leadership in AI infrastructure continue to drive growth, with potential for further upside as the market recognizes its value.",
+     "Regulatory scrutiny in China could impact NVIDIA's business, particularly if it leads to significant restrictions or penalties.",
+     "NVIDIA continues to execute on its AI infrastructure strategy, with strong revenue growth and margin expansion, leading to multiple expansion as the market reassesses its valuation.",
+     "The current price of $X implies a forward P/E of #x, which is below historical multiples and peer averages, suggesting the market may be overly pessimistic about NVIDIA's future growth."
+    ]
+   },
+   "df": {
+    "looks": 0.0,
+    "below": 0.2756,
+    "fair": 0.0192,
+    "value": 0.0705,
+    "recent": 0.3226,
+    "turmoil": 0.0192
+   },
+   "loose_at_read": true,
+   "strict_at_read": true,
+   "label": "no_new_fact",
+   "label_note": "valuation opinion; no new fact"
+  },
+  {
+   "id": 99730,
+   "ticker": "TSLA",
+   "action": "WATCH",
+   "source": "news",
+   "new_fact": "true",
+   "company": [
+    "tesla"
+   ],
+   "title": "Tesla’s Big Self-Driving Upgrade Arrives Right on Time for the Stock",
+   "fields": {
+    "reasoning": [
+     "Tesla's FSD software upgrade could drive significant demand and improve margins, but the market is not fully pricing in a major inflection point (per news). The current multiple of #x NTM revenue is above peer range, suggesting limited upside unless the thesis accelerates (per fundamentals_data)."
+    ],
+    "thesis_summary": [
+     "Tesla's FSD software upgrade could drive significant demand and improve margins."
+    ],
+    "key_risks": [
+     "FSD upgrade underwhelms or faces regulatory delays",
+     "Competition from other automotive tech companies"
+    ],
+    "expectation_gap": [
+     "Tesla's Full Self-Driving (FSD) software upgrade could drive significant demand and improve margins.",
+     "The FSD upgrade may underwhelm or face regulatory delays.",
+     "The FSD upgrade significantly boosts customer adoption and revenue growth.",
+     "The market is pricing in moderate growth from the FSD upgrade, but not a major inflection point."
+    ]
+   },
+   "df": {
+    "big": 0.0,
+    "self-driving": 0.0541,
+    "upgrade": 0.0541,
+    "arrives": 0.0,
+    "right": 0.0,
+    "time": 0.2027
+   },
+   "loose_at_read": true,
+   "strict_at_read": true,
+   "label": "engaged",
+   "label_note": "FSD upgrade is the thesis"
+  },
+  {
+   "id": 100209,
+   "ticker": "NVDA",
+   "action": "HOLD",
+   "source": "news",
+   "new_fact": "false",
+   "company": [
+    "nvidia"
+   ],
+   "title": "Nvidia stock: How to trade Jensen Huang's return as CEO",
+   "fields": {
+    "reasoning": [
+     "Nvidia's stock is currently trading at a forward P/E of #x, which is below its historical multiples and peer range, suggesting potential undervaluation per Q2 fundamentals. The return of Jensen Huang as CEO could reinvigorate investor confidence and lead to a re-rating of the stock, with a bull case target of $X (# months) based on historical multiples."
+    ],
+    "thesis_summary": [
+     "Nvidia is a core AI infrastructure play with strong fundamentals but faces regulatory scrutiny in China; Jensen Huang's return as CEO could reinvigorate investor confidence and drive positive sentiment."
+    ],
+    "key_risks": [
+     "Regulatory scrutiny in China",
+     "Continued macroeconomic uncertainty (Risk-Off regime)"
+    ],
+    "expectation_gap": [
+     "Jensen Huang's return as CEO could reinvigorate investor confidence and drive positive sentiment, leading to a re-rating of the stock.",
+     "Regulatory scrutiny in China continues or worsens, impacting Nvidia's business operations and revenue growth.",
+     "Jensen Huang's return as CEO is positively received by investors, leading to improved sentiment and potential re-rating of the stock.",
+     "The market is currently pricing in continued regulatory scrutiny and uncertainty around leadership changes, with the stock trading at a forward P/E of #x and an RSI(#) indicating oversold conditions."
+    ]
+   },
+   "df": {
+    "trade": 0.109,
+    "jensen": 0.3846,
+    "huang": 0.4103,
+    "return": 0.3397,
+    "ceo": 0.4573
+   },
+   "loose_at_read": true,
+   "strict_at_read": false,
+   "label": "engaged",
+   "label_note": "Huang's return as CEO in all fields"
+  },
+  {
+   "id": 100296,
+   "ticker": "CRWV",
+   "action": "WATCH",
+   "source": "news",
+   "new_fact": "true",
+   "company": [
+    "coreweave"
+   ],
+   "title": "Jensen Huang back as Nvidia CEO after # days: Shares surge #%",
+   "fields": {
+    "reasoning": [
+     "CRWV trades at a #x NTM revenue multiple, below the peer range of #x to #x (per FUNDAMENTALS). The reinstatement of Jensen Huang as CEO is a positive catalyst that could boost investor confidence and drive growth (per NEWS)."
+    ],
+    "thesis_summary": [
+     "CRWV is positioned to benefit from the AI infrastructure boom, with a strong catalyst in the form of Jensen Huang's return as Nvidia CEO."
+    ],
+    "key_risks": [
+     "CEO reinstatement may not translate to sustained performance",
+     "Intense competition in the AI compute market"
+    ],
+    "expectation_gap": [
+     "CRWV continues to benefit from the AI infrastructure boom and Jensen Huang's return boosts investor confidence.",
+     "The market overreacts to Jensen Huang's return, leading to a short-term rally that does not sustain long-term growth.",
+     "Jensen Huang successfully executes on his vision for Nvidia and CRWV continues to gain traction as an AI compute provider.",
+     "The market is pricing in a recovery following the CEO reinstatement, but may not fully appreciate the long-term growth potential of CRWV in the AI compute space."
+    ]
+   },
+   "df": {
+    "jensen": 0.2,
+    "huang": 0.2,
+    "back": 0.0,
+    "ceo": 0.2,
+    "days": 0.0,
+    "surge": 0.0
+   },
+   "loose_at_read": true,
+   "strict_at_read": true,
+   "label": "engaged",
+   "label_note": "Huang's reinstatement as the named catalyst"
+  },
+  {
+   "id": 100433,
+   "ticker": "TSLA",
+   "action": "WATCH",
+   "source": "news",
+   "new_fact": "true",
+   "company": [
+    "tesla"
+   ],
+   "title": "Tesla’s FSD v15 An ‘Illustration’ Of Head Start In Consumer Autonomy, Says JPMorgan – TSLA Stock Eyes Best Day In Over # Months",
+   "fields": {
+    "reasoning": [
+     "Tesla's FSD v15 rollout is a significant catalyst that could drive user adoption and revenue growth, despite current high valuation multiples (P/S: #x) per FUNDAMENTALS section."
+    ],
+    "thesis_summary": [
+     "Tesla is a key player in the robotics/physical AI sector with potential for significant growth through FSD v15 adoption."
+    ],
+    "key_risks": [
+     "Regulatory delays in FSD v15 rollout",
+     "Technical issues with the new software version"
+    ],
+    "expectation_gap": [
+     "FSD v15 rollout leads to increased adoption and revenue growth",
+     "Regulatory delays or technical issues could slow down the rollout of FSD v15",
+     "FSD v15 proves highly effective and gains rapid user adoption",
+     "Market is cautious due to recent negative news and high valuation multiples, expecting modest progress with FSD"
+    ]
+   },
+   "df": {
+    "fsd": 0.1486,
+    "v15": 0.0541,
+    "illustration": 0.0,
+    "head": 0.027,
+    "start": 0.0541,
+    "consumer": 0.0,
+    "autonomy": 0.027,
+    "jpmorgan": 0.027,
+    "eyes": 0.0,
+    "best": 0.0,
+    "day": 0.0,
+    "months": 0.0541
+   },
+   "loose_at_read": true,
+   "strict_at_read": true,
+   "label": "engaged",
+   "label_note": "FSD v15 is the thesis"
+  },
+  {
+   "id": 100784,
+   "ticker": "NVDA",
+   "action": "HOLD",
+   "source": "news",
+   "new_fact": "true",
+   "company": [
+    "nvidia"
+   ],
+   "title": "US lawmakers criticize Nvidia decision to reinstate Huang as CEO",
+   "fields": {
+    "reasoning": [
+     "Nvidia's strong fundamentals and leadership in AI infrastructure (revenue growth +#%, gross margin +#%) support a bull case, but the current price reflects significant regulatory risk (per news). The stock is oversold (RSI #) and could rebound if regulatory concerns ease."
+    ],
+    "thesis_summary": [
+     "Nvidia is a core AI infrastructure play with strong fundamentals but faces regulatory scrutiny in China."
+    ],
+    "key_risks": [
+     "Increased regulatory scrutiny",
+     "Leadership instability"
+    ],
+    "expectation_gap": [
+     "Nvidia's strong fundamentals and leadership in AI infrastructure continue to drive growth despite regulatory scrutiny.",
+     "Increased regulatory scrutiny or leadership instability could negatively impact investor sentiment and business operations.",
+     "Regulatory concerns ease, and Nvidia maintains its competitive position in AI infrastructure.",
+     "The market is pricing in significant regulatory risk and near-term headwinds due to the CEO controversy."
+    ]
+   },
+   "df": {
+    "lawmakers": 0.0021,
+    "criticize": 0.0,
+    "decision": 0.0064,
+    "reinstate": 0.0919,
+    "huang": 0.4103,
+    "ceo": 0.4573
+   },
+   "loose_at_read": true,
+   "strict_at_read": false,
+   "label": "engaged",
+   "label_note": "lawmakers' criticism as regulatory risk and the CEO controversy (paraphrase)"
+  },
+  {
+   "id": 100867,
+   "ticker": "CRWD",
+   "action": "WATCH",
+   "source": "news",
+   "new_fact": "true",
+   "company": [
+    "crowdstrike"
+   ],
+   "title": "Can CrowdStrike Holdings (CRWD) Justify Its Valuation As It Raises Full Year Outlook?",
+   "fields": {
+    "reasoning": [
+     "CRWD's strong revenue growth and raised guidance suggest continued outperformance, but the high valuation multiple (#x NTM revenue) relative to peers (#x to #x) limits upside potential. The upcoming earnings report on #-12-01 is a key catalyst that could confirm or break the thesis."
+    ],
+    "thesis_summary": [
+     "CRWD is a leader in AI-driven cybersecurity with strong revenue growth and high margins, positioned to benefit from increasing enterprise adoption of advanced security solutions."
+    ],
+    "key_risks": [
+     "Slower enterprise adoption of AI-driven cybersecurity solutions",
+     "High valuation multiples could compress if growth expectations are not met"
+    ],
+    "expectation_gap": [
+     "CRWD continues to outperform with strong revenue growth and expanding margins, driven by AI-driven cybersecurity solutions.",
+     "Slower-than-expected enterprise adoption of AI-driven cybersecurity solutions could lead to revenue growth disappointment.",
+     "CRWD meets or exceeds its raised guidance and demonstrates further AI integration into its products.",
+     "The market is pricing in continued strong performance but may be skeptical of the high valuation multiples."
+    ]
+   },
+   "df": {
+    "crowdstrike": 0.0,
+    "holdings": 0.0,
+    "justify": 0.0,
+    "valuation": 0.5,
+    "raises": 0.0,
+    "full": 0.5,
+    "outlook": 0.0
+   },
+   "loose_at_read": true,
+   "strict_at_read": false,
+   "label": "engaged",
+   "label_note": "raised guidance in reasoning and gap"
+  },
+  {
+   "id": 101555,
+   "ticker": "NVDA",
+   "action": "HOLD",
+   "source": "news",
+   "new_fact": "true",
+   "company": [
+    "nvidia"
+   ],
+   "title": "Nvidia surge: What investors should do with the stock and the AI trade now - CNBC",
+   "fields": {
+    "reasoning": [
+     "NVIDIA's reinstatement of Jensen Huang as CEO is a positive catalyst that could boost investor confidence and drive the stock higher, despite regulatory risks in China (per news and filing). The current valuation at #x NTM earnings is within peer range but offers potential upside if revenue growth continues (per FUNDAMENTALS section)."
+    ],
+    "thesis_summary": [
+     "NVIDIA is a core AI infrastructure play with strong fundamentals, now bolstered by the return of Jensen Huang as CEO."
+    ],
+    "key_risks": [
+     "Regulatory scrutiny in China",
+     "Continued market volatility"
+    ],
+    "expectation_gap": [
+     "NVIDIA's strong revenue growth and gross margin continue, driven by AI infrastructure demand and the reinstatement of Jensen Huang as CEO.",
+     "Regulatory scrutiny in China could continue to impact NVIDIA's business and stock performance.",
+     "Jensen Huang's return boosts investor confidence, leading to improved sentiment and higher revenue growth.",
+     "The market is pricing in a continued downtrend due to regulatory scrutiny in China and recent price action."
+    ]
+   },
+   "df": {
+    "surge": 0.0085,
+    "investors": 0.047,
+    "trade": 0.109
+   },
+   "loose_at_read": true,
+   "strict_at_read": false,
+   "label": "no_new_fact",
+   "label_note": "how-to-trade piece; no new fact"
+  },
+  {
+   "id": 102149,
+   "ticker": "APLD",
+   "action": "WATCH",
+   "source": "options",
+   "new_fact": null,
+   "company": [
+    "applied",
+    "digital"
+   ],
+   "title": "Unusual options activity: APLD",
+   "fields": {
+    "reasoning": [
+     "APLD has shown strong revenue growth (+#% YoY per FUNDAMENTALS section) but trades at a discount to peers (P/S at the #% percentile). The upcoming earnings report on #-01-06 could provide clarity on future growth and margin improvement."
+    ],
+    "thesis_summary": [
+     "APLD is a speculative AI infrastructure play with strong revenue growth but currently trading below peer multiples, offering potential upside if margins improve."
+    ],
+    "key_risks": [
+     "Revenue growth may not be sustainable",
+     "Negative FCF and gross margins could persist"
+    ],
+    "expectation_gap": [
+     "APLD could see continued revenue growth driven by AI infrastructure demand, potentially leading to improved margins and cash flow.",
+     "APLD may not be able to sustain its revenue growth or improve its margins, leading to further downward pressure on the stock price.",
+     "Revenue growth continues at a high rate, and the company begins to show signs of improving gross and FCF margins.",
+     "The market expects APLD to continue its downtrend, with current price reflecting pessimism about future growth and profitability."
+    ]
+   },
+   "df": {
+    "unusual": 0.0,
+    "options": 0.0,
+    "activity": 0.0
+   },
+   "loose_at_read": false,
+   "strict_at_read": false,
+   "label": "not_engaged",
+   "label_note": "the options activity is not mentioned"
+  },
+  {
+   "id": 102170,
+   "ticker": "RKLB",
+   "action": "WATCH",
+   "source": "options",
+   "new_fact": null,
+   "company": [
+    "lab",
+    "rocket"
+   ],
+   "title": "Unusual options activity: RKLB",
+   "fields": {
+    "reasoning": [
+     "Rocket Lab's revenue growth of +#% (per FUNDAMENTALS) and its position in the space industry support a speculative thesis, but the current multiple is high relative to peers (#th percentile P/S). The upcoming earnings report could provide clarity on contract wins and progress."
+    ],
+    "thesis_summary": [
+     "RKLB has near-term revenue drivers and long-term optionality in space data centers."
+    ],
+    "key_risks": [
+     "Launch costs remain high",
+     "Failure to secure significant contracts"
+    ],
+    "expectation_gap": [
+     "Rocket Lab continues to grow its launch services and spacecraft business, benefiting from the broader space industry's expansion.",
+     "Launch costs remain high, and the company fails to secure significant commercial or government contracts.",
+     "Rocket Lab demonstrates progress in orbital infrastructure or secures contracts that validate its long-term thesis.",
+     "The market expects moderate growth in Rocket Lab’s core businesses but is skeptical of long-term space data center potential."
+    ]
+   },
+   "df": {
+    "unusual": 0.0,
+    "options": 0.0,
+    "activity": 0.0
+   },
+   "loose_at_read": true,
+   "strict_at_read": false,
+   "label": "not_engaged",
+   "label_note": "the options activity is not mentioned"
+  },
+  {
+   "id": 102201,
+   "ticker": "NVDA",
+   "action": "ADD",
+   "source": "news",
+   "new_fact": "false",
+   "company": [
+    "nvidia"
+   ],
+   "title": "Nvidia's stunning comeback delivers new shock to Fed rate-hike bets",
+   "fields": {
+    "reasoning": [
+     "NVDA's reinstatement of Jensen Huang as CEO and positive regulatory changes provide a strong catalyst for recovery, with fundamentals showing robust growth (#% YoY revenue) and margins (#% gross margin). The current price implies cautious optimism, but the bull case target of $X (per Q3 FY27 earnings release) offers a #% upside potential."
+    ],
+    "thesis_summary": [
+     "NVDA is a core AI infrastructure play with strong fundamentals and a significant catalyst from Jensen Huang's return as CEO."
+    ],
+    "key_risks": [
+     "Regulatory scrutiny in China",
+     "Negative macroeconomic conditions"
+    ],
+    "expectation_gap": [
+     "Continued strong revenue growth and expansion in AI infrastructure, driven by Jensen Huang's leadership and positive regulatory changes.",
+     "Regulatory scrutiny or negative macroeconomic conditions could undermine NVDA's recovery.",
+     "Jensen Huang's return leads to accelerated growth and improved investor sentiment, particularly if regulatory hurdles are further resolved.",
+     "Market is pricing in a recovery from the recent downturn but remains cautious due to macroeconomic headwinds and regulatory uncertainty."
+    ]
+   },
+   "df": {
+    "stunning": 0.0,
+    "comeback": 0.0021,
+    "delivers": 0.0021,
+    "shock": 0.0,
+    "fed": 0.0,
+    "rate-hike": 0.0,
+    "bets": 0.0
+   },
+   "loose_at_read": false,
+   "strict_at_read": false,
+   "label": "not_engaged",
+   "label_note": "the comeback is discussed, but not the headline's claim (Fed rate-hike bets)"
+  },
+  {
+   "id": 102251,
+   "ticker": "NVDA",
+   "action": "ADD",
+   "source": "news",
+   "new_fact": "false",
+   "company": [
+    "nvidia"
+   ],
+   "title": "Live Updates: Huang’s Return to Nvidia Sparks Stock Rally and Lawmaker Skepticism - The New York Times",
+   "fields": {
+    "reasoning": [
+     "NVDA trades at a forward P/E of #x, below the peer range of #x to #x (per FUNDAMENTALS section). The reinstatement of Huang as CEO could reinvigorate investor confidence and drive further innovation in AI infrastructure, leading to potential upside."
+    ],
+    "thesis_summary": [
+     "NVDA is a core AI infrastructure play with strong fundamentals but faces regulatory scrutiny in China."
+    ],
+    "key_risks": [
+     "Regulatory scrutiny and potential legal challenges",
+     "Economic downturn affecting AI infrastructure spending"
+    ],
+    "expectation_gap": [
+     "Huang's return could reinvigorate investor confidence and drive further innovation in AI infrastructure.",
+     "Regulatory scrutiny and potential legal challenges could undermine the positive impact of Huang's return.",
+     "If Huang can navigate regulatory scrutiny and continue driving strong revenue and earnings growth.",
+     "The market is pricing in some recovery due to Huang's return, but not a full return to previous highs or continued strong growth."
+    ]
+   },
+   "df": {
+    "huang": 0.4103,
+    "return": 0.3397,
+    "sparks": 0.0,
+    "rally": 0.0085,
+    "lawmaker": 0.0021,
+    "skepticism": 0.0321,
+    "york": 0.0043,
+    "times": 0.0021
+   },
+   "loose_at_read": true,
+   "strict_at_read": false,
+   "label": "engaged",
+   "label_note": "Huang's return and legal/lawmaker scrutiny in risks and gap"
+  },
+  {
+   "id": 102883,
+   "ticker": "NVDA",
+   "action": "HOLD",
+   "source": "news",
+   "new_fact": "true",
+   "company": [
+    "nvidia"
+   ],
+   "title": "Nvidia board joins Jensen Huang under scrutiny after reinstating embattled CEO",
+   "fields": {
+    "reasoning": [
+     "NVDA is trading at a forward P/E of #x, below the peer range of #x to #x (per FUNDAMENTALS section). The reinstatement of Jensen Huang as CEO could stabilize the company and reinvigorate investor confidence, leading to a potential recovery in share price. However, regulatory scrutiny remains a significant risk."
+    ],
+    "thesis_summary": [
+     "NVDA is a core AI infrastructure play with strong fundamentals but faces regulatory scrutiny and management stability concerns."
+    ],
+    "key_risks": [
+     "Regulatory scrutiny and potential sanctions",
+     "Further management instability"
+    ],
+    "expectation_gap": [
+     "Jensen Huang's return could stabilize the company and reinvigorate investor confidence, leading to a recovery in share price.",
+     "Regulatory scrutiny or further management instability could continue to weigh on the stock.",
+     "Huang's leadership stabilizes the company, and positive earnings or guidance confirm the thesis.",
+     "The market is pricing in continued uncertainty and potential regulatory scrutiny, as well as concerns about management stability."
+    ]
+   },
+   "df": {
+    "board": 0.015,
+    "joins": 0.0,
+    "jensen": 0.3846,
+    "huang": 0.4103,
+    "under": 0.2009,
+    "scrutiny": 0.406,
+    "reinstating": 0.0021,
+    "embattled": 0.0,
+    "ceo": 0.4573
+   },
+   "loose_at_read": true,
+   "strict_at_read": false,
+   "label": "engaged",
+   "label_note": "scrutiny and management stability after the reinstatement"
+  },
+  {
+   "id": 103593,
+   "ticker": "NVDA",
+   "action": "HOLD",
+   "source": "news",
+   "new_fact": "true",
+   "company": [
+    "nvidia"
+   ],
+   "title": "Michael Burry Sells Remaining Nasdaq-100 Puts, Eyes Fresh Nvidia Short Near $X: ‘I Am Long Undervalued Common Stocks’",
+   "fields": {
+    "reasoning": [
+     "NVIDIA's strong fundamentals and positive catalyst (earnings report) suggest potential upside, despite the current bearish technical indicators and market sentiment. The stock trades at a forward P/E of #x, below its peer range, indicating possible undervaluation."
+    ],
+    "thesis_summary": [
+     "NVIDIA is a core AI infrastructure play with strong fundamentals and potential for long-term growth."
+    ],
+    "key_risks": [
+     "Hyperscaler capex slowdown",
+     "Regulatory scrutiny in China"
+    ],
+    "expectation_gap": [
+     "NVIDIA continues to benefit from AI infrastructure demand and maintains strong revenue growth.",
+     "Hyperscaler capex slowdown could reduce demand for NVIDIA's products.",
+     "NVIDIA reports strong earnings, or there is positive news regarding AI infrastructure demand or regulatory developments.",
+     "The market is pricing in a significant slowdown in NVIDIA's growth due to the current downtrend and bearish technical indicators."
+    ]
+   },
+   "df": {
+    "michael": 0.0064,
+    "burry": 0.0064,
+    "sells": 0.0,
+    "remaining": 0.0064,
+    "nasdaq-100": 0.0,
+    "puts": 0.0,
+    "eyes": 0.0,
+    "fresh": 0.0,
+    "short": 0.0363,
+    "near": 0.141,
+    "long": 0.594,
+    "undervalued": 0.0107,
+    "common": 0.0
+   },
+   "loose_at_read": true,
+   "strict_at_read": false,
+   "label": "not_engaged",
+   "label_note": "the investor's short is not mentioned"
+  },
+  {
+   "id": 104531,
+   "ticker": "NVDA",
+   "action": "HOLD",
+   "source": "news",
+   "new_fact": "true",
+   "company": [
+    "nvidia"
+   ],
+   "title": "Nvidia’s Top Lawyer Sold $X Million of Nvidia Stock the Day Before Its #% Plunge - #/# Wall St.",
+   "fields": {
+    "reasoning": [
+     "Nvidia's strong fundamentals and Jensen Huang's return as CEO provide a positive catalyst, with the stock trading at a discount to peers (#x NTM earnings vs #x to #x). The Q4 FY27 earnings report on #-11-30 could confirm or break the thesis."
+    ],
+    "thesis_summary": [
+     "Nvidia is a core AI infrastructure play with strong fundamentals and positive leadership changes."
+    ],
+    "key_risks": [
+     "Regulatory scrutiny in China",
+     "Hyperscaler capex slowdown"
+    ],
+    "expectation_gap": [
+     "Jensen Huang's return as CEO and strong fundamentals in AI infrastructure could drive significant upside.",
+     "Regulatory scrutiny in China or a slowdown in hyperscaler capex could undermine the thesis.",
+     "Jensen Huang's leadership and positive earnings reports confirm the thesis of Nvidia being a core AI infrastructure play.",
+     "The market is pricing in continued uncertainty and regulatory risks, with the stock down significantly from its entry price."
+    ]
+   },
+   "df": {
+    "lawyer": 0.0,
+    "sold": 0.2671,
+    "million": 0.0,
+    "day": 0.0064,
+    "plunge": 0.0021,
+    "wall": 0.0043
+   },
+   "loose_at_read": false,
+   "strict_at_read": false,
+   "label": "not_engaged",
+   "label_note": "the insider sale is not mentioned"
+  },
+  {
+   "id": 105498,
+   "ticker": "NVDA",
+   "action": "HOLD",
+   "source": "news",
+   "new_fact": "true",
+   "company": [
+    "nvidia"
+   ],
+   "title": "Nvidia Makes A Record $X Billion In Revenue. Now S&P Warns Its Credit Rating Could Be Cut In # Days.",
+   "fields": {
+    "reasoning": [
+     "Nvidia's strong fundamentals and revenue growth (+#% YoY per Q3 earnings) support a higher valuation, but the market is pricing in regulatory risks (S&P credit watch). The upcoming S&P decision within # days could be a key catalyst to either confirm or break the thesis."
+    ],
+    "thesis_summary": [
+     "Nvidia is a core AI infrastructure play with strong fundamentals and potential for long-term growth, despite near-term regulatory concerns."
+    ],
+    "key_risks": [
+     "Credit rating downgrade",
+     "Regulatory scrutiny",
+     "Slowing AI demand"
+    ],
+    "expectation_gap": [
+     "Nvidia continues to benefit from strong AI demand, potentially reversing the current downtrend and reaching a higher valuation multiple as governance concerns are addressed.",
+     "Credit rating downgrade or further regulatory scrutiny could lead to continued pressure on the stock price.",
+     "Nvidia successfully addresses governance concerns, maintains strong AI demand, and sees an improvement in its credit rating outlook.",
+     "The market is pricing in continued regulatory scrutiny and potential credit rating downgrade, along with a slowdown in revenue growth and margin compression."
+    ]
+   },
+   "df": {
+    "makes": 0.0,
+    "record": 0.0021,
+    "billion": 0.0128,
+    "revenue": 0.8162,
+    "s&p": 0.0021,
+    "warns": 0.0,
+    "credit": 0.0085,
+    "rating": 0.0769,
+    "cut": 0.1026,
+    "days": 0.0021
+   },
+   "loose_at_read": true,
+   "strict_at_read": true,
+   "label": "engaged",
+   "label_note": "S&P credit watch in all fields"
+  },
+  {
+   "id": 105786,
+   "ticker": "NVDA",
+   "action": "HOLD",
+   "source": "news",
+   "new_fact": "false",
+   "company": [
+    "nvidia"
+   ],
+   "title": "Worried About a Market Crash? # Gold Mining Stocks to Buy Before # Ends.",
+   "fields": {
+    "reasoning": [
+     "NVIDIA's strong revenue growth (+#% YoY) and competitive position in AI infrastructure support the bull case, but the stock is trading in a downtrend with lower highs and lows per PRICE STRUCTURE section."
+    ],
+    "thesis_summary": [
+     "NVIDIA is a core AI infrastructure play with strong fundamentals and a positive catalyst in Jensen Huang's return as CEO."
+    ],
+    "key_risks": [
+     "Hyperscaler capex slowdown",
+     "Regulatory issues in China"
+    ],
+    "expectation_gap": [
+     "NVIDIA continues to benefit from AI infrastructure demand, leading to strong revenue growth and margin expansion.",
+     "Hyperscaler capex slowdown or regulatory issues in China could negatively impact revenue growth.",
+     "AI infrastructure demand remains robust, and NVIDIA maintains its competitive position in GPU and AI compute solutions.",
+     "The market expects NVIDIA to face continued headwinds, with the stock trading in a downtrend and below key moving averages."
+    ]
+   },
+   "df": {
+    "worried": 0.0,
+    "crash": 0.0,
+    "gold": 0.0,
+    "mining": 0.0,
+    "ends": 0.0021
+   },
+   "loose_at_read": false,
+   "strict_at_read": false,
+   "label": "no_new_fact",
+   "label_note": "gold-miner listicle; nothing about the ticker"
+  }
+ ]
+}

@@ -59,7 +59,8 @@ def test_fill_write_without_the_source_column_keeps_every_other_field(caplog):
         assert db.mark_submitted_order_fill(44, 171.5, 50.0, "filled", filled_at="T",
                                             filled_at_source="receipt") == 1
     conn.rollback.assert_called()
-    retried = [c for c in calls if c[0].startswith("UPDATE") and "filled_at_source" not in c[0]]
+    retried = [c for c in calls if c[0].startswith("UPDATE") and "filled_at_source" not in c[0]
+               and "fill_time_complete" not in c[0]]   # the stamp runs after the fill
     assert len(retried) == 2
     sql, params = retried[0]
     assert "filled_at=COALESCE(%s, filled_at)" in sql and "reconcile_note" in sql

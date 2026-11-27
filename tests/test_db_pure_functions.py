@@ -114,6 +114,12 @@ class TestRecordedSellOrderIds:
         assert self._run(RuntimeError("down")) is None
 
 
+def _fill_statement(cur):
+    """The last fill UPDATE; the fill_time_complete stamp runs after it."""
+    return [c[0] for c in cur.execute.call_args_list
+            if c[0][0].startswith("UPDATE orders SET fill_price")][-1]
+
+
 def test_update_order_fill_keeps_an_earlier_fill_time_when_none_is_given():
     """Professor M110: filled_at=COALESCE(new, old)."""
     from unittest.mock import MagicMock, patch
@@ -123,7 +129,7 @@ def test_update_order_fill_keeps_an_earlier_fill_time_when_none_is_given():
     conn.cursor.return_value.__enter__.return_value = cur
     with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
         db.update_order_fill(44, 171.5, 50.0, "filled", filled_at="T")
-    sql, params = cur.execute.call_args_list[-1][0]
+    sql, params = _fill_statement(cur)
     assert "filled_at=COALESCE(%s, filled_at)" in sql and params[4] == "T" and params[-1] == 44
 
 
@@ -137,13 +143,13 @@ def test_update_order_fill_writes_the_fill_time_source_only_with_a_fill_time():
     conn.cursor.return_value.__enter__.return_value = cur
     with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
         db.update_order_fill(44, 171.5, 50.0, "filled", filled_at="T", filled_at_source="receipt")
-    sql, params = cur.execute.call_args_list[-1][0]
+    sql, params = _fill_statement(cur)
     assert "filled_at_source=CASE WHEN %s IS NULL THEN filled_at_source ELSE %s END" in sql
     assert params[4:7] == ["T", "T", "receipt"] and params[-1] == 44
     with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
         db.mark_submitted_order_fill(44, 171.5, 50.0, "filled", filled_at="T",
                                      filled_at_source="execution")
-    sql, params = cur.execute.call_args_list[-1][0]
+    sql, params = _fill_statement(cur)
     assert params[4:7] == ["T", "T", "execution"] and sql.endswith("AND status='submitted'")
     assert (80, "ALTER TABLE orders ADD COLUMN IF NOT EXISTS filled_at_source VARCHAR(20);") \
         in db._MIGRATIONS

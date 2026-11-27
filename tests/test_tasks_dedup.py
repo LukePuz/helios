@@ -623,6 +623,20 @@ class TestReconcileUnconfirmedOrders:
         mock_update_approval.assert_not_called()
         mock_alert.assert_not_called()
 
+    def test_the_fill_lookup_is_given_the_orders_perm_id(self):
+        """An id alone can match another client's execution; the row's permId
+        is passed so the lookup matches on it when known."""
+        for perm, want in ((9001, 9001), (None, None)):
+            order = {**self._order(), "perm_id": perm}
+            with patch("db.get_unconfirmed_orders", return_value=[order]), \
+                 patch("tasks._backfill_perm_ids"), \
+                 patch("ibkr.get_fill_for_order", return_value=None) as lookup, \
+                 patch("db.log_trade"), patch("db.update_approval_status"), \
+                 patch("tasks._retry_pending_reprotects"), patch("alerts._send"):
+                tasks.reconcile_unconfirmed_orders.run()
+            assert lookup.call_args.kwargs["perm_id"] == want
+            assert lookup.call_args.args[0] == 764 and lookup.call_args.kwargs["ticker"] == "CRWD"
+
     def test_no_pending_orders_is_a_noop(self):
         with patch("db.get_unconfirmed_orders", return_value=[]), \
              patch("ibkr.get_fill_for_order") as mock_lookup:
@@ -726,7 +740,7 @@ class TestReconcileUnconfirmedOrders:
              patch("ibkr.get_fill_for_order", return_value=None) as lookup:
             tasks.reconcile_unconfirmed_orders.run()
         lookup.assert_called_once_with(764, ticker="CRWD", side="BUY",
-                                       placed_at=created - timedelta(minutes=5))
+                                       placed_at=created - timedelta(minutes=5), perm_id=None)
 
     def test_partial_late_fill_is_marked_partial(self):
         """Professor M-4: a fill short of the order used to be marked filled."""

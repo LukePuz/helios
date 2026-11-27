@@ -563,19 +563,26 @@ def _refuse_sell_on_short(ib, ticker: str, qty: float | None = None) -> None:
     size from abs(qty) in many places, so the check sits where all of them
     meet (professor M63 residual, run 11 follow-up). The position cache can
     lag right after a fill, so a shortfall is confirmed with a fresh
-    reqPositions() before refusing."""
+    reqPositions() before refusing. When that confirm read fails, the SELL is
+    still refused on the cached read (the safe side), but the message says the
+    read failed and the count is the cache's, not the broker's (m120). Same
+    type either way: callers match the type by name across the worker."""
     def short_of(positions):
         held = _long_qty(positions, ticker)
         return held < 0 or (qty is not None and float(qty) > held + 1e-6), held
     bad, held = short_of(ib.positions())
+    confirmed = True
     if bad:
         try:
             bad, held = short_of(_latest_positions(_bounded_req(ib, "reqPositions", ib.reqPositions)))
-        except Exception:
-            pass
+        except Exception as e:
+            confirmed = False
+            log.warning(f"[{ticker}] SELL check: positions read failed ({e}); "
+                        f"refusing on the cached read ({held:g} shares)")
     if bad:
-        raise SellExceedsPosition(f"{ticker}: SELL {qty if qty is not None else ''} refused; "
-                                  f"broker shows {held:g} shares")
+        seen = f"broker shows {held:g} shares" if confirmed else \
+            f"positions read failed; cached read shows {held:g} shares"
+        raise SellExceedsPosition(f"{ticker}: SELL {qty if qty is not None else ''} refused; {seen}")
 
 
 def get_broker_stock_qty(symbol: str, settle: bool = False) -> float:
@@ -914,6 +921,19 @@ def place_market_order(ticker: str, side: str, qty: float, fill_timeout: float =
                 log.error(f"Failed to cancel stale {side.upper()} {ticker} order "
                           f"(orderId={trade.order.orderId}) after market-closed check: {e}")
 
+    # Price, quantity and status are final above; this only waits (up to
+    # config.FILL_TIME_WAIT_S) for execDetails still due after Filled, so the
+    # fill time below is the last execution's (m141). Only for an order that
+    # is done: a working one (part filled at the timeout, a rejected cancel)
+    # can fill more during the wait, past the filled_qty read above.
+    fill_time_complete = None
+    try:
+        order_done = bool(trade.isDone())
+    except Exception:
+        order_done = False
+    if order_done:
+        fill_time_complete = _wait_for_fill_records(ib, trade, filled_qty)
+
     # fill_time from the executions, so an immediate close records when it
     # filled, not only problem orders that reconcile later (professor m128).
     result = _with_fill_time({
@@ -930,9 +950,65 @@ def place_market_order(ticker: str, side: str, qty: float, fill_timeout: float =
         "fill_price": fill_price,
         "status":     status,
         "quote":      quote,
+        # orders.fill_time_complete / trade_outcomes.exit_fill_complete
+        "fill_time_complete": fill_time_complete,
     }, getattr(trade, "fills", None) or [])
+    if result.get("fill_time") is None and fill_time_complete is True:
+        result["fill_time_complete"] = None   # every record's time was unreadable
     _record_order_quote(ticker, side.upper(), result)
     return result
+
+
+_FILL_RECORDS_POLL_S = 0.1
+
+
+def _fill_records_shares(trade) -> float:
+    """Shares across trade.fills, one count per execution: a corrected
+    execution (execId ending .02 for .01) replaces its original rather than
+    adding to it."""
+    by_exec: dict = {}
+    for i, f in enumerate(list(getattr(trade, "fills", None) or [])):
+        ex = f.execution
+        exec_id = str(getattr(ex, "execId", "") or "")
+        key = exec_id.rsplit(".", 1)[0] if exec_id.count(".") >= 2 else (exec_id or i)
+        by_exec[key] = float(ex.shares or 0)
+    return sum(by_exec.values())
+
+
+def _wait_for_fill_records(ib, trade, filled_qty: float) -> bool | None:
+    """m141: after orderStatus Filled, execDetails (and so trade.fills) can
+    still be on the way, and the fill time taken from trade.fills would be
+    NULL or one execution early. Polls the event loop (ib.sleep in
+    _FILL_RECORDS_POLL_S steps) while the fills' shares are below
+    filled_qty, for at most config.FILL_TIME_WAIT_S seconds.
+
+    True: the fills reached filled_qty (no sleep when they already had).
+    False: the cap ran out first. None: the wait is off (0), nothing filled,
+    or the check itself failed (logged; the caller goes on as before).
+    Reads only; never changes the order or raises."""
+    import time as _time
+    try:
+        import config as _config
+        cap = float(getattr(_config, "FILL_TIME_WAIT_S", 0) or 0)
+        if cap <= 0 or not filled_qty or filled_qty <= 0:
+            return None
+        target = float(filled_qty) - 1e-6
+        if _fill_records_shares(trade) >= target:
+            return True
+        start = _time.monotonic()
+        while _time.monotonic() - start < cap:
+            ib.sleep(min(_FILL_RECORDS_POLL_S, max(cap - (_time.monotonic() - start), 0.0)))
+            if _fill_records_shares(trade) >= target:
+                log.info(f"fill records complete after "
+                         f"{_time.monotonic() - start:.2f}s (orderId={trade.order.orderId})")
+                return True
+        log.warning(f"fill records still short of the filled count after {cap:g}s: "
+                    f"{_fill_records_shares(trade):g} of {filled_qty:g} "
+                    f"(orderId={trade.order.orderId}); fill time from the fills seen")
+        return False
+    except Exception as e:
+        log.warning(f"fill-record wait failed ({type(e).__name__}: {e}); fill time from the fills seen")
+        return None
 
 
 def _compute_marketable_limit(ib: ibi.IB, contract: ibi.Stock, side: str,
@@ -1712,7 +1788,8 @@ def get_completed_orders(timeout: float | None = None) -> list[dict]:
 
 
 def get_fill_for_order(broker_order_id: int, ticker: str | None = None,
-                       side: str | None = None, placed_at=None) -> dict | None:
+                       side: str | None = None, placed_at=None,
+                       perm_id: int | None = None) -> dict | None:
     """Looks up actual executions for a specific order by id, aggregating
     partials into one (filled_qty, avg_price). Returns None if nothing has
     executed for that order (yet, or ever).
@@ -1741,14 +1818,23 @@ def get_fill_for_order(broker_order_id: int, ticker: str | None = None,
     orderIds are per clientId and reqExecutions returns every client's
     executions, so an id alone can match an unrelated order (professor M-4,
     2026-10-28). Callers pass the order's ticker, side (BUY/SELL) and
-    placement time; an execution must agree on each one given.
+    placement time; an execution must agree on each one given. perm_id
+    (the order row's, when known) is matched instead of the orderId on
+    executions that carry a permId, since permIds don't collide across
+    clients; an execution without one falls back to the orderId.
     """
     ib = get_ib()
     execs = _bounded_req(ib, "reqExecutions", ib.reqExecutions)
     want_side = {"BUY": "BOT", "SELL": "SLD"}.get(side) if side else None
+
+    def same_order(ex):
+        got = int(getattr(ex, "permId", 0) or 0)
+        if perm_id and got:
+            return got == int(perm_id)
+        return ex.orderId == broker_order_id
     matches = [
         e for e in execs
-        if e.execution.orderId == broker_order_id
+        if same_order(e.execution)
         and (ticker is None or e.contract.symbol == ticker)
         and (want_side is None or e.execution.side == want_side)
         and (placed_at is None or (lambda t: t is None or t >= placed_at)(_exec_time(e)))

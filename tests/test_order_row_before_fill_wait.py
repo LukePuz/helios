@@ -73,25 +73,28 @@ class FakeOrders:
         return True
 
     def update_order_fill(self, order_id, fill_price, filled_qty, status,
-                          expect_filled_qty=None, filled_at=None, filled_at_source=None):
+                          expect_filled_qty=None, filled_at=None, filled_at_source=None,
+                          fill_time_complete=None):
         r = self.rows[order_id]
         if expect_filled_qty is not None and (
                 r["status"] not in ("unconfirmed", "partial")
                 or abs((r["filled_qty"] or 0) - expect_filled_qty) >= 1e-4):
             return False
         r.update(fill_price=fill_price, filled_qty=filled_qty, status=status)
+        r["fill_time_complete"] = fill_time_complete   # db._stamp_order_fill_complete
         self.events.append(f"order:{status}")
         if r["reconcile_note"] == AWAIT:
             r["reconcile_note"] = None
         return True
 
     def mark_submitted_order_fill(self, order_id, fill_price, filled_qty, status, filled_at=None,
-                                  filled_at_source=None):
+                                  filled_at_source=None, fill_time_complete=None):
         """Same as the SQL: only while 'submitted'; rows updated."""
         r = self.rows[order_id]
         if r["status"] != "submitted":
             return 0
-        if not self.update_order_fill(order_id, fill_price, filled_qty, status, filled_at=filled_at):
+        if not self.update_order_fill(order_id, fill_price, filled_qty, status, filled_at=filled_at,
+                                      fill_time_complete=fill_time_complete):
             return None
         r["reconcile_note"] = db.TRADE_PENDING_NOTE      # same write as the fill
         return 1
@@ -527,12 +530,18 @@ def test_adoption_sql_is_guarded_on_status_note_env_and_age():
         assert db.adopt_orphaned_submitted_orders() is None
 
 
+def _fill_sql(cur):
+    """The last fill UPDATE; the fill_time_complete stamp runs after it."""
+    return [c.args for c in cur.execute.call_args_list
+            if c.args[0].startswith("UPDATE orders SET fill_price")][-1]
+
+
 def test_update_order_fill_clears_the_awaiting_note():
     conn, cur = _conn()
     cur.fetchone.return_value = (None, "SELL")
     with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
         db.update_order_fill(4, 10.0, 3.0, "filled")
-    sql, params = cur.execute.call_args.args
+    sql, params = _fill_sql(cur)
     assert "reconcile_note=NULLIF(reconcile_note, %s)" in sql and AWAIT in params
 
 
@@ -1465,17 +1474,33 @@ def test_a_priceless_trade_pending_row_waits_for_a_price():
     assert fake.trades == [] and fake.rows[1]["reconcile_note"] == db.TRADE_PENDING_NOTE
 
 
+def test_a_priceless_trade_pending_rows_fill_lookup_is_given_its_perm_id():
+    fake = FakeOrders()
+    fake.log_order(ticker="NVDA", side="SELL", order_type="MARKET", qty=5, broker_order_id=602,
+                   intent="TRIM", status="submitted", reconcile_note=AWAIT, perm_id=9001)
+    fake.mark_submitted_order_fill(1, None, 5.0, "filled")
+    _age(fake)
+    with ExitStack() as st:
+        for p in fake.patches():
+            st.enter_context(p)
+        lookup = st.enter_context(patch("ibkr.get_fill_for_order", return_value=None))
+        st.enter_context(patch("ibkr.get_latest_price", return_value=None))
+        tasks._recover_trade_pending_orders()
+    lookup.assert_called_once()
+    assert lookup.call_args.args[0] == 602 and lookup.call_args.kwargs["perm_id"] == 9001
+
+
 def test_trade_pending_sql():
     conn, cur = _conn(rowcount=1)
     cur.fetchone.return_value = (None, "SELL")
     with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
         assert db.mark_submitted_order_fill(4, 10.0, 3.0, "filled") == 1
-    sql, params = cur.execute.call_args.args
+    sql, params = _fill_sql(cur)
     assert ", reconcile_note=%s," in sql and sql.endswith("WHERE id=%s AND status='submitted'")
     assert params[-2] == db.TRADE_PENDING_NOTE
     with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
         assert db.update_order_fill(4, 10.0, 3.0, "filled") is True
-    assert "NULLIF(reconcile_note, %s)" in cur.execute.call_args.args[0]   # reconcile's own write
+    assert "NULLIF(reconcile_note, %s)" in _fill_sql(cur)[0]   # reconcile's own write
 
     with patch("db._get_conn", return_value=conn), patch("db._put_conn"):
         assert db.claim_trade_pending(4, None) == 1

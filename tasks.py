@@ -2378,7 +2378,8 @@ def _reconcile_unconfirmed_orders_locked(task):
             if placed_at is not None:
                 placed_at -= timedelta(minutes=5)
             fill = ibkr.get_fill_for_order(order["broker_order_id"], ticker=ticker,
-                                           side=order["side"], placed_at=placed_at)
+                                           side=order["side"], placed_at=placed_at,
+                                           perm_id=order.get("perm_id"))
         except Exception as e:
             log.warning(f"[{ticker}] reconcile_unconfirmed_orders: fill lookup failed for "
                         f"order {order['broker_order_id']}: {e}")
@@ -3116,7 +3117,8 @@ def _recover_trade_pending_order(order: dict, db, ibkr) -> None:
     if not price:
         try:
             fill = ibkr.get_fill_for_order(oid, ticker=ticker, side=order["side"],
-                                           placed_at=order.get("created_at"))
+                                           placed_at=order.get("created_at"),
+                                           perm_id=order.get("perm_id"))
             price = (fill or {}).get("fill_price")
             if not price:
                 price, source = ibkr.get_latest_price(ticker), "quote"
@@ -3583,16 +3585,31 @@ def _close_queued_flat_exit(ticker: str, rec: dict, held_alerts: list | None = N
                                    exit_source=(rec.get("exit_source")
                                                 or f"late_{(rec.get('intent') or 'sell').lower()}"),
                                    exit_price_source="fill", exit_fill_at=row.get("filled_at"),
-                                   exit_fill_at_source=row.get("filled_at_source"))
+                                   exit_fill_at_source=row.get("filled_at_source"),
+                                   # the order row's stamp goes with its time (m141)
+                                   exit_fill_complete=db.get_order_fill_complete(oid))
             db.delete_position_stop(ticker)
         except Exception as e:
             log.warning(f"[{ticker}] reconcile: close after a queued flat exit failed: {e}; waiting")
             return True
         return False
     if row["status"] in ("partial", "unconfirmed"):
+        # get_open_orders is all-clients, and orderIds collide across clientIds:
+        # match on permId when both sides have one, else orderId; the ticker
+        # always (m117). A row with no perm_id (these rows aren't run through
+        # _backfill_perm_ids) still matches another client's same-id order on
+        # the same ticker: that errs on the safe side (wait plus an alert).
+        perm = row.get("perm_id")
+
+        def ours(o):
+            if o.get("ticker") != ticker:
+                return False
+            if perm and o.get("perm_id"):
+                return int(o["perm_id"]) == int(perm)
+            return o.get("order_id") == row.get("broker_order_id")
         try:
-            working = any(o.get("order_id") == row.get("broker_order_id")
-                          and o.get("status") not in _NOT_WORKING for o in ibkr.get_open_orders())
+            working = any(ours(o) and o.get("status") not in _NOT_WORKING
+                          for o in ibkr.get_open_orders())
         except Exception as e:
             log.warning(f"[{ticker}] reconcile: open-order read failed ({e}); queued flat EXIT waiting")
             return True
@@ -7107,7 +7124,8 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
                 db.update_order_fill(local_id, result.get("fill_price"), filled,
                                      "filled" if filled >= owned - 1e-6 else "partial",
                                      filled_at=result.get("fill_time"),
-                                     filled_at_source=result.get("fill_time_source"))
+                                     filled_at_source=result.get("fill_time_source"),
+                                     fill_time_complete=result.get("fill_time_complete"))
         except Exception as e:
             log.warning(f"[{ticker}] Backstop sale order logging failed: {e}")
         db.log_trade(symbol=ticker, side="SELL", quantity=filled, price=fill_price,
@@ -7163,7 +7181,8 @@ def _execute_backstop_sell(ticker: str, alert: dict, _is_retry: bool = False) ->
                     db.close_trade_outcome(ticker, exit_price=fill_price, exit_source="backstop_sell",
                                            exit_price_source="fill" if result.get("fill_price") else "quote",
                                            exit_fill_at=result.get("fill_time"),
-                                           exit_fill_at_source=result.get("fill_time_source"))
+                                           exit_fill_at_source=result.get("fill_time_source"),
+                                           exit_fill_complete=result.get("fill_time_complete"))
                 except Exception as e:
                     log.error(f"[{ticker}] close_trade_outcome failed after the backstop sell: {e}")  # m98
         log.warning(f"[{ticker}] BACKSTOP SELL executed: {filled} shares @ ~${fill_price:.2f}")

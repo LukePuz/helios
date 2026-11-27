@@ -461,9 +461,17 @@ def test_level_hits_for_the_watcher():
     assert plans.level_hits(plan, None, date(2026, 11, 26)) == [("horizon_end", "2026-11-25")]
 
 
+def _price_watch_plan():
+    """An undated plan for the price-level watcher tests: no catalyst date, and
+    a horizon 30 days past the real date, since watch_plan_levels reads the
+    real date and level_hits adds a horizon_end hit once it has passed (the
+    plan built from PARSED ends 2026-11-25)."""
+    return _plan(catalyst_date=None, horizon_end=date.today() + timedelta(days=30))
+
+
 def test_watcher_logs_once_per_plan_and_kind():
     import tasks
-    plan = _plan(catalyst_date=None)
+    plan = _price_watch_plan()
     with patch("market_data.is_market_hours", return_value=True), \
          patch("db.get_active_plans", return_value=[plan]), \
          patch("tasks._held_prices", return_value={"NVDA": 470.0}), \
@@ -505,7 +513,7 @@ def test_level_hit_on_an_unheld_name_records_no_price_not_zero():
 
 
 def test_level_hit_on_a_held_name_keeps_its_price_and_text():
-    rows = _watch_rows(_plan(catalyst_date=None), {"NVDA": 470.0})
+    rows = _watch_rows(_price_watch_plan(), {"NVDA": 470.0})
     assert len(rows) == 1 and rows[0][1]["price"] == 470.0
     assert rows[0][0] == "plan 1: invalidation (480.0) at $470.00; would re-review"
 
@@ -514,7 +522,7 @@ def test_watcher_says_when_price_checks_were_skipped(caplog):
     import logging
     import tasks
     with patch("market_data.is_market_hours", return_value=True), \
-         patch("db.get_active_plans", return_value=[_plan(catalyst_date=None)]), \
+         patch("db.get_active_plans", return_value=[_price_watch_plan()]), \
          patch("tasks._held_prices", return_value={}), patch("db.log_signal"), \
          caplog.at_level(logging.WARNING, logger="tasks"):
         tasks.watch_plan_levels()
@@ -523,7 +531,7 @@ def test_watcher_says_when_price_checks_were_skipped(caplog):
 
 def _watch(enabled):
     import tasks
-    plan = _plan(catalyst_date=None)
+    plan = _price_watch_plan()
     redis = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock()
     redis.set.return_value = True
     with patch("market_data.is_market_hours", return_value=True), \
@@ -547,7 +555,7 @@ def test_level_hit_records_whether_the_position_exited_since_the_plan():
     """Record-only (audit 2026-11-08 11:07 #2): held -> False; unheld with an
     exit after the plan -> True; nothing held at all -> None."""
     import tasks
-    plan = _plan(catalyst_date=None)
+    plan = _price_watch_plan()
     assert tasks._plan_exited(plan, {"NVDA": 470.0}) is False
     with patch("db.outcome_closed_since", return_value={"id": 7, "exit_date": None}):
         assert tasks._plan_exited(plan, {"MSFT": 400.0}) is True

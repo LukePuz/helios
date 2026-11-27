@@ -229,7 +229,8 @@ def test_backstop_sale_gets_an_orders_row_and_a_part_fill_waits_for_reconcile():
             assert tasks._execute_backstop_sell("AMD", TestBackstopSellReads._alert) is True
         assert log_order.call_args.kwargs["intent"] == "BACKSTOP"
         assert log_order.call_args.kwargs["broker_order_id"] == 77
-        upd.assert_called_once_with(5, 140.0, filled, status, filled_at=None, filled_at_source=None)
+        upd.assert_called_once_with(5, 140.0, filled, status, filled_at=None, filled_at_source=None,
+                                    fill_time_complete=None)
         assert close.called is closes
         # A part fill keeps the stop record: a broker-cancelled remainder
         # leaves held shares the next cycle must see (professor, M128 class).
@@ -536,7 +537,7 @@ _T0 = _dt(2026, 10, 30, 15, 0, tzinfo=_tz.utc)
 
 
 def _queued_flat(intent, row, open_orders=(), stop=None, order_id=5, outcomes=(), pushed=0.0,
-                 exit_source=None):
+                 exit_source=None, fill_complete=None):
     client = MagicMock()
     client.get_all_positions.return_value = []
     rec = {"intent": intent, "order_id": order_id, **({"exit_source": exit_source} if exit_source else {})}
@@ -549,7 +550,10 @@ def _queued_flat(intent, row, open_orders=(), stop=None, order_id=5, outcomes=()
          patch("ibkr.get_open_orders", return_value=list(open_orders)), \
          patch("ibkr.get_recent_sell_fill") as fill, patch("db.delete_position_stop"), \
          patch("db.get_open_outcomes", return_value=list(outcomes)), \
-         patch("db.close_trade_outcome") as close, patch("alerts._send") as alert:
+         patch("db.close_trade_outcome") as close, patch("alerts._send") as alert, \
+         patch("db.get_order_fill_complete",
+               fill_complete if isinstance(fill_complete, MagicMock)
+               else MagicMock(return_value=fill_complete)):
         r = tasks._reprotect_after_late_sell("CRWD", rec, 175.0, from_queue=True)
     fill.assert_not_called()   # never the execution-blend lookup
     return r, close, alert
@@ -561,7 +565,7 @@ def test_queued_flat_exit_closes_at_its_orders_average_fill():
     r, close, alert = _queued_flat("EXIT", {"status": "filled", "fill_price": 171.5, "broker_order_id": 77, "created_at": _T0})
     assert r is None
     close.assert_called_once_with("CRWD", exit_price=171.5, exit_source="late_exit", exit_price_source="fill", exit_fill_at=None,
-                                  exit_fill_at_source=None)
+                                  exit_fill_at_source=None, exit_fill_complete=None)
     alert.assert_not_called()
 
 
@@ -646,7 +650,7 @@ def test_queued_flat_exit_never_places_a_stop_from_the_pushed_read():
     ({"status": "filled", "fill_price": 171.5, "broker_order_id": 77, "created_at": _T0}, 8.0, [],
      "POSITION READS DISAGREE"),
     ({"status": "partial", "fill_price": 171.5, "broker_order_id": 77}, 0.0,
-     [{"order_id": 77, "status": "Submitted"}], "SELL STILL WORKING ON A FLAT POSITION"),
+     [{"order_id": 77, "ticker": "CRWD", "status": "Submitted"}], "SELL STILL WORKING ON A FLAT POSITION"),
 ])
 def test_queued_flat_exit_alerts_go_out_after_the_pass_outside_the_lock(row, pushed, open_orders, text):
     """Review of 3f57f1c: a Telegram send can take tens of seconds; the
@@ -726,7 +730,7 @@ def test_exit_source_rides_along_when_a_restore_or_target_replaces_the_exit():
 
 def test_queued_flat_exit_waits_while_its_remainder_works_or_a_lookup_fails():
     row = {"status": "partial", "fill_price": 171.5, "broker_order_id": 77}
-    working = {"order_id": 77, "status": "Submitted"}
+    working = {"order_id": 77, "ticker": "CRWD", "status": "Submitted"}
     for kw, due, alerted in (({"row": row, "open_orders": [working]}, True, True),
                              ({"row": row, "open_orders": [working]}, False, False),   # throttled
                              ({"row": RuntimeError("db")}, True, False)):
@@ -739,7 +743,7 @@ def test_queued_flat_exit_waits_while_its_remainder_works_or_a_lookup_fails():
 
 def test_queued_flat_exit_leaves_mixed_and_owned_cases_alone():
     row = {"status": "partial", "fill_price": 171.5, "broker_order_id": 77}
-    for kw in ({"row": row, "open_orders": [{"order_id": 77, "status": "Cancelled"}]},   # mixed close
+    for kw in ({"row": row, "open_orders": [{"order_id": 77, "ticker": "CRWD", "status": "Cancelled"}]},   # mixed close
                {"row": row, "order_id": None}):                                          # old entry
         r, close, alert = _queued_flat("EXIT", **kw)
         assert r is None
@@ -821,11 +825,11 @@ def test_a_queued_profit_target_keeps_a_later_exits_order_for_the_flat_close():
          patch("db.get_open_outcomes", return_value=[]), patch("db.delete_position_stop"), \
          patch("db.get_order_fill_state", return_value={"status": "filled", "fill_price": 171.5,
                                                          "broker_order_id": 77, "created_at": _T0}) as row, \
-         patch("db.close_trade_outcome") as close:
+         patch("db.close_trade_outcome") as close, patch("db.get_order_fill_complete", return_value=None):
         tasks._reprotect_after_late_sell("CRWD", rec, 171.0, from_queue=True)
     row.assert_called_once_with(5)
     close.assert_called_once_with("CRWD", exit_price=171.5, exit_source="late_exit", exit_price_source="fill", exit_fill_at=None,
-                                  exit_fill_at_source=None)
+                                  exit_fill_at_source=None, exit_fill_complete=None)
 
 
 def test_a_restore_replacing_a_queued_exit_keeps_the_exits_order():
@@ -1021,12 +1025,13 @@ def test_a_queued_flat_backstop_with_its_kept_record_closes_from_its_fill():
          patch("db.get_open_outcomes", return_value=[{"ticker": "CRWD", "entry_date": _T0 - _td(days=2)}]), \
          patch("db.get_order_fill_state", return_value={"status": "filled", "fill_price": 171.5,
                                                          "broker_order_id": 77, "created_at": _T0}), \
-         patch("db.close_trade_outcome") as close, patch("db.delete_position_stop") as delete:
+         patch("db.close_trade_outcome") as close, patch("db.delete_position_stop") as delete, \
+         patch("db.get_order_fill_complete", return_value=None):
         r = tasks._reprotect_after_late_sell("CRWD", {"intent": "BACKSTOP", "order_id": 5}, 171.0,
                                              from_queue=True)
     assert r is None
     close.assert_called_once_with("CRWD", exit_price=171.5, exit_source="late_backstop", exit_price_source="fill", exit_fill_at=None,
-                                  exit_fill_at_source=None)
+                                  exit_fill_at_source=None, exit_fill_complete=None)
     delete.assert_called_once_with("CRWD")
 
 

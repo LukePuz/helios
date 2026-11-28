@@ -30,6 +30,18 @@ every compiled plan at its creation session.
 Percentages only: levels are shown as % from the plan's entry price, never
 as prices.
 
+Non-finite values (NaN or infinite): a plan level is non-finite for a rule
+when the level itself, or a bar value that rule reads (low or high for
+intraday, close for close) on a session at or before the first crossing (any
+session when it never crossed), is NaN or infinite, since the first crossing
+then can't be known. Such plan levels are counted and named per rule, and
+kept out of that rule's crossed counts, shares, median and exit split. In
+the in-force view a session whose level or bar value is non-finite is
+counted apart, and a name with one before its first crossing is kept out of
+the first-crossing columns and the forward rows. The % from entry is "-"
+when the level or entry is non-finite. No bar is dropped or changed
+(whether to is Luke's; scripts/_bar_qa.py flags the bars).
+
     env -C ~/Desktop/trading_bot SUPABASE_PORT=6543 venv/bin/python \
         scripts/plan_level_readout.py [--since 2026-10-28] [--out FILE]
 
@@ -39,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import math
 import os
 import statistics
 import subprocess
@@ -54,6 +67,16 @@ PRICE_LEVELS = (("structural_stop", "down"), ("t1", "up"), ("t2", "up"), ("add_t
 LEVELS = tuple(n for n, _ in PRICE_LEVELS) + ("time_stop",)
 FORWARD_LEVELS = ("t1", "structural_stop", "add_trigger")
 SESSION_OPEN, SESSION_CLOSE = time(9, 30), time(16, 0)
+
+
+def nonfinite(v) -> bool:
+    """True for a NaN or infinite number; None and non-numbers are not."""
+    if v is None or isinstance(v, bool):
+        return False
+    try:
+        return not math.isfinite(float(v))
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def _forward_readout():
@@ -87,21 +110,28 @@ def window(bars: list[dict], created_at, end) -> list[dict]:
 
 
 def first_crossings(plan: dict, sessions: list[dict]) -> dict:
-    """{level: {"intraday": (index, date) | None, "close": (index, date) | None}}
-    for each level the plan has; index 0 is the plan's first full session."""
+    """{level: {"intraday": (index, date) | None, "close": (index, date) | None,
+    "nonfinite": {"intraday": bool, "close": bool}}} for each level the plan
+    has; index 0 is the plan's first full session. nonfinite is True when the
+    level, or the bar value the rule reads on a session up to its first
+    crossing (all sessions when none), is NaN or infinite; the crossing is
+    then None."""
     out = {}
     for name, direction in PRICE_LEVELS:
         level = plan.get(name)
-        if level is None or level <= 0:
+        if level is None or (not nonfinite(level) and level <= 0):
             continue
-        rec = {"intraday": None, "close": None}
+        rec = {"intraday": None, "close": None,
+               "nonfinite": {"intraday": nonfinite(level), "close": nonfinite(level)}}
+        intra_key = "low" if direction == "down" else "high"
         for i, b in enumerate(sessions):
-            hit_i = b["low"] <= level if direction == "down" else b["high"] >= level
-            hit_c = b["close"] <= level if direction == "down" else b["close"] >= level
-            if hit_i and rec["intraday"] is None:
-                rec["intraday"] = (i, b["date"])
-            if hit_c and rec["close"] is None:
-                rec["close"] = (i, b["date"])
+            for rule, key in (("intraday", intra_key), ("close", "close")):
+                if rec[rule] is not None or rec["nonfinite"][rule]:
+                    continue
+                if nonfinite(b[key]):
+                    rec["nonfinite"][rule] = True
+                elif (b[key] <= level) if direction == "down" else (b[key] >= level):
+                    rec[rule] = (i, b["date"])
         out[name] = rec
     end = plan.get("horizon_end")
     if isinstance(end, date):
@@ -127,7 +157,8 @@ def analyse(plans: list[dict], bars_by_ticker: dict, outcomes, now: datetime) ->
         sess = window(bars, p["created_at"], end)
         ex = exit_after(outcomes, p["ticker"], p["created_at"])
         entry = p.get("entry_price")
-        pct = {n: (round((p[n] / entry - 1) * 100, 2) if p.get(n) and entry else None)
+        pct = {n: (round((p[n] / entry - 1) * 100, 2)
+                   if p.get(n) and entry and not nonfinite(p[n]) and not nonfinite(entry) else None)
                for n, _ in PRICE_LEVELS}
         out.append({"plan": p, "sessions": sess, "n_sessions": len(sess),
                     "crossings": first_crossings(p, sess), "exit_at": ex, "pct_from_entry": pct})
@@ -166,7 +197,10 @@ def in_force(plans: list[dict], bars_by_ticker: dict, outcomes, now: datetime) -
             for name, direction in PRICE_LEVELS:
                 lv = p.get(name)
                 if lv:
-                    crossed[name] = b["low"] <= lv if direction == "down" else b["high"] >= lv
+                    v = b["low"] if direction == "down" else b["high"]
+                    # None: the level or the bar value is non-finite (counted apart)
+                    crossed[name] = (None if nonfinite(lv) or nonfinite(v)
+                                     else v <= lv if direction == "down" else v >= lv)
             if isinstance(p.get("horizon_end"), date):
                 crossed["time_stop"] = b["date"] > p["horizon_end"]
             days.append({"date": b["date"], "plan_id": p["id"], "crossed": crossed})
@@ -179,16 +213,23 @@ def in_force_summary(view: dict, outcomes) -> list[dict]:
     and each name's first crossing vs its first exit after that plan."""
     rows = []
     for name in LEVELS:
-        n_sess = n_hit = 0
-        firsts = {}
+        n_sess = n_hit = n_nf = 0
+        firsts, nf_names, uncertain = {}, set(), set()
         for t, days in view.items():
             for d in days:
                 if name not in d["crossed"]:
                     continue
+                if d["crossed"][name] is None:
+                    n_nf += 1
+                    nf_names.add(t)
+                    if t not in firsts:
+                        uncertain.add(t)
+                    continue
                 n_sess += 1
                 if d["crossed"][name]:
                     n_hit += 1
-                    firsts.setdefault(t, d["date"])
+                    if t not in uncertain:
+                        firsts.setdefault(t, d["date"])
         vs = []
         for t, d0 in firsts.items():
             ex = [x for tk, x in outcomes if tk == t and x is not None
@@ -196,7 +237,8 @@ def in_force_summary(view: dict, outcomes) -> list[dict]:
             xd = min(_aware(x) for x in ex).astimezone(NY).date() if ex else None
             vs.append("no exit" if xd is None else "before exit" if d0 < xd else "exit day")
         rows.append({"level": name, "sessions": n_sess, "crossed": n_hit, "names": len(firsts),
-                     "firsts": firsts, "vs_exit": vs})
+                     "firsts": firsts, "vs_exit": vs, "nonfinite_sessions": n_nf,
+                     "nonfinite_names": sorted(nf_names), "uncertain_first": sorted(uncertain)})
     return rows
 
 
@@ -215,41 +257,58 @@ def forward_rows(recs: list[dict], summary: list[dict]) -> list[tuple]:
     return rows
 
 
+def _names(n: int, names) -> str:
+    return f"{n} ({', '.join(sorted(set(names)))})" if n else "0"
+
+
 def readout(recs: list[dict], summary: list[dict], fwd_md: str, since: date, env: str,
-            head: str, excluded: int) -> str:
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            head: str, excluded: int, now: datetime | None = None) -> str:
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     tickers = {r["plan"]["ticker"] for r in recs}
     lines = [f"# Compiled plan levels readout ({env}, plans since {since})", "",
              f"Generated {now} at code {head}. Pilot-phase engineering diagnostic, not a study "
              f"result. Plans with compiled levels: {len(recs)} on {len(tickers)} names "
              f"({excluded} plans since {since} have none: held_seed or before 11-04). Two "
              "crossing rules tried (intraday high/low, close). Levels as % from the plan's entry "
-             "price; no prices.", "",
+             "price; no prices. Non-finite = a NaN or infinite level or bar value at or before "
+             "the first crossing: counted and named, kept out of that rule's counts, shares, "
+             "median and exit split; no bar changed.", "",
              "## Per level", "",
-             "| level | plans with it | crossed intraday | crossed on a close | median sessions to "
-             "first intraday crossing | before exit | exit day | after exit | no exit |",
-             "|---|---|---|---|---|---|---|---|---|"]
+             "| level | plans with it | non-finite intraday | non-finite close | crossed intraday "
+             "| crossed on a close | median sessions to first intraday crossing | before exit "
+             "| exit day | after exit | no exit |",
+             "|---|---|---|---|---|---|---|---|---|---|---|"]
     for name in LEVELS:
         have = [r for r in recs if name in r["crossings"]]
-        hi = [r for r in have if r["crossings"][name]["intraday"]]
-        hc = [r for r in have if r["crossings"][name]["close"]]
+        nf = {rule: [r for r in have if r["crossings"][name].get("nonfinite", {}).get(rule)]
+              for rule in ("intraday", "close")}
+        ok_i = [r for r in have if r not in nf["intraday"]]
+        ok_c = [r for r in have if r not in nf["close"]]
+        hi = [r for r in ok_i if r["crossings"][name]["intraday"]]
+        hc = [r for r in ok_c if r["crossings"][name]["close"]]
         idx = [r["crossings"][name]["intraday"][0] for r in hi]
         vs = [_vs_exit(r["crossings"][name]["intraday"], r["exit_at"]) for r in hi]
         n = len(have)
-        pc = lambda k: f"{k} ({k / n:.0%})" if n else "0"
-        lines.append(f"| {name} | {n} | {pc(len(hi))} | {pc(len(hc))} | "
+        pc = lambda k, d: f"{k} ({k / d:.0%})" if d else "0"
+        nfc = {rule: _names(len(v), [r["plan"]["ticker"] for r in v]) for rule, v in nf.items()}
+        lines.append(f"| {name} | {n} | {nfc['intraday']} | {nfc['close']} | "
+                     f"{pc(len(hi), len(ok_i))} | {pc(len(hc), len(ok_c))} | "
                      f"{statistics.median(idx) if idx else '-'} | {vs.count('before exit')} | "
                      f"{vs.count('exit day')} | {vs.count('after exit')} | {vs.count('no exit')} |")
     lines += ["", "## Levels in force at the open", "",
               "Each session's levels from the newest compiled plan in force at 09:30 ET (intraday "
               "rule). First crossing per name, against the name's first exit on or after it.", "",
-              "| level | sessions in force | sessions crossed | names crossed | first crossing "
-              "before exit | on exit day | no exit |", "|---|---|---|---|---|---|---|"]
+              "| level | sessions in force | non-finite sessions | sessions crossed | names crossed "
+              "| first crossing unknown (non-finite first) | first crossing before exit "
+              "| on exit day | no exit |", "|---|---|---|---|---|---|---|---|---|"]
     for s_ in summary:
         n = s_["sessions"]
-        lines.append(f"| {s_['level']} | {n} | {s_['crossed']}"
-                     + (f" ({s_['crossed'] / n:.0%})" if n else "")
-                     + f" | {s_['names']} | {s_['vs_exit'].count('before exit')} | "
+        unc = s_.get("uncertain_first", [])
+        lines.append(f"| {s_['level']} | {n} | "
+                     f"{_names(s_.get('nonfinite_sessions', 0), s_.get('nonfinite_names', []))} | "
+                     f"{s_['crossed']}" + (f" ({s_['crossed'] / n:.0%})" if n else "")
+                     + f" | {s_['names']} | {_names(len(unc), unc)} | "
+                     f"{s_['vs_exit'].count('before exit')} | "
                      f"{s_['vs_exit'].count('exit day')} | {s_['vs_exit'].count('no exit')} |")
     lines += ["", "## Per plan", "",
               "| plan | name | status | sessions | stop % | t1 % | t2 % | add % | first intraday "
@@ -322,7 +381,7 @@ def build(plans, outcomes, bars, since: date, env: str, head: str, now: datetime
     closes = {t: [(b["date"], b["close"]) for b in bs] for t, bs in bars.items()}
     fwd = fr.readout(fr.collect(forward_rows(recs, summary), closes,
                                 label_fn=lambda kind, dec: kind), since, env, head)
-    return readout(recs, summary, fwd, since, env, head, len(plans) - len(compiled))
+    return readout(recs, summary, fwd, since, env, head, len(plans) - len(compiled), now)
 
 
 def _bar_qa():

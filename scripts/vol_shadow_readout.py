@@ -18,7 +18,10 @@ from the same code:
     ATR_STOP_MULTIPLIER midpoint when the approval's stop_method was an ATR
     stop, else none.
 It also gives each fill's 20-session return minus SPY from the fill-day
-close, for context only. Output is percentages and ratios: no prices, share
+close, for context only. When either close of that return (the name's or
+SPY's) is NaN or infinite, x20 is "non-finite" with the ticker named, and
+the row is kept out of the x20 mean; no bar is dropped or changed (whether
+to is Luke's; scripts/_bar_qa.py flags the bars). Output is percentages and ratios: no prices, share
 counts, dollar amounts or account values. Read-only: one transaction opened
 READ ONLY, then rolled back.
 
@@ -30,6 +33,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import importlib.util
+import math
 import os
 import statistics
 import subprocess
@@ -41,6 +45,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 NY = ZoneInfo("America/New_York")
 ATR_BARS = 19          # _cached_bars_for_atr(days=14) reads days + 5 rows
+NONFINITE = "non-finite"   # _x20 when a close it reads is NaN or infinite
+
+
+def nonfinite(v) -> bool:
+    """True for a NaN or infinite number; None and non-numbers are not."""
+    if v is None or isinstance(v, bool):
+        return False
+    try:
+        return not math.isfinite(float(v))
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def _ny_date(ts: datetime) -> date:
@@ -61,22 +76,34 @@ def _atr(bars: list[dict]) -> float | None:
     return risk_manager._compute_atr([{"h": b["high"], "l": b["low"], "c": b["close"]} for b in tail])
 
 
-def _x20(bars: list[dict], spy: list[dict], d: date) -> float | None:
-    """20-session return minus SPY from the close of session d (or the next
-    cached session of the name)."""
-    def ret(bs):
-        keys = [b["date"] for b in bs]
-        i = bisect.bisect_left(keys, d.isoformat())
-        if i + 20 >= len(bs):
-            return None, None
-        return bs[i + 20]["close"] / bs[i]["close"] - 1, (keys[i], keys[i + 20])
-    r, span = ret(bars)
-    if r is None:
-        return None
+def x20_detail(bars: list[dict], spy: list[dict], d: date) -> tuple[float | None, str | None]:
+    """(20-session return minus SPY from the close of session d, or the next
+    cached session of the name; which side was non-finite). The second item
+    is "name" or "SPY" when a close the return reads is NaN or infinite (the
+    first is then None), else None."""
+    keys = [b["date"] for b in bars]
+    i = bisect.bisect_left(keys, d.isoformat())
+    if i + 20 >= len(bars):
+        return None, None
+    c0, c1 = bars[i]["close"], bars[i + 20]["close"]
+    if nonfinite(c0) or nonfinite(c1):
+        return None, "name"
+    r, span = c1 / c0 - 1, (keys[i], keys[i + 20])
     sk = {b["date"]: b["close"] for b in spy}
     if span[0] not in sk or span[1] not in sk:
-        return None
-    return r - (sk[span[1]] / sk[span[0]] - 1)
+        return None, None
+    s0, s1 = sk[span[0]], sk[span[1]]
+    if nonfinite(s0) or nonfinite(s1):
+        return None, "SPY"
+    return r - (s1 / s0 - 1), None
+
+
+def _x20(bars: list[dict], spy: list[dict], d: date) -> float | str | None:
+    """20-session return minus SPY from the close of session d (or the next
+    cached session of the name); NONFINITE when a close it reads is NaN or
+    infinite."""
+    v, bad = x20_detail(bars, spy, d)
+    return NONFINITE if bad else v
 
 
 def fill_rows(fills, bars_by_ticker, snapshots, approvals) -> list[dict]:
@@ -117,10 +144,11 @@ def fill_rows(fills, bars_by_ticker, snapshots, approvals) -> list[dict]:
         finally:
             risk_manager._vol_shadow_bars = saved
         rec["vol_target_shadow"]["weights_at"] = "fill"     # the fill quantity is the final order
+        x20, bad = x20_detail(bars_by_ticker.get(f["symbol"], []), bars_by_ticker.get("SPY", []), d)
         rows.append({"date": d, "symbol": f["symbol"], "env": f["env"], "bucket": bucket,
                      "linked": appr is not None, "pv_known": pv is not None,
-                     "x20": _x20(bars_by_ticker.get(f["symbol"], []),
-                                 bars_by_ticker.get("SPY", []), d),
+                     "x20": x20,
+                     "x20_nonfinite": [] if bad is None else [f["symbol"] if bad == "name" else "SPY"],
                      **rec})
     return rows
 
@@ -138,8 +166,15 @@ def _med(vals):
     return statistics.median(vals) if vals else None
 
 
-def readout(rows: list[dict], env: str, head: str) -> str:
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+def _nf_cell(rs) -> str:
+    """'0', or 'N (TICKERS)' for rows whose x20 read a non-finite close."""
+    bad = [r for r in rs if r.get("x20_nonfinite")]
+    tick = sorted({t for r in bad for t in r["x20_nonfinite"]})
+    return f"{len(bad)} ({', '.join(tick)})" if bad else "0"
+
+
+def readout(rows: list[dict], env: str, head: str, now: datetime | None = None) -> str:
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     from config import VOL_TARGET_CONTRIBUTION
     ok = [r for r in rows if r["vol_target_shadow"]["read"] == "ok"]
     lines = [f"# Volatility shadow readout ({env} fills)", "",
@@ -149,12 +184,15 @@ def readout(rows: list[dict], env: str, head: str) -> str:
              "fill; under 1 means the vol budget would have cut the buy. Percentages and "
              "ratios only.", "",
              f"Fills: {len(rows)}; bars ok: {len(ok)}; stop linked: {sum(r['linked'] for r in rows)}; "
-             f"portfolio snapshot found: {sum(r['pv_known'] for r in rows)}.", ""]
+             f"portfolio snapshot found: {sum(r['pv_known'] for r in rows)}; x20 non-finite "
+             f"(a NaN or infinite close of the name or SPY; out of the x20 mean, no bar "
+             f"changed): {_nf_cell(rows)}.", ""]
     cut = [r for r in ok if r["vol_target_shadow"]["would_cut"] is True]
     keep = [r for r in ok if r["vol_target_shadow"]["would_cut"] is False]
     lines += ["## Summary", "",
-              "| group | fills | median rvol20 % | median ratio | median stop sigma20 | median stop ATR | mean x20 % |",
-              "|---|---|---|---|---|---|---|"]
+              "| group | fills | median rvol20 % | median ratio | median stop sigma20 | median stop ATR | mean x20 % "
+              "| x20 non-finite |",
+              "|---|---|---|---|---|---|---|---|"]
 
     def summ(name, rs):
         xs = [r["x20"] for r in rs if r["x20"] is not None]
@@ -162,7 +200,7 @@ def readout(rows: list[dict], env: str, head: str) -> str:
                      f"{_num(_med(r['vol_target_shadow']['weight_ratio'] for r in rs))} | "
                      f"{_num(_med(r['stop_vol']['stop_sigma20'] for r in rs))} | "
                      f"{_num(_med(r['stop_vol']['stop_distance_atr'] for r in rs))} | "
-                     f"{_pct(statistics.mean(xs)) if xs else '-'} ({len(xs)}) |")
+                     f"{_pct(statistics.mean(xs)) if xs else '-'} ({len(xs)}) | {_nf_cell(rs)} |")
     summ("all with bars", ok)
     summ("vol budget would cut", cut)
     summ("vol budget would not cut", keep)
@@ -180,7 +218,9 @@ def readout(rows: list[dict], env: str, head: str) -> str:
                      f"{_pct(vt['vol_weight'])} | {_num(vt['weight_ratio'])} | "
                      f"{'-' if wc is None else ('yes' if wc else 'no')} | {_pct(sv['stop_pct'])} | "
                      f"{_num(sv['stop_distance_atr'])} | {_num(sv['atr_multiple'])} | "
-                     f"{_num(sv['stop_sigma20'])} | {_pct(r['x20'])} |")
+                     f"{_num(sv['stop_sigma20'])} | "
+                     + (f"non-finite ({', '.join(r['x20_nonfinite'])})" if r.get("x20_nonfinite")
+                        else _pct(r['x20'])) + " |")
     lines += ["", "x20 is context, not a test: fills of one day move together, and the vol "
               "budget's target was not tuned on these outcomes."]
     return "\n".join(lines) + "\n"

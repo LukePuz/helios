@@ -172,6 +172,19 @@ def _pin_code_stamp(sender=None, **_):
         log.warning(f"boot row not written: {e}")
 
 
+@worker_init.connect
+def _instrument_source_health(sender=None, **_):
+    """Source health (record only): wrap the Polygon and FRED fetchers in the
+    worker's parent before the pool forks, so each child notes their calls
+    (ingestion/source_health.instrument; the wrapped modules' source, which
+    brief_template_full_sha hashes, stays as it is). Never raises."""
+    try:
+        from ingestion import source_health
+        source_health.instrument()
+    except Exception as e:
+        log.warning(f"source health instrument failed: {type(e).__name__}: {e}")
+
+
 @worker_process_shutdown.connect
 def _drain_on_child_exit(**_):
     """A pool child exits through os._exit, which skips atexit, so its
@@ -7836,6 +7849,11 @@ def cache_live_vix():
         except Exception as e:
             err = type(e).__name__
         rec = {"vix": vix, "at": datetime.now(timezone.utc).isoformat(), "error": err}
+        try:
+            from ingestion import source_health
+            source_health.note("yfinance_vix", source_health.ERROR if err else source_health.OK)
+        except Exception:
+            pass
         redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"),
                              socket_timeout=2, socket_connect_timeout=2
                              ).set(VIX_LIVE_KEY, json.dumps(rec), ex=900)
@@ -8931,6 +8949,12 @@ def refresh_price_history(self):
         except Exception as e:
             log.warning(f"entry gate reclaim hook failed: {e}")
         try:
+            # Record only: non-routed verdicts' forward closes, on the same bars.
+            from agents.crew import _check_unrouted_verdict_forwards
+            _check_unrouted_verdict_forwards()
+        except Exception as e:
+            log.warning(f"unrouted verdict forward hook failed: {e}")
+        try:
             _log_plan_cross_section()   # log-only snapshot; never fails this task
         except Exception as e:
             log.warning(f"plan cross-section hook failed: {e}")
@@ -9347,6 +9371,16 @@ def send_daily_digest(self):
     and halt status. alerts.send_daily_summary() existed but nothing ever
     scheduled it; this is its replacement on the beat schedule.
     """
+    # Source health (record only, roadmap 04e4): its own try, before anything
+    # the digest needs, so it neither stops the digest nor waits on it. A
+    # retried digest reruns it (idempotent within the ET day).
+    dead_sources = []
+    try:
+        from ingestion import source_health
+        dead_sources = source_health.daily_record()
+    except Exception as e:
+        log.warning(f"source health record failed: {type(e).__name__}: {e}")
+        dead_sources = []
     try:
         import db
         import alerts
@@ -9486,6 +9520,7 @@ def send_daily_digest(self):
             pending_count=pending_count,
             halted=halted, ingestion_issues=ingestion_issues,
             atr_fallback_tickers=atr_fallback_tickers,
+            dead_sources=dead_sources,
         )
     except Exception as e:
         log.error(f"send_daily_digest failed: {e}")
@@ -10413,7 +10448,12 @@ def _fix_overstop(ticker: str, fresh_qty: float | None = None, allow_cancel: boo
     outcome_out (optional dict): "disagree_over_cover" is set to the line
     (no emoji) when stops exceed the position but nothing was cancelled
     because the position reads disagree, for recheck_stop_coverage to look
-    again. The returned text is the same either way."""
+    again. When an over-cover cancel is about to be sent (set before the
+    call, so one that raises counts too; also before the refused-stop
+    retry), "cancel_sent" True, "sized_signed" (the signed count this fix
+    sized from), "mkt_sell_working" (a working market SELL lowered the count
+    covered) and "cancel_at" (UTC) are set, for reconcile's trim fresh
+    check. The returned text is the same either way."""
     import db
     import execution
     import ibkr
@@ -10433,8 +10473,9 @@ def _fix_overstop(ticker: str, fresh_qty: float | None = None, allow_cancel: boo
             held = round(max(float(max_qty), 0.0), 4)
         # Shares a working market SELL is already selling need no stop
         # (professor M129).
+        mkt_sell = _working_mkt_sell_qty(open_orders, ticker) if signed > 0 else 0.0
         if signed > 0:
-            held = max(round(held - _working_mkt_sell_qty(open_orders, ticker), 4), 0.0)
+            held = max(round(held - mkt_sell, 4), 0.0)
     except Exception as e:
         return f"⚠️ {ticker}: stop-coverage re-check failed ({e}); check TWS"
     if signed < 0:
@@ -10474,6 +10515,13 @@ def _fix_overstop(ticker: str, fresh_qty: float | None = None, allow_cancel: boo
         if outcome_out is not None:
             outcome_out["disagree_over_cover"] = body
         return f"🚨 {body} — check the stops in TWS"
+    def mark_cancel():
+        # Before the first cancel call, so a cancel that raises still counts.
+        if outcome_out is not None and not outcome_out.get("cancel_sent"):
+            from datetime import datetime, timezone
+            outcome_out.update(cancel_sent=True, sized_signed=round(signed, 4),
+                               mkt_sell_working=mkt_sell > 1e-6,
+                               cancel_at=datetime.now(timezone.utc))
     try:
         if resting > held:
             import risk_manager
@@ -10487,16 +10535,19 @@ def _fix_overstop(ticker: str, fresh_qty: float | None = None, allow_cancel: boo
             refused_cover = round(sum(float(o["qty"]) for o in mine
                                       if refused(o) and o.get("status") not in cancelling_now), 4)
             if refused_ids and refused_cover > held + 1e-6:
+                mark_cancel()
                 return _fix_refused_over_position(ticker, mine, refused, held, stop_price, last,
                                                   recheck_try)
             target = round(max(held - refused_cover, 0.0), 4)
             others = [o for o in mine if not refused(o) and o.get("status") not in cancelling_now]
             sent = False
             if not any(refused(o) for o in mine):
+                mark_cancel()
                 manage_cancel_stop_orders_for(ticker)
                 sent = True
             elif sum(float(o["qty"]) for o in others) > target + 1e-6:
                 # Only the stops that didn't refuse: the refused ones stay.
+                mark_cancel()
                 for o in others:
                     manage_cancel_order(int(o["order_id"]), symbol=ticker, perm_id=o.get("perm_id"))
                 sent = True
@@ -11642,6 +11693,179 @@ def _watch_broker_sells_body(now=None) -> list[dict]:
     return written
 
 
+# The fresh positions read for a reconcile over-cover trim
+# (RECONCILE_TRIM_FRESH_CHECK_MODE): this bound, this process's session. A
+# timeout drops the session (ibkr._bounded_req), so shadow reads only after
+# the cycle's order work, and enforce before the trim with no ticker lock
+# held (up to the bound inside 2b once per cycle).
+_TRIM_FRESH_TIMEOUT_S = None   # the usual bound (ibkr._REQ_TIMEOUT_S): no ticker lock is held
+
+
+def _trim_fresh_mode() -> str:
+    """config RECONCILE_TRIM_FRESH_CHECK_MODE: "shadow" or "enforce", else "off"."""
+    import config
+    mode = str(getattr(config, "RECONCILE_TRIM_FRESH_CHECK_MODE", "off") or "off").lower()
+    return mode if mode in ("shadow", "enforce") else "off"
+
+
+def _trim_fresh_check(ticker: str, cache_signed: float | None, cycle_fresh: dict | None,
+                      box: dict) -> dict | None:
+    """Before reconcile section 2b trims an over-cover (cancel all, re-place for
+    the cache's count): does a fresh positions read agree with the cache for
+    ticker? None with the mode off (no read). Otherwise {"mode", "block",
+    "status", "fresh", "cap"}: block True when the fresh read failed or was
+    empty ("failed: <type>" / "empty"), leaves the ticker out ("missing"), or
+    shows another signed count ("mismatch"); "agrees" otherwise. fresh is the
+    fresh signed count (0.0 when missing). source: "cycle" (section 1's read)
+    or "own" (this check's read, read_at its time). cap is the smaller read for the
+    add-only fix (0.0 on a sign flip or a missing ticker; None when the read
+    failed). cycle_fresh: the cycle's own fresh read when it took one; else
+    one read per cycle is kept in box (bounded, no reconnect). Never
+    raises."""
+    mode = _trim_fresh_mode()
+    if mode == "off":
+        return None
+    out = {"mode": mode, "block": True, "fresh": None, "cap": None, "source": None,
+           "read_at": None}
+    try:
+        if cycle_fresh is not None:
+            read, status = cycle_fresh, "ok"
+            out["source"] = "cycle"
+        else:
+            if "read" not in box:
+                import ibkr
+                from datetime import datetime, timezone
+                try:
+                    box["read"] = ibkr.get_fresh_stock_positions(timeout=_TRIM_FRESH_TIMEOUT_S,
+                                                                 reconnect=False)
+                    box["status"] = "ok"
+                except Exception as e:
+                    box["read"], box["status"] = None, f"failed: {type(e).__name__}"
+                box["at"] = datetime.now(timezone.utc)
+            read, status = box["read"], box["status"]
+            out.update(source="own", read_at=box.get("at"))
+        if read is None:
+            out["status"] = status
+            return out
+        if not read:
+            out["status"] = "empty"           # a reconnect gap, as reconcile reads it
+            return out
+        cache = round(float(cache_signed or 0.0), 4)
+        if read.get(ticker) is None:
+            out.update(status="missing", fresh=0.0, cap=0.0)
+            return out
+        fresh = round(float(read[ticker]), 4)
+        out["fresh"] = fresh
+        if abs(fresh - cache) <= 1e-6:
+            out.update(block=False, status="agrees")
+            return out
+        out.update(status="mismatch",
+                   cap=0.0 if fresh * cache < 0 else min(abs(fresh), abs(cache)))
+        return out
+    except Exception as e:
+        log.warning(f"[{ticker}] trim fresh check failed: {type(e).__name__}: {e}")
+        out["status"] = f"failed: {type(e).__name__}"
+        return out
+
+
+def _record_trim_fresh_check(ticker: str, check: dict, covered: float,
+                             cache_signed: float | None, trim: dict | None = None) -> None:
+    """Activity row (stage reconcile_trim_fresh_check) for an over-cover trim
+    whose fresh read disagreed with the cache or failed: in shadow the trim
+    ran and sent a cancel anyway (blocked False), in enforce the add-only
+    branch ran instead (blocked True). Fractions of the cache count only, no share counts: fresh_vs_cache
+    ((fresh - cache) / cache) and covered_vs_cache (stops / cache). minutes
+    since the ticker's last filled BUY order row (None when unknown). trim
+    (shadow): _fix_overstop's outcome_out for the trim, whose sized_signed
+    is the cache count compared (the count the trim sized from), with
+    read_lag_s (the read's time after the cancel), mkt_sell_working and
+    buy_fill_after_trim; null in enforce. Record only; never raises."""
+    try:
+        import db
+        from datetime import datetime, timezone
+        trim = trim or {}
+        cache = abs(float(cache_signed or 0.0))
+        fresh = check.get("fresh")
+        last = db.last_buy_fill_at(ticker)
+        minutes = None
+        if last is not None:
+            last = last if last.tzinfo else last.replace(tzinfo=timezone.utc)
+            minutes = round((datetime.now(timezone.utc) - last).total_seconds() / 60, 1)
+        cancel_at, read_at = trim.get("cancel_at"), check.get("read_at")
+        lag = (round((read_at - cancel_at).total_seconds(), 1)
+               if cancel_at is not None and read_at is not None else None)
+        after = (last > cancel_at if cancel_at is not None and last is not None
+                 else None)
+        blocked = check["mode"] == "enforce"
+        db.log_activity_direct(
+            "reconcile_trim_fresh_check", ticker,
+            (f"Over-cover trim {'blocked' if blocked else 'ran'}: the fresh positions read "
+             f"{'disagrees with the cache' if check['status'] in ('mismatch', 'missing') else 'failed'} "
+             f"({check['status']})"),
+            "neutral",
+            {"mode": check["mode"], "would_block": True, "blocked": blocked,
+             "read_status": check["status"],
+             "fresh_vs_cache": (round((float(fresh) - float(cache_signed)) / cache, 4)
+                                if fresh is not None and cache else None),
+             "covered_vs_cache": round(float(covered) / cache, 4) if cache else None,
+             "minutes_since_last_buy_fill": minutes,
+             "read_source": check.get("source"), "read_lag_s": lag,
+             "mkt_sell_working": trim.get("mkt_sell_working"),
+             "buy_fill_after_trim": after, "env": db.TRADING_ENV})
+    except Exception as e:
+        log.warning(f"[{ticker}] reconcile_trim_fresh_check row not written: {e}")
+
+
+# _fix_overstop's add-only over-cover reports (nothing cancelled), the only
+# lines the enforce alert throttles.
+_TRIM_FRESH_ADD_ONLY_PHRASES = (" while the position reads disagree;",
+                                " while the fresh positions read ",
+                                " the smaller position read ")
+
+
+def _trim_fresh_enforce_alert(ticker: str, check: dict, msg: str) -> str:
+    """The enforce branch's alert for its add-only fix line, which it returns:
+    the add-only report (_TRIM_FRESH_ADD_ONLY_PHRASES) is sent once per
+    RECONCILE_ALERT_THROTTLE_HOURS (overstop_trim_fresh_<T>, as the other
+    over-cover-while-reads-differ alerts); any other line (a short, a failed
+    fix, no usable stop level) as _stop_fix_alert_due. When the read failed or came
+    back empty, the line says so instead of "the position reads disagree".
+    Never raises."""
+    if check.get("cap") is None:
+        msg = msg.replace(" while the position reads disagree;",
+                          f" while the fresh positions read {check.get('status')};")
+    try:
+        add_only = msg.startswith("🚨") and any(p in msg for p in _TRIM_FRESH_ADD_ONLY_PHRASES)
+        due = (_reconcile_alert_due(f"overstop_trim_fresh_{ticker}") if add_only
+               else _stop_fix_alert_due(ticker, msg))
+        if due:
+            import alerts
+            alerts._send(f"STOP RECONCILE — {msg}")
+    except Exception as e:
+        log.error(f"[{ticker}] could not send the trim fresh check alert: {e}")
+    return msg
+
+
+def _flush_trim_fresh_shadow(trims: list, cycle_fresh: dict | None, box: dict) -> None:
+    """Shadow (RECONCILE_TRIM_FRESH_CHECK_MODE): after the cycle's order work,
+    the fresh read for each over-cover trim that sent a cancel this cycle
+    (trims: [(ticker, covered, _fix_overstop's outcome_out)]), compared with
+    the signed count that trim sized from (outcome_out sized_signed), and
+    one row for each whose read disagreed or failed. Read after the work, so
+    a read that times out (and drops the session) can't touch the cycle's
+    fixes. A read taken after the trim can also see a fill that came after
+    it (an ADD, a market SELL, a stop), so the row carries read_lag_s,
+    mkt_sell_working and buy_fill_after_trim. Never raises."""
+    for ticker, covered, trim in trims:
+        try:
+            sized = trim.get("sized_signed")
+            check = _trim_fresh_check(ticker, sized, cycle_fresh, box)
+            if check is not None and check["block"]:
+                _record_trim_fresh_check(ticker, check, covered, sized, trim)
+        except Exception as e:
+            log.warning(f"[{ticker}] trim fresh shadow check failed: {e}")
+
+
 @app.task(name="tasks.watch_broker_sells", bind=True, max_retries=0)
 def watch_broker_sells(self):
     """Record-only fill watch, every 2 min in market hours: see
@@ -12102,6 +12326,8 @@ def _reconcile_stop_orders_body(self):
         skip_flat = set(disagree)   # held per the fresh read: never cancelled or deleted
         stopped_now = {o["ticker"] for o in working}
         reread_box: dict = {}   # one extra fresh read per cycle, shared by every ticker
+        trim_box: dict = {}     # the trim fresh check's read, once per cycle
+        trim_shadow: list = []  # shadow: trims that sent a cancel, checked after the work
 
         def _fresh_reread() -> dict | None:
             """A second fresh positions read, taken at most once this cycle,
@@ -12486,7 +12712,28 @@ def _reconcile_stop_orders_body(self):
             elif fresh_mismatch:
                 msg = _fix_overstop_safe(ticker, allow_cancel=False, max_qty=cap)   # add only
             else:
-                msg = _fix_overstop_safe(ticker)
+                # Before a trim (cancel all, re-place for the cache's count), a
+                # fresh read should agree with the cache, read even when no
+                # ticker looks flat (RECONCILE_TRIM_FRESH_CHECK_MODE): enforce
+                # reads it here, shadow after the cycle's order work.
+                trim_mode = _trim_fresh_mode() if covered > qty + 1e-6 else "off"
+                trim = (_trim_fresh_check(ticker, cache_qty.get(ticker), fresh, trim_box)
+                        if trim_mode == "enforce" else None)
+                if trim is not None and trim["block"]:
+                    msg = _trim_fresh_enforce_alert(
+                        ticker, trim, _fix_overstop_safe(ticker, allow_cancel=False,
+                                                         max_qty=trim["cap"]))
+                    all_actions.append(msg)
+                    new_actions.append(msg)
+                    _record_trim_fresh_check(ticker, trim, covered, cache_qty.get(ticker))
+                    continue
+                if trim_mode == "shadow":
+                    fix_out: dict = {}
+                    msg = _fix_overstop_safe(ticker, outcome_out=fix_out)
+                    if fix_out.get("cancel_sent"):
+                        trim_shadow.append((ticker, covered, fix_out))
+                else:
+                    msg = _fix_overstop_safe(ticker)
             all_actions.append(msg)
             new_actions.append(msg)
             try:
@@ -12594,6 +12841,8 @@ def _reconcile_stop_orders_body(self):
             pending_sell_tickers, skip=set(disagree))
         all_actions.extend(partial)
         new_actions.extend(partial)
+        if trim_shadow:
+            _flush_trim_fresh_shadow(trim_shadow, fresh, trim_box)
 
         if all_actions:
             log.info("Stop reconciliation status: " + " | ".join(all_actions))

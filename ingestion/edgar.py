@@ -880,6 +880,9 @@ def _poll_all(on_filing=None) -> list[dict]:
     LAST_PASS.update(stats)
     log.info(f"EDGAR pass: {stats['ok']} ok, {stats['failed']} failed, "
              f"{stats['skipped']} skipped of {total} in {stats['seconds']}s (start {start})")
+    if total:
+        from ingestion import source_health   # an empty pass is normal: ran = ok
+        source_health.note("edgar", source_health.ERROR if stats["poll_failed"] else source_health.OK)
     return new_filings
 
 

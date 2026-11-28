@@ -223,6 +223,13 @@ def get_all_flow_summaries(implied_sink: dict | None = None) -> dict[str, dict]:
         summaries[ticker] = (get_flow_summary(ticker, implied_sink) if implied_sink is not None
                              else get_flow_summary(ticker))
         time.sleep(0.2)
+    if summaries:
+        # A failed and an empty chain read the same here: "empty" when no
+        # ticker had a chain (source health, record only).
+        from ingestion import source_health
+        source_health.note("options", source_health.OK if any(
+            not str(s.get("summary", "")).startswith("No free options data") for s in summaries.values())
+            else source_health.EMPTY)
     return summaries
 
 

@@ -59,14 +59,19 @@ tail -f /opt/helios/helios.log    # the bot's own application log
 ## Database port per unit
 
 The bot reads `SUPABASE_PORT` from the environment, else `.env`, else 5432.
-`helios-local.service.d/db-port.conf` sets 6543 (the transaction-mode
-pooler) for `helios-local` and every process it starts, including the
-dashboard probe. The session pooler on 5432 caps at 15 clients.
+The session pooler on 5432 caps at 15 clients (EMAXCONNSESSION), so the
+busiest workers use the transaction pooler on 6543; process_manager.start
+sets it for them. main.py must stay on 5432: its init_db builds the
+CREATE INDEX CONCURRENTLY migrations, which need a session and are refused
+on 6543. So there is no unit-wide port drop-in (the old
+`helios-local.service.d/db-port.conf`, never installed, would have moved
+main.py too; retired 2026-11-24, roadmap 04e7).
 
-| Unit | Port | Why |
+| Process | Port | Why |
 |---|---|---|
-| `helios-local` (main.py, its workers, dashboard) | 6543 with the drop-in, else `.env` | the drop-in |
-| `helios-watchdog`, `helios-gateway-watchdog` (deploy/watchdog.py) | `.env` (5432) | no drop-in; a few short reads per run |
+| `helios-local`: main.py, celery ops, llm and orders workers, beat, dashboard | `.env` (5432) | init_db's concurrent-index migrations (main.py); trading-path workers stay on the session pooler |
+| `helios-local`: celery screen and ingestion workers | 6543, set by process_manager.start | 7 forks, the most sessions; nothing on their DB paths needs a session |
+| `helios-watchdog`, `helios-gateway-watchdog` (deploy/watchdog.py) | `.env` (5432) | a few short reads per run |
 | `helios-backup` (user unit, scripts/backup_db.py: pg_dump) | `.env` (5432); must stay there | pg_dump isn't supported through the transaction pooler, so never give it 6543 |
 | `helios-standby`, `helios-notify-failure@`, `helios-evening-stop`, `ibc`, `ollama-cpu` | none | no database access |
 

@@ -303,6 +303,19 @@ STAGES = (
      "switch": None, "writer": ("earnings_claim.py", '"catalyst_kind"'),
      "expect_rows": "always",
      "sources": ((_SIG, "decision->'catalyst_check' ? 'catalyst_kind'"),)},
+    # Nightly only (agents/crew.py:_check_unrouted_verdict_forwards, after the
+    # price refresh). No trigger: a record's first row (forward_5) comes 5
+    # sessions after its verdict, and an off-watchlist name only ever gets
+    # expired, so a verdict with no row yet isn't silent.
+    {"stage": "unrouted_verdict_forward_shadow", "card": "forward closes after non-routed verdicts",
+     "switch": "UNROUTED_VERDICT_FORWARD_SHADOW_ENABLED", "expect_rows": "conditional",
+     "sources": (_stage("unrouted_verdict_forward_shadow"),)},
+    {"stage": "source_health", "card": "per-source data health",
+     "switch": "SOURCE_HEALTH_RECORD_ENABLED", "expect_rows": "always",
+     "sources": (_stage("source_health"),)},
+    {"stage": "reconcile_trim_fresh_check", "card": "fresh read before a reconcile trim",
+     "switch": "RECONCILE_TRIM_FRESH_CHECK_MODE", "expect_rows": "conditional",
+     "sources": (_stage("reconcile_trim_fresh_check"),)},
 )
 
 

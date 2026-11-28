@@ -54,9 +54,10 @@ def test_first_crossings_intraday_and_close():
     sess = [_bar(DAYS[0], 100.0), _bar(DAYS[1], 105.0, hi=110.5), _bar(DAYS[2], 111.0),
             _bar(DAYS[3], 95.0, lo=89.0)]
     c = plr.first_crossings(_plan(1, _et(DAYS[0], 8)), sess)
-    assert c["t1"] == {"intraday": (1, DAYS[1]), "close": (2, DAYS[2])}
-    assert c["structural_stop"] == {"intraday": (3, DAYS[3]), "close": None}
-    assert c["t2"] == {"intraday": None, "close": None}
+    ok = {"intraday": False, "close": False}
+    assert c["t1"] == {"intraday": (1, DAYS[1]), "close": (2, DAYS[2]), "nonfinite": ok}
+    assert c["structural_stop"] == {"intraday": (3, DAYS[3]), "close": None, "nonfinite": ok}
+    assert c["t2"] == {"intraday": None, "close": None, "nonfinite": ok}
     assert c["time_stop"]["intraday"] is None
     c = plr.first_crossings(_plan(1, _et(DAYS[0], 8), t1=None, horizon_end=DAYS[1]), sess)
     assert "t1" not in c and c["time_stop"]["intraday"] == (2, DAYS[2])
@@ -113,3 +114,76 @@ def test_fetch_only_reads():
     assert "SET TRANSACTION READ ONLY" in src and "conn.rollback()" in src
     for word in ("INSERT", "UPDATE ", "DELETE", "commit"):
         assert word not in src, word
+
+
+# --- non-finite values (audit 2026-11-27 16:53 #3 follow-up) ------------------
+
+NAN, INF = float("nan"), float("inf")
+
+
+def test_nonfinite_values():
+    for v in (NAN, INF, -INF, "NaN"):
+        assert plr.nonfinite(v)
+    for v in (None, True, 0, 1.5, "x"):
+        assert not plr.nonfinite(v)
+
+
+def test_a_nan_bar_before_the_first_crossing_makes_that_rule_unknown():
+    sess = [_bar(DAYS[0], 100.0), {"date": DAYS[1], "high": NAN, "low": 99.0, "close": 105.0},
+            _bar(DAYS[2], 111.0)]
+    c = plr.first_crossings(_plan(1, _et(DAYS[0], 8)), sess)["t1"]
+    # intraday reads the NaN high before any crossing: unknown; close crosses on day 2
+    assert c["nonfinite"] == {"intraday": True, "close": False}
+    assert c["intraday"] is None and c["close"] == (2, DAYS[2])
+
+
+def test_a_nan_bar_after_the_first_crossing_changes_nothing():
+    sess = [_bar(DAYS[0], 100.0, hi=110.5), {"date": DAYS[1], "high": NAN, "low": NAN, "close": NAN}]
+    c = plr.first_crossings(_plan(1, _et(DAYS[0], 8)), sess)["t1"]
+    assert c["intraday"] == (0, DAYS[0]) and c["nonfinite"]["intraday"] is False
+    assert c["nonfinite"]["close"] is True and c["close"] is None   # no close crossing before the NaN
+
+
+def test_a_nonfinite_level_is_unknown_for_both_rules_and_has_no_pct():
+    sess = [_bar(DAYS[0], 100.0), _bar(DAYS[1], 120.0)]
+    c = plr.first_crossings(_plan(1, _et(DAYS[0], 8), t1=NAN), sess)["t1"]
+    assert c["nonfinite"] == {"intraday": True, "close": True} and c["intraday"] is None
+    rec = plr.analyse([_plan(1, _et(DAYS[0], 8), t1=INF, entry_price=100.0)],
+                      {"NVDA": sess}, [], _et(DAYS[1], 17))[0]
+    assert rec["pct_from_entry"]["t1"] is None and rec["pct_from_entry"]["t2"] == 30.0
+    rec = plr.analyse([_plan(1, _et(DAYS[0], 8), entry_price=NAN)], {"NVDA": sess}, [],
+                      _et(DAYS[1], 17))[0]
+    assert all(v is None for v in rec["pct_from_entry"].values())
+
+
+def test_in_force_counts_nonfinite_sessions_and_an_unknown_first_crossing():
+    bars = {"NVDA": [_bar(DAYS[0], 100.0), {"date": DAYS[1], "high": NAN, "low": 99.0, "close": 100.0},
+                     _bar(DAYS[2], 112.0)],
+            "AMD": [_bar(DAYS[0], 112.0), {"date": DAYS[1], "high": NAN, "low": 99.0, "close": 100.0}]}
+    plans = [_plan(1, _et(DAYS[0], 8)), _plan(2, _et(DAYS[0], 8), ticker="AMD")]
+    view = plr.in_force(plans, bars, [], _et(DAYS[2], 17))
+    assert view["NVDA"][1]["crossed"]["t1"] is None and view["NVDA"][1]["crossed"]["structural_stop"] is False
+    s = {r["level"]: r for r in plr.in_force_summary(view, [])}["t1"]
+    assert s["sessions"] == 3 and s["crossed"] == 2 and s["nonfinite_sessions"] == 2
+    assert s["nonfinite_names"] == ["AMD", "NVDA"]
+    assert s["firsts"] == {"AMD": DAYS[0]} and s["uncertain_first"] == ["NVDA"]   # AMD crossed first
+    assert all(t != "NVDA" or "t1" not in lab for t, lab, _, _ in plr.forward_rows([], [s]))
+
+
+def test_readout_columns_and_widths_with_nonfinite():
+    nan_day = {"date": DAYS[3], "high": NAN, "low": NAN, "close": NAN}
+    bars = {"NVDA": [_bar(d, 100.0) for d in DAYS[:3]] + [nan_day]
+            + [_bar(d, 100.0) for d in DAYS[4:30]],
+            "SPY": [_bar(d, 400.0) for d in DAYS[:30]]}
+    plans = [_plan(1, _et(DAYS[0], 8))]
+    text = plr.build(plans, [], bars, DAYS[0], "live", "pinned0", _et(DAYS[29], 17))
+    assert "Generated " in text and "at code pinned0" in text
+    # no level crossed, so the NaN day is before any crossing for every price level
+    assert "| t1 | 1 | 1 (NVDA) | 1 (NVDA) | 0 | 0 | - | 0 | 0 | 0 | 0 |" in text
+    assert "| t1 | 29 | 1 (NVDA) | 0 (0%) | 0 | 1 (NVDA) | 0 | 0 | 0 |" in text
+    assert "| time_stop | 1 | 0 | 0 | 0 (0%) | 0 (0%) | - | 0 | 0 | 0 | 0 |" in text
+    for head in ("| level | plans with it |", "| level | sessions in force |"):
+        block = text.split(head)[1].split("\n\n")[0]
+        widths = {l.count("|") for l in (head + block).splitlines() if l.startswith("|")}
+        assert len(widths) == 1, widths
+    assert "nan" not in text.replace("non-finite", "").replace("NaN", "").lower().replace("financ", "")

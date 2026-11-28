@@ -197,6 +197,10 @@ def _log_feed_stats() -> None:
                             f"this poll ({st['failed']} failed)")
             if st["tickers"]:
                 _track_feed_outage(f, down, st["first_error"])
+                from ingestion import source_health
+                source_health.note(f"news:{f}",
+                                   source_health.ERROR if st["failed"] == st["tickers"]
+                                   else source_health.OK if st["returned"] else source_health.EMPTY)
     except Exception as e:
         log.debug(f"news feed stats failed: {e}")
 

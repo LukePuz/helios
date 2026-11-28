@@ -57,8 +57,8 @@ def test_held_exit_fires_per_rule_and_forward_split():
     assert "| below_both_sma | 1 | 1 | 0 | 50% |" in text
     assert "| time_stop | 1 | 1 | 0 | 50% |" in text
     assert "| atr_drawdown | 0 | 0 | 2 | - |" in text                      # None = unknown, not a fire
-    assert "| below_both_sma: fire | 5 | 1 | 0 | 1 |" in text              # NVDA, falling
-    assert "| time_stop: fire | 5 | 1 | 0 | 1 |" in text                   # AMD, rising
+    assert "| below_both_sma: fire | 5 | 1 | 0 | 0 | 1 |" in text              # NVDA, falling
+    assert "| time_stop: fire | 5 | 1 | 0 | 0 | 1 |" in text                   # AMD, rising
     assert so.DEFINITION_NOTE in text
 
 
@@ -120,8 +120,8 @@ def test_recheck_and_add_loser_counts_and_forward_by_would_block():
     assert "| recheck_contradiction, routing rows that ended before sizing | 1 | 1 | 0 | 0 | 0 |" in text
     assert "| add_loser_gate, ADD approvals (shadow) | 2 | 1 | 0 | 0 | 1 |" in text
     assert "| add_loser_gate_shadow, deferred retries | 1 | 0 | 1 | 0 | 0 |" in text
-    assert "| recheck would_block true | 5 | 1 | 0 | 1 |" in text
-    assert "| add_loser would_block true | 5 | 1 | 0 | 1 |" in text
+    assert "| recheck would_block true | 5 | 1 | 0 | 0 | 1 |" in text
+    assert "| add_loser would_block true | 5 | 1 | 0 | 0 | 1 |" in text
     assert so.DEFINITION_NOTE in text
 
 

@@ -65,8 +65,8 @@ def test_readout_reports_percentages_and_pending_never_prices():
     bars = {"SPY": spy, "MSFT": [(d, 487.65) for d in SESSIONS]}
     rows = [("MSFT", "ADD", datetime(2026, 11, 16, 15, 0, tzinfo=timezone.utc), None)]
     text = fr.readout(fr.collect(rows, bars), date(2026, 11, 16), "live", "abc123")
-    assert "| ADD | 5 | 1 | 0 | 1 | +0.0 | +0.0 | 0% | +0.0 |" in text
-    assert "| ADD | 10 | 1 | 1 | 1 | - | - | - | - |" in text
+    assert "| ADD | 5 | 1 | 0 | 0 | 1 | +0.0 | +0.0 | 0% | +0.0 |" in text
+    assert "| ADD | 10 | 1 | 1 | 0 | 1 | - | - | - | - |" in text
     assert "412.37" not in text and "487.65" not in text and "not a study result" in text
 
 
@@ -184,5 +184,99 @@ def test_default_mode_is_unchanged_by_the_new_hooks():
     rows = [("AAA", "OPEN", datetime(2026, 11, 16, 15, 0, tzinfo=timezone.utc), None)]
     bars = {"SPY": [(d, 100.0) for d in SESSIONS], "AAA": [(d, 50.0) for d in SESSIONS]}
     g = fr.collect(rows, bars)
-    assert set(g) == {"OPEN"} and set(g["OPEN"][0]) == {"symbol", "d0", "f5", "x5", "f10", "x10",
-                                                       "f20", "x20"}
+    assert set(g) == {"OPEN"} and set(g["OPEN"][0]) == {"symbol", "d0", "f5", "x5", "nf5", "f10",
+                                                       "x10", "nf10", "f20", "x20", "nf20"}
+    assert all(g["OPEN"][0][f"nf{k}"] == [] for k in fr.HORIZONS)
+
+
+# --------------------------------------------------------------------------
+# non-finite closes (audit 2026-11-27 16:53 #3)
+# --------------------------------------------------------------------------
+
+NAN, INF = float("nan"), float("inf")
+NOW = datetime(2026, 11, 27, 23, 10, tzinfo=timezone.utc)
+
+
+def test_nonfinite_values():
+    for v in (NAN, INF, -INF, "NaN", __import__("decimal").Decimal("NaN")):
+        assert fr.nonfinite(v)
+    for v in (None, True, 0, 0.0, 1.5, "x", "1.2"):
+        assert not fr.nonfinite(v)
+
+
+def test_forward_return_flags_a_nan_base_or_end_and_never_returns_nan():
+    dates = list(SESSIONS)
+    for bad_i in (0, 5):
+        closes = {d: 100.0 for d in SESSIONS}
+        for bad in (NAN, INF):
+            closes[SESSIONS[bad_i]] = bad
+            assert fr.forward_return(closes, dates, SESSIONS[0], 5) == fr.NONFINITE
+    closes = {d: 100.0 for d in SESSIONS}
+    closes[SESSIONS[2]] = NAN                    # between base and end: not read
+    assert fr.forward_return(closes, dates, SESSIONS[0], 5) == 0.0
+    closes[SESSIONS[0]] = 0.0                    # zero base: pending, as before
+    assert fr.forward_return(closes, dates, SESSIONS[0], 5) is None
+
+
+def _nf_bars():
+    spy = [(d, 100.0) for d in SESSIONS]
+    good = [(d, 50.0 + i) for i, d in enumerate(SESSIONS)]
+    sndk = [(d, 30.0) for d in SESSIONS]
+    sndk[5] = (SESSIONS[5], NAN)                 # SNDK's 5th bar after SESSIONS[0]
+    return {"SPY": spy, "AAA": good, "SNDK": sndk}
+
+
+def test_collect_marks_the_name_and_keeps_the_row_out_of_the_returns():
+    t0 = datetime(2026, 11, 16, 15, 0, tzinfo=timezone.utc)
+    g = fr.collect([("SNDK", "OPEN", t0, None), ("AAA", "OPEN", t0, None)], _nf_bars())
+    by = {r["symbol"]: r for r in g["OPEN"]}
+    assert by["SNDK"]["nf5"] == ["SNDK"] and by["SNDK"]["f5"] is None and by["SNDK"]["x5"] is None
+    assert by["SNDK"]["nf10"] == [] and by["SNDK"]["f10"] is None        # pending, not non-finite
+    assert by["AAA"]["nf5"] == [] and abs(by["AAA"]["x5"] - 0.1) < 1e-12
+
+
+def test_a_nonfinite_spy_close_marks_spy():
+    bars = _nf_bars()
+    bars["SPY"][5] = (SESSIONS[5], INF)
+    t0 = datetime(2026, 11, 16, 15, 0, tzinfo=timezone.utc)
+    rec = fr.collect([("AAA", "OPEN", t0, None)], bars)["OPEN"][0]
+    assert rec["nf5"] == ["SPY"] and rec["f5"] is None and rec["x5"] is None
+
+
+def test_readout_counts_nonfinite_out_of_pending_and_stats_with_no_nan():
+    t0 = datetime(2026, 11, 16, 15, 0, tzinfo=timezone.utc)
+    t1 = datetime(2026, 11, 17, 15, 0, tzinfo=timezone.utc)
+    rows = [("SNDK", "OPEN", t0, None), ("AAA", "OPEN", t0, None), ("AAA", "OPEN", t1, None)]
+    text = fr.readout(fr.collect(rows, _nf_bars()), date(2026, 11, 16), "live", "pinned0", NOW)
+    assert "Generated 2026-11-27 23:10 UTC at code pinned0." in text
+    # 3 rows at 5 sessions: SNDK non-finite, AAA twice resolved (+10.0%, 50->55 and 51->56)
+    assert "| OPEN | 5 | 3 | 0 | 1 (SNDK) | 2 |" in text
+    assert "| OPEN | 10 | 3 | 3 | 0 | 2 | - | - | - | - |" in text
+    assert not any(v in text.lower() for v in ("+nan", "-nan", "nan%", "| nan", "+inf", "-inf"))
+    assert "30.0" not in text and "| non-finite |" in text
+
+
+def test_every_forward_table_line_has_the_header_width():
+    t0 = datetime(2026, 11, 16, 15, 0, tzinfo=timezone.utc)
+    rows, bars = _conv_rows_and_bars()
+    texts = [fr.readout(fr.collect([("SNDK", "OPEN", t0, None)], _nf_bars()), date(2026, 11, 16),
+                        "live", "h", NOW),
+             fr.readout({}, date(2026, 11, 16), "live", "h", NOW),
+             fr.conviction_readout(rows, bars, date(2026, 9, 1), "live", "h", NOW)]
+    for text in texts:
+        for line in text.splitlines():
+            cells = line.split(" | ")
+            if line.startswith(("| group", "| (no rows)")) or (
+                    line.startswith("| ") and len(cells) > 1 and cells[1] in ("5", "10", "20")):
+                assert line.count("|") == 11, line
+
+
+def test_conviction_readout_counts_nonfinite_in_both_views():
+    rows, bars = _conv_rows_and_bars()
+    up = dict(bars["UP"])
+    first = sorted(up)[5]                        # UP's 5th bar after its first session 0
+    bars["UP"] = [(d, NAN if d == first else c) for d, c in bars["UP"]]
+    text = fr.conviction_readout(rows, bars, date(2026, 9, 1), "live", "pinned0", NOW)
+    assert "| c8 | 5 | 12 | 0 | 2 (UP) |" in text
+    assert "| logprob >= 7.5 | 5 | 12 | 0 | 2 (UP) |" in text
+    assert not any(v in text.lower() for v in ("+nan", "-nan", "nan%", "| nan", "+inf", "-inf"))

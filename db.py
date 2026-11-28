@@ -250,6 +250,23 @@ CREATE INDEX IF NOT EXISTS chat_history_user_idx ON chat_history (user_id, times
 
 _POOL_HEALTH_CHECK_INTERVAL_S = 60
 _last_pool_health_check: float = 0.0
+# Held only while a process builds its pool. Two threads (a task and the
+# activity writer) used to both see no pool and build one each, opening a
+# second session on the pooler at first use (screen children, 2026-11-24
+# 05:00; roadmap 04e7). Re-created in a forked child, which must not inherit
+# a lock another thread of the parent held at the fork.
+_POOL_CREATE_LOCK = threading.Lock()
+
+
+def _new_pool_create_lock_in_child() -> None:
+    """After a fork, in the child: fresh pool locks (_POOL_CREATE_LOCK and
+    _issued_lock, defined below), never ones a parent thread held."""
+    global _POOL_CREATE_LOCK, _issued_lock
+    _POOL_CREATE_LOCK = threading.Lock()
+    _issued_lock = threading.Lock()
+
+
+os.register_at_fork(after_in_child=_new_pool_create_lock_in_child)
 
 
 def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
@@ -291,14 +308,26 @@ def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
                 pass
         return _pool
 
+    with _POOL_CREATE_LOCK:
+        if _pool is not None:      # another thread built it while this one waited
+            return _pool
+        return _create_pool()
+
+
+def _create_pool() -> psycopg2.pool.ThreadedConnectionPool:
+    """Build this process's pool (called by _get_pool under _POOL_CREATE_LOCK).
+    Logs the port and maxconn it uses, never the host or credentials, so the
+    session/transaction pooler split shows per process."""
+    global _pool, _last_pool_health_check
     maxconn = int(os.getenv("DB_MAXCONN", "5"))
+    port = int(os.getenv("SUPABASE_PORT", "5432"))
     for attempt in range(1, 4):
         try:
             _pool = psycopg2.pool.ThreadedConnectionPool(
                 minconn=1,
                 maxconn=maxconn,
                 host=os.getenv("SUPABASE_HOST"),
-                port=int(os.getenv("SUPABASE_PORT", "5432")),
+                port=port,
                 dbname=os.getenv("SUPABASE_DB", "postgres"),
                 user=os.getenv("SUPABASE_USER", "postgres"),
                 password=os.getenv("SUPABASE_PASSWORD"),
@@ -311,7 +340,8 @@ def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
                 # (audit 2026-11-07 05:07 #5).
                 connect_timeout=10,
             )
-            logging.info(f"DB connection pool created (maxconn={maxconn}).")
+            logging.info(f"DB connection pool created (port={port}, maxconn={maxconn}, "
+                         f"pid={os.getpid()}).")
             _last_pool_health_check = _time.monotonic()
             return _pool
         except Exception as e:
@@ -5896,6 +5926,36 @@ def recorded_sell_order_ids(ticker: str, max_age_hours: int = 24) -> tuple[set[i
         return None
     finally:
         _put_conn(conn)
+
+
+def last_buy_fill_at(ticker: str):
+    """The newest filled_at of a filled or part-filled BUY order row for this
+    ticker in this env (aware datetime), None when there is none or the read
+    failed (a 3 s statement bound). A BUY still waiting for its fill has no
+    filled_at yet, so it isn't counted. Record only:
+    tasks._record_trim_fresh_check's minutes since the last BUY fill. Never
+    raises."""
+    conn = None
+    try:
+        conn = _get_conn()
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = 3000")
+            cur.execute(
+                "SELECT max(filled_at) FROM orders WHERE ticker=%s AND side='BUY' "
+                "AND status IN ('filled', 'partial') AND trading_env=%s",
+                (ticker, TRADING_ENV),
+            )
+            row = cur.fetchone()
+        conn.rollback()
+        return row[0] if row else None
+    except Exception as e:
+        logging.warning(f"last_buy_fill_at({ticker}) failed: {e}")
+        if conn is not None:
+            _rollback_quietly(conn)
+        return None
+    finally:
+        if conn is not None:
+            _put_conn(conn)
 
 
 def get_unconfirmed_orders(max_age_hours: int = 24) -> list[dict]:

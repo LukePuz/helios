@@ -10,6 +10,13 @@ ROOT = Path(__file__).resolve().parent.parent / "deploy" / "systemd"
 def test_named_drop_ins_exist():
     readme = (ROOT / "README.md").read_text()
     named = set(re.findall(r"([\w@-]+\.service\.d/[\w.-]+\.conf)", readme))
-    assert "helios-local.service.d/db-port.conf" in named
-    for rel in named:
+    retired = {"helios-local.service.d/db-port.conf"}   # named only as retired (roadmap 04e7)
+    for rel in named - retired:
         assert (ROOT / rel).is_file(), rel
+
+
+def test_no_unit_wide_port_drop_in():
+    """main.py must stay on the session pooler (init_db's concurrent-index
+    migrations); the workers that use 6543 get it from process_manager."""
+    for conf in ROOT.glob("*.service.d/*.conf"):
+        assert "SUPABASE_PORT" not in conf.read_text(), conf.name

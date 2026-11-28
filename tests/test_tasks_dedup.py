@@ -3118,7 +3118,10 @@ def test_over_cover_fix_waits_only_for_the_ticker_the_reads_disagree_on():
         tasks.reconcile_stop_orders.run()
     cancel.assert_not_called()
     delete.assert_not_called()
-    fix.assert_called_once_with("NVDA")
+    # NVDA's plain fix, once (in shadow the trim fresh check passes outcome_out)
+    fix.assert_called_once()
+    assert fix.call_args.args == ("NVDA",)
+    assert not {"allow_cancel", "max_qty", "fresh_qty"} & set(fix.call_args.kwargs)
     due.assert_any_call("overstop_disagree_AMD")
     assert any("STOP CHECK" in c.args[0] and "AMD" in c.args[0] and "nothing was cancelled" in c.args[0]
                for c in alert.call_args_list)

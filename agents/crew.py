@@ -1419,13 +1419,18 @@ def process_candidates(candidates: list[dict], max_per_run: int = 5) -> list[dic
 
 def _c6_bar_unrouted(result: dict, regime: dict, client) -> None:
     """c6 bar shadow (agents/c6_shadow.py) for a verdict not routed: a
-    fire-and-forget enqueue, no price or broker call here. Log-only, never
-    raises."""
+    fire-and-forget enqueue, no price or broker call here. Also the unrouted
+    verdict forward record (_unrouted_verdict_forward_record), which every
+    non-routed verdict reaches through here. Log-only, never raises."""
     try:
         from agents.c6_shadow import observe_unrouted
         observe_unrouted(result, regime)
     except Exception as e:
         log.warning(f"[{result.get('ticker')}] c6 bar shadow failed: {e}")
+    try:
+        _unrouted_verdict_forward_record(result)
+    except Exception as e:
+        log.warning(f"[{(result or {}).get('ticker')}] unrouted verdict forward record failed: {e}")
 
 
 def _c6_bar_tier_floor(result: dict, regime_str: str, price, sizing: dict) -> None:
@@ -4422,6 +4427,292 @@ def _check_entry_gate_reclaims(today=None) -> int:
             _reclaim_book_edit(apply)
     except Exception as e:
         log.warning(f"entry gate reclaim check failed: {type(e).__name__}: {e}")
+    return logged
+
+
+# Forward closes after verdicts that were not routed (config
+# UNROUTED_VERDICT_FORWARD_SHADOW_ENABLED). Record only: one record per ticker
+# per ET date in system_state under this key, for the day's first non-routed
+# verdict; the nightly check logs activity_feed rows under _UVF_STAGE. Gate-
+# blocked buys were routed, so they never reach this path (the reclaim shadow
+# above follows them).
+_UVF_KEY = "unrouted_verdict_forward_shadow_{env}"
+_UVF_STAGE = "unrouted_verdict_forward_shadow"
+_UVF_FORWARD_SESSIONS = (5, 10, 20)
+_UVF_BOOK_MAX = 400          # records kept, the oldest verdict dropped first (7-14 names a day live)
+_UVF_LOCK_WAIT_S = 5         # the nightly check
+_UVF_RECORD_WAIT_S = 1.0     # the verdict path: a short wait on the LLM worker
+_UVF_NOT_VERDICTS = ("SKIP",)   # pipeline placeholders (positions unavailable, analysis failed)
+
+
+def _unrouted_forward_book_edit(fn, wait_s=_UVF_LOCK_WAIT_S) -> bool:
+    """Apply fn(book) -> book (or None: nothing to write) to the unrouted
+    verdict forward book in system_state under a short Redis lock, the same
+    way _reclaim_book_edit edits the reclaim book: a failed read writes
+    nothing, a stored value that isn't a JSON object is reset to {} (one
+    warning), a busy lock skips the edit, and without Redis the edit runs
+    unlocked. True when written. Never raises."""
+    lock = None
+    try:
+        import json
+        import db
+        import stop_lock
+        from config import TRADING_ENV
+        key = _UVF_KEY.format(env=TRADING_ENV)
+        try:
+            lock = stop_lock._redis().lock(f"helios:{key}", timeout=30, blocking_timeout=wait_s)
+            if not lock.acquire():
+                log.warning(f"{key}: lock busy; unrouted verdict forward edit skipped")
+                return False
+        except Exception as e:
+            lock = None
+            log.debug(f"{key}: lock unavailable ({type(e).__name__}); editing without it")
+        raw = db.get_state_strict(key, "")
+        try:
+            book = json.loads(raw or "{}")
+        except (TypeError, ValueError):
+            book = None
+        if not isinstance(book, dict):
+            log.warning(f"{key}: stored value is not a JSON object; unrouted verdict forward book reset to {{}}")
+            book = {}
+        new = fn(book)
+        if new is None:
+            return False
+        db.set_state(key, json.dumps(new, default=str))
+        return True
+    except Exception as e:
+        log.warning(f"unrouted verdict forward book edit failed: {type(e).__name__}: {e}")
+        return False
+    finally:
+        if lock is not None:
+            try:
+                lock.release()
+            except Exception:
+                pass
+
+
+def _last_completed_session_date(now_et):
+    """The ET date of the last NYSE session whose close (16:00, or 13:00 on an
+    early close) is at or before now_et: today after its close, else the
+    session before. market_data's calendar; weekends and holidays skipped."""
+    from datetime import timedelta
+    from market_data import _session
+    d = now_et.date()
+    sess = _session(d)
+    if sess is not None and now_et.time() >= sess[1]:
+        return d
+    for _ in range(15):
+        d -= timedelta(days=1)
+        if _session(d) is not None:
+            return d
+    return d
+
+
+def _unrouted_verdict_forward_record(result: dict, now=None) -> bool:
+    """Record only (config UNROUTED_VERDICT_FORWARD_SHADOW_ENABLED): called
+    for each verdict that was not routed (_c6_bar_unrouted's callers: HOLD,
+    WATCH, PASS, and any buy or sell the analyst didn't pass to risk). Keeps
+    one record per ticker per ET date for _check_unrouted_verdict_forwards:
+    the day's first non-routed verdict (action, conviction, conviction_raw,
+    signal_id, trigger path, verdict time) and base_session, the verdict-time
+    last completed session, whose cached close the nightly check takes as the
+    base. Later non-routed verdicts that day only add to verdicts (the count
+    the record stands for) and actions_seen (that count by action). SKIP and
+    action-less results are pipeline placeholders, not verdicts, and are not
+    recorded. Which verdicts and which horizon an evaluation counts is a
+    research choice (Luke). Waits at most _UVF_RECORD_WAIT_S for the book's
+    lock; no DB read beyond the book. Nothing it writes is read by a gate, a
+    prompt, routing or sizing. Returns True when stored. Never raises."""
+    try:
+        try:
+            from config import UNROUTED_VERDICT_FORWARD_SHADOW_ENABLED as on
+        except ImportError:
+            on = False
+        if not on or not isinstance(result, dict):
+            return False
+        ticker = result.get("ticker")
+        action = result.get("action")
+        if not ticker or not isinstance(action, str) or not action or action in _UVF_NOT_VERDICTS:
+            return False
+        from datetime import datetime, timezone
+        from zoneinfo import ZoneInfo
+        now = now or datetime.now(timezone.utc)
+        now_et = now.astimezone(ZoneInfo("America/New_York"))
+        et_date = now_et.date().isoformat()
+        prov = result.get("provenance") if isinstance(result.get("provenance"), dict) else {}
+        trig = prov.get("trigger") if isinstance(prov.get("trigger"), dict) else {}
+        sid = prov.get("signal_id")
+        sid = sid if isinstance(sid, int) and not isinstance(sid, bool) else None
+        rec = {"ticker": ticker, "action": action, "conviction": result.get("conviction"),
+               "conviction_raw": result.get("conviction_raw"), "signal_id": sid,
+               "path": trig.get("path"), "verdict_at": now.isoformat(), "et_date": et_date,
+               "base_session": _last_completed_session_date(now_et).isoformat(),
+               "verdicts": 1, "actions_seen": {action: 1}, "logged": {}}
+        rid = f"{ticker}:{et_date}"
+
+        def add(book):
+            old = book.get(rid)
+            if isinstance(old, dict) and old.get("verdict_at"):
+                try:
+                    old["verdicts"] = int(old.get("verdicts") or 1) + 1
+                except (TypeError, ValueError):
+                    old["verdicts"] = 2
+                seen = old.get("actions_seen") if isinstance(old.get("actions_seen"), dict) else {}
+                seen[action] = (seen.get(action) if isinstance(seen.get(action), int) else 0) + 1
+                old["actions_seen"] = seen
+                return book
+            book[rid] = rec
+            if len(book) > _UVF_BOOK_MAX:
+                drop = [k for k, _ in sorted(book.items(), key=lambda kv: str(
+                    (kv[1] if isinstance(kv[1], dict) else {}).get("verdict_at")))
+                    if k != rid][:len(book) - _UVF_BOOK_MAX]
+                for k in drop:
+                    book.pop(k, None)
+                log.warning(f"unrouted verdict forward book full: {len(drop)} oldest record(s) dropped")
+            return book
+        return _unrouted_forward_book_edit(add, wait_s=_UVF_RECORD_WAIT_S)
+    except Exception as e:
+        log.warning(f"[{(result or {}).get('ticker') if isinstance(result, dict) else '?'}] "
+                    f"unrouted verdict forward record failed: {type(e).__name__}: {e}")
+        return False
+
+
+def _check_unrouted_verdict_forwards(today=None) -> int:
+    """Record only, nightly after refresh_price_history (beside
+    _check_entry_gate_reclaims, on the bars just stored). For each record
+    _unrouted_verdict_forward_record kept:
+    - the base: the cached close of its base_session (the verdict-time last
+      completed session). If that bar is missing but a later bar exists, the
+      last cached close before it, with base_bar_matches false; with no bar
+      on or after base_session yet, the record waits.
+    - forward_<n>, once each for n in _UVF_FORWARD_SESSIONS: the close n
+      completed sessions (cached bars) after the base bar vs the base close,
+      in percent.
+    - expired, once, when the last horizon's sessions have passed (or the
+      bars never got there within twice that many calendar days plus 10:
+      window_complete false, e.g. a name with no cached bars); the record is
+      then dropped.
+    Rows go to activity_feed stage unrouted_verdict_forward_shadow with a
+    shadow_key (env:ticker:et_date:event), deduped against the rows already
+    written; percentages and counts only. No evaluation: which horizon and
+    which verdicts an evaluation counts is a research choice (Luke). Reads
+    the price cache, the stage's shadow keys and system_state: no broker or
+    network call. Returns the rows written. Never raises."""
+    logged = 0
+    try:
+        try:
+            from config import UNROUTED_VERDICT_FORWARD_SHADOW_ENABLED as on
+        except ImportError:
+            return 0
+        if not on:
+            return 0
+        from datetime import date, datetime
+        from zoneinfo import ZoneInfo
+        import json
+        import db
+        from config import TRADING_ENV
+        life = max(_UVF_FORWARD_SESSIONS)
+        key = _UVF_KEY.format(env=TRADING_ENV)
+        raw = db.get_state_strict(key, "")
+        try:
+            book = json.loads(raw or "{}")
+        except (TypeError, ValueError):
+            book = None
+        if not isinstance(book, dict):
+            _unrouted_forward_book_edit(lambda b: b)   # resets it to {} (its one warning)
+            return 0
+        if not book:
+            return 0
+        today = today or datetime.now(ZoneInfo("America/New_York")).date()
+        tickers = sorted({r.get("ticker") for r in book.values() if isinstance(r, dict) and r.get("ticker")})
+        bars = db.get_price_history_bulk(tickers, days=120)
+        done = db.get_activity_shadow_keys(_UVF_STAGE)
+        updates = {}   # record id -> (verdict_at seen, record to keep or None)
+
+        def pct(a, b):
+            return round((a / b - 1) * 100, 2) if a and b else None
+        for rid, rec in book.items():
+            ticker = None
+            try:
+                if not isinstance(rec, dict) or not rec.get("verdict_at") or not rec.get("ticker"):
+                    continue
+                rec = json.loads(json.dumps(rec))          # a copy to change
+                ticker = rec["ticker"]
+                logged_ev = rec.setdefault("logged", {})
+                tb = [b for b in bars.get(ticker, []) if b.get("date") and b.get("close")]
+                if not rec.get("base_bar_date"):
+                    bs = str(rec.get("base_session"))
+                    if any(b["date"] >= bs for b in tb):
+                        before = [b for b in tb if b["date"] <= bs]
+                        if before:
+                            rec["base_bar_date"], rec["base_close"] = before[-1]["date"], before[-1]["close"]
+                            rec["base_bar_matches"] = before[-1]["date"] == bs
+                base_d, base = rec.get("base_bar_date"), rec.get("base_close")
+                after = [b for b in tb if base_d and b["date"] > str(base_d)]
+                ident = f"{TRADING_ENV}:{ticker}:{rec.get('et_date')}"
+                common = {"action": rec.get("action"), "conviction": rec.get("conviction"),
+                          "conviction_raw": rec.get("conviction_raw"),
+                          "signal_id": rec.get("signal_id"), "path": rec.get("path"),
+                          "verdict_at": rec.get("verdict_at"), "verdict_et_date": rec.get("et_date"),
+                          "verdicts": rec.get("verdicts"), "actions_seen": rec.get("actions_seen"),
+                          "base_session": rec.get("base_session"), "base_bar_date": base_d,
+                          "base_bar_matches": rec.get("base_bar_matches"),
+                          "base_source": "verdict-time last completed close (cached bar)",
+                          "life_sessions": life, "env": TRADING_ENV}
+
+                def write(event, msg, fields):
+                    nonlocal logged
+                    sk = f"{ident}:{event}"
+                    if event in logged_ev or (done is not None and sk in done):
+                        logged_ev.setdefault(event, "already written")
+                        return
+                    if db.log_activity(_UVF_STAGE, ticker, msg, "neutral",
+                                       {**common, "event": event, **fields, "shadow_key": sk}):
+                        logged_ev[event] = today.isoformat()
+                        logged += 1
+                for n in _UVF_FORWARD_SESSIONS:
+                    if len(after) >= n:
+                        b = after[n - 1]
+                        write(f"forward_{n}",
+                              f"{n} sessions after a non-routed {rec.get('action')}: "
+                              f"{pct(b['close'], base)}% ({b['date']}; record only)",
+                              {"sessions": n, "bar_date": b["date"], "move_pct": pct(b["close"], base)})
+                expired = len(after) >= life
+                try:
+                    stale = (today - date.fromisoformat(str(rec.get("et_date")))).days > 2 * life + 10
+                except ValueError:
+                    stale = True
+                if expired or stale:
+                    write("expired",
+                          f"non-routed {rec.get('action')} record closed after {len(after)} sessions "
+                          f"(record only)",
+                          {"sessions": len(after), "window_complete": expired,
+                           "forward_logged": sorted(k for k in logged_ev if k.startswith("forward_"))})
+                    if "expired" in logged_ev:
+                        updates[rid] = (rec["verdict_at"], None)
+                        continue
+                updates[rid] = (rec["verdict_at"], rec)
+            except Exception as e:
+                log.warning(f"[{ticker or rid}] unrouted verdict forward check failed: "
+                            f"{type(e).__name__}: {e}")
+
+        def apply(current):
+            for r_, (seen, keep) in updates.items():
+                cur = current.get(r_)
+                if not isinstance(cur, dict) or cur.get("verdict_at") != seen:
+                    continue
+                if keep is None:
+                    current.pop(r_, None)
+                else:
+                    # The verdict path may have counted more verdicts meanwhile.
+                    keep["verdicts"] = cur.get("verdicts", keep.get("verdicts"))
+                    keep["actions_seen"] = cur.get("actions_seen", keep.get("actions_seen"))
+                    current[r_] = keep
+            return current
+        if updates:
+            _unrouted_forward_book_edit(apply)
+    except Exception as e:
+        log.warning(f"unrouted verdict forward check failed: {type(e).__name__}: {e}")
     return logged
 
 

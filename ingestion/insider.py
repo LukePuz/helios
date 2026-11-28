@@ -333,6 +333,9 @@ def poll_once() -> list[dict]:
     LAST_PASS.update(stats)
     log.info(f"Insider pass: {stats['ok']} ok, {stats['failed']} failed, "
              f"{stats['skipped']} skipped of {total} in {stats['seconds']}s (start {start})")
+    if total:
+        from ingestion import source_health   # an empty pass is normal: ran = ok
+        source_health.note("insider", source_health.ERROR if stats["poll_failed"] else source_health.OK)
     return all_results
 
 

@@ -525,6 +525,17 @@ FEED_HEALTH_LOW_RATIO = 0.2
 FEED_HEALTH_LOW_SESSIONS = 3
 FEED_HEALTH_LOOKBACK_DAYS = 60
 FEED_HEALTH_EXCLUDED_SOURCES = ("news_title",)
+# Per-source poll health (ingestion/source_health.py, record and report only;
+# roadmap 04e4). Each poller notes each poll as ok / empty / error in Redis
+# (0.2 s timeout, skipped while Redis is down); once a day, inside
+# tasks.send_daily_digest, a source_health activity row records per source
+# today's counts, the consecutive empty/error polls, the last success and the
+# dead-session streak, and the digest gets one line naming the sources dead
+# for SOURCE_HEALTH_DEAD_SESSIONS or more sessions (dead: polled that ET day
+# with no ok poll). No retry, fallback, prompt or brief change. False: no
+# capture, no row, no line. Not read from .env.
+SOURCE_HEALTH_RECORD_ENABLED = True
+SOURCE_HEALTH_DEAD_SESSIONS = 2
 # Fundamentals freeze watch (tasks.refresh_fundamentals, record only): after
 # each refresh, how many tickers' target_mean_price or forward_eps changed
 # from their previous fundamentals_history row (a fundamentals_changes
@@ -651,6 +662,16 @@ ENTRY_TREND_GATE_MARKET_TICKER = "SPY"
 # routing or sizing.
 ENTRY_GATE_RECLAIM_SHADOW_ENABLED = True
 ENTRY_GATE_RECLAIM_SHADOW_SESSIONS = 20
+# Forward closes after non-routed verdicts (agents/crew.py:
+# _unrouted_verdict_forward_record and _check_unrouted_verdict_forwards).
+# Record only: the day's first non-routed verdict per ticker (HOLD, WATCH,
+# PASS, or a buy/sell not passed to risk) goes to system_state
+# unrouted_verdict_forward_shadow_<env>, with a count of that day's later
+# ones; the nightly price refresh logs the name's cached close 5/10/20
+# sessions after the verdict-time last completed close (stage
+# unrouted_verdict_forward_shadow), then drops the record. No evaluation or
+# threshold. Nothing here changes a verdict, a prompt, routing or sizing.
+UNROUTED_VERDICT_FORWARD_SHADOW_ENABLED = True
 # Would-be sizing on gate-blocked buys (agents/crew.py:_would_be_sizing_record).
 # Record only: the route's ENTRY_GATE_BLOCKED row gets decision.would_be_sizing,
 # marked hypothetical: the stop sizing's calculate_stop would set (on cached
@@ -1233,6 +1254,23 @@ BROKER_SELL_WATCH_ENABLED = True
 # the position cache, one executions pass (5 s bound) and the other-BUY count
 # (3 s): up to ~11 s more before that stop. Shadow does them after the run.
 LATE_FILL_HELD_BEFORE_MODE = "shadow"
+
+# Reconcile's over-cover trim (tasks.reconcile_stop_orders section 2b) sizes
+# stops from the portfolio cache and takes a fresh positions read only when a
+# ticker looks flat, so a cache reading a held ticker short (a reconnect, an
+# ADD's fill not yet in it) on two cycles cancelled every stop and re-placed
+# one for the short count, leaving the rest bare (08 Helios Engineering/
+# reconcile-trim-under-lag.md, G1). One fresh read per cycle (the usual
+# bound, no reconnect; this cycle's own fresh read when there is one) is
+# compared with the cache for the ticker. "shadow" (default): the trim runs
+# as before; after the cycle's order work (a timed-out read drops the
+# session), each trim that sent a cancel is checked against the count it
+# sized from, and one reconcile_trim_fresh_check activity row says it would
+# have been blocked when the read disagrees or failed. "enforce": read before
+# the trim; then the add-only branch (nothing cancelled, capped at the
+# smaller read) and its throttled alert instead, plus the same row. Any
+# other value ("off"): today's behaviour, no read, no row.
+RECONCILE_TRIM_FRESH_CHECK_MODE = "shadow"
 
 # ib_async marks a market order done on orderStatus Filled, but adds each
 # execution to trade.fills only when its execDetails arrives, which can be

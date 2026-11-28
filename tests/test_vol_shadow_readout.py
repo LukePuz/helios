@@ -84,3 +84,51 @@ def test_fallback_link_requires_the_same_env():
     r = vr.fill_rows(fills, bars, snaps, approvals)[0]
     assert not r["linked"] and r["stop_vol"]["stop_pct"] is None
     assert r["vol_target_shadow"]["weights_at"] == "fill"
+
+
+# --- non-finite closes in x20 --------------------------------------------------
+
+NAN, INF = float("nan"), float("inf")
+
+
+def _x20_bars():
+    d0 = date(2026, 9, 1)
+    days = [(d0 + timedelta(days=i)).isoformat() for i in range(30)]
+    name = [{"date": d, "close": 100.0 + i} for i, d in enumerate(days)]
+    spy = [{"date": d, "close": 400.0} for d in days]
+    return name, spy, d0
+
+
+def test_x20_detail_flags_the_name_or_spy_and_never_returns_nan():
+    name, spy, d0 = _x20_bars()
+    v, bad = vr.x20_detail(name, spy, d0)
+    assert bad is None and abs(v - 0.2) < 1e-12 and vr._x20(name, spy, d0) == v
+    for i in (0, 20):
+        n2 = [dict(b) for b in name]
+        n2[i]["close"] = NAN
+        assert vr.x20_detail(n2, spy, d0) == (None, "name") and vr._x20(n2, spy, d0) == vr.NONFINITE
+    s2 = [dict(b) for b in spy]
+    s2[20]["close"] = INF
+    assert vr.x20_detail(name, s2, d0) == (None, "SPY")
+    n3 = [dict(b) for b in name]
+    n3[5]["close"] = NAN                         # between the two closes: not read
+    assert vr.x20_detail(n3, spy, d0)[1] is None
+    assert vr.x20_detail(name[:20], spy, d0) == (None, None)        # 20th bar not in yet
+
+
+def test_rows_and_readout_count_a_nonfinite_x20():
+    import datetime as _dt
+    fills, bars, snaps, approvals = _setup()
+    i = next(k for k, b in enumerate(bars["NVDA"]) if b["date"] >= "2026-10-01")
+    bars["NVDA"][i]["close"] = NAN               # the fill-day close x20 starts from
+    rows = vr.fill_rows(fills, bars, snaps, approvals)
+    assert rows[0]["x20"] is None and rows[0]["x20_nonfinite"] == ["NVDA"]
+    now = _dt.datetime(2026, 11, 27, 23, 10, tzinfo=timezone.utc)
+    text = vr.readout(rows, "live", "pinned0", now)
+    assert "Generated 2026-11-27 23:10 UTC at code pinned0." in text
+    assert "x20 non-finite (a NaN or infinite close of the name or SPY; out of the x20 mean, " \
+           "no bar changed): 1 (NVDA)." in text
+    assert "| - (0) | 1 (NVDA) |" in text and "| non-finite (NVDA) |" in text
+    assert "nan" not in text.replace("non-finite", "").replace("NaN", "").lower()
+    ok = vr.fill_rows(*_setup())
+    assert ok[0]["x20_nonfinite"] == [] and "x20 non-finite" in vr.readout(ok, "live", "h", now)

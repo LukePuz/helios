@@ -39,6 +39,14 @@ _SCREEN_POOL_ARGS = ["--pool=solo"] if sys.platform == "win32" else ["--pool=pre
 # of queueing behind each other on top of already being isolated from ops.
 _INGESTION_POOL_ARGS = ["--pool=solo"] if sys.platform == "win32" else ["--pool=prefork", "-c", "4"]
 
+# The Supabase transaction pooler (db._TRANSACTION_POOLER_PORT). The screen
+# and ingestion workers use it: their 7 forks held 7 of the session pooler's
+# 15 client slots at rest and up to 14 when busy (roadmap 04e7). Nothing on
+# their DB paths needs a session (no session SET, advisory session lock,
+# LISTEN, temp table or held cursor); main.py, which runs init_db and its
+# CREATE INDEX CONCURRENTLY migrations, and the other workers stay on 5432.
+_TRANSACTION_POOLER_PORT = "6543"
+
 LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
@@ -294,11 +302,13 @@ def start(name: str) -> str:
             # vector store, and db.log_signal), so it doesn't need a
             # broker connection at all.
             extra["DB_MAXCONN"] = "2"
+            extra["SUPABASE_PORT"] = _TRANSACTION_POOLER_PORT
         elif name == "celery_ingestion_worker":
             # No IB_CLIENT_ID — pollers only hit external HTTP APIs (EDGAR,
             # yfinance, etc.) and the DB, never IBKR. -c 4 forks, so cap
             # tight like the other multi-fork workers above.
             extra["DB_MAXCONN"] = "2"
+            extra["SUPABASE_PORT"] = _TRANSACTION_POOLER_PORT
         elif name == "celery_orders_worker":
             # Base 30 -- clear of every other worker's base+fork-index range
             # (10-12, 20). -c 1 (see _ORDERS_POOL_ARGS) means this base is

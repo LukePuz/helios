@@ -261,13 +261,48 @@ def test_a_failed_read_is_shown_not_counted():
 
 def test_every_batch_card_is_listed_once():
     names = [st["stage"] for st in src.STAGES]
-    assert len(names) == len(set(names)) == 42
+    assert len(names) == len(set(names)) == 45
     assert {st["card"] for st in src.STAGES} >= {"held-exit candidates", "book heat",
                                                  "above-market stop guard",
                                                  "self-consistency vote on routed entries",
                                                  "book overnight gap risk",
                                                  "quote a market order was sent on",
-                                                 "same-day consensus on OPEN/ADD routing"}
+                                                 "same-day consensus on OPEN/ADD routing",
+                                                 "forward closes after non-routed verdicts",
+                                                 "per-source data health",
+                                                 "fresh read before a reconcile trim"}
+
+
+def test_unrouted_verdict_forwards_is_conditional_with_no_trigger():
+    """Its rows come only from the nightly check, 5 sessions or more after a
+    verdict, so no trigger row makes it due."""
+    import agents.crew as crew
+    st = {s["stage"]: s for s in src.STAGES}[crew._UVF_STAGE]
+    assert st["switch"] == "UNROUTED_VERDICT_FORWARD_SHADOW_ENABLED"
+    assert st["expect_rows"] == "conditional"
+    assert "trigger" not in st
+    assert st["sources"] == (src._stage(crew._UVF_STAGE),)
+
+
+def test_source_health_is_always_with_its_switch():
+    """One row per digest day (send_daily_digest, Mon-Fri), so a session
+    without one is silent."""
+    from ingestion import source_health
+    st = {s["stage"]: s for s in src.STAGES}[source_health.STAGE]
+    assert st["switch"] == "SOURCE_HEALTH_RECORD_ENABLED"
+    assert st["expect_rows"] == "always"
+    assert st["sources"] == (src._stage(source_health.STAGE),)
+
+
+def test_reconcile_trim_fresh_check_is_conditional_with_no_trigger():
+    """Rows come only when a reconcile trim sent a cancel and the fresh read
+    disagreed with the count it sized from, or failed; no other stage marks
+    those trims, so no trigger row makes it due and silence is normal."""
+    st = {s["stage"]: s for s in src.STAGES}["reconcile_trim_fresh_check"]
+    assert st["switch"] == "RECONCILE_TRIM_FRESH_CHECK_MODE"
+    assert st["expect_rows"] == "conditional"
+    assert "trigger" not in st
+    assert st["sources"] == (src._stage("reconcile_trim_fresh_check"),)
 
 
 def test_every_switch_is_in_config():
@@ -314,8 +349,8 @@ def test_text_marks_silent_and_not_recording():
     text = src.render_text(lines, _meta())
     assert "VERDICT_VOTE_SHADOW_ENABLED=False (not recording)" in text
     always = [st["stage"] for st in src.STAGES if st["expect_rows"] == "always"]
-    assert len(always) == 10
-    assert f"{len(always)} silent, 0 alarm of 42 stages." in text
+    assert len(always) == 11
+    assert f"{len(always)} silent, 0 alarm of 45 stages." in text
     assert "no trigger yet" in text
     assert "no switch" in text
     assert "$" not in text
@@ -334,7 +369,7 @@ def test_text_marks_alarm_and_a_triggered_silent_stage():
     assert by["book_heat"]["silent"] is True
     assert by["hwm_guard"]["alarm"] is True
     assert by["risk_subcheck_fail"]["alarm"] is True
-    assert "1 silent, 2 alarm of 42 stages." in text
+    assert "1 silent, 2 alarm of 45 stages." in text
 
 
 def test_json_is_serialisable():

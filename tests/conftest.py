@@ -226,6 +226,16 @@ def _no_reclaim_book_io(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_unrouted_forward_book_io(monkeypatch):
+    """Each non-routed verdict stores a record-only forward record
+    (agents/crew.py:_unrouted_verdict_forward_record) in system_state under a
+    Redis lock. Stubbed as "not stored" (no Redis or DB) unless a test
+    restores it; tests/test_unrouted_verdict_forwards.py does."""
+    from agents import crew
+    monkeypatch.setattr(crew, "_unrouted_forward_book_edit", lambda fn, wait_s=None: False)
+
+
+@pytest.fixture(autouse=True)
 def _no_deal_state_io(monkeypatch):
     """A screened deal item is folded into a record-only per-ticker deal
     record (agents/material_event.deal_state_note) in system_state under a
@@ -348,6 +358,9 @@ def _no_more_stop_qty_from_broker(monkeypatch):
     import config
     _switch_off(monkeypatch, config, "PT_STOP_QTY_FROM_BROKER", False)
     _switch_off(monkeypatch, config, "LATE_FILL_EXPECT_MODE", "off")
+    # Reconcile's trim fresh check reads positions the existing reconcile
+    # tests don't mock (tests/test_reconcile_trim_fresh_check.py turns it on).
+    _switch_off(monkeypatch, config, "RECONCILE_TRIM_FRESH_CHECK_MODE", "off")
 
 
 @pytest.fixture(autouse=True)
@@ -376,6 +389,16 @@ def _fresh_positions_from_the_cache(monkeypatch):
                 out[p.symbol] = out.get(p.symbol, 0.0) + qty
         return out
     monkeypatch.setattr(ibkr, "get_fresh_stock_positions", from_cache)
+
+
+@pytest.fixture(autouse=True)
+def _no_source_health_io(monkeypatch):
+    """ingestion/source_health.py: pollers note each poll in Redis and the
+    digest writes a daily row. Stubbed (no Redis client, no daily row) unless
+    a test restores them; tests/test_source_health.py does."""
+    from ingestion import source_health
+    monkeypatch.setattr(source_health, "_redis", lambda: None)
+    monkeypatch.setattr(source_health, "daily_record", lambda now=None: [])
 
 
 @pytest.fixture(autouse=True)

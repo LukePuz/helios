@@ -27,6 +27,10 @@ else the next cached session. It reads closes from the nightly price_history
 cache, with no vendor or broker call. The return at k sessions is close(0+k) /
 close(0) - 1 on the name's own bars. The excess return subtracts SPY over the
 same two dates. A row whose k-th bar is not cached yet counts as pending.
+A row whose base or k-th close (the name's, or SPY's for the excess) is NaN
+or infinite counts as non-finite, with the tickers named: it is kept out of
+pending and of every statistic. No bar is dropped or changed (whether to is
+Luke's; scripts/_bar_qa.py flags the bars).
 Percentages only: no prices, sizes or account data. Which number decides
 anything (and after how many rows) is a separate choice, not this script's.
 Read-only: one transaction opened READ ONLY, then rolled back.
@@ -36,6 +40,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import importlib.util
+import math
 import os
 import statistics
 import subprocess
@@ -54,6 +59,7 @@ CONVICTION_KINDS = ("OPEN", "ADD")
 LOGPROB_BANDS = ((None, 6.5, "< 6.5"), (6.5, 7.5, "6.5 to < 7.5"), (7.5, None, ">= 7.5"))
 BOOTSTRAP_DRAWS = 2000
 BOOTSTRAP_SEED = 23
+NONFINITE = "non-finite"   # forward_return when the base or the k-th close is NaN or infinite
 
 
 def session_zero(ts: datetime, sessions: list[date]) -> date | None:
@@ -70,18 +76,33 @@ def session_zero(ts: datetime, sessions: list[date]) -> date | None:
     return sessions[j] if j < len(sessions) else None
 
 
-def forward_return(closes: dict[date, float], dates: list[date], d0: date, k: int) -> float | None:
+def nonfinite(v) -> bool:
+    """True for a NaN or infinite number; None and non-numbers are not."""
+    if v is None or isinstance(v, bool):
+        return False
+    try:
+        return not math.isfinite(float(v))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def forward_return(closes: dict[date, float], dates: list[date], d0: date,
+                   k: int) -> float | str | None:
     """close k sessions after d0 over close at d0, on the name's own bars.
-    None when d0 is not a cached bar of the name or the k-th bar is not in yet."""
+    None when d0 is not a cached bar of the name or the k-th bar is not in yet;
+    NONFINITE when either close is NaN or infinite (`not base` is False for
+    NaN, so it is tested first)."""
     if d0 not in closes:
         return None
     i = bisect.bisect_left(dates, d0)
     if i + k >= len(dates):
         return None
-    base = closes[d0]
+    base, end = closes[d0], closes[dates[i + k]]
+    if nonfinite(base) or nonfinite(end):
+        return NONFINITE
     if not base:
         return None
-    return closes[dates[i + k]] / base - 1
+    return end / base - 1
 
 
 def gate_label(kind: str, decision) -> str:
@@ -208,7 +229,9 @@ def collect(rows, bars: dict[str, list[tuple[date, float]]], label_fn=None,
             extra_fn=None) -> dict[str, list[dict]]:
     """rows: (symbol, kind, ts, decision). bars: ticker -> [(date, close)].
     Returns label -> one record per (symbol, session 0) with raw and excess
-    returns per horizon (None while pending). label_fn(kind, decision) names
+    returns per horizon (None while pending or non-finite) and nf<k>: the
+    tickers whose non-finite close blocked horizon k (empty when none; the
+    row then has f and x None). label_fn(kind, decision) names
     the group (default gate_label); extra_fn(decision) adds fields to each
     record (default none)."""
     label_fn = label_fn or gate_label
@@ -234,15 +257,22 @@ def collect(rows, bars: dict[str, list[tuple[date, float]]], label_fn=None,
         s = series.get(symbol)
         for k in HORIZONS:
             raw = forward_return(*s, d0, k) if s else None
+            nf = []
+            if raw == NONFINITE:
+                raw, nf = None, [symbol]
             spy = None
             if raw is not None and bench:
                 # SPY over the same two dates as the name, not SPY's own k-th bar,
                 # so a bar missing from the name cannot misalign the two windows.
                 dk = s[1][bisect.bisect_left(s[1], d0) + k]
                 b0, bk = bench[0].get(d0), bench[0].get(dk)
-                spy = bk / b0 - 1 if b0 and bk is not None else None
+                if nonfinite(b0) or nonfinite(bk):
+                    raw, nf = None, [BENCHMARK]
+                else:
+                    spy = bk / b0 - 1 if b0 and bk is not None else None
             rec[f"f{k}"] = raw
             rec[f"x{k}"] = raw - spy if raw is not None and spy is not None else None
+            rec[f"nf{k}"] = nf
         out.setdefault(label, []).append(rec)
     return out
 
@@ -255,25 +285,40 @@ def _cell(vals: list[float]) -> str:
             f"{hit * 100:.0f}%")
 
 
-def readout(groups: dict[str, list[dict]], since: date, env: str, head: str) -> str:
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+TABLE_HEAD = ["| group | horizon | rows | pending | non-finite | names | mean x % | median x % "
+              "| x > 0 | mean f % |", "|---|---|---|---|---|---|---|---|---|---|"]
+
+
+def _group_lines(label: str, recs: list[dict]) -> list[str]:
+    """One table line per horizon. Non-finite rows (nf<k> non-empty) are out
+    of pending and of the stats; the cell names their tickers."""
+    names = len({r["symbol"] for r in recs})
+    out = []
+    for k in HORIZONS:
+        bad = [r for r in recs if r.get(f"nf{k}")]
+        xs = [r[f"x{k}"] for r in recs if r[f"x{k}"] is not None]
+        fs = [r[f"f{k}"] for r in recs if r[f"f{k}"] is not None]
+        f_mean = f"{statistics.mean(fs) * 100:+.1f}" if fs else "-"
+        tick = sorted({t for r in bad for t in r[f"nf{k}"]})
+        nf = f"{len(bad)} ({', '.join(tick)})" if bad else "0"
+        out.append(f"| {label} | {k} | {len(recs)} | {len(recs) - len(xs) - len(bad)} | {nf} | "
+                   f"{names} | {_cell(xs)} | {f_mean} |")
+    return out
+
+
+def readout(groups: dict[str, list[dict]], since: date, env: str, head: str,
+            now: datetime | None = None) -> str:
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [f"# Forward-return readout ({env}, rows since {since})", "",
              f"Generated {now} at code {head}. Engineering diagnostic, not a study result. "
              "One row per name per session 0; x = minus SPY over the same sessions, "
-             "f = raw. Percentages only.", "",
-             "| group | horizon | rows | pending | names | mean x % | median x % | x > 0 | mean f % |",
-             "|---|---|---|---|---|---|---|---|---|"]
+             "f = raw. Non-finite = the base or k-th close (the name's, or SPY's) is NaN or "
+             "infinite: those rows are out of pending and the stats, and no bar is dropped or "
+             "changed. Percentages only.", ""] + TABLE_HEAD
     for label in sorted(groups):
-        recs = groups[label]
-        names = len({r["symbol"] for r in recs})
-        for k in HORIZONS:
-            xs = [r[f"x{k}"] for r in recs if r[f"x{k}"] is not None]
-            fs = [r[f"f{k}"] for r in recs if r[f"f{k}"] is not None]
-            f_mean = f"{statistics.mean(fs) * 100:+.1f}" if fs else "-"
-            lines.append(f"| {label} | {k} | {len(recs)} | {len(recs) - len(xs)} | {names} | "
-                         f"{_cell(xs)} | {f_mean} |")
+        lines += _group_lines(label, groups[label])
     if not groups:
-        lines.append("| (no rows) | | | | | | | | |")
+        lines.append("| (no rows) | | | | | | | | | |")
     lines += ["", "Small groups are noise: rows of one day move together, so a few sessions "
               "can look like a pattern."]
     return "\n".join(lines) + "\n"
@@ -303,11 +348,12 @@ def conviction_groups(rows, bars) -> tuple[dict, dict]:
     return by_int, by_band
 
 
-def conviction_readout(rows, bars, since: date, env: str, head: str) -> str:
+def conviction_readout(rows, bars, since: date, env: str, head: str,
+                       now: datetime | None = None) -> str:
     """Markdown for --by conviction: both views with per-horizon rank correlations."""
     by_int, by_band = conviction_groups(rows, bars)
     bands = "; ".join(label for _, _, label in LOGPROB_BANDS)
-    text = readout(by_int, since, env, head).replace(
+    text = readout(by_int, since, env, head, now).replace(
         "# Forward-return readout (", "# Forward-return readout by conviction (", 1)
     head_lines = ["Conviction = decision.final_conviction, else signals.confidence x 10. "
                   f"Logprob bands (provenance.llm_call.conviction_logprobs.expected), fixed before "
@@ -315,21 +361,13 @@ def conviction_readout(rows, bars, since: date, env: str, head: str) -> str:
                   f"{BOOTSTRAP_DRAWS} bootstrap draws over session-0 dates, seed {BOOTSTRAP_SEED}.", ""]
     lines = text.rstrip("\n").split("\n")
     lines[2:2] = head_lines
-    lines += ["", "## By logprob band", "",
-              "| group | horizon | rows | pending | names | mean x % | median x % | x > 0 | mean f % |",
-              "|---|---|---|---|---|---|---|---|---|"]
+    lines += ["", "## By logprob band", ""] + TABLE_HEAD
     order = [f"logprob {label}" for _, _, label in LOGPROB_BANDS] + ["logprob no logprobs"]
     for label in order:
         recs = by_band.get(label)
         if not recs:
             continue
-        names = len({r["symbol"] for r in recs})
-        for k in HORIZONS:
-            xs = [r[f"x{k}"] for r in recs if r[f"x{k}"] is not None]
-            fs = [r[f"f{k}"] for r in recs if r[f"f{k}"] is not None]
-            f_mean = f"{statistics.mean(fs) * 100:+.1f}" if fs else "-"
-            lines.append(f"| {label} | {k} | {len(recs)} | {len(recs) - len(xs)} | {names} | "
-                         f"{_cell(xs)} | {f_mean} |")
+        lines += _group_lines(label, recs)
     all_recs = [r for recs in by_int.values() for r in recs]
     lines += ["", "## Rank correlation with the excess return (95% interval, day blocks)", "",
               "| horizon | integer conviction | logprob expectation |", "|---|---|---|"]

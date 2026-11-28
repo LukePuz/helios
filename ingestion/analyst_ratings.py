@@ -66,6 +66,10 @@ def _log_stats() -> None:
             return
         log.info(f"Analyst ratings this poll (log-only): tickers {st['tickers']} failed {st['failed']} "
                  f"empty {st['empty']} recent {st['recent']} returned {st['returned']}")
+        from ingestion import source_health
+        source_health.note("analyst_ratings",
+                           source_health.ERROR if st["failed"] == st["tickers"]
+                           else source_health.OK if st["returned"] else source_health.EMPTY)
         if st["failed"] == st["tickers"]:
             log.warning(f"Analyst ratings feed failed for all {st['tickers']} ticker(s) this poll "
                         f"(first: {st['first_error']})")

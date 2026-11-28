@@ -389,6 +389,7 @@ def send_daily_digest(
     catalysts_label: str | None = None,
     exits_text: list[str] | None = None,
     book_text: list[str] | None = None,
+    dead_sources: list[str] | None = None,
 ) -> None:
     """
     Richer post-close digest — day P&L vs SPY, open positions with stop
@@ -438,6 +439,15 @@ def send_daily_digest(
     if ingestion_issues:
         lines.append("\n⚠️ <b>Ingestion Health:</b>")
         lines.extend(f"  {i}" for i in ingestion_issues[:8])
+
+    if dead_sources:
+        # Source health (low severity; names only): polled with no good poll
+        # for SOURCE_HEALTH_DEAD_SESSIONS+ sessions (ingestion/source_health.py).
+        try:
+            from config import SOURCE_HEALTH_DEAD_SESSIONS as _dead_n
+        except Exception:
+            _dead_n = 2
+        lines.append(f"\nData sources dead {_dead_n}+ sessions: {', '.join(dead_sources)}")
 
     if atr_fallback_tickers:
         n = len(atr_fallback_tickers)
